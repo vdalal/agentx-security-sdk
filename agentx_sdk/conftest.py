@@ -18,3 +18,11 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_override_store(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTX_OVERRIDES", str(tmp_path / "overrides.json"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tool_pins(tmp_path, monkeypatch):
+    """MCP tool-description drift pins default to .agentx/mcp_tool_pins.json under
+    the project root; isolate them per-test so a run_proxy-path test (or the e2e
+    stub server) can never read/write a real pin file or order-flake."""
+    monkeypatch.setenv("AGENTX_MCP_PINS_PATH", str(tmp_path / "mcp_tool_pins.json"))
