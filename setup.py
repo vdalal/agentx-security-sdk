@@ -41,6 +41,7 @@ setup(
     project_urls={
         "Homepage": "https://agentx-core.com",
         "Get Started": "https://bit.ly/agentfirewall",
+        "Source": "https://github.com/vdalal/agentx-security-sdk",
     },
     packages=find_packages(include=["agentx_sdk", "agentx_sdk.*"]),
     install_requires=[

@@ -87,6 +87,68 @@ def test_nowhere_update_blocked():
     assert _cat("UPDATE accounts SET balance = 0") == "DESTRUCTIVE_ACTION"
 
 
+def test_tautological_where_mass_write_blocked():
+    # A wholly always-true WHERE scopes nothing -> same class as no WHERE. Keyless
+    # parity with the gateway's tautology floor (the canonical `1=1` / `true` /
+    # `'a'='a'` forms; the exotic tail stays the gateway judge's job).
+    assert _cat("DELETE FROM users WHERE 1=1") == "DESTRUCTIVE_ACTION"
+    assert _cat("UPDATE accounts SET status = 'void' WHERE 'a'='a'") == "DESTRUCTIVE_ACTION"
+    assert _cat("DELETE FROM audit WHERE true") == "DESTRUCTIVE_ACTION"
+
+
+def test_scoped_where_with_tautology_stub_allowed():
+    # A real predicate ANDed onto a 1=1 stub is a scoped write -> must NOT block.
+    assert _eval("DELETE FROM sessions WHERE 1=1 AND created_at < '2020-01-01'") is None
+    assert _eval("DELETE FROM users WHERE id = 5") is None
+    # AND with a real condition, even wrapping a tautology, stays scoped (no FP).
+    assert _eval("DELETE FROM t WHERE col=5 AND (1=1 OR 1=1)") is None
+    assert _eval("DELETE FROM accounts WHERE balance=0 OR status='x'") is None
+
+
+def test_tautological_where_evasions_blocked():
+    # Evasions from the high code review: a stacked statement, a trailing comment,
+    # a LIMIT suffix, and a no-space / parenthesized WHERE all still block on the
+    # keyless path (which has NO judge behind it, so catching these deterministically
+    # matters more here than on the gateway).
+    assert _cat("DELETE FROM users WHERE 1=1; SELECT 1") == "DESTRUCTIVE_ACTION"
+    assert _cat("DELETE FROM users WHERE 1=1 -- cleanup") == "DESTRUCTIVE_ACTION"
+    assert _cat("DELETE FROM t WHERE 1=1 LIMIT 5") == "DESTRUCTIVE_ACTION"
+    assert _cat("DELETE FROM t WHERE(1=1)") == "DESTRUCTIVE_ACTION"
+    # a no-WHERE mass write on a table whose name merely contains 'where'
+    assert _cat("UPDATE somewhere SET status=1") == "DESTRUCTIVE_ACTION"
+    assert _cat("DELETE FROM nowhere_table") == "DESTRUCTIVE_ACTION"
+
+
+# --- Pon's coaching-as-oracle boundary --------------------------------------
+# Keyless coaching must REDUCE capability (point at the minimal-privilege version
+# of the caller's OWN intent), never act as an oracle that maps the floor for an
+# injected caller ("analyze the barrier, change your path, retry"). The shipped
+# builtins already obey this; this guard keeps a future edit from reintroducing an
+# oracle string. See designs/keyless-coaching-oracle-boundary.md.
+_ORACLE_PHRASES = (
+    "analyze this", "analyse this", "change your execution", "change your query path",
+    "change your path", "bypass", "what gets through", "what shape", "work around",
+    "try a different", "retry your",
+)
+
+
+def test_keyless_coaching_is_capability_reducing_not_an_oracle():
+    from agentx_sdk.decorators import _BUILTIN_POLICY_KEYWORDS
+    for p in _BUILTIN_POLICY_KEYWORDS:
+        blob = " ".join(
+            str(p.get(k, "")) for k in ("socratic_prompt", "preferred_alternative")
+        ).lower()
+        assert blob.strip(), f"{p['name']}: coaching must not be empty"
+        # Must name a concrete safe path (the minimal-privilege version of intent)
+        assert p.get("preferred_alternative"), \
+            f"{p['name']}: needs a preferred_alternative safe path"
+        # Must NOT invite the caller to probe / retry-around the barrier
+        for phrase in _ORACLE_PHRASES:
+            assert phrase not in blob, (
+                f"{p['name']}: coaching contains oracle-inviting phrase '{phrase}' — keyless "
+                f"coaching must reduce capability, not map the floor (Pon boundary)")
+
+
 def test_scoped_update_with_where_allowed():
     assert _eval("UPDATE accounts SET balance = 0 WHERE id = 5") is None
 

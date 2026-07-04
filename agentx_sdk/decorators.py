@@ -1067,6 +1067,18 @@ _DESTRUCTIVE_DDL_RE = re.compile(
     r"|\btruncate\s+(?:table\s+)?\w")
 _MASS_WRITE_RE = re.compile(
     r"\bdelete\s+from\s+[\w.]+|\bupdate\s+[\w.]+\s+set\b")
+# A WHERE clause whose effective predicate is a canonical always-true form
+# (`true` / `1=1` / `'a'='a'`), optionally parenthesized, keyed off "not followed
+# by AND/OR" (not an end-anchor) so trailing content (a second statement, a `--`
+# comment, `LIMIT n`) cannot evade it while `1=1 AND real_col=…` is NOT matched.
+# Byte-identical to the gateway fallback regex (the SDK cannot import backend). No
+# AST here, so an OR-combined tautology (`1=1 OR 1=1`) is a documented residual the
+# gateway AST owns.
+_TAUTOLOGICAL_WHERE_RE = re.compile(
+    r"\bwhere\b\s*\(?\s*"
+    r"(?:true\b|(\d+)\s*=\s*\1\b|'([^']*)'\s*=\s*'\2')"
+    r"\s*\)?(?!\s*(?:and|or)\b)",
+    re.IGNORECASE)
 
 
 def _detect_destructive_sql(normalized):
@@ -1074,11 +1086,17 @@ def _detect_destructive_sql(normalized):
     if _DESTRUCTIVE_DDL_RE.search(normalized):
         return True
     m = _MASS_WRITE_RE.search(normalized)
-    # No-WHERE mass delete/update: fire ONLY when no WHERE follows the write verb.
-    # If a WHERE appears anywhere after (even inside a subquery or a string literal)
-    # we stay conservative and do NOT fire — that subtlety is the gateway judge's job,
-    # and it keeps a legitimate scoped write (the common case) from false-blocking.
-    return bool(m and "where" not in normalized[m.start():])
+    if not m:
+        return False
+    after = normalized[m.start():]
+    # Mass delete/update that scopes nothing: no real WHERE after the verb
+    # (\bwhere\b, so a `somewhere`/`nowhere` identifier is not read as a WHERE), OR
+    # a canonical always-true WHERE. A real WHERE (incl. `1=1 AND real_col=…`) stays
+    # the gateway judge's call — we stay conservative so a scoped write never
+    # false-blocks.
+    if not re.search(r"\bwhere\b", after):
+        return True
+    return bool(_TAUTOLOGICAL_WHERE_RE.search(after))
 
 
 # ---- Structural SSRF: encoded / alternate-form private-IP targets ----
