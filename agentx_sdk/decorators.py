@@ -875,7 +875,13 @@ _BUILTIN_POLICY_KEYWORDS = [
         "id": "11111111-1111-1111-1111-111111111103",
         "name": "Network Sandbox (SSRF)",
         "category": "NETWORK_TRAVERSAL",
-        "blocked_intents": ["169.254.169.254", "localhost", "127.0.0.1", "0.0.0.0", "metadata.google.internal", "100.100.100.200", "[::1]", "fd00:ec2::254", "::ffff:169.254.169.254", "2852039166", "0xa9fea9fe"],
+        # The literal loopback/metadata hostnames stay as fast substring rails; the
+        # ENCODED-IP class (decimal/hex/octal/IPv6 forms of ANY loopback/link-local/
+        # private/reserved target) is generalized by the structural _detect_ssrf_encoded
+        # pass below. That replaces the two hardcoded encodings of 169.254.169.254 that
+        # used to sit here AND removes their bare-integer false positive (a numeric id
+        # such as `WHERE id = 2852039166` is no longer mistaken for the metadata IP).
+        "blocked_intents": ["169.254.169.254", "localhost", "127.0.0.1", "0.0.0.0", "metadata.google.internal", "100.100.100.200", "[::1]", "fd00:ec2::254", "::ffff:169.254.169.254"],
         "socratic_prompt": "This target is a loopback or cloud-metadata address, a common SSRF path to internal credentials.",
         "preferred_alternative": "Send the request to the intended external service hostname over HTTPS, not an internal IP, localhost, or 169.254.169.254.",
     },
@@ -1050,8 +1056,14 @@ def _normalize_for_match(raw):
 #   * DROP / TRUNCATE of ANY object (table, database, schema, index, view, role)
 #   * a MASS write with NO WHERE: DELETE FROM <t> or UPDATE <t> SET ... with no WHERE
 # Mirrors the gateway's destructive-DDL + no-WHERE detectors (backend/gateway.py).
+# Keyless has NO AST, so this regex runs as a substring match over arbitrary payload text.
+# That forces it to stay NARROWER than the gateway: it deliberately omits the prose-ambiguous
+# objects `user` and `trigger` (ordinary English words -> false positives on non-SQL text like
+# "drop user surveys"). Real `DROP USER` / `DROP TRIGGER` are still caught precisely by the
+# gateway's AST path; keyless enumerates only the SQL-specific objects.
 _DESTRUCTIVE_DDL_RE = re.compile(
-    r"\bdrop\s+(?:table|database|schema|index|view|role)\b"
+    r"\bdrop\s+(?:table|database|schema|index|view|materialized\s+view|"
+    r"role|sequence|tablespace)\b"
     r"|\btruncate\s+(?:table\s+)?\w")
 _MASS_WRITE_RE = re.compile(
     r"\bdelete\s+from\s+[\w.]+|\bupdate\s+[\w.]+\s+set\b")
@@ -1069,6 +1081,66 @@ def _detect_destructive_sql(normalized):
     return bool(m and "where" not in normalized[m.start():])
 
 
+# ---- Structural SSRF: encoded / alternate-form private-IP targets ----
+# The literal metadata/loopback hostnames are fast substring rails in the SSRF policy above.
+# This pass generalizes the ENCODED-IP class those literals cannot enumerate: decimal / hex /
+# IPv6 forms of ANY loopback, link-local, private, reserved, or unspecified address
+# (http://2130706433/ == 127.0.0.1, http://0x7f000001/ == 127.0.0.1), mirroring the gateway's
+# _coerce_ip decode. It is deliberately NARROWER than the gateway's detect_ssrf_target: it
+# fires ONLY on a host inside an explicit scheme://URL (not a bare host, and not the gateway's
+# `.internal`/`.localhost` suffix rule), so a bare numeric id in a payload
+# (`WHERE id = 2852039166`) is never coerced -> no false positive. (Dotted-octal like
+# 0177.0.0.1 is NOT decoded -- ipaddress rejects leading-zero octets; same limit as the gateway.)
+_SSRF_URL_RE = re.compile(r"\b[a-z][a-z0-9+.\-]*://([^\s/'\"<>]+)", re.IGNORECASE)
+
+
+def _coerce_ip_keyless(host):
+    """Canonicalize a host token to an ipaddress, decoding the common SSRF-bypass
+    encodings (decimal int, hex int, dotted, IPv6). Returns None for a genuine hostname.
+    Kept in step with the gateway's _coerce_ip so client + server agree."""
+    import ipaddress
+    h = host.strip().strip("[]")
+    if not h:
+        return None
+    try:
+        return ipaddress.ip_address(h)
+    except ValueError:
+        pass
+    try:
+        as_int = int(h, 16) if h.lower().startswith("0x") else int(h)
+        return ipaddress.ip_address(as_int)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _detect_ssrf_encoded(raw):
+    """True if a scheme://URL in the payload targets a loopback / link-local / private /
+    reserved / unspecified address in ANY encoding. URL-context-only (never a bare token),
+    so a numeric literal elsewhere in the payload cannot false-trip it. ``raw`` is the
+    already-stringified payload from evaluate_call_keyless."""
+    if "://" not in raw:            # cheap guard: skip the regex on the common no-URL case
+        return False
+    for m in _SSRF_URL_RE.finditer(raw):
+        netloc = m.group(1).split("@")[-1]
+        if netloc.startswith("["):            # bracketed IPv6: [::1]:port
+            host = netloc[1:].split("]")[0]
+        else:
+            host = netloc.split(":")[0]
+        ip = _coerce_ip_keyless(host)
+        if ip is None:
+            continue
+        # Unwrap an IPv4-mapped IPv6 (::ffff:a.b.c.d) to its embedded IPv4: the whole
+        # ::ffff:0:0/96 block is is_reserved, which would else over-block a PUBLIC mapped
+        # host (::ffff:93.184.216.34). Matches the gateway's _host_is_blocked_target.
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:
+            ip = mapped
+        if (ip.is_loopback or ip.is_link_local or ip.is_private
+                or ip.is_reserved or ip.is_unspecified):
+            return True
+    return False
+
+
 def _is_catalog_token(token):
     """True for a DB-catalog introspection token (information_schema / pg_catalog /
     sqlite_master / a read PRAGMA). Used to NARROW the benign-catalog exemption so it
@@ -1081,6 +1153,12 @@ def _is_catalog_token(token):
 # SQL floor's block so its category/coaching stay stable regardless of pulled policies.
 _MASS_DESTRUCTIVE_POLICY = next(
     (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Mass Destructive Intent"),
+    _BUILTIN_POLICY_KEYWORDS[0])
+
+# The SSRF builtin, used to attribute the structural encoded-IP floor so its
+# category/coaching stay stable regardless of pulled policies.
+_SSRF_POLICY = next(
+    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Network Sandbox (SSRF)"),
     _BUILTIN_POLICY_KEYWORDS[0])
 
 
@@ -1117,8 +1195,9 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False):
     It deliberately does NOT run the circuit breaker, the org-reframe swap
     (``_apply_org_override``), the incident park, or the pulse: the caller owns those.
 
-    This is the blatant-catastrophic floor. Deeper obfuscation (encoded IPs, base64,
-    semantic paraphrase) is by design caught by the gateway judge, not here.
+    This is the blatant-catastrophic floor. It catches encoded-IP SSRF only inside an
+    explicit URL (see _detect_ssrf_encoded); deeper obfuscation (base64, semantic
+    paraphrase, or a bare/scheme-less encoded host) is by design left to the gateway judge.
 
     Returns ``None`` (allow) or
     ``{policy_id, policy_name, challenge_text, category, preferred_alternative}``
@@ -1142,6 +1221,13 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False):
             if benign_catalog and _is_catalog_token(token):
                 continue
             return _keyless_decision(policy)
+
+    # 1b) Structural SSRF: an encoded / alternate-form private-IP target inside a URL that
+    #     no flat literal enumerates (decimal/hex loopback + metadata IPs). Runs on the RAW
+    #     payload (URLs survive normalization) and is URL-context-scoped, so a bare numeric
+    #     id never coerces.
+    if _detect_ssrf_encoded(raw):
+        return _keyless_decision(_SSRF_POLICY)
 
     # 2) Structural destructive-SQL FALLBACK for classes no flat token expresses
     #    (DROP of other objects, TRUNCATE, a no-WHERE mass UPDATE/DELETE). Reached only

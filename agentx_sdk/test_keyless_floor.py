@@ -111,11 +111,62 @@ def test_truncate_and_drop_variants_blocked():
     assert _cat("DROP INDEX idx_users") == "DESTRUCTIVE_ACTION"
 
 
+def test_drop_sql_specific_objects_blocked():
+    # Keyless has no AST, so its DDL net is a substring regex enumerating only the
+    # SQL-specific objects (role/sequence/tablespace/materialized view). Real DROP USER /
+    # DROP TRIGGER are left to the gateway's AST -- they are prose-ambiguous words keyless
+    # cannot safely match (see test_ddl_prose_ambiguous_objects_not_false_blocked).
+    assert _cat("DROP ROLE app_admin") == "DESTRUCTIVE_ACTION"
+    assert _cat("DROP SEQUENCE order_seq") == "DESTRUCTIVE_ACTION"
+    assert _cat("DROP TABLESPACE archive_ts") == "DESTRUCTIVE_ACTION"
+    assert _cat("DROP MATERIALIZED VIEW mv_sales") == "DESTRUCTIVE_ACTION"
+
+
+def test_ddl_prose_ambiguous_objects_not_false_blocked():
+    # 'user' and 'trigger' are ordinary English words -> deliberately NOT in the keyless
+    # regex, so non-SQL prose containing them must ALLOW (the gateway AST still floors the
+    # real DDL form). Also: 'drop' as a substring of another word must not fire.
+    assert _eval("drop user surveys from the onboarding flow") is None
+    assert _eval("we can drop trigger reminders for now") is None
+    assert _eval("UPDATE users SET dropped = true WHERE id = 5") is None
+    assert _eval("SELECT * FROM shipping WHERE status = 'dropoff'") is None
+
+
 # --- #5: SSRF encoded / alternate literals ---
 def test_ssrf_metadata_and_ipv6_blocked():
     assert _cat("GET http://metadata.google.internal/computeMetadata/v1/") == "NETWORK_TRAVERSAL"
     assert _cat("connect to [::1]:9000") == "NETWORK_TRAVERSAL"
     assert _cat("http://2852039166/latest/meta-data/") == "NETWORK_TRAVERSAL"
+
+
+def test_ssrf_encoded_ip_generalized_block():
+    # The structural normalizer catches ANY encoded loopback/link-local/private IP in a
+    # URL, not just the two hardcoded encodings of 169.254.169.254 that used to be literals.
+    assert _cat("fetch http://2130706433/") == "NETWORK_TRAVERSAL"        # 127.0.0.1 (decimal)
+    assert _cat("curl http://0x7f000001/latest/") == "NETWORK_TRAVERSAL"  # 127.0.0.1 (hex)
+    assert _cat("GET http://0xa9fea9fe/latest/meta-data/") == "NETWORK_TRAVERSAL"  # 169.254.169.254 (hex)
+    assert _cat("http://[::1]:8080/admin") == "NETWORK_TRAVERSAL"         # ipv6 loopback in a URL
+
+
+def test_ssrf_ipv4_mapped_ipv6_unwrapped():
+    # An IPv4-mapped IPv6 host is judged by its EMBEDDED IPv4. ::ffff:0:0/96 is is_reserved,
+    # so without unwrapping a mapped PUBLIC host would over-block; a mapped PRIVATE host must
+    # still block.
+    assert _eval("GET http://[::ffff:93.184.216.34]/index.html") is None      # public -> allow
+    assert _cat("GET http://[::ffff:10.0.0.5]/") == "NETWORK_TRAVERSAL"        # private -> block
+
+
+def test_ssrf_bare_integer_id_not_a_false_positive():
+    # Regression for the removed hardcoded literals: a bare numeric id that merely happens
+    # to equal an encoded metadata IP is NOT a URL host -> must NOT be mistaken for SSRF.
+    assert _eval("SELECT total FROM orders WHERE id = 2852039166") is None
+    assert _eval("UPDATE jobs SET code = 2130706433 WHERE id = 7") is None
+
+
+def test_ssrf_public_host_and_ip_allowed():
+    # A real external service (hostname or public IP) in a URL must still pass untouched.
+    assert _eval("GET http://93.184.216.34/index.html") is None          # public IP
+    assert _eval('requests.get("https://api.stripe.com/v1/charges")') is None
 
 
 # --- #6: broadened secret reads + paste sinks ---
