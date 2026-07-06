@@ -230,6 +230,66 @@ def test_allow_resets_block_streak():
 
 
 # --------------------------------------------------------------------------- #
+# Finding 2 — keyless runaway-loop ceiling (the cost-explosion class over MCP,
+# which the gateway budget floor owns for the decorator but has no keyless signal here)
+# --------------------------------------------------------------------------- #
+def test_call_ceiling_default_off_and_parses_env(monkeypatch):
+    monkeypatch.delenv("AGENTX_MCP_CALL_CEILING", raising=False)
+    assert mp._call_ceiling() == 0                 # opt-in: disabled by default
+    monkeypatch.setenv("AGENTX_MCP_CALL_CEILING", "500")
+    assert mp._call_ceiling() == 500
+    monkeypatch.setenv("AGENTX_MCP_CALL_CEILING", "-3")
+    assert mp._call_ceiling() == 0                 # clamped >= 0
+    monkeypatch.setenv("AGENTX_MCP_CALL_CEILING", "garbage")
+    assert mp._call_ceiling() == 0                 # unparseable -> disabled
+
+
+def test_call_ceiling_halts_session_after_volume():
+    """Once the session's tool-call VOLUME crosses the ceiling, EVERY further call is halted
+    with runaway coaching — even a benign one that would otherwise forward — because the runaway
+    is the cumulative volume, not the individual call (the budget-ceiling shape over MCP). This
+    catches the payload-VARYING loop the per-tool circuit breaker (identical payloads) evades."""
+    stats = {"_call_ceiling": 3, "total_calls": 0}
+    streaks = {}
+    benign = _line(name="read_file", arguments={"path": "/data/ok.txt"})
+    for _ in range(3):                              # first 3 calls forward untouched
+        forwarded, client_out, stats = _route(benign, stats=stats, streaks=streaks)
+        assert forwarded == benign and client_out == ""
+    forwarded, client_out, stats = _route(benign, stats=stats, streaks=streaks)
+    assert forwarded == ""                          # the 4th is halted, not forwarded
+    resp = json.loads(client_out)
+    assert resp["result"]["isError"] is True
+    text = resp["result"]["content"][0]["text"].lower()
+    assert "runaway" in text and "ceiling" in text
+    assert stats["critical_blocks"] == 1 and stats["total_calls"] == 4
+
+
+def test_call_ceiling_absent_never_halts():
+    """With no ceiling set (the default), a high call volume never halts — a cold install is
+    byte-identical to before."""
+    stats, streaks = {}, {}
+    benign = _line(name="read_file", arguments={"path": "/data/ok.txt"})
+    for _ in range(50):
+        forwarded, _, stats = _route(benign, stats=stats, streaks=streaks)
+        assert forwarded == benign
+    assert stats["total_calls"] == 50
+    assert stats.get("critical_blocks", 0) == 0
+
+
+def test_invisible_unicode_carrier_in_nested_arg_is_caught():
+    """A carrier smuggled inside a NESTED dict arg value is still caught: the shared flattener
+    uses ensure_ascii=False so json does not escape the codepoint into \\uXXXX text before the
+    shield sees it. Regression guard for the nested-arg bypass. Codepoint via chr(), not a literal."""
+    tag = chr(0xE0041)                                   # Unicode Tags-block smuggling
+    line = _line(name="write_note", arguments={"payload": {"body": "hello" + tag}})
+    forwarded, client_out, stats = _route(line)
+    assert forwarded == ""                                # blocked, never forwarded to the server
+    resp = json.loads(client_out)
+    assert resp["result"]["isError"] is True
+    assert stats["critical_blocks"] == 1
+
+
+# --------------------------------------------------------------------------- #
 # A1a — coaching is call-fitting and names a safe path (not generic)
 # --------------------------------------------------------------------------- #
 def test_block_coaching_is_call_fitting_and_names_a_safe_path(monkeypatch):

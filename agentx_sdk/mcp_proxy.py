@@ -155,6 +155,25 @@ def _harvest_enabled():
     return os.environ.get("AGENTX_MCP_HARVEST", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _call_ceiling():
+    """Session tools/call ceiling — the keyless runaway-loop guard for the cost-explosion
+    class over MCP (AFDB #17/#23/#55, which the gateway budget floor owns for the decorator
+    but has no keyless signal here). The proxy cannot meter LLM tokens (it never sees usage),
+    so it uses tool-call VOLUME as the proxy: once a session crosses the ceiling, every
+    further tools/call is halted with coaching. It catches the payload-VARYING runaway loop
+    that the per-tool circuit breaker (identical payloads only) evades — the same 'the signal
+    is the cumulative total, not any single call' shape as the budget ceiling.
+
+    DEFAULT 0 = DISABLED (opt-in). A legitimate long agent session can make many tool calls,
+    so a default-on halt would risk breaking a real run — the MCP wedge's whole value — which
+    is why it is off unless an operator arms it (AGENTX_MCP_CALL_CEILING, e.g. 500 for a
+    generous runaway bound). Clamped >= 0; an unparseable value disables it."""
+    try:
+        return max(0, int(os.environ.get("AGENTX_MCP_CALL_CEILING", "0")))
+    except (TypeError, ValueError):
+        return 0
+
+
 # The structural-signature vocab for a recovered call Y (designs/mcp-corpus-intake.md (B),
 # open decision #2 ratified 2026-06-30). Keyless MCP has NO judge to label a call, so the
 # signature is a LOCAL, coarse heuristic: target_action is read off the tool NAME (word tokens
@@ -795,6 +814,29 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
 
     session_stats["total_calls"] = session_stats.get("total_calls", 0) + 1
 
+    # Keyless runaway-loop ceiling (AFDB #17/#23/#55 over MCP): once this session's tool-call
+    # VOLUME crosses the operator ceiling, halt every further call with coaching — the runaway
+    # is the volume, not any single call, so this catches the payload-varying cost loop the
+    # per-tool breaker (identical payloads only) evades. Opt-in: absent/0 ceiling is a no-op, so
+    # a cold install is byte-identical to today. Placed BEFORE the shield so a runaway is halted
+    # whether or not this particular call is otherwise clean. Never raises.
+    ceiling = session_stats.get("_call_ceiling", 0)
+    if ceiling and session_stats["total_calls"] > ceiling:
+        req_id = msg.get("id")
+        text = ("AgentX halted this session: it has made %d tool calls, past the configured "
+                "ceiling of %d, a likely runaway loop burning budget. Stop retrying the task and "
+                "ask the human operator before continuing."
+                % (session_stats["total_calls"], ceiling))
+        if req_id is not None:
+            writer.send(_block_response(req_id, text))
+        else:
+            print("[agentx-mcp] dropped id-less tools/call past the runaway ceiling", file=log)
+        session_stats["intercepts"] = session_stats.get("intercepts", 0) + 1
+        session_stats["critical_blocks"] = session_stats.get("critical_blocks", 0) + 1
+        print("[agentx-mcp] blocked tools/call (runaway ceiling %d exceeded at %d calls)."
+              % (ceiling, session_stats["total_calls"]), file=log)
+        return "block"
+
     # block-mode drift gate: a tools/call to a tool whose advertised definition
     # drifted is stopped with re-verify coaching BEFORE the shield runs -- the
     # malice is in the changed definition, not necessarily this call. The drifted
@@ -1004,6 +1046,13 @@ def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
         session_stats["_pin_mode"] = pin_mode
         session_stats["_drifted"] = drifted
         session_stats["_pending_list_ids"] = pending_list_ids
+
+    # Resolve the keyless runaway-loop ceiling ONCE per session (opt-in; 0 = disabled, the
+    # default, so the key is absent and _screen_message's guard is a no-op). Stashed on
+    # session_stats like _pin_mode so no routing-core signature churns.
+    ceiling = _call_ceiling()
+    if ceiling:
+        session_stats["_call_ceiling"] = ceiling
 
     def _default_popen(cmd):
         # errors="replace": a stray non-UTF-8 byte from the server must not raise in the

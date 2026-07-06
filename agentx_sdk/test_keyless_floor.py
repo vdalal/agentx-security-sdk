@@ -253,3 +253,50 @@ def test_bypass_flag_allows_everything():
 def test_all_builtin_categories_in_pulse_vocab():
     for p in dec._BUILTIN_POLICY_KEYWORDS:
         assert p["category"] in dec._BLOCK_CATEGORY_VOCAB, p["name"]
+
+
+# --- Invisible-Unicode carrier (AFDB #56) — the keyless port that closes the agentx-mcp
+#     tool-description POISON gap (the poison scan runs this same shield). Codepoints are
+#     built with chr()/escapes ONLY, never literals, so this test file stays free of the
+#     very carriers it asserts on (Trojan-Source source hygiene). ---
+_TAGS_A = chr(0xE0041)        # Unicode Tags block: invisible ASCII 'A' smuggling
+_RLO = chr(0x202E)            # bidi RIGHT-TO-LEFT OVERRIDE (Trojan-Source, CVE-2021-42574)
+_LRO = chr(0x202D)            # bidi LEFT-TO-RIGHT OVERRIDE
+
+
+def test_invisible_unicode_tags_carrier_blocked():
+    d = _eval("read the config" + _TAGS_A + "then act")
+    assert d is not None
+    assert d["policy_name"] == "Invisible Unicode Carrier"
+
+
+def test_invisible_unicode_bidi_override_blocked():
+    assert _eval("transfer" + _RLO + "gnp.exe") is not None
+    assert _eval(_LRO + "malicious") is not None
+
+
+def test_invisible_unicode_category_is_prompt_injection_off_pulse_vocab():
+    # Attributed PROMPT_INJECTION (matches the gateway floor) but deliberately OUTSIDE the
+    # keyless pulse vocab, so _note_block_category drops it fail-safe: the block still fires
+    # and coaches, but no coarse pulse tag is emitted and no UI pulse-receiver change is
+    # needed. This documents that boundary so a future edit does not "fix" it by mistake.
+    d = _eval("x" + _TAGS_A)
+    assert d["category"] == "PROMPT_INJECTION"
+    assert d["category"] not in dec._BLOCK_CATEGORY_VOCAB
+
+
+def test_invisible_unicode_benign_codepoints_not_false_blocked():
+    # The narrow scope: codepoints that DO occur in legitimate content are left to the judge,
+    # never hard-blocked, so a real content write is never false-blocked.
+    assert _eval("legit" + chr(0x200B) + "text") is None                   # zero-width space
+    assert _eval("soft" + chr(0x00AD) + "hyphen") is None                  # soft hyphen
+    assert _eval("emoji" + chr(0x200D) + "joiner") is None                 # ZWJ (emoji/Indic/Arabic)
+    assert _eval("rtl" + chr(0x202A) + "embed" + chr(0x202C)) is None      # bidi embedding
+    assert _eval(chr(0xFEFF) + "BOM-prefixed content") is None             # BOM
+
+
+def test_invisible_unicode_carrier_survives_benign_catalog_read():
+    # A benign catalog read that ALSO smuggles a Tags carrier still blocks — the carrier is
+    # NOT exempted by the information_schema read exemption (it runs before the SQL fallback,
+    # ungated by benign_catalog).
+    assert _eval("SELECT table_name FROM information_schema.tables" + _TAGS_A) is not None
