@@ -16,7 +16,7 @@ import contextvars
 from contextvars import ContextVar
 
 from .client import AgentXClient
-from .db import init_db, log_intercept, get_lifetime_stats, log_self_correction
+from .db import init_db, log_intercept, get_lifetime_stats, log_self_correction, WOULD_BLOCK_STATUS
 from . import pulse
 from .overrides import get_active_override
 
@@ -59,6 +59,33 @@ _ensure_utf8_console()
 logger = logging.getLogger("agentx")
 _FAILOPEN_BANNER_SHOWN = False
 _FAILMODE_WARNED = False
+_ENFORCEMENT_WARNED = False
+_AUDIT_BANNER_SHOWN = False
+
+
+def _emit_audit_banner():
+    """One LOUD, once-per-process warning that AgentX is in AUDIT posture — recording, NOT
+    blocking. Audit is a deliberate observe-first on-ramp (and the shipped `.env.example`
+    default), but a security control that is not blocking must announce itself so a headless
+    prod deploy can't be silently unprotected: the developer sees, at the first protected
+    call, that their agent is being watched but not defended. Same channel + once-per-process
+    style as the fail-open degraded banner (logger.warning -> stderr, ops-alertable), because
+    audit is the same category of fact: a posture in which the tool runs unblocked."""
+    global _AUDIT_BANNER_SHOWN
+    if _AUDIT_BANNER_SHOWN:
+        return
+    logger.warning(
+        "\n"
+        "════════════════════════════════════════════════════════════\n"
+        " ⚠️  AgentX is in AUDIT mode (AGENTX_ENFORCEMENT=audit)\n"
+        "────────────────────────────────────────────────────────────\n"
+        " Detections are RECORDED but NOT blocked. Your agent is NOT\n"
+        " protected: a flagged call still runs. This is observe-first.\n"
+        " See what it caught:  agentx insights\n"
+        " Block for real:      set AGENTX_ENFORCEMENT=enforce\n"
+        "════════════════════════════════════════════════════════════"
+    )
+    _AUDIT_BANNER_SHOWN = True
 
 
 def _emit_failopen_warning(reason, tool_name):
@@ -140,6 +167,42 @@ def _resolve_fail_mode():
         )
         _FAILMODE_WARNED = True
     return "open"
+
+
+def _resolve_enforcement(override=None):
+    """Resolve the ENFORCEMENT LEVEL (posture) to 'audit' or 'enforce'.
+
+    A FOURTH, orthogonal axis (see designs/shadow-audit-mode-spec.md), distinct from
+    AGENTX_MODE (local/linked/cloud), AGENTX_FAIL_MODE (open/closed), and per-detector
+    warn/block/off:
+      * enforce (default) — a policy catch is terminal: coach-and-continue / HITL /
+        the AgentXBlock substitution. Nothing changes for existing installs.
+      * audit — run the SAME detection but RECORD what WOULD have blocked and let the
+        original call proceed. The trust-before-enforce on-ramp: a developer runs
+        AgentX in staging non-blocking for a week and sees exactly what it would have
+        caught (and what it would have caught WRONGLY) with zero risk.
+
+    Precedence: an explicit per-tool ``override`` (the ``enforcement=`` decorator arg)
+    wins — the surgical exception for a genuinely dangerous tool kept hard-blocked while
+    the rest of the app is in audit — else the global ``AGENTX_ENFORCEMENT`` env var,
+    else the safe default 'enforce'. Like the fail-mode resolver, an unrecognized value
+    never silently downgrades enforcement: it falls back to 'enforce' but warns once."""
+    global _ENFORCEMENT_WARNED
+    if override is not None:
+        raw = str(override).strip().lower()
+    else:
+        raw = os.environ.get("AGENTX_ENFORCEMENT", "enforce").strip().lower()
+    if raw == "":
+        raw = "enforce"
+    if raw in ("audit", "enforce"):
+        return raw
+    if not _ENFORCEMENT_WARNED:
+        logger.warning(
+            f"[AgentX] Unrecognized AGENTX_ENFORCEMENT={raw!r}; expected 'audit' or 'enforce'. "
+            f"Falling back to 'enforce' — fix the value to run in audit (non-blocking) mode."
+        )
+        _ENFORCEMENT_WARNED = True
+    return "enforce"
 
 # =====================================================================
 # 🎛️ SDK CLIENT-SIDE MODEL ENVIRONMENT DESERIALIZATION
@@ -306,6 +369,7 @@ _session_stats = {
     "gateway_reached": False,          # <-- True once any real gateway verdict came back this session (NOT unreachable). Coarse funnel-stage signal for the anonymous pulse: distinguishes "SDK only" from "SDK + gateway". Never carries identity.
     "reasoning_enabled": None,         # <-- Tri-state Recover signal for the pulse: None = no gateway ever advertised it (old gateway / SDK-only), False = gateway reported keyless, True = judge seen active (sticky). Never identity.
     "block_category": None,            # <-- Coarse closed-vocab failure class of a block this session (DESTRUCTIVE_ACTION/etc), for the pulse. "What KIND of action got blocked", never the tool name/payload. None = no categorized block. See _BLOCK_CATEGORY_VOCAB.
+    "would_blocks": 0,                 # <-- AUDIT posture (AGENTX_ENFORCEMENT=audit): count of catches that WOULD have blocked but were recorded-and-let-through. Distinct from intercepts (an audit install is NOT "protected"): would_blocks>0 with intercepts==0 = an install EVALUATING, not yet enforcing. Rides the pulse as a coarse count. See _resolve_enforcement / _audit_and_proceed.
     "overrides_applied": 0,            # <-- BUILD #2: blocks where an adopted org reframe replaced the gateway's generic challenge
     # Session budget meter (AFDB #17/#23). The gateway's budget-ceiling floor reads
     # the running total off the payload; we feed it from one of two sources:
@@ -1433,8 +1497,50 @@ class _ExecuteTool:
         self.scrub_targets = scrub_targets or []
 
 
+def _audit_and_proceed(trace_id, agent_id, tool_name, policy_id, policy_name, category):
+    """AUDIT posture: record what WOULD have blocked, then let the original call proceed
+    unchanged (returns an _ExecuteTool directive the wrapper shell runs).
+
+    The SINGLE home for the audit route, called from every POLICY block site (the
+    Layer-0 keyword shield AND the gateway policy violation) so the two can't drift. The
+    circuit breaker and the fail-closed availability block are deliberately NOT routed
+    here: a runaway loop must still halt even in audit, and audit is about false-positive
+    risk on POLICY blocks, not availability. Records honestly:
+      * a WOULD_BLOCK ledger row — a status DISTINCT from CHALLENGED, so `agentx insights`
+        can show exactly what audit caught, and get_lifetime_stats / get_block_frequency
+        (which count only CHALLENGED / RECOVERED) never fold an audited catch into the
+        recovery rate, and
+      * a coarse `would_blocks` pulse count + the block_category (what KIND of action),
+        but NEVER the intercepts / critical_blocks counters that mark an install
+        "protected". So an audit-only install reads as EVALUATING, not enforcing.
+    Takes NONE of the challenge accounting the enforce path does (no challenged-trace
+    mark, no incident park, no strike). Best-effort (log_intercept swallows its own
+    errors); the wrapped tool runs regardless."""
+    _incr("would_blocks")
+    _note_block_category(category)
+    log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, WOULD_BLOCK_STATUS)
+    # Best-effort narration: a broken/closed stdout must NOT raise out of here, or the
+    # caller's `except Exception` (the Layer-0 shield's) would swallow it and fall through
+    # to the gateway path, double-counting this one call. The record above already stood.
+    try:
+        print(f"🔍 [AgentX AUDIT] Would have blocked '{tool_name}' on policy '{policy_name}'. "
+              f"AGENTX_ENFORCEMENT=audit, so the call was allowed through and recorded. "
+              f"Review what audit caught with: agentx insights")
+    except Exception:
+        pass
+    return _ExecuteTool()
+
+
 # --- 3. THE MAIN SENSOR DECORATOR ---
-def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None, action: str = None, budget_pool_id: str = None):
+def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None, action: str = None, budget_pool_id: str = None, enforcement: str = None):
+    """Wrap a tool function so AgentX vets every call.
+
+    ``enforcement`` is the per-tool ENFORCEMENT-LEVEL override (audit | enforce): a
+    surgical exception to the global ``AGENTX_ENFORCEMENT`` env switch. Leave it unset to
+    inherit the global (default 'enforce'); pass ``enforcement="enforce"`` to keep a
+    genuinely dangerous tool hard-blocked even while the rest of the app runs in audit,
+    or ``enforcement="audit"`` to record-and-proceed for just this tool. An explicit
+    per-tool value ALWAYS wins over the env var. See designs/shadow-audit-mode-spec.md."""
     def decorator(func):
         # Async tool functions (LangGraph / autogen / asyncio.gather swarms) get an
         # async wrapper; sync tools keep the original synchronous path unchanged.
@@ -1495,6 +1601,21 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # reset (first-call / pre-seeded behaviour). Done atomically under the lock
             # so the reset can't race a concurrent increment (#115 finding 3).
             _adopt_strike_trace(strike_key, current_trace_id)
+
+            # --- ENFORCEMENT LEVEL (posture): audit vs enforce ---
+            # Resolved ONCE per call (the per-tool `enforcement=` decorator arg wins,
+            # else the global AGENTX_ENFORCEMENT env, else 'enforce'). In `audit` a
+            # POLICY catch is recorded-and-let-through instead of blocked (see the two
+            # `enforcement_level == "audit"` guards at the keyword-shield and gateway
+            # policy sites); the circuit breaker + the fail-closed availability block
+            # are exempt (a runaway loop must still halt; audit is about policy
+            # false-positive risk, not availability).
+            enforcement_level = _resolve_enforcement(enforcement)
+            # Loud, once-per-process: a non-blocking security posture must announce itself so
+            # a headless deploy is never silently unprotected (founder-ratified: template
+            # ships audit, so the runtime must make the observe-only state unmissable).
+            if enforcement_level == "audit":
+                _emit_audit_banner()
 
             # =========================================================
             # THE RETURN ROUTER (Dynamic Type Reflection)
@@ -1699,6 +1820,20 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                             log_message="🛑 [LOCAL KEYWORD SHIELD] Circuit breaker threshold met. Killing loop natively.")
                         _incr_strike(strike_key)
 
+                        # AUDIT posture: record what WOULD have blocked and let it proceed,
+                        # taking NONE of the CHALLENGED accounting below (no intercept /
+                        # critical / challenged-trace count, no incident park, no reframe).
+                        # Placed AFTER the breaker + strike ON PURPOSE (spec: the circuit
+                        # breaker is EXEMPT — a runaway loop must still halt even in audit).
+                        # Keyless, this Layer-0 breaker is the ONLY local runaway protection,
+                        # so a sustained same-tool would-block loop still trips the ceiling
+                        # here while a single would-block simply records-and-proceeds. Shares
+                        # _audit_and_proceed with the gateway policy path so the two can't drift.
+                        if enforcement_level == "audit":
+                            return _audit_and_proceed(
+                                current_trace_id, agent_id, func_name, policy_id, policy_name,
+                                matched_policy.get("category") or _POLICY_ID_TO_CATEGORY.get(policy_id))
+
                         # BUILD #2 — org-reframe swap on the Layer-0 local-shield path
                         # too (the offline path a keyworded block like DROP TABLE takes;
                         # the incident is logged under this same policy_id, so the adopted
@@ -1793,6 +1928,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 session_tokens=session_tokens_total,
                 session_cost_usd=session_cost_total,
                 budget_pool_id=resolved_pool_id,
+                enforcement=enforcement_level,
             )
 
             status = eval_res.get("status") if isinstance(eval_res, dict) else None
@@ -1894,6 +2030,22 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
 
             # 1. Check for the Unified Gateway's Block Signal
             if isinstance(eval_res, dict) and eval_res.get("error") == "AgentX Policy Violation":
+                # AUDIT posture (see the Layer-0 twin): the gateway flagged a policy
+                # violation, but AGENTX_ENFORCEMENT=audit — record the WOULD_BLOCK and
+                # let the call proceed, taking none of the CHALLENGED accounting below.
+                # We still consulted the gateway on purpose: audit's value is seeing what
+                # the JUDGE would catch, not just what keywords catch. The gateway is
+                # enforcement-aware too: the SDK forwarded enforcement=audit on this call
+                # (client.evaluate_intent), so the gateway returned the verdict but did NOT
+                # persist its CHALLENGED incident — no cloud recovery-denominator pollution
+                # for an evaluating install. The gateway's runaway breaker still trips
+                # (strikes still count), and it stays exempt (a separate elif below).
+                if enforcement_level == "audit":
+                    return _audit_and_proceed(
+                        current_trace_id, agent_id, func_name,
+                        eval_res.get("policy_id", "POL-UNKNOWN"),
+                        eval_res.get("policy_triggered", "Unknown Policy"),
+                        _POLICY_ID_TO_CATEGORY.get(eval_res.get("policy_id")))
                 _incr("intercepts")
                 # NOTE: the local strike counter is NOT incremented here anymore. A
                 # reachable gateway block means the gateway already counted this strike

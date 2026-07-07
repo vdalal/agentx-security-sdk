@@ -70,6 +70,30 @@ def test_benign_tools_call_is_forwarded_verbatim():
     assert "critical_blocks" not in stats or stats["critical_blocks"] == 0
 
 
+def test_audit_forwards_dangerous_call_and_records():
+    """AGENTX_ENFORCEMENT=audit (chokepoint parity with the decorator): a caught tools/call
+    is FORWARDED to the real server and recorded as a would-block, taking none of the block
+    accounting (no intercept/critical count, no coaching response)."""
+    line = _line(name="run_sql", arguments={"query": "DROP TABLE users;"})
+    forwarded, client_out, stats = _route(line, stats={"_enforcement": "audit"})
+    assert forwarded == line                     # proceeded to the server, byte-for-byte
+    assert client_out == ""                       # no coaching block synthesized back
+    assert stats["would_blocks"] == 1
+    assert stats.get("intercepts", 0) == 0
+    assert stats.get("critical_blocks", 0) == 0
+    assert stats["block_category"] == "DESTRUCTIVE_ACTION"   # coarse pulse signal still set
+    assert stats["total_calls"] == 1
+
+
+def test_audit_absent_defaults_to_enforce():
+    """No _enforcement key (default enforce) still blocks the dangerous call."""
+    line = _line(name="run_sql", arguments={"query": "DROP TABLE users;"})
+    forwarded, client_out, stats = _route(line)
+    assert forwarded == ""
+    assert stats["intercepts"] == 1
+    assert stats.get("would_blocks", 0) == 0
+
+
 @pytest.mark.parametrize("line", [
     _line(method="initialize", id=0, name=None),
     _line(method="tools/list", id=5, name=None),

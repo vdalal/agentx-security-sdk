@@ -471,6 +471,25 @@ def execute_insights(args=None):
     store = load_overrides(warn=True)   # surface a corrupt store instead of showing an empty one
     active = store.get("overrides", {})
 
+    # --- AUDIT posture report: what AGENTX_ENFORCEMENT=audit WOULD have blocked ---
+    # Printed FIRST and unconditionally (even when there are no learned safe-paths yet),
+    # because an install evaluating in audit mode has would-block rows but usually no
+    # recoveries. This is the report that earns the enforce decision: what audit caught,
+    # per policy, with zero risk taken. Kept semantically separate from the recovery loop
+    # below (these are catches audit RECORDED, not blocks it enforced). Silent at zero
+    # rows, so a normal enforce user never sees audit noise.
+    from .db import get_would_block_summary
+    audit = get_would_block_summary()
+    if audit["total"]:
+        print("\n🔍 AUDIT MODE: what AgentX WOULD have blocked        (nothing was blocked)")
+        print("=" * 75)
+        print(f"  {audit['total']} action(s) recorded under AGENTX_ENFORCEMENT=audit, by policy:")
+        for row in audit["policies"]:
+            print(f"     {row['would_blocks']:>4}x   {row['policy_name']}")
+        print("\n  These ran normally; audit takes zero risk. When the catches look right,")
+        print("  flip to enforcing:   AGENTX_ENFORCEMENT=enforce")
+        print("=" * 75)
+
     print("\n🧠 SAFE-PATHS YOUR AGENTS LEARNED        (local to this machine)")
     print("=" * 75)
     print("  When an agent recovered from a block, AgentX saved the fix. Adopt one and")
@@ -1283,6 +1302,9 @@ def _demo_next_steps(mcp):
             '       "args": ["npx", "-y", "your-mcp-server", "..."]',
             f" 1 ▶ Then keep using {name} normally. Every real tool call is screened, and your",
             "     protection streak grows each session:  agentx status",
+            " 2 ▶ Not sure it's safe to enforce on a real server? Front it in audit first:",
+            "       AGENTX_ENFORCEMENT=audit   (records what it WOULD block, blocks nothing)",
+            "     Then see what it caught, risk-free:  agentx insights",
             " ▶ Prefer to wrap Python tools directly?  https://agentx-core.com/docs",
         ]
     else:
@@ -1296,6 +1318,9 @@ def _demo_next_steps(mcp):
             "           revised = your_llm(out.challenge)   # coach it to a safe path",
             "           out = your_tool(revised, receipt_id=out.receipt_id)   # then retry",
             " 2 ▶ Wrap a tool, run your agent, then watch your protection streak grow:  agentx status",
+            " 3 ▶ Not sure it's safe to enforce on a real agent? Run it in audit first:",
+            "       AGENTX_ENFORCEMENT=audit   (records what it WOULD block, blocks nothing)",
+            "     Then see what it caught, risk-free:  agentx insights",
         ]
     lines += [
         " ▶ Unlock RECOVER (auto block to self-heal): the gateway + your Gemini key, then",

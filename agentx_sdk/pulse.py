@@ -64,7 +64,8 @@ _ALLOWED_KEYS = {"install_id", "sdk_version", "python", "os", "first_seen", "ts"
                  "block_category", "integration", "session"}
 _ALLOWED_SESSION_KEYS = {
     "tools_monitored", "intercepts", "critical_blocks",
-    "human_escalations", "self_corrections", "had_block", "first_block_ever",
+    "human_escalations", "self_corrections", "would_blocks",
+    "had_block", "first_block_ever",
 }
 
 
@@ -608,6 +609,12 @@ def build_payload(session_stats, state, first_block_ever=None):
             "critical_blocks": int(session_stats.get("critical_blocks", 0)),
             "human_escalations": int(session_stats.get("human_escalations", 0)),
             "self_corrections": int(session_stats.get("self_corrections", 0)),
+            # AUDIT posture: catches that WOULD have blocked but were recorded-and-let-
+            # through (AGENTX_ENFORCEMENT=audit). A DISTINCT coarse count from intercepts
+            # so the funnel sees a new honest activation state: would_blocks>0 with
+            # had_block False = an install EVALUATING (running audit), not yet enforcing.
+            # Never identity/payload, same privacy class as the other counts.
+            "would_blocks": int(session_stats.get("would_blocks", 0)),
             "had_block": had_block,
             "first_block_ever": first_block_ever,
         },

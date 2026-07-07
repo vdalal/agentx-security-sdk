@@ -19,7 +19,7 @@ class AgentXClient:
 
     def evaluate_intent(self, agent_id, query, chain_of_thought, receipt_id=None, trace_id=None,
                         action=None, args=None, session_tokens=0, session_cost_usd=0, budget_pool_id=None,
-                        strike_count=None):
+                        enforcement=None, strike_count=None):
         # `strike_count` is DEPRECATED and ignored (issue #80): the gateway owns the
         # strike count + the Path B decision per trace_id now, so a forwarded count
         # can no longer influence the verdict. The parameter is retained only so
@@ -89,7 +89,14 @@ class AgentXClient:
         # and verdict path — is byte-identical to today (no pool aggregation runs).
         if budget_pool_id:
             payload["budget_pool_id"] = str(budget_pool_id)
-        
+        # Enforcement posture (AGENTX_ENFORCEMENT). Forwarded ONLY when audit, so the
+        # gateway skips persisting a policy CHALLENGED for an evaluating (non-enforcing)
+        # install — it still returns the verdict, so the SDK records its own local
+        # WOULD_BLOCK. Omitted for enforce so an enforcing/legacy caller's payload — and
+        # the gateway's persistence path — is byte-identical to today.
+        if str(enforcement or "").strip().lower() == "audit":
+            payload["enforcement"] = "audit"
+
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"

@@ -20,6 +20,13 @@ DB_PATH = ".agentx.db"
 # (log_intercept / log_self_correction) are ALSO wrapped best-effort below.
 _BUSY_TIMEOUT_MS = 5000
 
+# The AUDIT-posture ledger status. Written by BOTH keyless surfaces (the decorator's
+# _audit_and_proceed and the agentx-mcp proxy) and read by get_would_block_summary, so
+# the one literal that couples those three sites lives here instead of drifting as a bare
+# string. Distinct from the CHALLENGED / RECOVERED episode statuses on purpose: the block
+# and recovery readers filter those, so a WOULD_BLOCK row never inflates the recovery rate.
+WOULD_BLOCK_STATUS = "WOULD_BLOCK"
+
 
 def _connect(path=None):
     """Open a connection with a busy timeout so concurrent in-process writers
@@ -236,6 +243,47 @@ def log_self_correction(trace_id, agent_id, tool_name):
         pass
 
 
+def _grouped_policy_rows(path, status_clause, exclude_agents, extra_select=""):
+    """Shared 'GROUP BY policy, count rows' aggregation over the ledger for a given status
+    filter, so the ledger readers (get_block_frequency / get_would_block_summary) don't each
+    hand-roll the exclude-agent clause + connection scaffold (the drift the two-copy version
+    risked: a future 'also drop test-artifact agents' change would have to edit both). The
+    caller shapes its own dict from the rows and maps a None return to its own empty value.
+
+    status_clause: a trusted WHERE fragment on `status` (built from module constants, never
+    user input). extra_select: an optional extra aggregate column appended to the SELECT
+    (e.g. the recoveries SUM). Returns rows (policy_name, policy_id, COUNT(*)[, *extra])
+    ordered count-DESC then policy_name-ASC, or None on missing-db / error."""
+    p = path or DB_PATH
+    if not os.path.exists(p):
+        return None
+    excluded = [a for a in (exclude_agents or []) if a]
+    clause = status_clause
+    params = []
+    if excluded:
+        clause += " AND agent_id NOT IN (%s)" % ",".join("?" for _ in excluded)
+        params.extend(excluded)
+    sel_extra = (", " + extra_select) if extra_select else ""
+    try:
+        with _connection(p) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT policy_name,
+                       MAX(policy_id) AS policy_id,
+                       COUNT(*) AS n{sel_extra}
+                FROM event_log
+                WHERE {clause}
+                GROUP BY policy_name
+                ORDER BY n DESC, policy_name ASC
+                """,
+                params,
+            )
+            return cursor.fetchall()
+    except Exception:
+        return None
+
+
 def get_block_frequency(path=None, exclude_agents=None):
     """Rank the local flight-recorder ledger BY POLICY: how often each policy fired
     and how often the agent recovered from it. Aggregates BOTH the decorator and the
@@ -255,33 +303,10 @@ def get_block_frequency(path=None, exclude_agents=None):
     Returns a list of {policy_id, policy_name, blocks, recoveries, recovery_rate}
     dicts, most-frequent first; [] when there is no DB, an error, or no blocks.
     """
-    p = path or DB_PATH
-    if not os.path.exists(p):
-        return []
-    excluded = [a for a in (exclude_agents or []) if a]
-    clause = "status IN ('CHALLENGED', 'RECOVERED')"
-    params = []
-    if excluded:
-        clause += " AND agent_id NOT IN (%s)" % ",".join("?" for _ in excluded)
-        params.extend(excluded)
-    try:
-        with _connection(p) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                f"""
-                SELECT policy_name,
-                       MAX(policy_id) AS policy_id,
-                       COUNT(*) AS blocks,
-                       SUM(CASE WHEN status = 'RECOVERED' THEN 1 ELSE 0 END) AS recoveries
-                FROM event_log
-                WHERE {clause}
-                GROUP BY policy_name
-                ORDER BY blocks DESC, policy_name ASC
-                """,
-                params,
-            )
-            rows = cursor.fetchall()
-    except Exception:
+    rows = _grouped_policy_rows(
+        path, "status IN ('CHALLENGED', 'RECOVERED')", exclude_agents,
+        extra_select="SUM(CASE WHEN status = 'RECOVERED' THEN 1 ELSE 0 END)")
+    if rows is None:
         return []
     out = []
     for policy_name, policy_id, blocks, recoveries in rows:
@@ -295,3 +320,33 @@ def get_block_frequency(path=None, exclude_agents=None):
             "recovery_rate": round(recoveries / blocks, 3) if blocks else 0.0,
         })
     return out
+
+
+def get_would_block_summary(path=None, exclude_agents=None):
+    """Aggregate the AUDIT-posture ledger: how many times each policy WOULD have blocked
+    while running under AGENTX_ENFORCEMENT=audit (status WOULD_BLOCK), most-frequent first.
+
+    This is the report that earns the enforce decision: a developer runs AgentX
+    non-blocking in staging for a week, then `agentx insights` shows exactly what audit
+    would have caught, per policy, with zero risk taken. Kept STRICTLY separate from
+    get_block_frequency / get_lifetime_stats (which count only real CHALLENGED /
+    RECOVERED episodes) so an audited catch never inflates the recovery rate or the
+    'agents protected' metric — an audit install is evaluating, not yet protected.
+
+    Privacy-safe by construction (same as the block ledger): only the policy class, the
+    dev's own tool name, and the verdict are stored, never a raw query or payload.
+
+    path: read a specific ledger file (default: the module DB_PATH in the CWD).
+    exclude_agents: iterable of agent_id values to drop.
+
+    Returns {"total": int, "policies": [{policy_id, policy_name, would_blocks}, ...]};
+    total is 0 (policies []) when there is no DB, an error, or no audited catch yet.
+    """
+    rows = _grouped_policy_rows(path, f"status = '{WOULD_BLOCK_STATUS}'", exclude_agents)
+    if rows is None:
+        return {"total": 0, "policies": []}
+    policies = [
+        {"policy_id": pid, "policy_name": pname, "would_blocks": wb or 0}
+        for pname, pid, wb in rows
+    ]
+    return {"total": sum(row["would_blocks"] for row in policies), "policies": policies}

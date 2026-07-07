@@ -67,6 +67,7 @@ try:
         _max_cognitive_turns,
         _name_tokens,
         _note_block_category,
+        _resolve_enforcement,
         evaluate_call_keyless,
     )
     # Bound at module load, under the same stdout guard, so the atexit _protection_report
@@ -77,7 +78,7 @@ try:
     # `agentx status` reads), so a real MCP catch shows up in `agentx status` — not just
     # the streak. Best-effort at the call sites; gated on session_stats["_ledger"] so the
     # routing-core unit tests (which build a bare session_stats) never touch the ledger.
-    from agentx_sdk.db import init_db, log_intercept, log_self_correction
+    from agentx_sdk.db import init_db, log_intercept, log_self_correction, WOULD_BLOCK_STATUS
 finally:
     sys.stdout = _real_stdout
 
@@ -914,6 +915,33 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 harvest.note_recovery(tool_key, params.get("arguments"))
         return "forward"
 
+    # AUDIT posture: this call matched a policy, but AGENTX_ENFORCEMENT=audit — record the
+    # WOULD_BLOCK and FORWARD the real call instead of answering with coaching, so the
+    # wrapped server runs untouched. Takes NONE of the block accounting below (no intercept
+    # / critical count, no CHALLENGED ledger row, no strike, no harvest) — the twin of the
+    # decorator's _audit_and_proceed, sharing the same category vocab guard + ledger so the
+    # two keyless surfaces can't drift. Placed before the breaker: a would-block that
+    # actually runs is not a blocked-retry loop.
+    if session_stats.get("_enforcement") == "audit":
+        session_stats["would_blocks"] = session_stats.get("would_blocks", 0) + 1
+        _note_block_category(decision.get("category"), session_stats)
+        if session_stats.get("_ledger"):
+            try:
+                seq = session_stats.get("_ledger_seq", 0)
+                session_stats["_ledger_seq"] = seq + 1
+                wb_trace = "%s-%d" % (session_stats.get("_trace_id") or "mcp-session", seq)
+                log_intercept(wb_trace, "mcp_proxy", tool_key,
+                              decision.get("policy_id"), decision.get("policy_name"), WOULD_BLOCK_STATUS)
+            except Exception:
+                pass
+        try:
+            print("[agentx-mcp] AUDIT: would have blocked '%s' (%s); AGENTX_ENFORCEMENT=audit, "
+                  "forwarded and recorded. Review: agentx insights"
+                  % (tool_key, decision.get("policy_name")), file=log)
+        except Exception:
+            pass
+        return "forward"
+
     # Blocked. Match the decorator's breaker edge: _trip_breaker_if_ceiling checks the
     # count BEFORE the increment, so it trips on the call AFTER the ceiling is reached
     # (max_turns blocks are allowed, the next one trips). Compare-then-increment here so
@@ -1198,6 +1226,13 @@ def main(argv=None):
     # already ran it); repeat it here so a proxy started in a fresh CWD still has a table.
     session_stats["_trace_id"] = "mcp-" + uuid.uuid4().hex[:12]
     session_stats["_ledger"] = True
+    # ENFORCEMENT LEVEL (posture) for the whole wrapped server — chokepoint parity with
+    # the decorator: the SAME global AGENTX_ENFORCEMENT switch means "audit the whole
+    # server" is one env line here too. In `audit` a caught tools/call is recorded
+    # (WOULD_BLOCK) and FORWARDED to the real server instead of being answered with a
+    # coaching error, so a team can run the shield non-blocking in staging first. Resolved
+    # once at startup (a long-lived process; no per-tool override on the proxy path).
+    session_stats["_enforcement"] = _resolve_enforcement(None)
     try:
         init_db()
     except Exception:
@@ -1212,7 +1247,22 @@ def main(argv=None):
             pulse.on_session_end(session_stats)
     atexit.register(_session_end)
 
-    print("[agentx-mcp] AgentX shield active, wrapping: %s" % " ".join(argv), file=sys.stderr)
+    _posture = session_stats.get("_enforcement", "enforce")
+    if _posture == "audit":
+        # Loud, unmissable: audit records but does NOT block, so a wrapped-server operator
+        # must see at startup that the tools are being watched, not defended (twin of the
+        # decorator's _emit_audit_banner).
+        print("[agentx-mcp] "
+              "============================================================", file=sys.stderr)
+        print("[agentx-mcp]  AGENTX AUDIT MODE (AGENTX_ENFORCEMENT=audit): tool calls are "
+              "RECORDED but NOT blocked.", file=sys.stderr)
+        print("[agentx-mcp]  The server is NOT protected. See catches: agentx insights  |  "
+              "Block for real: set AGENTX_ENFORCEMENT=enforce", file=sys.stderr)
+        print("[agentx-mcp] "
+              "============================================================", file=sys.stderr)
+    print("[agentx-mcp] AgentX shield active (%s), wrapping: %s"
+          % ("AUDIT: record-only, nothing blocked" if _posture == "audit" else "enforcing",
+             " ".join(argv)), file=sys.stderr)
     return run_proxy(argv, client_in=client_in, client_out=client_out,
                      session_stats=session_stats, close_client_on_child_exit=True)
 
