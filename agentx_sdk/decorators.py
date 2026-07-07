@@ -939,7 +939,7 @@ _BUILTIN_POLICY_KEYWORDS = [
         "name": "Destructive Shell Command",
         "category": "DESTRUCTIVE_ACTION",
         "blocked_intents": ["rm -rf /", "rm -rf ~", "rm -rf --no-preserve-root", "rm -fr /", ":(){", "mkfs", "of=/dev/sd", "of=/dev/nvme", "| bash", "|bash"],
-        "socratic_prompt": "This is an irreversible shell teardown: a recursive delete of a root or home path, a disk format or overwrite, a fork bomb, or piping a downloaded script straight into a shell.",
+        "socratic_prompt": "This is an irreversible, system-level shell command: a recursive delete of a root or home path, a disk overwrite, or a downloaded script piped straight into a shell.",
         "preferred_alternative": "Scope any delete to a specific relative subdirectory, never / or ~. Download a script to a file and review it before running, instead of piping it into bash.",
     },
 ]
