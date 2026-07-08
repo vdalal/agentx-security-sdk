@@ -534,3 +534,159 @@ def test_execute_share_rejects_unknown_flag(capsys):
     with patch("agentx_sdk.db.get_recent_blocks", return_value=[_BLOCK]):
         with pytest.raises(SystemExit):
             execute_share(["--bogus"])
+
+
+# =============================================================================
+# agentx policies / customize  (keyless challenge-string customization DX)
+# The override store is isolated + empty per-test by conftest's autouse fixture;
+# populate it by writing to AGENTX_OVERRIDES (directly or via execute_customize).
+# =============================================================================
+from agentx_sdk.cli import (execute_policies, execute_customize, _policies_check,
+                            _print_rule_adopted)
+from agentx_sdk import overrides as _ov
+
+_MDI_ID = "11111111-1111-1111-1111-111111111101"   # Mass Destructive Intent
+_SSRF_ID = "11111111-1111-1111-1111-111111111103"  # Network Sandbox (SSRF)
+
+
+def _read_store():
+    with open(os.environ["AGENTX_OVERRIDES"], encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_policies_lists_builtin_coaching(capsys):
+    execute_policies([])
+    out = capsys.readouterr().out
+    assert "CUSTOMIZABLE FLOOR POLICIES" in out
+    assert "Mass Destructive Intent" in out and "Network Sandbox (SSRF)" in out
+    assert "destructive, irreversible write" in out          # shipped default coaching shown
+    assert "customized" not in out                           # nothing customized yet
+    assert 'agentx customize "Mass Destructive Intent" --edit' in out   # concrete next step
+
+
+def test_policies_overlays_active_override(capsys):
+    _ov.adopt(_MDI_ID, challenge="ACME: snapshot then soft-delete.",
+              policy_violated="Mass Destructive Intent", source="customize")
+    execute_policies([])
+    out = capsys.readouterr().out
+    assert "customized" in out
+    assert "ACME: snapshot then soft-delete." in out
+    assert "destructive, irreversible write" not in out      # default replaced in the listing
+
+
+def test_customize_by_name_writes_override(capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)   # non-interactive -> auto-confirm
+    execute_customize(["Mass Destructive Intent", "--text", "Ping #data-eng before any DROP.",
+                       "--safe-path", "Add a WHERE, or snapshot first."])
+    entry = _read_store()["overrides"][_MDI_ID]
+    assert entry["challenge"] == "Ping #data-eng before any DROP."
+    assert entry["safe_path"] == "Add a WHERE, or snapshot first."
+    assert entry["policy_violated"] == "Mass Destructive Intent"
+    assert entry["source"] == "customize"
+    out = capsys.readouterr().out
+    assert "Customized coaching for 'Mass Destructive Intent'" in out
+    assert "BOTH the SDK decorator and agentx-mcp" in out    # names the two surfaces it reaches
+
+
+def test_customize_unknown_name_lists_names_and_exits(capsys):
+    with pytest.raises(SystemExit) as e:
+        execute_customize(["No Such Policy", "--text", "x"])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "No customizable policy named 'No Such Policy'" in out
+    assert "Mass Destructive Intent" in out                  # lists the valid names to type
+
+
+def test_customize_safe_path_only_keeps_default_coaching(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    execute_customize(["Network Sandbox (SSRF)", "--safe-path", "Use the public hostname over HTTPS."])
+    entry = _read_store()["overrides"][_SSRF_ID]
+    assert "loopback or cloud-metadata" in entry["challenge"]   # coaching kept the default
+    assert entry["safe_path"] == "Use the public hostname over HTTPS."
+
+
+def test_customize_edit_seeds_current_and_stores(monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    seen = {}
+    def _fake_edit(seed):
+        seen["seed"] = seed
+        return "Edited coaching text."
+    monkeypatch.setattr("agentx_sdk.cli._edit_text", _fake_edit)
+    execute_customize(["Mass Destructive Intent", "--edit"])
+    assert "destructive, irreversible write" in seen["seed"]  # seeded from the shipped default
+    assert _read_store()["overrides"][_MDI_ID]["challenge"] == "Edited coaching text."
+
+
+def test_customize_rejects_text_and_edit_together():
+    with pytest.raises(SystemExit):
+        execute_customize(["Mass Destructive Intent", "--text", "x", "--edit"])
+
+
+def test_customize_requires_something_to_change(capsys):
+    with pytest.raises(SystemExit):
+        execute_customize(["Mass Destructive Intent"])       # no --text/--edit/--safe-path
+
+
+def test_policies_check_missing_store_is_ok(capsys, monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTX_OVERRIDES", str(tmp_path / "nope.json"))
+    execute_policies(["--check"])
+    assert "No override store yet" in capsys.readouterr().out
+
+
+def test_policies_check_lists_active(capsys):
+    _ov.adopt(_MDI_ID, challenge="ACME coaching.",
+              policy_violated="Mass Destructive Intent", source="customize")
+    execute_policies(["--check"])
+    out = capsys.readouterr().out
+    assert "parses" in out
+    assert "Mass Destructive Intent" in out and "ACME coaching." in out
+
+
+def test_policies_check_corrupt_store_exits_nonzero(capsys, monkeypatch, tmp_path):
+    bad = tmp_path / "overrides.json"
+    bad.write_text('{"overrides": {,}}')                     # invalid JSON
+    monkeypatch.setenv("AGENTX_OVERRIDES", str(bad))
+    with pytest.raises(SystemExit) as e:
+        execute_policies(["--check"])
+    assert e.value.code == 1
+    assert "NOT valid JSON" in capsys.readouterr().out
+
+
+def test_policies_rejects_unknown_flag():
+    with pytest.raises(SystemExit):
+        execute_policies(["--bogus"])
+
+
+# --- Option A: keyless-context-aware rule-adopted message --------------------
+_RULE_ENTRY = {"name": "SSRF via fetch_url", "id": "abc-123", "target_action": "fetch_url",
+               "semantic_description": "fetching a cloud metadata endpoint",
+               "indicators": ["169.254.169.254"], "path": ".agentx/policies.json"}
+
+
+def test_rule_adopted_message_keyless(capsys, monkeypatch):
+    monkeypatch.setattr("agentx_sdk.cli._is_keyless_context", lambda: True)
+    _print_rule_adopted(dict(_RULE_ENTRY))
+    out = capsys.readouterr().out
+    assert "running keyless right now" in out
+    assert "arms the moment you do" in out
+    assert "Restart the gateway" not in out                  # not told to restart a gateway they lack
+
+
+def test_rule_adopted_message_with_gateway(capsys, monkeypatch):
+    monkeypatch.setattr("agentx_sdk.cli._is_keyless_context", lambda: False)
+    _print_rule_adopted(dict(_RULE_ENTRY))
+    out = capsys.readouterr().out
+    assert "Restart the gateway to arm it" in out
+    assert "running keyless right now" not in out
+
+
+def test_is_keyless_context_key_present_skips_probe(monkeypatch):
+    from agentx_sdk import cli
+    monkeypatch.setenv("AGENTX_API_KEY", "agentx_sk_test")
+    probed = {"hit": False}
+    def _probe(*a, **k):
+        probed["hit"] = True
+        return True
+    monkeypatch.setattr(cli, "_gateway_reachable", _probe)
+    assert cli._is_keyless_context() is False                # a key => Control/cloud, not keyless
+    assert probed["hit"] is False                            # and it must NOT probe the network

@@ -4,7 +4,9 @@ import json
 import requests
 
 from .overrides import (harvest_candidates, load_overrides, adopt as adopt_override,
-                        incident_db_census, enumerate_candidates)
+                        incident_db_census, enumerate_candidates,
+                        list_customizable_policies, resolve_policy_by_name,
+                        get_active_override, _overrides_path)
 from .rules import harvest_rule_candidates, adopt_rule
 
 # Re-exported from the stdlib-only envfile module (kept importable here for
@@ -605,7 +607,7 @@ def execute_insights(args=None):
     if rule_list:
         print("       author a rule:  agentx adopt --rule --action <a> --desc \"…\"")
     print()
-    print("  Adopted reframes land in ./.agentx/overrides.json — commit it to share with your")
+    print("  Adopted coaching lands in ./.agentx/overrides.json. Commit it to share with your")
     print("  repo. A rule lands in your local policy store (the gateway enforces it next start).")
     print("\n  Share adopted safe-paths across your team + add the full deterministic floor:")
     print("     https://bit.ly/agentfirewall")
@@ -679,7 +681,7 @@ def execute_mcp_insights():
     print("  ▶ Adopt one (pins it; a hand-adopt WINS over auto):   agentx adopt <#>")
     print("       tweak first:  agentx adopt <#> --edit")
     print("  Auto-coach promotes the strongest paths for you (AGENTX_MCP_AUTO_COACH=off to stop).")
-    print("  Adopted reframes land in ./.agentx/overrides.json — commit to share with your team.")
+    print("  Adopted coaching lands in ./.agentx/overrides.json. Commit to share with your team.")
     print("=" * 75)
 
 
@@ -728,9 +730,9 @@ def _edit_text(seed_text):
 
 def _adopt_usage_exit():
     print("\n⚠️  Usage:")
-    print("   agentx adopt <#>                     promote candidate #N — a reframe OR a rule")
+    print("   agentx adopt <#>                     promote candidate #N (a coaching or a rule)")
     print("   agentx adopt <#> --edit              tweak that candidate in $EDITOR first")
-    print("   agentx adopt <policy_id> --text \"...\"  author a REFRAME from scratch (reframes only)")
+    print("   agentx adopt <policy_id> --text \"...\"  author coaching from scratch (not a rule)")
     print("   ...add --safe-path \"...\"  to set result.safe_path distinctly from the challenge")
     print("   agentx adopt --rule --action <a> --desc \"...\"  author a detection RULE from scratch")
     print("   ...optional: --effect <CAT> --indicators \"a,b\" --challenge \"...\" --name \"...\"")
@@ -762,6 +764,59 @@ def _confirm_adopt(label, challenge):
         return input("   Proceed? [y/N]: ").strip().lower() in ("y", "yes")
     except (EOFError, KeyboardInterrupt):
         return False
+
+
+def _gateway_reachable(timeout=0.4):
+    """Best-effort probe: is a gateway listening at the configured URL? ANY HTTP
+    response (even a 401/404) means something is bound there, so it counts as
+    reachable; only a connection error or timeout counts as unreachable. Short
+    timeout so authoring never stalls; a probe is never on a hot path (one CLI
+    action). Reuses the resolved AGENTX_GATEWAY_URL so it agrees with `agentx status`."""
+    env = load_env_file()
+    gateway_url = (os.environ.get("AGENTX_GATEWAY_URL")
+                   or env.get("AGENTX_GATEWAY_URL", "http://localhost:8000"))
+    try:
+        requests.get(f"{gateway_url}/health", timeout=timeout)
+        return True
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return False
+    except requests.exceptions.RequestException:
+        return True   # something answered, just not cleanly — a gateway IS there
+
+
+def _is_keyless_context():
+    """True when the dev has NO control-plane key AND NO reachable gateway — so a
+    GATEWAY-enforced detection rule they author is fully inert right now. Used to tell
+    the honest truth on `agentx adopt --rule` (Option A) without blocking. A key set
+    (Control/cloud) or a live gateway (Recover) means the standard 'restart the
+    gateway' guidance is the right one."""
+    env = load_env_file()
+    if os.environ.get("AGENTX_API_KEY") or env.get("AGENTX_API_KEY"):
+        return False
+    return not _gateway_reachable()
+
+
+def _print_rule_adopted(entry, verb="Adopted"):
+    """Shared post-adopt message for BOTH rule-authoring paths (`adopt <#>` landing on
+    a rule, and `adopt --rule` from scratch) so their output can't drift.
+
+    Keyless-context-aware (Option A): a detection rule is GATEWAY-enforced, so for a
+    dev running keyless (no key, no reachable gateway) it will not fire yet. Say that
+    honestly instead of telling them to 'restart the gateway' they do not run. Never
+    blocks or discards the work: a dev legitimately authors rules to commit for
+    teammates / CI who DO run the gateway, and it arms the moment a gateway starts."""
+    print(f"\n✅ {verb} detection rule '{entry['name']}'  (id: {entry['id']}).")
+    print(f"     action={entry['target_action']} · {entry['semantic_description']}")
+    if entry.get("indicators"):
+        print(f"     exact indicators: {', '.join(entry['indicators'])}")
+    print(f"   💾 Saved to {entry['path']} (the local policy store the gateway loads).")
+    if _is_keyless_context():
+        print("   This rule needs the gateway to enforce it (the Recover tier). You are")
+        print("   running keyless right now, so it will not fire until you run the gateway.")
+        print("   It is written to .agentx/ and arms the moment you do.")
+    else:
+        print("   The gateway enforces it on its NEXT start. Restart the gateway to arm it.")
+    print("=" * 75)
 
 
 def _adopt_rule_candidate(rule, do_edit):
@@ -801,14 +856,7 @@ def _adopt_rule_candidate(rule, do_edit):
             print("   (non-interactive — auto-confirmed)")
 
     entry = adopt_rule(rule, challenge=challenge)
-    print(f"\n✅ Adopted detection rule '{entry['name']}'  (id: {entry['id']}).")
-    print(f"   The gateway enforces it on its NEXT start:")
-    print(f"     action={entry['target_action']} · {entry['semantic_description']}")
-    if entry.get("indicators"):
-        print(f"     exact indicators: {', '.join(entry['indicators'])}")
-    print(f"   💾 Saved to {entry['path']} (the local policy store the gateway loads).")
-    print(f"   Restart the gateway to arm it.")
-    print("=" * 75)
+    _print_rule_adopted(entry, verb="Adopted")
 
 
 # Common vocabularies the gateway recognizes — used only for a soft hint when a
@@ -878,14 +926,7 @@ def _author_rule(args):
         "policy_violated": name,
     }
     entry = adopt_rule(candidate, challenge=challenge)
-    print(f"\n✅ Authored detection rule '{entry['name']}'  (id: {entry['id']}).")
-    print(f"   The gateway enforces it on its NEXT start:")
-    print(f"     action={entry['target_action']} · {entry['semantic_description']}")
-    if entry.get("indicators"):
-        print(f"     exact indicators: {', '.join(entry['indicators'])}")
-    print(f"   💾 Saved to {entry['path']} (the local policy store the gateway loads).")
-    print(f"   Restart the gateway to arm it.")
-    print("=" * 75)
+    _print_rule_adopted(entry, verb="Authored")
 
 
 def execute_adopt(args):
@@ -1052,7 +1093,7 @@ def execute_adopt(args):
         policy_violated=policy_violated,
         source=source,
     )
-    print(f"\n✅ Adopted org reframe for '{policy_violated or pid}'  (source: {source}).")
+    print(f"\n✅ Adopted org coaching for '{policy_violated or pid}'  (source: {source}).")
     print(f"   Next block on this policy delivers:")
     print(f"   “{entry['challenge']}”")
     if entry.get("safe_path") and entry["safe_path"] != entry["challenge"]:
@@ -1061,6 +1102,213 @@ def execute_adopt(args):
     print(f"      (ensure your .gitignore tracks it; the starter kit's does by default).")
     print(f"   ✏️  Change this wording anytime: edit the `challenge` (and `safe_path`)")
     print(f"      for this policy in ./.agentx/overrides.json, or re-run `agentx adopt`.")
+    print("=" * 75)
+
+
+def execute_policies(args=None):
+    """`agentx policies` — list the customizable built-in floor policies, keyless.
+
+    The discovery surface for `agentx customize`: each policy's NAME (what you type),
+    and the CURRENT agent-facing coaching (the shipped default, overlaid with any
+    coaching you've customized). `agentx policies --check` validates your override
+    store so a hand-edit typo is loud, not a silent disable.
+
+    Keyless by construction: the coaching listed here is exactly what both keyless
+    block paths (the SDK decorator and agentx-mcp) deliver — no gateway, no key."""
+    args = args or []
+    if any(a in ("--check", "-c") for a in args):
+        _policies_check()
+        return
+    unknown = [a for a in args if a.startswith("-")]
+    if unknown:
+        print(f"\n❌ Unknown option '{unknown[0]}' for `agentx policies` (did you mean --check?).")
+        print("=" * 75)
+        sys.exit(1)
+
+    policies = list_customizable_policies()
+    print("\n🛡️  CUSTOMIZABLE FLOOR POLICIES        (keyless · no gateway, no key)")
+    print("=" * 75)
+    print("  These built-in floors block deterministically, offline. You can customize the")
+    print("  COACHING each one gives your agent on a block, by name:")
+    print("       agentx customize \"<name>\" --text \"...\"        (or --edit to open your editor)")
+
+    for p in policies:
+        tag = "   ✏️  customized" if p["customized"] else ""
+        print(f"\n  📋 {p['name']}{tag}")
+        challenge = p["active_challenge"] or p["default_challenge"]
+        safe = p["active_safe_path"] or p["default_safe_path"]
+        if challenge:
+            print(_wrap(challenge, "     coaching:   "))
+        if safe:
+            print(_wrap(safe, "     safe path:  "))
+
+    print("\n" + "=" * 75)
+    first = policies[0]["name"] if policies else "<name>"
+    print(f"  ▶ Customize one:      agentx customize \"{first}\" --edit")
+    print("  ▶ Validate your store:  agentx policies --check")
+    print("  Customized coaching lands in ./.agentx/overrides.json. Commit it to share with")
+    print("  your team. It applies keyless on BOTH the SDK decorator and agentx-mcp.")
+    print("=" * 75)
+
+
+def _policies_check():
+    """`agentx policies --check` — validate the override store and list what's active,
+    so a hand-edit typo is LOUD (a single bad comma otherwise silently disables EVERY
+    customized coaching). Exits non-zero on an unparseable store so CI catches it."""
+    path = _overrides_path()
+    print("\n🩺 OVERRIDE STORE CHECK        (validates ./.agentx/overrides.json)")
+    print("=" * 75)
+    print("  Your customized coaching lives in this file. A JSON typo silently disables ALL")
+    print("  of it, so this confirms it parses and lists what is actually active.")
+
+    if not os.path.exists(path):
+        print(f"\n  ℹ️  No override store yet at {path}.")
+        print("     Nothing customized, so the built-in floor coaching is in effect.")
+        print("     ▶ Customize one:   agentx customize \"<name>\" --edit   (names: agentx policies)")
+        print("=" * 75)
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"\n  ❌ {path} is NOT valid JSON: {e}")
+        print("     Your customized coaching is NOT being applied until this is fixed.")
+        print("     It's plain JSON, so check for a trailing comma or an unclosed quote.")
+        print("=" * 75)
+        sys.exit(1)
+
+    active = load_overrides(warn=True).get("overrides", {})
+    if not active:
+        print(f"\n  ✅ {path} parses. No active overrides in it yet.")
+        print("=" * 75)
+        return
+
+    catalog = {p["id"]: p["name"] for p in list_customizable_policies()}
+    real = [(pid, e) for pid, e in active.items() if isinstance(e, dict) and e.get("challenge")]
+    print(f"\n  ✅ {path} parses.  {len(real)} active override(s):")
+    for pid, entry in real:
+        label = entry.get("policy_violated") or catalog.get(pid) or pid
+        print(f"\n  📋 {label}   (source: {entry.get('source', '?')})")
+        print(_wrap(entry["challenge"], "     coaching:   "))
+        if entry.get("safe_path"):
+            print(_wrap(entry["safe_path"], "     safe path:  "))
+    print("\n" + "=" * 75)
+    print("  ▶ Change one:   agentx customize \"<name>\" --edit")
+    print("=" * 75)
+
+
+def _customize_usage_exit():
+    print("\n⚠️  Usage:")
+    print("   agentx customize \"<policy name>\" --text \"<coaching>\"   set the coaching inline")
+    print("   agentx customize \"<policy name>\" --edit               open $EDITOR seeded with the current coaching")
+    print("   ...add --safe-path \"<path>\"  to set the concrete safe path distinctly from the coaching")
+    print("   See the names you can customize:  agentx policies")
+    print("=" * 75)
+    sys.exit(1)
+
+
+def execute_customize(args):
+    """`agentx customize "<policy name>" [--text "..." | --edit] [--safe-path "..."]`
+    — override a built-in floor policy's COACHING by human-readable name (no UUID),
+    keyless. The smooth keyless path: it stores to ./.agentx/overrides.json keyed by
+    the policy's stable id, so `get_active_override` applies it on BOTH the SDK
+    decorator and the agentx-mcp block paths, no gateway.
+
+    Human-authored text is always allowed (the anti-poisoning gate only forbids
+    auto-applying AGENT-generated text), so no new gate is needed here."""
+    if not args:
+        _customize_usage_exit()
+
+    name = text = safe_path = None
+    do_edit = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--edit":
+            do_edit = True
+            i += 1
+        elif tok in ("--text", "--safe-path"):
+            if i + 1 >= len(args):
+                print(f"\n❌ {tok} needs a value.")
+                _customize_usage_exit()
+            if tok == "--text":
+                text = args[i + 1]
+            else:
+                safe_path = args[i + 1]
+            i += 2
+        elif tok.startswith("--"):
+            print(f"\n❌ Unknown option '{tok}'.")
+            _customize_usage_exit()
+        elif name is None:
+            name = tok
+            i += 1
+        else:
+            print(f"\n❌ Unexpected extra argument '{tok}'. Quote the policy name if it has spaces.")
+            _customize_usage_exit()
+
+    if not name:
+        _customize_usage_exit()
+    if do_edit and text is not None:
+        print("\n❌ Use EITHER --text OR --edit, not both.")
+        _customize_usage_exit()
+
+    entry_meta, n = resolve_policy_by_name(name)
+    if entry_meta is None:
+        if n > 1:
+            print(f"\n❌ '{name}' is ambiguous ({n} policies match).")
+        else:
+            print(f"\n❌ No customizable policy named '{name}'.")
+        print("   Names you can customize (from `agentx policies`):")
+        for p in list_customizable_policies():
+            print(f"     • {p['name']}")
+        print("=" * 75)
+        sys.exit(1)
+
+    pid = entry_meta["id"]
+    # Current effective coaching = any active override's, else the shipped default.
+    # So `--edit` seeds from what the agent gets today, and a `--safe-path`-only edit
+    # keeps the current coaching instead of blanking it.
+    current = get_active_override(pid, policy_name=entry_meta["name"])
+    current_challenge = (current.get("challenge") if current else None) or entry_meta["challenge"]
+    current_safe = (current.get("safe_path") if current else None) or entry_meta["safe_path"]
+
+    if do_edit:
+        challenge = _edit_text(current_challenge or "")
+    elif text is not None:
+        challenge = text
+    elif safe_path is not None:
+        challenge = current_challenge          # safe-path-only: keep the current coaching
+    else:
+        print("\n❌ Nothing to change. Pass --text \"...\", --edit, or --safe-path \"...\".")
+        _customize_usage_exit()
+
+    if not challenge or not challenge.strip():
+        print("\n🚫 Empty coaching, nothing customized (aborted).")
+        print("=" * 75)
+        return
+
+    effective_safe = safe_path if safe_path is not None else current_safe
+
+    if not _confirm_adopt(entry_meta["name"], challenge):
+        print("\n🚫 Not customized.")
+        print("=" * 75)
+        return
+
+    stored = adopt_override(
+        pid,
+        challenge=challenge,
+        safe_path=effective_safe,
+        policy_violated=entry_meta["name"],
+        source="customize",
+    )
+    print(f"\n✅ Customized coaching for '{entry_meta['name']}'.")
+    print("   Next block on this policy delivers:")
+    print(f"   “{stored['challenge']}”")
+    if stored.get("safe_path") and stored["safe_path"] != stored["challenge"]:
+        print(f"   result.safe_path → {stored['safe_path']}")
+    print("   💾 Saved to ./.agentx/overrides.json. Commit it to share with your team.")
+    print("   It applies keyless on BOTH the SDK decorator and agentx-mcp block paths.")
+    print("   ▶ Verify:  agentx policies --check")
     print("=" * 75)
 
 
@@ -1290,17 +1538,25 @@ def _detect_mcp_client():
 def _demo_next_steps(mcp):
     """The demo's closing next-steps as a list of lines. `mcp` is (client_name, config_hint)
     or None. Split out so the MCP-vs-decorator branch is unit-testable without running the
-    whole demo. Both branches frame the protection streak as a thing that GROWS (the return
-    hook the post-demo funnel was missing) and keep the Recover + share + Discord CTAs."""
+    whole demo.
+
+    ONE primary next step (protect a real surface, framed so the protection streak GROWS —
+    the return hook the post-demo funnel was missing) plus audit as the safe-first variant,
+    then a single Discord support line. Deliberately NOT here: Recover is already taught in
+    the 'What this shows' paragraph, so it is not repeated as a competing CTA; and
+    `agentx share` is omitted because the demo's catch is SYNTHETIC (identical every run),
+    not a unique war-story worth posting. The MCP branch says 'Have {name}?' rather than
+    'You're running {name}' — the detector only found a client CONFIG on disk, which does
+    not mean the dev ran the demo from that client (they may be evaluating the Python SDK)."""
     lines = []
     if mcp:
         name, cfg = mcp
         lines += [
-            f" You're running {name}. Protect a REAL server the same way: one line, no code, no key.",
+            f" Have {name}? Protect a REAL MCP server the same way: one line, no code, no key.",
             f"   In {cfg}, front any server's command with agentx-mcp:",
             '       "command": "agentx-mcp",',
             '       "args": ["npx", "-y", "your-mcp-server", "..."]',
-            f" 1 ▶ Then keep using {name} normally. Every real tool call is screened, and your",
+            f" 1 ▶ Then use {name} as usual. Every real tool call is screened, and your",
             "     protection streak grows each session:  agentx status",
             " 2 ▶ Not sure it's safe to enforce on a real server? Front it in audit first:",
             "       AGENTX_ENFORCEMENT=audit   (records what it WOULD block, blocks nothing)",
@@ -1323,9 +1579,6 @@ def _demo_next_steps(mcp):
             "     Then see what it caught, risk-free:  agentx insights",
         ]
     lines += [
-        " ▶ Unlock RECOVER (auto block to self-heal): the gateway + your Gemini key, then",
-        "     AgentX coaches the agent for you.  Free, runs locally: https://bit.ly/agentfirewall",
-        " ▶ Share this catch as a postable card:  agentx share",
         f" ▶ A bug or feature request? #bugs / #feature-requests on Discord: {_DISCORD_INVITE}",
     ]
     return lines
@@ -1432,6 +1685,8 @@ def _print_cli_usage():
     print("  insights    Review your agents' learned safe-paths (numbered) for adoption")
     print("  mcp-insights  Review + adopt safe-paths from the keyless MCP wedge (sibling of insights)")
     print("  adopt       Adopt a learned safe-path: 'adopt <#>' (--edit to tweak) or 'adopt <policy_id> --text ...'")
+    print("  policies    List the customizable floor policies + your active coaching ('--check' to validate)")
+    print("  customize   Customize a floor policy's coaching by name: 'customize \"<name>\" --text ...' (or --edit)")
     print("  help        Show this message (also: -h, --help)")
     print("\n  Protect your own agent. Wrap any tool function, then handle the block:")
     print("       from agentx_sdk import agentx_protect, is_block")
@@ -1501,6 +1756,10 @@ def main():
         execute_mcp_insights()
     elif command == "adopt":
         execute_adopt(args[1:])
+    elif command == "policies":
+        execute_policies(args[1:])
+    elif command == "customize":
+        execute_customize(args[1:])
     elif command == "demo":
         execute_demo()
     elif command == "share":

@@ -240,6 +240,60 @@ def adopt(policy_id, *, challenge, safe_path=None, resolution_type=None,
     return entry
 
 
+# ------------------------------------------------- customize (agentx policies)
+
+def list_customizable_policies(path=None):
+    """Project the built-in floor policies for the ``agentx policies`` surface: each
+    with its stable id, name, category, the shipped default challenge + safe path,
+    and — overlaid — any ACTIVE override the dev has adopted or customized, so the
+    listing shows what actually ships on the next block (not just the default).
+
+    Read-only. Lazy-imports the built-in catalog so ``overrides.py`` stays import-safe
+    (no ``decorators`` dependency at module load — the 0.3.1 lesson). The overlay uses
+    the SAME ``get_active_override`` the block path uses (id-first, name-fallback), so
+    ``customized`` here is true iff a block would actually be reframed.
+
+    Returns ``[{id, name, category, default_challenge, default_safe_path,
+    active_challenge, active_safe_path, customized}]``.
+    """
+    from .decorators import builtin_policy_catalog
+    out = []
+    for p in builtin_policy_catalog():
+        override = get_active_override(p["id"], policy_name=p["name"], path=path)
+        out.append({
+            "id": p["id"],
+            "name": p["name"],
+            "category": p.get("category"),
+            "default_challenge": p.get("challenge"),
+            "default_safe_path": p.get("safe_path"),
+            "active_challenge": override.get("challenge") if override else None,
+            "active_safe_path": override.get("safe_path") if override else None,
+            "customized": override is not None,
+        })
+    return out
+
+
+def resolve_policy_by_name(name):
+    """Resolve a human-readable policy name (as shown by ``agentx policies``) to its
+    built-in catalog entry for ``agentx customize`` — so the keyless dev types a name,
+    never a UUID. Case-insensitive, whitespace-normalized EXACT match.
+
+    Returns ``(entry, matches)`` where ``entry`` is the single matched catalog dict
+    (or ``None``) and ``matches`` is the count. The built-ins have unique names so a
+    real hit is always ``(entry, 1)``; ``(None, 0)`` is a typo and ``(None, n>1)`` is
+    an ambiguity the caller warns on rather than guessing (per the deferred
+    name-collision decision)."""
+    from .decorators import builtin_policy_catalog
+    target = _norm_for_dedup(name)
+    if not target:
+        return None, 0
+    matches = [p for p in builtin_policy_catalog()
+               if _norm_for_dedup(p["name"]) == target]
+    if len(matches) == 1:
+        return matches[0], 1
+    return None, len(matches)
+
+
 # --------------------------------------------------------------- harvest
 
 _HARVEST_QUERY = (

@@ -1020,6 +1020,29 @@ _BLOCK_CATEGORY_VOCAB = frozenset({
 # (which carries the canonical floor ids but may drop the category field).
 _POLICY_ID_TO_CATEGORY = {p["id"]: p["category"] for p in _BUILTIN_POLICY_KEYWORDS}
 
+
+def builtin_policy_catalog():
+    """Read-only projection of the built-in floor policies for the `agentx policies`
+    discovery surface and `agentx customize` name-resolution.
+
+    Each entry carries the policy's stable ``id``, human-readable ``name``, coarse
+    ``category``, the current agent-facing ``challenge`` (``socratic_prompt``) and
+    ``safe_path`` (``preferred_alternative``). Returns a fresh list of plain dicts
+    (a copy) so a caller can never mutate the live floor. This is the SHIPPED default
+    wording — the same ``socratic_prompt`` / ``preferred_alternative`` both keyless
+    block paths deliver — so ``agentx policies`` seeds ``--edit`` from exactly what
+    the agent would otherwise receive. No runtime/block-path behavior depends on it."""
+    return [
+        {
+            "id": p["id"],
+            "name": p["name"],
+            "category": p.get("category"),
+            "challenge": p.get("socratic_prompt"),
+            "safe_path": p.get("preferred_alternative"),
+        }
+        for p in _BUILTIN_POLICY_KEYWORDS
+    ]
+
 def _note_block_category(category, stats=None):
     """Record the coarse category of a block for the anonymous pulse. Closed-vocab
     only (off-vocab dropped). Last-write-wins across a session — a coarse 'what kind
