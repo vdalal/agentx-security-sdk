@@ -362,6 +362,17 @@ _session_stats = {
     "challenged_traces": set(),        # traces that hit a policy challenge this session
     "recovered_traces": set(),         # challenged traces the agent self-corrected on
     "human_resolved_traces": set(),    # challenged traces resolved by a human (not autonomous)
+    # Continuity-scoped recovery (2026-07): a "recovery" is a safe call on the SAME tool
+    # that was blocked (a self-correction), counted per BLOCK-RECOVER EPISODE so the
+    # summary, the local ledger, and the MCP surface all agree on the same unit.
+    # open_challenges holds (trace, tool) pairs currently blocked-and-unrecovered: a
+    # credit closes one, a re-block reopens it (so a genuine second recovery is counted),
+    # and a safe call on a DIFFERENT tool (the agent abandoned the blocked action) never
+    # matches an open pair, so it is never credited. The trace-level sets above stay in
+    # lockstep for the streak nudge + back-compat.
+    "open_challenges": set(),          # (trace, tool) pairs blocked and not yet recovered
+    "challenge_episodes": 0,           # total policy-challenge episodes this session (rate denominator)
+    "looped_traces": set(),            # runs whose runaway loop tripped a local breaker (the "looped" bucket)
     "consecutive_strikes": {},         # <-- Tracks repeated failures per tool function name
     "circuit_breakers_tripped": 0,     # <-- Stable initialization key preserved
     "human_escalations": 0,            # <-- SURGICAL REFACTOR: Local tracker variable added
@@ -481,21 +492,58 @@ def _mark_trace(set_name, trace_id):
         _session_stats[set_name].add(trace_id)
 
 
-def _credit_recovery(trace_id):
-    """Atomically credit a self-correction for `trace_id` and return True iff THIS
-    call is the one that transitioned it to recovered — so the caller logs the DB
-    row exactly once, OUTSIDE the lock. A trace is credited only if it was
-    challenged, not already recovered, and not human-resolved. Concurrent ALLOWs on
-    one shared trace can't double-credit / double-log (review #115 finding 6)."""
+def _mark_challenged(trace_id, tool_name):
+    """Open a challenge EPISODE at (trace, tool) granularity under the lock: bump the
+    episode counter, add the open (trace, tool), and record the trace (streak nudge /
+    back-compat). A recovery is credited later only when the SAME (trace, tool) pair is
+    still open (see _credit_recovery), so a safe call on a DIFFERENT tool (the agent
+    abandoned the blocked action) is never miscounted, and a re-block reopens the pair so
+    a genuine second recovery is credited again."""
+    with _stats_lock:
+        _session_stats["challenged_traces"].add(trace_id)
+        _session_stats["open_challenges"].add((trace_id, tool_name))
+        _session_stats["challenge_episodes"] += 1
+
+
+def _credit_recovery(trace_id, tool_name):
+    """Atomically credit a self-correction EPISODE for the (trace_id, tool_name) pair and
+    return True iff THIS call closed an OPEN challenge for it — so the caller logs the DB
+    row exactly once, OUTSIDE the lock. Credited only if that SAME-tool pair is currently
+    open (2026-07 continuity check: a safe call on a DIFFERENT tool is abandonment, not
+    recovery) and the trace was not human-resolved. Closing the open challenge means a
+    re-block reopens it, so a genuine second recovery on the same pair is credited again;
+    self_corrections and the ledger both count episodes. Concurrent ALLOWs on one shared
+    open challenge can't double-credit / double-log: only the call that discards it wins
+    (review #115 finding 6)."""
     with _stats_lock:
         s = _session_stats
-        if (trace_id in s["challenged_traces"]
-                and trace_id not in s["recovered_traces"]
-                and trace_id not in s["human_resolved_traces"]):
+        pair = (trace_id, tool_name)
+        if pair in s["open_challenges"] and trace_id not in s["human_resolved_traces"]:
+            s["open_challenges"].discard(pair)
             s["recovered_traces"].add(trace_id)
-            s["self_corrections"] = len(s["recovered_traces"])
+            s["self_corrections"] += 1
             return True
         return False
+
+
+def _recovery_breakdown():
+    """The (total, recovered, abandoned, looped) split of this session's challenge
+    EPISODES, computed under ONE lock so the summary's rate line, its breakdown line, and
+    the continuity tripwire all share a single implementation (no drift between a
+    displayed number and its test). recovered = self_corrections (episodes a same-tool
+    safe call closed); looped = still-open episodes on a run a breaker halted; abandoned =
+    still-open episodes that neither recovered nor looped; human-approved episodes are
+    excluded (counted under Human Escalations). The buckets partition challenge_episodes."""
+    with _stats_lock:
+        total = _session_stats["challenge_episodes"]
+        recovered = _session_stats["self_corrections"]
+        open_ch = set(_session_stats["open_challenges"])
+        looped = set(_session_stats["looped_traces"])
+        human = set(_session_stats["human_resolved_traces"])
+    looped_ep = sum(1 for (_t, _tool) in open_ch if _t in looped)
+    human_ep = sum(1 for (_t, _tool) in open_ch if _t in human and _t not in looped)
+    abandoned_ep = len(open_ch) - looped_ep - human_ep
+    return total, recovered, abandoned_ep, looped_ep
 
 
 def _returns_coroutine(fn):
@@ -607,7 +655,7 @@ def _apply_org_override(policy_id, challenge_text, safe_path, policy_name=None):
     return new_challenge, new_safe
 
 
-def _trip_breaker_if_ceiling(func_name, max_allowed_turns, raise_message, log_message=None):
+def _trip_breaker_if_ceiling(func_name, max_allowed_turns, raise_message, log_message=None, trace_id=None):
     """Halt a runaway loop on a LOCAL block path the gateway never sees — the
     Layer-0 keyword shield and the REASONING_ENGINE_UNREACHABLE offline fallback.
     Both decide off the same per-tool ``consecutive_strikes`` counter; centralising
@@ -622,6 +670,13 @@ def _trip_breaker_if_ceiling(func_name, max_allowed_turns, raise_message, log_me
         tripped = _session_stats["consecutive_strikes"][func_name] >= max_allowed_turns
     if tripped:
         _incr("circuit_breakers_tripped")
+        # Record the trace as "looped" (a terminal non-recovery outcome) for the
+        # recovered|abandoned|looped session breakdown. Best-effort: an absent trace_id
+        # (older callers) just skips the tag, and the breakdown intersects with the
+        # challenged set, so an availability-only loop never miscounts as a challenge.
+        if trace_id is not None:
+            with _stats_lock:
+                _session_stats["looped_traces"].add(trace_id)
         if log_message:
             print(log_message)
         raise AgentXCircuitBreakerTripped(raise_message)
@@ -696,17 +751,14 @@ def _print_agentx_summary():
     
     # The Action-Oriented UI
         
-    # 1. Calculate Session Recovery Rate — per trace (session), bounded <=100%
-    #    because recovered_traces is always a subset of challenged_traces. Snapshot
-    #    both lengths under the lock so a concurrent _credit_recovery / _mark_trace
-    #    can't tear the numerator/denominator if the summary prints mid-session
-    #    (#117 finding 4 — the read side of finding 6's write locking).
-    with _stats_lock:
-        challenged_sessions = len(_session_stats["challenged_traces"])
-        recovered_sessions = len(_session_stats["recovered_traces"])
+    # 1. Session recovery rate + continuity breakdown — per challenge EPISODE, from ONE
+    #    shared helper (_recovery_breakdown) so the rate line and the breakdown line can
+    #    never disagree, the read is a single locked snapshot (no two-lock tear), and the
+    #    tripwire tests the SAME code the summary prints. Bounded <=100% (recovered <=
+    #    total: each recovery closes one open challenge).
+    total_ch, recovered_ch, abandoned_ch, looped_ch = _recovery_breakdown()
     session_recovery_rate = (
-        (recovered_sessions / challenged_sessions) * 100
-        if challenged_sessions else 0.0
+        (recovered_ch / total_ch) * 100 if total_ch else 0.0
     )
         
     # 2. Calculate Cumulative Recovery Rate
@@ -740,6 +792,13 @@ def _print_agentx_summary():
 
     print(f" 🔄 Self-Corrections:      {_session_stats['self_corrections']:<3} |  Cumulative: {history.get('total_self_corrections', 0)}")
     print(f" 📈 Recovery Rate:         {session_recovery_rate:<3.1f}% |  Cumulative: {cumulative_recovery_rate:.1f}%")
+
+    # recovered (a same-tool safe call closed the challenge) / abandoned (still open) /
+    # looped (a breaker halted the run). Buckets partition the challenge episodes; only
+    # shown when there was a challenge, so a clean run stays quiet.
+    if total_ch:
+        print(f"    ↳ of {total_ch} challenge(s): "
+              f"{recovered_ch} recovered · {abandoned_ch} abandoned · {looped_ch} looped")
 
     # --- PROTECTION STREAK: the retention half of the value report — a reason to
     #     keep the SDK wired after the first catch. LOCAL-ONLY bookkeeping in
@@ -958,7 +1017,11 @@ _BUILTIN_POLICY_KEYWORDS = [
         # mass form, which is why "DELETE FROM" is deliberately absent here.
         "blocked_intents": ["DROP TABLE", "TRUNCATE TABLE", "DROP DATABASE"],
         "socratic_prompt": "This is a destructive, irreversible write that drops or mass-deletes data.",
-        "preferred_alternative": "Add a WHERE clause so the change touches only the specific rows you intend. If you must reset everything, snapshot or soft-delete first instead of dropping the table.",
+        "preferred_alternative": "Add a WHERE clause so the change touches only the specific rows you intend.",
+        # Reversibility-first coaching (recover-depth slice 2): steer onto the reversible
+        # equivalent and let the run proceed. The soft-delete clause that used to live in
+        # the string above is now single-sourced in _REVERSIBLE_ALTERNATIVES (below).
+        "reversible_transform": "soft_delete",
     },
     {
         "id": "11111111-1111-1111-1111-111111111103",
@@ -1005,6 +1068,10 @@ _BUILTIN_POLICY_KEYWORDS = [
         "blocked_intents": ["rm -rf /", "rm -rf ~", "rm -rf --no-preserve-root", "rm -fr /", ":(){", "mkfs", "of=/dev/sd", "of=/dev/nvme", "| bash", "|bash"],
         "socratic_prompt": "This is an irreversible, system-level shell command: a recursive delete of a root or home path, a disk overwrite, or a downloaded script piped straight into a shell.",
         "preferred_alternative": "Scope any delete to a specific relative subdirectory, never / or ~. Download a script to a file and review it before running, instead of piping it into bash.",
+        # NOT tagged with a reversible_transform: this policy's blocked_intents are
+        # heterogeneous (rm, mkfs, disk-overwrite, fork-bomb, pipe-to-bash), so a single
+        # "move to trash" steer would misdescribe most of them. Reversibility-first coaching
+        # only fits a homogeneous, cleanly-reversible class (see _REVERSIBLE_ALTERNATIVES).
     },
 ]
 
@@ -1019,6 +1086,57 @@ _BLOCK_CATEGORY_VOCAB = frozenset({
 # survives even when LOCAL_POLICY_KEYWORDS is loaded from a pulled .agentx/policies.json
 # (which carries the canonical floor ids but may drop the category field).
 _POLICY_ID_TO_CATEGORY = {p["id"]: p["category"] for p in _BUILTIN_POLICY_KEYWORDS}
+
+
+# --- Reversibility-first coaching (recover-depth slice 2) ------------------------
+# The deepest honest form of "keeps the run alive" is not "don't", it is "do the
+# REVERSIBLE equivalent and proceed": coach a destructive / irreversible action onto a
+# form the agent can undo, so the run finishes safely instead of just being stopped.
+# Generalizes the ratified Pon soft-delete seam (destructive-write -> soft-delete;
+# designs/recover-depth-and-vertical-integration-spec.md Q2 #1) from hand-written prose on
+# one seed into a single-source library keyed by a `reversible_transform` id. A seed (or a
+# pulled policy) opts in; one without it (SSRF, secrets, PII) keeps its specific safe path,
+# because "make it reversible" is not a coherent steer for an exfiltration attempt.
+# The gateway carries a PARALLEL copy of this idea (backend/gateway.py DDL / bulk-delete
+# branches); unifying them is the tracked "canonical coaching per failure_mode" follow-up
+# (designs/keyless-coaching-review.md rec 3), deliberately out of this SDK-only slice. Only
+# transforms with a live keyless floor seed ship; the spec's other classes (infra->dry-run,
+# exec->sandbox, comms->staged, db->transaction) are added here AND tagged when they seed a floor.
+_REVERSIBLE_ALTERNATIVES = {
+    # Only the Mass Destructive Intent policy is a homogeneous, cleanly-reversible class
+    # (DROP / TRUNCATE / DROP DATABASE / no-WHERE mass UPDATE|DELETE), so it is the only
+    # transform that ships today. The steer is deliberately action-GENERAL (it must fit an
+    # UPDATE and a DROP DATABASE, not only a table DELETE) so it never misdescribes a case
+    # the same policy fires on.
+    "soft_delete": (
+        "Prefer a reversible form you can undo: back up or snapshot the data first, or "
+        "stage the change behind a deleted or status flag you can revert, so it can be "
+        "restored, instead of an irreversible DROP, TRUNCATE, or unscoped bulk write."
+    ),
+}
+
+
+def _reversible_alternative(policy):
+    """The reversibility-first steer for a policy's action class, or None. Sourced from the
+    single _REVERSIBLE_ALTERNATIVES library (keyed by the seed's `reversible_transform` id)
+    so the same steer can never drift across seeds. A policy with no `reversible_transform`
+    (or an unknown id on a pulled policy) returns None, leaving its specific safe path as-is."""
+    tid = policy.get("reversible_transform")
+    return _REVERSIBLE_ALTERNATIVES.get(tid) if tid else None
+
+
+def _effective_safe_path(policy):
+    """The safe-path coaching actually delivered to the agent: the reversibility-first steer
+    LEADING the policy's specific alternative when the action class has a reversible
+    equivalent, else the specific alternative alone. Shared by _keyless_decision (both
+    keyless block surfaces) and builtin_policy_catalog (the `agentx policies` discovery
+    surface) so the delivered coaching and what `agentx policies --edit` seeds from can never
+    drift on wording."""
+    base = policy.get("preferred_alternative")
+    rev = _reversible_alternative(policy)
+    if rev and base:
+        return f"{rev} {base}"
+    return rev or base
 
 
 def builtin_policy_catalog():
@@ -1038,7 +1156,7 @@ def builtin_policy_catalog():
             "name": p["name"],
             "category": p.get("category"),
             "challenge": p.get("socratic_prompt"),
-            "safe_path": p.get("preferred_alternative"),
+            "safe_path": _effective_safe_path(p),
         }
         for p in _BUILTIN_POLICY_KEYWORDS
     ]
@@ -1093,6 +1211,10 @@ def load_local_policy_keywords(seed_dir=".agentx"):
                             # Carry the concrete safe path through if the pull supplies one, so the
                             # keyless coaching (A1a) can surface it for pulled/cloud policies too.
                             "preferred_alternative": p.get("preferred_alternative"),
+                            # Carry the reversibility-first transform id too (slice 2), so a
+                            # pulled/cloud policy that declares one gets the same reversible steer
+                            # as a built-in seed instead of silently losing it in this whitelist.
+                            "reversible_transform": p.get("reversible_transform"),
                         })
                 if policies:
                     return policies
@@ -1354,7 +1476,7 @@ def _keyless_decision(policy):
             "socratic_prompt",
             "Policy Violation. Revise your action to comply with security policy."),
         "category": policy.get("category") or _POLICY_ID_TO_CATEGORY.get(policy_id),
-        "preferred_alternative": policy.get("preferred_alternative"),
+        "preferred_alternative": _effective_safe_path(policy),
     }
 
 
@@ -1840,7 +1962,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                             f"AgentX Circuit Breaker Triggered: agent repeated a keyword-blocked "
                             f"action on '{func_name}' {max_allowed_turns} times. Halting to prevent "
                             f"token drain (Layer-0 shield — the gateway never sees this call).",
-                            log_message="🛑 [LOCAL KEYWORD SHIELD] Circuit breaker threshold met. Killing loop natively.")
+                            log_message="🛑 [LOCAL KEYWORD SHIELD] Circuit breaker threshold met. Killing loop natively.",
+                            trace_id=current_trace_id)
                         _incr_strike(strike_key)
 
                         # AUDIT posture: record what WOULD have blocked and let it proceed,
@@ -1870,7 +1993,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         _incr("intercepts")
                         _incr("critical_blocks")
                         _note_block_category(matched_policy.get("category") or _POLICY_ID_TO_CATEGORY.get(policy_id))
-                        _mark_trace("challenged_traces", current_trace_id)
+                        _mark_challenged(current_trace_id, func_name)
 
                         log_intercept(current_trace_id, agent_id, func_name, policy_id, policy_name, "CHALLENGED")
 
@@ -2011,7 +2134,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     # challenged, the same gate as the gateway ALLOWED path) + narrate the
                     # heal beat, so the keyless "the run survived" moment is finally
                     # visible AND countable on the pulse (self_corrections).
-                    if _credit_recovery(current_trace_id):
+                    if _credit_recovery(current_trace_id, func_name):
                         log_self_correction(current_trace_id, agent_id, func_name)
                         print(f"🔄 [AgentX SDK] Recovered: the agent revised its approach after the block and the safe '{func_name}' call cleared the keyless shield.")
                     return _ExecuteTool()
@@ -2020,7 +2143,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     strike_key, max_allowed_turns,
                     f"[OFFLINE FALLBACK] Agent failed to self-correct on '{func_name}' "
                     f"{max_allowed_turns} times and the AgentX gateway is unreachable. "
-                    f"Halting to prevent token drain.")
+                    f"Halting to prevent token drain.", trace_id=current_trace_id)
 
                 if fail_mode == "closed":
                     # FAIL CLOSED: do NOT execute — the engine could not vet this action.
@@ -2077,7 +2200,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # path, so an online block must not double-count into it.
                 # +++ SENSOR: mark this trace as challenged so a later safe call on the
                 # same trace is counted as a self-correction (per-trace, bounded) +++
-                _mark_trace("challenged_traces", current_trace_id)
+                _mark_challenged(current_trace_id, func_name)
                 
                 actual_policy_id = eval_res.get("policy_id", "POL-UNKNOWN")
                 policy_name = eval_res.get("policy_triggered", "Unknown Policy")
@@ -2193,7 +2316,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # Atomic credit-and-claim: only the call that actually transitions the
                 # trace to recovered logs the DB row, so concurrent ALLOWs on one
                 # shared async session can't double-log (#115 finding 6).
-                if _credit_recovery(current_trace_id):
+                if _credit_recovery(current_trace_id, func_name):
                     log_self_correction(current_trace_id, agent_id, func_name)
                     # The heal-narration beat. The block is narrated loudly and the
                     # session summary counts corrections, but without this line the

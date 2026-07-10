@@ -288,13 +288,18 @@ def test_log_self_correction_does_not_re_update_already_recovered(isolated_db):
     conn = sqlite3.connect(isolated_db)
     rows = conn.execute("SELECT status FROM event_log WHERE trace_id='trace-001'").fetchall()
     conn.close()
-    # The original RECOVERED row plus the INSERT fallback row
+    # Only the original RECOVERED row: the UPDATE matches no CHALLENGED row, and since
+    # the 2026-07 continuity fix there is no INSERT fallback, so nothing else is added.
     statuses = [r[0] for r in rows]
+    assert len(rows) == 1
     assert all(s == "RECOVERED" for s in statuses)
 
 
-def test_log_self_correction_insert_fallback_when_no_matching_row(isolated_db):
-    """When no CHALLENGED row exists for the trace, a RECOVERED row is inserted as audit trail."""
+def test_log_self_correction_no_orphan_row_when_no_matching_challenge(isolated_db):
+    """After the 2026-07 continuity fix, log_self_correction no longer fabricates an
+    orphan RECOVERED row when no matching CHALLENGED (trace, tool) exists: it flips a
+    real block row or writes nothing. Removing that INSERT fallback is what stops a
+    cross-tool abandonment from being miscounted (and persisted) as a recovery."""
     init_db()
     log_self_correction("ghost-trace", "agent", "orphaned_tool")
     conn = sqlite3.connect(isolated_db)
@@ -302,31 +307,34 @@ def test_log_self_correction_insert_fallback_when_no_matching_row(isolated_db):
         "SELECT status, tool_name FROM event_log WHERE trace_id='ghost-trace'"
     ).fetchone()
     conn.close()
-    assert row is not None
-    assert row[0] == "RECOVERED"
-    assert row[1] == "orphaned_tool"
+    assert row is None    # no orphan RECOVERED row fabricated
 
 
 # =============================================================================
 # Metrics drift — recovered rows stay in the denominator (no >100% rate)
 # =============================================================================
 
-def test_metrics_no_drift_recovered_rows_stay_in_denominator(isolated_db):
-    """
-    The INSERT fallback in log_self_correction can create RECOVERED rows without
-    a prior CHALLENGED row. Because RECOVERED counts as a challenge episode,
-    total_self_corrections can never exceed total_intercepts, so the recovery
-    rate stays bounded at <=100% (the per-session fix).
+def test_metrics_no_drift_no_orphan_recovered_rows(isolated_db):
+    """After the 2026-07 continuity fix there is no INSERT fallback, so a
+    log_self_correction with no matching CHALLENGED row can no longer create an orphan
+    RECOVERED row that would inflate the numerator. A real CHALLENGED -> RECOVERED flip
+    keeps recovered a subset of challenged, so the rate stays bounded at <=100%.
     """
     init_db()
-    # No prior CHALLENGED rows — two orphaned self-corrections via the INSERT fallback
+    # No-match self-corrections add nothing: no orphan rows, no denominator pollution.
     log_self_correction("ghost-1", "agent", "tool")
     log_self_correction("ghost-2", "agent", "tool")
+    empty = get_lifetime_stats()
+    assert empty["total_intercepts"] == 0
+    assert empty["total_self_corrections"] == 0
+
+    # A real block the agent recovers from: one CHALLENGED row flipped in place.
+    log_intercept("t1", "agent", "tool", "P1", "Policy A", "CHALLENGED")
+    log_self_correction("t1", "agent", "tool")
     result = get_lifetime_stats()
-    # Both RECOVERED rows count as episodes AND as self-corrections → 2/2 = 100%
-    assert result["total_intercepts"] == 2
-    assert result["total_self_corrections"] == 2
-    assert result["total_self_corrections"] <= result["total_intercepts"]  # no drift
+    assert result["total_intercepts"] == 1           # the flipped row still counts as an episode
+    assert result["total_self_corrections"] == 1
+    assert result["total_self_corrections"] <= result["total_intercepts"]   # no drift, <=100%
 
 
 def test_log_self_correction_and_stats_reflect_correct_counts(isolated_db):

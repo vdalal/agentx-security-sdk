@@ -37,6 +37,10 @@ def reset_state(monkeypatch):
     _session_stats["challenged_traces"].clear()
     _session_stats["recovered_traces"].clear()
     _session_stats["human_resolved_traces"].clear()
+    for _k in ("open_challenges", "looped_traces"):
+        _session_stats[_k].clear()
+    _session_stats["challenge_episodes"] = 0
+    _session_stats["self_corrections"] = 0
     _session_stats["consecutive_strikes"].clear()
     _session_stats["gateway_reached"] = False  # coarse pulse stage signal — reset so a reached-gateway test can't leak into the next
     _session_stats["reasoning_enabled"] = None  # companion pulse stage signal — reset alongside gateway_reached (SDK session-globals isolation)

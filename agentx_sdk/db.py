@@ -227,17 +227,23 @@ def log_self_correction(trace_id, agent_id, tool_name):
             cursor.execute('''
                 UPDATE event_log
                 SET status = 'RECOVERED'
-                WHERE trace_id = ? AND tool_name = ? AND status = 'CHALLENGED'
+                WHERE id = (
+                    SELECT id FROM event_log
+                    WHERE trace_id = ? AND tool_name = ? AND status = 'CHALLENGED'
+                    ORDER BY id DESC LIMIT 1
+                )
             ''', (trace_id, tool_name))
 
-            # Local Fallback Backstop: If Turn 1 wasn't written to this database file for some reason,
-            # write a baseline recovery token to maintain a clear audit trail.
-            if cursor.rowcount == 0:
-                cursor.execute('''
-                    INSERT INTO event_log (trace_id, agent_id, tool_name, policy_id, policy_name, status, tokens_saved, time_saved_mins)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (trace_id, agent_id, tool_name, 'RECOVERY', 'Self-Correction', 'RECOVERED', 1500, 5.0))
-
+            # Flip exactly ONE row -- the most-recent open CHALLENGED row for this
+            # (trace, tool) -- so one recovery EPISODE flips one ledger row. An unbounded
+            # UPDATE flipped EVERY matching CHALLENGED row, inflating cumulative recoveries
+            # when the same tool was blocked several times on one trace (code review).
+            # (Removed 2026-07) The old "backstop" INSERT that wrote a fresh RECOVERED row
+            # when no CHALLENGED row matched is gone too: it fabricated an ORPHAN recovery
+            # on a cross-tool safe call, inflating the numerator. The in-memory (trace, tool)
+            # credit gate (_credit_recovery) is authoritative and same-tool-scoped, so this
+            # UPDATE flips the one real row for this episode or nothing. Under-recording a
+            # rare row whose CHALLENGED write was lost beats fabricating one.
             conn.commit()
     except Exception:
         pass

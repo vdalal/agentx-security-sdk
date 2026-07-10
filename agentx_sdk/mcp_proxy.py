@@ -834,6 +834,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
             print("[agentx-mcp] dropped id-less tools/call past the runaway ceiling", file=log)
         session_stats["intercepts"] = session_stats.get("intercepts", 0) + 1
         session_stats["critical_blocks"] = session_stats.get("critical_blocks", 0) + 1
+        session_stats["runaway_halts"] = session_stats.get("runaway_halts", 0) + 1
         print("[agentx-mcp] blocked tools/call (runaway ceiling %d exceeded at %d calls)."
               % (ceiling, session_stats["total_calls"]), file=log)
         return "block"
@@ -873,14 +874,19 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     tool_key = str(name)
     if not decision:
         # A clean call zeroes this tool's block streak. If that streak was non-zero, this
-        # SAME tool was blocked earlier and now runs safe: a rough proxy for "the agent
-        # recovered on the coaching", so count it on the pulse. This is a HEURISTIC keyed
-        # by tool name (the keyless proxy has no per-call trace) so it can over-attribute
-        # (a later unrelated clean call on a tool that was once blocked) and under-count
-        # cross-tool recoveries; it is therefore NOT identical to the decorator's
-        # trace-keyed _credit_recovery (which bounds recovered <= challenged). Counts-only
-        # / advisory: harvest-IN (designs/mcp-corpus-intake.md (B))'s block->allow
-        # correlation hook used purely to COUNT (capturing the revised-safe call is later).
+        # SAME tool was blocked earlier and now runs safe: the SAME-TOOL forward-safe
+        # recovery definition the decorator's _credit_recovery enforces. Both surfaces
+        # count recovery EPISODES (each block -> same-tool-safe-call is one recovery,
+        # counted once), and both hold: a block alone is not a recovery, and a safe call on
+        # a DIFFERENT tool is not a recovery. test_recovery_continuity.py is the
+        # cross-surface tripwire that pins this, INCLUDING a repeat
+        # block->recover->block->recover where both surfaces report 2. The one LEGITIMATE
+        # divergence (documented, not a drift): the keyless proxy has NO per-call trace, so
+        # this is keyed by tool NAME alone (not (trace, tool)); it can therefore
+        # over-attribute a later unrelated clean call on a once-blocked tool that the
+        # trace-keyed decorator would not. Counts-only / advisory: harvest-IN
+        # (designs/mcp-corpus-intake.md (B))'s block->allow correlation hook used purely to
+        # COUNT (capturing the revised-safe call is later).
         if streaks.pop(tool_key, None):
             session_stats["self_corrections"] = session_stats.get("self_corrections", 0) + 1
             # Flip EXACTLY the latest open ledger block for this tool to RECOVERED (see the
@@ -1171,6 +1177,20 @@ def _protection_report(session_stats, log):
               % (calls,
                  int(session_stats.get("critical_blocks", 0) or 0),
                  int(session_stats.get("self_corrections", 0) or 0)), file=log)
+        # Continuity breakdown (advisory; tool-keyed, no trace — see _screen_message):
+        # recovered = same-tool clean calls after a block (recovery episodes, SAME unit as
+        # the decorator); still-open = tools left with an un-recovered block at exit
+        # (abandoned); runaway-halted = the count of CALLS stopped by the
+        # AGENTX_MCP_CALL_CEILING. NOTE the last is call-level, NOT the decorator's
+        # run-level "looped" bucket (a single runaway loop halts many calls), so it is
+        # labelled "runaway-halted call(s)", never "looped". Not a strict partition of
+        # `blocked` (ceiling and drift blocks take a different path), so it is counts.
+        recovered_n = int(session_stats.get("self_corrections", 0) or 0)
+        abandoned_n = len(session_stats.get("_open_blocks", {}) or {})
+        halted_calls = int(session_stats.get("runaway_halts", 0) or 0)
+        if recovered_n or abandoned_n or halted_calls:
+            print("[agentx-mcp]   -> %d recovered, %d still-open (abandoned), %d runaway-halted call(s)."
+                  % (recovered_n, abandoned_n, halted_calls), file=log)
         protection = pulse.record_protection(session_stats)
         if protection:
             print("[agentx-mcp] protection streak: %s." % pulse.format_protection_line(protection), file=log)

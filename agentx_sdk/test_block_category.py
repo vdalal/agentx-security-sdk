@@ -20,6 +20,10 @@ def reset_block_category(monkeypatch):
         dec._session_stats[k] = 0
     dec._session_stats["block_category"] = None
     dec._session_stats["challenged_traces"].clear()
+    for _k in ("open_challenges", "looped_traces"):
+        dec._session_stats[_k].clear()
+    dec._session_stats["challenge_episodes"] = 0
+    dec._session_stats["self_corrections"] = 0
     dec._session_stats["consecutive_strikes"].clear()
     dec._strike_owner.clear()
     monkeypatch.delenv("AGENTX_BYPASS_LOCAL_SHIELD", raising=False)          # Layer-0 shield ACTIVE

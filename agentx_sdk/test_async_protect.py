@@ -38,6 +38,10 @@ def reset_session_state():
     _session_stats["challenged_traces"].clear()
     _session_stats["recovered_traces"].clear()
     _session_stats["human_resolved_traces"].clear()
+    for _k in ("open_challenges", "looped_traces"):
+        _session_stats[_k].clear()
+    _session_stats["challenge_episodes"] = 0
+    _session_stats["self_corrections"] = 0
     _session_stats["degraded_executions"] = 0
     _session_stats["consecutive_strikes"].clear()
     _session_stats["gateway_reached"] = False
@@ -318,20 +322,28 @@ def test_partial_wrapped_async_block_does_not_crash_on_name():
 
 
 def test_credit_recovery_idempotent_and_respects_human_resolved():
-    """_credit_recovery transitions a challenged trace exactly once; a second call
-    returns False (no double-credit / double-log), and a human-resolved trace is
+    """_credit_recovery closes an OPEN (trace, tool) challenge exactly once; a second
+    call on the now-closed pair returns False (no double-credit / double-log); a safe
+    call on a DIFFERENT tool is abandonment, not recovery; and a human-resolved trace is
     never credited (finding 6)."""
-    for k in ("challenged_traces", "recovered_traces", "human_resolved_traces"):
+    for k in ("challenged_traces", "recovered_traces", "human_resolved_traces",
+              "open_challenges"):
         _session_stats[k].clear()
-    t = "trace-xyz"
-    _session_stats["challenged_traces"].add(t)
-    assert _credit_recovery(t) is True
-    assert _credit_recovery(t) is False
+    _session_stats["self_corrections"] = 0
+    t, tool = "trace-xyz", "run_sql"
+    _session_stats["open_challenges"].add((t, tool))
+    assert _credit_recovery(t, tool) is True
+    assert _credit_recovery(t, tool) is False          # closed, not re-credited
     assert t in _session_stats["recovered_traces"]
+    assert _session_stats["self_corrections"] == 1
+    # A safe call on a DIFFERENT tool is abandonment, never a recovery.
+    _session_stats["open_challenges"].add((t, tool))
+    assert _credit_recovery(t, "send_email") is False
 
-    _session_stats["recovered_traces"].clear()
+    _session_stats["open_challenges"].clear()
+    _session_stats["open_challenges"].add((t, tool))
     _session_stats["human_resolved_traces"].add(t)
-    assert _credit_recovery(t) is False
+    assert _credit_recovery(t, tool) is False
 
 
 def test_recovery_beat_narrated_once_on_self_correction(monkeypatch, capsys):
@@ -374,18 +386,20 @@ def test_recovery_beat_narrated_once_on_self_correction(monkeypatch, capsys):
 
 
 def test_credit_recovery_single_winner_under_threads():
-    """Under concurrent ALLOWs on ONE shared challenged trace, exactly one call
-    wins the transition — so log_self_correction (the DB write) runs once, not N
+    """Under concurrent ALLOWs on ONE shared OPEN (trace, tool) challenge, exactly one
+    call wins the transition, so log_self_correction (the DB write) runs once, not N
     times (finding 6: the recovery double-log race)."""
-    for k in ("challenged_traces", "recovered_traces", "human_resolved_traces"):
+    for k in ("challenged_traces", "recovered_traces", "human_resolved_traces",
+              "open_challenges"):
         _session_stats[k].clear()
-    t = "trace-race"
-    _session_stats["challenged_traces"].add(t)
+    _session_stats["self_corrections"] = 0
+    t, tool = "trace-race", "run_sql"
+    _session_stats["open_challenges"].add((t, tool))
 
     wins = []
 
     def worker():
-        if _credit_recovery(t):
+        if _credit_recovery(t, tool):
             wins.append(1)
 
     threads = [threading.Thread(target=worker) for _ in range(32)]
