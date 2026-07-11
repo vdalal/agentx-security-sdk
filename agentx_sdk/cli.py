@@ -1704,7 +1704,25 @@ def main():
     print("=" * 75)
     print("🛡️  AGENTX LOCAL OBSERVABILITY ENGINE")
     print("=" * 75)
-    
+
+    # --- OFFLINE STALENESS NOTICE (the third surface) ---
+    # A CLI-only user never makes a protected tool call, so the decorator's session
+    # summary never runs and a notice wired only there would never reach them. `agentx
+    # demo` routes through here too, and its curated close suppresses that summary, so
+    # this is the only emit that covers it. The CLI is also the most natural place to
+    # nag: it is interactive and the remedy is a shell command.
+    #
+    # stdout is SAFE here: this is the `agentx` console script. agentx-mcp has its own
+    # separate main() (mcp_proxy) whose stdout is the JSON-RPC stream, and it emits the
+    # notice on stderr from _protection_report instead. Same shared helper on all three
+    # surfaces so the wording cannot drift.
+    from . import pulse
+    stale = pulse.staleness_notice()
+    if stale:
+        print(f" 📦 Update AgentX: {stale}.")
+        print(f"    ▶ {pulse.UPGRADE_COMMAND}")
+        print("=" * 75)
+
     env = load_env_file()
 
     # AGENTX_MODE is the single switch (local | linked | cloud). Mirror the

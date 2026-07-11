@@ -437,6 +437,72 @@ def test_offline_keyword_shield_coaching_is_decrufted_and_names_safe_path(monkey
     assert "read-only catalog query" in result             # the concrete safe path
 
 
+def test_gateway_block_delivers_self_contained_coaching_once(monkeypatch):
+    """CROSS-SURFACE SEAM (Recover tier): a gateway floor block delivers its coaching in the
+    single self-contained `challenge` field, and the SDK renders it to the agent COMPLETE and
+    exactly ONCE -- lead + concrete safe move, no stutter.
+
+    History: the gateway briefly split the safe move into a separate `safe_path` field so the
+    SDK could render a distinct "Safe alternative:" line. But the SDK appends that field ON TOP
+    of `challenge` (correct for the keyless path, whose socratic_prompt and preferred_alternative
+    are disjoint), so a gateway challenge that already contained the safe move stuttered, and a
+    lead-only challenge dropped the move from every consumer that reads only `challenge` (the
+    /playground relay, examples 01/10, the recovery eval, the VHS clips). The gateway now keeps
+    `challenge` self-contained and emits no safe_path field; the structured-field idea is a
+    deferred follow-up (BACKLOG C11). This binds the delivered result: complete, and once."""
+    from agentx_sdk.decorators import _session_stats, _client
+
+    _session_stats["consecutive_strikes"]["mock_secure_database_executor"] = 0
+
+    safe_move = (
+        "Target a specific, named subdirectory, or request human approval for a deletion at "
+        "this scope."
+    )
+    challenge = (
+        "Narrow the delete to a path you can restore. This recursively deletes a whole-scope "
+        "filesystem target. " + safe_move
+    )
+    # Current gateway floor shape: ONE self-contained challenge, no separate safe_path field.
+    monkeypatch.setattr(_client, "evaluate_intent", lambda **kwargs: {
+        "error": "AgentX Policy Violation",
+        "detection_layer": "floor",
+        "policy_id": "11111111-1111-1111-1111-111111111101",
+        "policy_triggered": "Mass Destructive Intent",
+        "challenge": challenge,
+        "receipt_id": "mock-receipt-id",
+    })
+    monkeypatch.setenv("AGENTX_BYPASS_LOCAL_SHIELD", "true")
+
+    result = str(mock_secure_database_executor(sql_query="DROP TABLE users;"))
+    assert "🚨 [AgentX Security Block]" in result
+    # The concrete safe move reaches the agent, exactly once.
+    assert safe_move in result, "the gateway coaching's safe move was dropped from the SDK render"
+    assert result.count(safe_move) == 1
+    # And it leads with the way through, not the wall.
+    assert "Policy Violation:" not in result.split("Challenge/Constraint:")[1]
+
+    # WHY the gateway must NOT emit a safe_path field, made explicit (not a vacuous guard):
+    # the SDK CORRECTLY appends any safe_path it receives, so if the gateway re-added the field
+    # ON TOP of a self-contained challenge, the SAME move would render twice. This arm proves
+    # that mechanism, so the anti-stutter invariant provably belongs on the GATEWAY side
+    # (guarded by backend/test_fires_in_anger.py: no block response emits safe_path). The SDK
+    # cannot and should not defend against it -- appending a provided safe_path is its job.
+    _session_stats["consecutive_strikes"]["mock_secure_database_executor"] = 0
+    monkeypatch.setattr(_client, "evaluate_intent", lambda **kwargs: {
+        "error": "AgentX Policy Violation", "detection_layer": "floor",
+        "policy_id": "11111111-1111-1111-1111-111111111101",
+        "policy_triggered": "Mass Destructive Intent",
+        "challenge": challenge,          # already self-contained (ends with safe_move)
+        "safe_path": safe_move,          # the reverted-regression shape: field on top
+        "receipt_id": "mock-receipt-id",
+    })
+    stuttered = str(mock_secure_database_executor(sql_query="DROP TABLE users;"))
+    assert stuttered.count(safe_move) == 2, (
+        "expected the SDK to append a provided safe_path (proving the gateway must not emit "
+        "one alongside a self-contained challenge); if this is 1, the SDK render contract changed"
+    )
+
+
 def test_is_fs_destructive_func_tokenizes_name():
     """Verb is matched as a discrete token (snake_case + camelCase), never as a
     substring — so `undelete_safely` / `formatter` do not false-positive."""

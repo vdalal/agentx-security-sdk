@@ -189,3 +189,47 @@ def test_loader_preserves_reversible_transform_for_pulled_policies(tmp_path, mon
     pulled = next(p for p in dec.load_local_policy_keywords() if p["id"] == "pulled-1")
     assert pulled.get("reversible_transform") == "soft_delete"
     assert dec._REVERSIBLE_ALTERNATIVES["soft_delete"] in dec._effective_safe_path(pulled)
+
+
+@pytest.mark.parametrize("malformed", [["soft_delete"], {"id": "soft_delete"}, 7, True])
+def test_malformed_reversible_transform_cannot_disarm_the_block(malformed):
+    """FAIL-OPEN GUARD. A NON-string `reversible_transform` on a pulled/hand-edited policy made
+    `_REVERSIBLE_ALTERNATIVES.get(<list>)` raise TypeError (unhashable). That escaped into the
+    Local Shield's `except Exception`, which prints "bypassed" and FALLS THROUGH, so the
+    keyless block never fired and the dangerous tool EXECUTED. Same bug class the sibling
+    `category` field is already isinstance-guarded for. The steer is dropped; the BLOCK stands."""
+    policy = {
+        "id": "pulled-bad", "name": "Pulled Destructive", "is_active": True,
+        "blocked_intents": ["DROP TABLE"], "socratic_prompt": "No.",
+        "preferred_alternative": "Add a WHERE clause.",
+        "reversible_transform": malformed,
+    }
+    # the lookup must not raise, and must not invent a steer from a malformed id
+    assert _reversible_alternative(policy) is None
+    # the policy-specific safe path survives; only the malformed steer is dropped
+    assert "WHERE clause" in _effective_safe_path(policy)
+
+
+def test_malformed_reversible_transform_still_blocks_end_to_end(tmp_path, monkeypatch):
+    """The bypass, end to end on the keyless decorator surface: a pulled policy carrying a
+    malformed reversible_transform must still BLOCK the tool call, not fail open and run it."""
+    seed = tmp_path / ".agentx"
+    seed.mkdir()
+    (seed / "policies.json").write_text(json.dumps([{
+        "id": "pulled-bad", "name": "Pulled Destructive", "is_active": True,
+        "blocked_intents": ["DROP TABLE"], "socratic_prompt": "Blocked.",
+        "reversible_transform": ["soft_delete"],   # malformed: a JSON array
+    }]), encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(dec, "LOCAL_POLICY_KEYWORDS", dec.load_local_policy_keywords())
+
+    executed = []
+
+    @agentx_protect(agent_id="reversibility_malformed")
+    def run_sql(query, db_session=None):
+        executed.append(query)
+        return {"status": "ok"}
+
+    out = run_sql(query="DROP TABLE users;", db_session="<session>")
+    assert is_block(out), "keyless shield failed OPEN on a malformed policy"
+    assert executed == [], "the dangerous tool EXECUTED despite the policy"

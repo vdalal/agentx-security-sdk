@@ -127,6 +127,34 @@ def test_recovery_breakdown_partitions_episodes_via_the_real_helper():
     assert total - recovered - abandoned - looped == 1
 
 
+def test_reblock_of_an_open_pair_is_the_same_episode_not_a_new_one():
+    """A RE-block of an already-open (trace, tool) is the agent retrying the SAME blocked
+    action (the loop the breaker exists for), so it is the same episode. Bumping the counter
+    unconditionally grew the denominator while `open_challenges` (a set) did not grow, so the
+    buckets stopped partitioning and the rate DEFLATED. Caught live by pr-overnight: example
+    04 printed "of 3 challenge(s): 0 recovered - 0 abandoned - 1 looped" (sum 1, not 3)."""
+    for _ in range(3):
+        _mark_challenged("t", "run_sql")                       # blocked 3x, same action
+
+    assert _session_stats["challenge_episodes"] == 1, "a re-block must not open a new episode"
+
+    total, recovered, abandoned, looped = _recovery_breakdown()
+    assert (total, recovered, abandoned, looped) == (1, 0, 1, 0)
+    assert recovered + abandoned + looped == total, "buckets must partition the episodes"
+
+
+def test_repeat_block_then_recovery_is_a_full_recovery_not_a_third():
+    """3 blocks of one action, then a same-tool self-correct = ONE episode, RECOVERED: the
+    session rate is 100%, not 33.3%. The denominator counts episodes, not intercepts."""
+    for _ in range(3):
+        _mark_challenged("t", "run_sql")
+    assert _credit_recovery("t", "run_sql") is True
+
+    total, recovered, abandoned, looped = _recovery_breakdown()
+    assert (total, recovered, abandoned, looped) == (1, 1, 0, 0)
+    assert recovered / total == 1.0
+
+
 # --------------------------------------------------------------------------- #
 # MCP proxy surface (tool only, no trace)
 # --------------------------------------------------------------------------- #

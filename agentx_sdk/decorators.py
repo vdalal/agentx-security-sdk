@@ -501,8 +501,18 @@ def _mark_challenged(trace_id, tool_name):
     a genuine second recovery is credited again."""
     with _stats_lock:
         _session_stats["challenged_traces"].add(trace_id)
-        _session_stats["open_challenges"].add((trace_id, tool_name))
-        _session_stats["challenge_episodes"] += 1
+        # Bump the episode counter ONLY when the pair actually OPENS. A re-block of an
+        # ALREADY-open pair (the agent retries the same blocked action -- the loop the breaker
+        # exists for) is the SAME episode, not a new one: it adds nothing to `open_challenges`
+        # (a set), so bumping unconditionally grew the denominator while no bucket grew. That
+        # broke _recovery_breakdown's partition invariant (ex. 04 printed "of 3 challenge(s):
+        # 0 recovered - 0 abandoned - 1 looped") and DEFLATED the rate (3 blocks then a
+        # self-correct printed 33.3%, not 100%). A re-block AFTER a recovery closed the pair
+        # does open a genuine new episode, which is still counted.
+        pair = (trace_id, tool_name)
+        if pair not in _session_stats["open_challenges"]:
+            _session_stats["open_challenges"].add(pair)
+            _session_stats["challenge_episodes"] += 1
 
 
 def _credit_recovery(trace_id, tool_name):
@@ -835,6 +845,19 @@ def _print_agentx_summary():
         print(f" ⚠️  Top Offender: '{history['top_offender']}'")
         print(" 💡 Tip: Consider refining your agent's system prompt to avoid this.")
 
+    # --- OFFLINE STALENESS NOTICE ---
+    # The only channel that reaches a pinned install: pip cannot declare a minimum
+    # version of the SDK itself, so an old copy never moves unless we tell its user.
+    # No network call, independent of telemetry consent, self-gated in automation/CI.
+    # Shares pulse.format_staleness_line + pulse.UPGRADE_COMMAND with the agentx-mcp
+    # report (which prints to STDERR, since MCP speaks JSON-RPC on stdout) so the two
+    # session-end surfaces cannot drift.
+    stale = pulse.staleness_notice()
+    if stale:
+        print("─"*60)
+        print(f" 📦 Update AgentX: {stale}.")
+        print(f"    ▶ {pulse.UPGRADE_COMMAND}")
+
     # --- SELF-SERVE NUDGE ---
     # At the activation moment (a keyless block), point the dev at Recover. The pulse
     # module owns the decision + bookkeeping: shown only for an install that has NEVER
@@ -1122,7 +1145,12 @@ def _reversible_alternative(policy):
     so the same steer can never drift across seeds. A policy with no `reversible_transform`
     (or an unknown id on a pulled policy) returns None, leaving its specific safe path as-is."""
     tid = policy.get("reversible_transform")
-    return _REVERSIBLE_ALTERNATIVES.get(tid) if tid else None
+    # isinstance guard, same as the sibling `category` field above: a malformed pulled policy
+    # can carry a NON-string transform id (a JSON array/object), and `dict.get(<list>)` raises
+    # TypeError (unhashable). That escapes into the Local Shield's `except Exception`, which
+    # prints "bypassed" and FALLS THROUGH -- fail-open, so the blocked tool would execute.
+    # Drop the malformed id rather than let it disarm the keyless block path.
+    return _REVERSIBLE_ALTERNATIVES.get(tid) if isinstance(tid, str) and tid else None
 
 
 def _effective_safe_path(policy):

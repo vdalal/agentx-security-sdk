@@ -499,6 +499,80 @@ def format_protection_line(protection):
                protection["since"]))
 
 
+# --- OFFLINE STALENESS NOTICE ------------------------------------------------
+# The SDK is the LEAF package: pip has no concept of "minimum version of myself",
+# so nothing can pull an already-installed old copy forward. (The agentx-mcp
+# floor only reaches installs that arrive THROUGH agentx-mcp.) A pinned install
+# keeps running whatever shield it shipped with, missing every enforcement fix
+# since, and we have no way to contact it — the pulse is anonymous. This is the
+# only channel that reaches it: once a build is old enough, it nags ITSELF.
+#
+# Deliberately OFFLINE. No PyPI query, no new outbound destination, works
+# airgapped, and it is independent of telemetry consent, so a developer who
+# opted OUT of the pulse still hears about a security release. The price of
+# being offline is that it cannot name the current version, only report that
+# this build is old — which is the actionable half anyway.
+#
+# THRESHOLD is tuned to the RELEASE CADENCE, not to a round number of days. We
+# ship roughly every 1-2 days in active development (~20 SDK releases between
+# 2026-06-26 and 2026-07-11), so a 15-day-old build is already many releases and
+# several enforcement fixes behind. A 90-day threshold would have let an install
+# sit ~40 releases behind while still reporting itself as fresh.
+#
+# The one hazard of an age-only signal is a release DROUGHT longer than the
+# threshold: it would nag developers who are already current. The longest gap in
+# that window is ~3 days, so 15 has ample headroom. REVISIT this constant if the
+# cadence slows down (post-launch, a stable maintenance line), or the notice
+# turns into wallpaper and stops being read.
+#
+# Self-clearing: upgrading resets the age to 0, so the only developers who keep
+# seeing it are the ones who have not upgraded, which is exactly the audience.
+_STALE_AFTER_DAYS = 15
+
+UPGRADE_COMMAND = "pip install --upgrade agentx-security-sdk"
+
+
+def build_age_days(released=None, today=None):
+    """Days since this build was cut, from the ``__released__`` constant. None when the
+    constant is missing or unparseable, so a bad constant produces NO notice rather than
+    a guessed age. Both args injectable for tests. Never raises."""
+    try:
+        if released is None:
+            import agentx_sdk
+            released = agentx_sdk.__released__
+        if isinstance(today, datetime):     # a datetime would poison the subtraction
+            today = today.date()
+        today = today or date.today()
+        return max(0, (today - date.fromisoformat(str(released))).days)
+    except Exception:
+        return None
+
+
+def format_staleness_line(age_days, version):
+    """The canonical staleness phrase shown by BOTH session-end surfaces (the decorator
+    summary and the agentx-mcp report), so the wording cannot drift across the two
+    integration paths (the same anti-drift discipline as format_protection_line). Each
+    surface adds only its own prefix, stream, and the shared UPGRADE_COMMAND."""
+    return ("this build is %d days old (%s) and newer releases may carry security fixes"
+            % (age_days, version))
+
+
+def staleness_notice(released=None, today=None):
+    """The one-line upgrade notice when this build is older than _STALE_AFTER_DAYS, else
+    None. Excluded from automation/CI (a nag inside someone's test matrix is noise, the
+    same rule as the streak and the nudge). Sends and tracks NOTHING. Never raises."""
+    try:
+        if is_automation_context():
+            return None
+        age = build_age_days(released=released, today=today)
+        if age is None or age < _STALE_AFTER_DAYS:
+            return None
+        import agentx_sdk
+        return format_staleness_line(age, agentx_sdk.__version__)
+    except Exception:
+        return None
+
+
 def on_session_end(session_stats):
     """Single atexit entry point for all telemetry I/O — called by the SDK session
     summary. Owns its own output. Never raises.

@@ -1194,6 +1194,13 @@ def _protection_report(session_stats, log):
         protection = pulse.record_protection(session_stats)
         if protection:
             print("[agentx-mcp] protection streak: %s." % pulse.format_protection_line(protection), file=log)
+        # Offline staleness notice — the MCP half of the same reach problem. An MCP user
+        # never sees the decorator's atexit summary (main() suppresses it), so a notice
+        # wired only there would reach ZERO of them. Same shared phrase + command as the
+        # decorator, on `log` (stderr): a banner on stdout would corrupt the JSON-RPC stream.
+        stale = pulse.staleness_notice()
+        if stale:
+            print("[agentx-mcp] update: %s. -> %s" % (stale, pulse.UPGRADE_COMMAND), file=log)
     except Exception:
         pass
 
