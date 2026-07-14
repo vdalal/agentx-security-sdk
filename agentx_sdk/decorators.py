@@ -61,6 +61,24 @@ _FAILOPEN_BANNER_SHOWN = False
 _FAILMODE_WARNED = False
 _ENFORCEMENT_WARNED = False
 _AUDIT_BANNER_SHOWN = False
+_SHIELD_FAILOPEN_BANNER_SHOWN = False
+_POLICY_DEGRADED_WARNED = False
+
+
+def _warn_policy_load_degraded_once(error):
+    """PERMISSIVE posture + a malformed policy file: the pulled/org policy is dropped and the
+    BUILT-IN floor screens the call instead. This is NOT a fail-open -- the built-ins still
+    screen -- so it does NOT touch shield_failopens (that metric means "ran unscreened", and
+    counting a screened-by-built-ins call there pollutes the founder's bypass hunt). Just a
+    once-per-process notice so the operator knows their org rules are not being applied."""
+    global _POLICY_DEGRADED_WARNED
+    if _POLICY_DEGRADED_WARNED:
+        return
+    _POLICY_DEGRADED_WARNED = True
+    logger.warning(
+        "[AgentX] policy file is malformed; running on the BUILT-IN floor "
+        "(AGENTX_POLICY_LOAD=permissive). Your pulled/org policies are NOT applied. "
+        "Fix it with: agentx policies --check  (%s)", error)
 
 
 def _emit_audit_banner():
@@ -86,6 +104,35 @@ def _emit_audit_banner():
         "════════════════════════════════════════════════════════════"
     )
     _AUDIT_BANNER_SHOWN = True
+
+
+def _record_shield_failopen(tool_name, error):
+    """The Local Shield THREW and fell through, so `tool_name` ran WITHOUT keyword
+    screening. This is a shield BUG, not a policy decision, and on the keyless tier
+    there is no Layer 2 behind it: the fall-through IS the decision.
+
+    Loud ONCE per process (a hot loop must not spam) but counted EVERY time, so the
+    session summary and the pulse both carry the true number. The exception text is
+    printed locally for the developer but NEVER pulsed: a traceback can carry a file
+    path, an argument, or a fragment of the user's data.
+    """
+    global _SHIELD_FAILOPEN_BANNER_SHOWN
+    _incr("shield_failopens")
+
+    if not _SHIELD_FAILOPEN_BANNER_SHOWN:
+        logger.warning(
+            "\n"
+            "════════════════════════════════════════════════════════════\n"
+            " ⚠️  AgentX Local Shield FAILED OPEN\n"
+            "────────────────────────────────────────────────────────────\n"
+            f" The shield threw while screening '{tool_name}', so the call\n"
+            " ran WITHOUT keyword screening. This is a bug in AgentX, not a\n"
+            " policy decision. Please report it:\n"
+            f"   {error}\n"
+            " Counted in your session summary as 'Shield Fail-Opens'.\n"
+            "════════════════════════════════════════════════════════════"
+        )
+        _SHIELD_FAILOPEN_BANNER_SHOWN = True
 
 
 def _emit_failopen_warning(reason, tool_name):
@@ -238,6 +285,34 @@ class AgentXCircuitBreakerTripped(Exception):
     pass
 
 
+class AgentXPolicyLoadError(Exception):
+    """The shield could not load or parse its own policy configuration.
+
+    We fail CLOSED on this: the tool does NOT run. A shield that cannot read its
+    rulebook must not certify a call as safe.
+
+    Deliberately NOT an `AgentXSecurityBlock` and NOT a policy block
+    (`is_block()` returns False). A block is a security VERDICT the agent is
+    coached to recover from by choosing a different action. This is an OPERATOR
+    FAULT the agent cannot fix by picking another tool, so routing it into the
+    recovery loop would feed a nonsense challenge to the LLM and pollute the
+    recovery-rate denominator (see BACKLOG: recovery-rate denominator pollution).
+    It is the same category as AgentXCircuitBreakerTripped: raised, never returned.
+
+    Escape hatch: AGENTX_POLICY_LOAD=permissive restores the old fail-OPEN
+    behavior for an operator who would rather run unprotected than be stopped.
+    The default is strict, and the hatch is what makes that default safe to ship.
+
+    Carries the offending source so the message can name the file to fix.
+    """
+    blocked = False
+
+    def __init__(self, message, source=None, field=None):
+        super().__init__(message)
+        self.source = source
+        self.field = field
+
+
 # =====================================================================
 # 🧱 THE BLOCK RESULT CONTRACT (developer-facing — read this)
 # =====================================================================
@@ -377,6 +452,7 @@ _session_stats = {
     "circuit_breakers_tripped": 0,     # <-- Stable initialization key preserved
     "human_escalations": 0,            # <-- SURGICAL REFACTOR: Local tracker variable added
     "degraded_executions": 0,          # <-- Tool calls that ran fail-open (gateway unreachable / timed out)
+    "shield_failopens": 0,             # <-- Tool calls the LOCAL SHIELD failed to screen because it THREW (a shield BUG, not a policy decision) and fell through, so the tool ran unscreened. Distinct from degraded_executions (that is the gateway being unreachable, an infrastructure fact; this is our own code crashing). Counted so instance 3 of the fail-open class finds US instead of a customer's database — instances 1 and 2 were both found by luck on an EOD pass. Pulsed as a coarse int, NEVER the exception text (a traceback can carry a path, an argument, a fragment of the user's data).
     "gateway_reached": False,          # <-- True once any real gateway verdict came back this session (NOT unreachable). Coarse funnel-stage signal for the anonymous pulse: distinguishes "SDK only" from "SDK + gateway". Never carries identity.
     "reasoning_enabled": None,         # <-- Tri-state Recover signal for the pulse: None = no gateway ever advertised it (old gateway / SDK-only), False = gateway reported keyless, True = judge seen active (sticky). Never identity.
     "block_category": None,            # <-- Coarse closed-vocab failure class of a block this session (DESTRUCTIVE_ACTION/etc), for the pulse. "What KIND of action got blocked", never the tool name/payload. None = no categorized block. See _BLOCK_CATEGORY_VOCAB.
@@ -788,6 +864,15 @@ def _print_agentx_summary():
     if _session_stats.get("degraded_executions", 0) > 0:
         print(f" ⚠️  Degraded Executions:   {_session_stats['degraded_executions']:<3} |  ran WITHOUT gateway semantic checks (fail-open)")
         print("     -> the gateway would have evaluated these — get it (free, runs locally): https://bit.ly/agentfirewall")
+
+    # --- SHIELD FAIL-OPENS: the shield itself THREW and the call ran unscreened.
+    #     Distinct from a degraded execution (that is the gateway being unreachable,
+    #     an infrastructure fact). This is OUR bug, and it is an enforcement bypass on
+    #     the keyless tier, where nothing sits behind the fall-through. Only surfaces
+    #     when non-zero, so a healthy run stays clean and this line stands out.
+    if _session_stats.get("shield_failopens", 0) > 0:
+        print(f" ⚠️  Shield Fail-Opens:     {_session_stats['shield_failopens']:<3} |  ran WITHOUT keyword screening (a shield BUG, not a policy decision)")
+        print("     -> this is an AgentX defect. Please report it: https://bit.ly/agentfirewall")
     
     # --- CIRCUIT BREAKER METRICS ---
     if cb_trips > 0:
@@ -1203,6 +1288,124 @@ def _note_block_category(category, stats=None):
     if isinstance(category, str) and category in _BLOCK_CATEGORY_VOCAB:
         target["block_category"] = category
 
+def _builtin_coaching_index():
+    """Built-in seeds keyed by policy id ONLY, for the C1 safe-path inheritance lookup.
+
+    It used to also key by lowercased NAME, and that quietly re-opened the exact
+    cross-policy misattribution the C1 lookup's own "MATCH ON ID ONLY" comment claimed to
+    close: a pulled row whose `id` string happened to equal a seed's lowercased name (e.g.
+    `"id": "mass destructive intent"`) would resolve to that seed via the name key and
+    INHERIT its `reversible_transform` -- so an exfiltration rule could be coached to
+    "snapshot the data first", steering the agent toward the very data the block protects.
+    An id is an identity; a name is a coincidence. Match on identity only."""
+    index = {}
+    for seed in _BUILTIN_POLICY_KEYWORDS:
+        if seed.get("id"):
+            index[str(seed["id"])] = seed
+    return index
+
+
+def _coerce_policy_ident(value, field, source, default):
+    """A policy id/name. It reaches dict keys, frozensets and string ops downstream, so a
+    list/dict/bool here throws INSIDE the shield and the blanket except swallows it --
+    printing "bypassed" and EXECUTING the tool.
+
+    FOUND BY THE FUZZ TRIPWIRE (test_fail_closed_policy_load), not by a customer: `id` as
+    a JSON array loaded fine and then disarmed the shield downstream. Numbers are accepted
+    (a cloud row may carry an int id) and stringified; bool is NOT a number here."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    raise AgentXPolicyLoadError(
+        f"policy field '{field}' must be a string, got {type(value).__name__}",
+        source=source,
+        field=field,
+    )
+
+
+def _coerce_policy_active(value, field, source):
+    """`is_active` decides whether a rule is ARMED AT ALL, so it is the single most
+    enforcement-critical field in the file. Absent means active (the historical default).
+
+    A malformed value here used to silently DISARM the rule: the old gate
+    `if p.get("is_active", True) and ...` short-circuits on any falsy value, so
+    `"is_active": {}` read as "not active" and the rule vanished with no error."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    raise AgentXPolicyLoadError(
+        f"policy field '{field}' must be true or false, got {type(value).__name__}",
+        source=source,
+        field=field,
+    )
+
+
+def _coerce_policy_intents(value, field, source):
+    """`blocked_intents` is the ONLY whitelist field that is a list, and it is the one the
+    keyword scan ITERATES. A scalar here ('int'/'bool' object is not iterable) throws
+    inside the shield and the tool runs unscreened.
+
+    ALSO FOUND BY THE FUZZ TRIPWIRE. A per-field isinstance guard at the use site would
+    never have caught it, because nobody thought to guard the field that "is obviously a
+    list"."""
+    if not isinstance(value, (list, tuple)):
+        raise AgentXPolicyLoadError(
+            f"policy field '{field}' must be a list of strings, got {type(value).__name__}",
+            source=source,
+            field=field,
+        )
+    intents = []
+    for item in value:
+        if not isinstance(item, str):
+            raise AgentXPolicyLoadError(
+                f"policy field '{field}' must contain only strings, found "
+                f"{type(item).__name__}",
+                source=source,
+                field=field,
+            )
+        intents.append(item)
+    return intents
+
+
+_POLICY_FIELD_WARNED = set()
+
+
+def _coerce_coaching_str(value, field, source):
+    """A COACHING field (the challenge text, the safe path, the reversible steer, the
+    pulse category). It must be a string, because downstream it reaches dict keys,
+    frozensets and string ops -- and a JSON array/object here is what raised the
+    TypeError that the blanket `except Exception` then swallowed, printing "bypassed"
+    and EXECUTING the tool (#200).
+
+    But a malformed COACHING field must NOT fail the call closed. We can still answer the
+    only question that matters for enforcement -- "does this call violate the policy?" --
+    because `blocked_intents` is intact. Failing closed here would take a customer's whole
+    agent down because a coaching STRING was the wrong shape: an outage for a cosmetic
+    defect. Blocking with degraded coaching is strictly better, and it still never executes
+    the dangerous call.
+
+    So: DROP the bad value (the seed's own safe path is then inherited by the C1 logic
+    below, so coaching usually degrades to the GOOD built-in text rather than to nothing),
+    and say so once per field, because a SILENT degradation is what got us here."""
+    if value is None or isinstance(value, str):
+        return value
+
+    key = (source, field)
+    if key not in _POLICY_FIELD_WARNED:
+        logger.warning(
+            "[AgentX] policy field '%s' in %s must be a string, got %s. Ignoring that "
+            "field and falling back to the built-in coaching. The policy still ENFORCES; "
+            "only its coaching text is degraded. Fix it with: agentx policies --check",
+            field, source, type(value).__name__,
+        )
+        _POLICY_FIELD_WARNED.add(key)
+    return None
+
+
 def load_local_policy_keywords(seed_dir=".agentx"):
     """
     Loads policy keyword/intent definitions for the lightweight Layer 0 pre-filter.
@@ -1211,6 +1414,13 @@ def load_local_policy_keywords(seed_dir=".agentx"):
     `agentx pull`, which carry blocked_intents + socratic_prompt), escalating
     to the parent directory, then falling back to a built-in seed list so
     protection works offline with zero setup.
+
+    Raises AgentXPolicyLoadError when a policy file EXISTS but cannot be read,
+    parsed, or coerced. It does NOT fall back to the built-ins in that case: a
+    corrupt rulebook must not be silently swapped for a different one, because the
+    developer would keep believing their pulled policies are armed when they are not.
+    Callers decide the posture (see _policy_load_posture); the import below records
+    the failure rather than crashing `import agentx_sdk`.
     """
     import os
     import json
@@ -1220,39 +1430,255 @@ def load_local_policy_keywords(seed_dir=".agentx"):
         os.path.join("..", seed_dir, "policies.json"),
     ]
 
+    builtins_by_key = _builtin_coaching_index()
+
+    # DELIBERATE BEHAVIOR CHANGE (flagged in review): the FIRST candidate file that EXISTS
+    # is authoritative. A malformed one FAILS CLOSED here; it does NOT fall through to the
+    # next candidate. The old loop swallowed a parse error and continued, so a broken child
+    # `.agentx/policies.json` would silently be replaced by a valid `../.agentx/policies.json`
+    # one directory up. That is exactly the SILENT RULEBOOK SWAP this PR exists to stop: a
+    # typo in the nearer file would quietly enforce a DIFFERENT (possibly weaker) rulebook
+    # than the operator is looking at. For a security shield, a loud fail-closed that names
+    # the broken file beats silently under-protecting. Monorepo caveat: a subdir with a
+    # broken/placeholder policies.json now blocks (in strict) instead of using the repo-root
+    # file -- fix or delete the child file; the error names it.
     for path in candidate_paths:
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
-                policies = []
-                for p in (loaded if isinstance(loaded, list) else []):
-                    # Only arm active rules that actually carry blocked intents
-                    if p.get("is_active", True) and p.get("blocked_intents"):
-                        policies.append({
-                            "id": p.get("id", "POL-LOCAL"),
-                            "name": p.get("name", "Local Policy"),
-                            "category": p.get("category"),  # preserve the coarse pulse class if the pull carries it
-                            "blocked_intents": p.get("blocked_intents", []),
-                            "socratic_prompt": p.get("socratic_prompt")
-                                or "Policy Violation. Revise your action to comply with security policy.",
-                            # Carry the concrete safe path through if the pull supplies one, so the
-                            # keyless coaching (A1a) can surface it for pulled/cloud policies too.
-                            "preferred_alternative": p.get("preferred_alternative"),
-                            # Carry the reversibility-first transform id too (slice 2), so a
-                            # pulled/cloud policy that declares one gets the same reversible steer
-                            # as a built-in seed instead of silently losing it in this whitelist.
-                            "reversible_transform": p.get("reversible_transform"),
-                        })
-                if policies:
-                    return policies
-            except Exception:
-                pass
+            except AgentXPolicyLoadError:
+                raise
+            except Exception as parse_error:
+                # FAIL CLOSED. Previously this was `except Exception: pass`, which
+                # silently armed the built-ins while the developer believed their
+                # pulled org policies were live.
+                raise AgentXPolicyLoadError(
+                    f"could not read or parse the policy file: {parse_error}",
+                    source=path,
+                ) from parse_error
+
+            # The TOP LEVEL must be a list. This used to be a silent `else []`, which meant
+            # a file shaped `{"policies": [...]}` (the natural shape of a cloud API dump, or
+            # of a hand-merged file) parsed fine, yielded ZERO policies, and fell through to
+            # `return list(_BUILTIN_POLICY_KEYWORDS)` -- a SILENT RULEBOOK SWAP. Every org
+            # rule was quietly unenforced while the boot banner still said the shield was up.
+            if not isinstance(loaded, list):
+                raise AgentXPolicyLoadError(
+                    f"the policy file must contain a JSON array of policies, got "
+                    f"{type(loaded).__name__}",
+                    source=path,
+                )
+
+            policies = []
+            for p in loaded:
+                if not isinstance(p, dict):
+                    raise AgentXPolicyLoadError(
+                        f"every policy must be an object, got {type(p).__name__}",
+                        source=path,
+                    )
+
+                # COERCE FIRST, THEN gate on truthiness. The gate used to run first:
+                #     if p.get("is_active", True) and p.get("blocked_intents"):
+                # which SHORT-CIRCUITS on any FALSY value. So `"blocked_intents": {}` (or
+                # "", 0, false) skipped coercion entirely, the row was silently DROPPED, and
+                # if it was the only row we returned the built-ins -- the org's rule never
+                # enforced and the tool EXECUTED. The fuzz tripwire could not see it: every
+                # value in MALFORMED_VALUES was TRUTHY. A malformed `is_active` had the same
+                # shape, silently disarming an active rule.
+                # Validate the enforcement fields BEFORE anything can skip them.
+                pid = _coerce_policy_ident(p.get("id"), "id", path, "POL-LOCAL")
+                pname = _coerce_policy_ident(p.get("name"), "name", path, "Local Policy")
+                intents = _coerce_policy_intents(
+                    p.get("blocked_intents"), "blocked_intents", path)
+                is_active = _coerce_policy_active(p.get("is_active"), "is_active", path)
+
+                # Only arm active rules that actually carry blocked intents. Both operands
+                # are now VALIDATED, so a falsy value here is a real "no rule", not a
+                # malformed one that slipped the check.
+                if is_active and intents:
+
+                    # --- C1: a pull must never DEGRADE coaching -------------------
+                    # A pulled policies.json WHOLLY REPLACES the built-in seeds, and
+                    # cloud rows carry no `preferred_alternative` (the column does not
+                    # exist), so pulling silently DROPPED the "Safe alternative:" line.
+                    # A paying Control customer got WORSE coaching than a free keyless
+                    # user — a direct inversion of the tier ladder. So when a pulled row
+                    # shadows a built-in seed and does not carry its own safe path, we
+                    # INHERIT the seed's. The pull can override it; it can no longer
+                    # silently delete it.
+                    # MATCH ON ID ONLY. The first cut also fell back to a LOWERCASED-NAME
+                    # match, and that is actively dangerous: a cloud row carrying a UUID id
+                    # but reusing a seed's NAME for a differently-scoped rule (say an
+                    # exfiltration rule named "Mass Destructive Intent") would inherit the
+                    # destructive seed's `reversible_transform: soft_delete`. The agent gets
+                    # coached to "back up or snapshot the data first" -- for a block whose
+                    # whole point was that it must not touch that data. Inherited coaching
+                    # would steer TOWARD the harm.
+                    #
+                    # A safe path is CLASS-SPECIFIC. Inheriting it across a name collision is
+                    # a guess, and a wrong guess here is worse than no coaching at all
+                    # (a generic challenge already measurably HURTS recovery). An id match is
+                    # an identity; a name match is a coincidence.
+                    seed = builtins_by_key.get(str(pid))
+                    pulled_alt = _coerce_coaching_str(
+                        p.get("preferred_alternative"), "preferred_alternative", path)
+                    pulled_tid = _coerce_coaching_str(
+                        p.get("reversible_transform"), "reversible_transform", path)
+                    pulled_challenge = _coerce_coaching_str(
+                        p.get("socratic_prompt"), "socratic_prompt", path)
+
+                    policies.append({
+                        "id": pid,
+                        "name": pname,
+                        # preserve the coarse pulse class if the pull carries it
+                        "category": _coerce_coaching_str(p.get("category"), "category", path),
+                        "blocked_intents": intents,
+                        # The CHALLENGE inherits too. It was the one coaching field left out,
+                        # so a malformed challenge on a pulled row fell all the way to the
+                        # generic "Policy Violation. Revise your action..." even while the
+                        # shadowed seed's real, task-fitting text sat right there. A GENERIC
+                        # challenge is not neutral: it measurably HURTS recovery (0/4 vs 3/3),
+                        # so degrading to it when we hold the good text is the exact
+                        # coaching-degradation defect C1 exists to close.
+                        "socratic_prompt": (
+                            pulled_challenge
+                            or (seed.get("socratic_prompt") if seed else None)
+                            or "Policy Violation. Revise your action to comply with security policy."),
+                        "preferred_alternative": (
+                            pulled_alt if pulled_alt
+                            else (seed.get("preferred_alternative") if seed else None)),
+                        "reversible_transform": (
+                            pulled_tid if pulled_tid
+                            else (seed.get("reversible_transform") if seed else None)),
+                    })
+            if policies:
+                return policies
 
     return list(_BUILTIN_POLICY_KEYWORDS)
 
-# Load the lightweight keyword rails once on SDK init (cheap, no heavy deps).
-LOCAL_POLICY_KEYWORDS = load_local_policy_keywords()
+
+# --- fail-closed policy load (PR #205) ----------------------------------------
+# The loader runs at IMPORT. A malformed policies.json must not crash
+# `import agentx_sdk` (that would take down the developer's whole app for a config
+# typo, and they could not even reach the CLI that fixes it). So we RECORD the
+# failure here and fail closed at the first protected CALL instead, which is the
+# moment where refusing to run actually protects something.
+# A distinct "never checked yet" marker. It must NOT be None, because None is a REAL
+# signature meaning "no policy file exists". Collapsing the two (the first cut used None
+# for both) meant: import fails -> signature left None -> operator DELETES the malformed
+# file -> next call computes signature None, sees None == None, returns the STALE cached
+# error without reloading -> the agent is bricked forever even though the bad file is gone,
+# and the remediation we printed ("remove the file") is a dead end.
+_UNCHECKED = object()
+
+_POLICY_LOAD_ERROR = None
+_POLICY_FILE_SIGNATURE = _UNCHECKED
+# Read-modify-write on the two globals above races under the async/thread pools the SDK
+# supports (the sibling _session_stats mutations are already lock-guarded). One lock makes
+# check-reload-publish atomic.
+_policy_load_lock = threading.Lock()
+
+try:
+    LOCAL_POLICY_KEYWORDS = load_local_policy_keywords()
+except AgentXPolicyLoadError as _policy_load_error:
+    _POLICY_LOAD_ERROR = _policy_load_error
+    # Arm the built-ins so a `permissive` operator still gets the baseline floor
+    # rather than nothing at all. In `strict` (the default) no call gets this far.
+    # NB: _POLICY_FILE_SIGNATURE stays _UNCHECKED here on purpose, so the first call
+    # re-reads (and notices a file that was fixed or deleted before that first call).
+    LOCAL_POLICY_KEYWORDS = list(_BUILTIN_POLICY_KEYWORDS)
+
+
+def _policy_file_signature(seed_dir=".agentx"):
+    """A change-detection signature for the policy file we would load, or None if there is
+    none. Uses (path, mtime_ns, inode, size): nanosecond mtime + inode catch an in-place
+    edit of identical byte-length that a coarse (mtime, size) tuple would miss (a same-size
+    swap within the filesystem's 1-2s mtime granularity). Cheap: at most two stats."""
+    for path in (os.path.join(seed_dir, "policies.json"),
+                 os.path.join("..", seed_dir, "policies.json")):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        return (path, getattr(st, "st_mtime_ns", st.st_mtime), st.st_ino, st.st_size)
+    return None
+
+
+def current_policy_load_error():
+    """The CURRENT policy-load failure, or None. THE single home both surfaces read.
+
+    Review findings that shaped this (it is a function, not a latched global, for a reason):
+
+    * REACH. `mcp_proxy` cannot see a by-value global; `evaluate_call_keyless` never raises,
+      so a by-value check was DEAD CODE and the fail-closed guarantee reached ZERO MCP users.
+    * SELF-HEAL. Latched at import, the error never cleared, so an operator who fixed the
+      file stayed BRICKED forever and the remediation we printed was a dead end.
+    * THE INVERSE HOLE. A policies.json written mid-session (`agentx pull`) was never noticed.
+
+    So the file is tracked by (path, mtime_ns, inode, size) and reloaded when that changes.
+    Concurrency-safe (one lock) and self-heal-correct (a fixed/deleted/created file is picked
+    up on the NEXT call, in both directions, with no delay).
+
+    On the hot-path cost: this runs per protected call and stats the policy file (at most two
+    stats), re-parsing only when the signature changes. A throttle was considered and
+    REJECTED: it would open a window where a healthy shield does not notice a file changing to
+    BAD, and for a security accessor an immediate, correct answer beats saving a microsecond
+    stat -- especially since protected calls are LLM-gated (seconds apart), so the syscall is
+    negligible in practice.
+    """
+    global _POLICY_LOAD_ERROR, LOCAL_POLICY_KEYWORDS, _POLICY_FILE_SIGNATURE
+
+    with _policy_load_lock:
+        signature = _policy_file_signature()
+        # While HEALTHY, an unchanged signature answers from cache (no re-parse). While
+        # FAILING CLOSED, always re-read: an operator's fix must un-brick even when it
+        # preserves byte-length within the filesystem's mtime granularity (an equal-size
+        # in-place swap can leave (mtime_ns, inode, size) identical on some filesystems).
+        # Re-parsing while bricked is fine -- that is not the hot path, and un-bricking fast
+        # is what matters.
+        if _POLICY_LOAD_ERROR is None and signature == _POLICY_FILE_SIGNATURE:
+            return None                        # healthy and unchanged: answer from cache
+
+        _POLICY_FILE_SIGNATURE = signature
+        try:
+            LOCAL_POLICY_KEYWORDS = load_local_policy_keywords()
+        except AgentXPolicyLoadError as broken:
+            _POLICY_LOAD_ERROR = broken
+            # Keep the baseline floor armed so a `permissive` operator has the floor.
+            LOCAL_POLICY_KEYWORDS = list(_BUILTIN_POLICY_KEYWORDS)
+            return _POLICY_LOAD_ERROR
+
+        if _POLICY_LOAD_ERROR is not None:
+            logger.warning("[AgentX] policy file re-read OK. The shield is armed again.")
+        _POLICY_LOAD_ERROR = None
+        return None
+
+
+def _policy_load_posture():
+    """'strict' (default: fail CLOSED on a policy-load failure) or 'permissive'
+    (restore the legacy fail-OPEN). The hatch is what makes a strict default safe
+    to ship: nobody is stranded, and choosing to run blind becomes an explicit,
+    recorded act rather than a silent default."""
+    return "permissive" if os.getenv(
+        "AGENTX_POLICY_LOAD", "strict").strip().lower() == "permissive" else "strict"
+
+
+def _policy_load_error_message(err):
+    """Operator-facing. Not a Socratic challenge: the agent cannot fix this by
+    choosing another tool, so we address the human and name the file and the fix."""
+    where = f"\n   file:  {err.source}" if getattr(err, "source", None) else ""
+    field = f"\n   field: {err.field}" if getattr(err, "field", None) else ""
+    return (
+        f"🛑 [AgentX] Shield disabled: your policy file is malformed, so the call was NOT run."
+        f"{where}{field}\n"
+        f"   {err}\n"
+        f"   AgentX fails closed here on purpose: it will not certify a tool call as safe\n"
+        f"   while it cannot read its own rules.\n"
+        f"   ▶ fix the field, or remove the file to fall back to the built-in policies:\n"
+        f"       agentx policies --check\n"
+        f"   (to run unprotected instead:  AGENTX_POLICY_LOAD=permissive)"
+    )
 
 
 # Reading the database catalog (information_schema / pg_catalog / sqlite_master /
@@ -1955,6 +2381,32 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # policy.json can still carry the stale keyword). A mutating catalog op is
             # NOT exempt and still falls through to the scan below.
             if not bypass_local_shield:
+                # === FAIL CLOSED: we cannot read our own rulebook ==================
+                # A policy file EXISTS but is malformed. We do NOT get to certify this
+                # call as safe while the shield is blind, so the tool does not run.
+                # This is an OPERATOR fault with an operator fix, and it is deliberately
+                # narrow: it fires only on a policy LOAD/PARSE/COERCE failure, never on
+                # some other bug inside the shield (those still fall open, but they are
+                # now loud and counted -- see _record_shield_failopen).
+                # Read through the accessor, NOT the raw global: it re-reads the file when
+                # we are already in the failed state, so an operator who fixes the field we
+                # told them to fix is un-bricked WITHOUT restarting their process.
+                policy_load_error = current_policy_load_error()
+                if policy_load_error is not None:
+                    if _policy_load_posture() == "strict":
+                        raise AgentXPolicyLoadError(
+                            _policy_load_error_message(policy_load_error),
+                            source=getattr(policy_load_error, "source", None),
+                            field=getattr(policy_load_error, "field", None),
+                        )
+                    # permissive: the operator chose to run rather than be stopped. The
+                    # built-in floor is armed and STILL screens this call, so this is NOT a
+                    # fail-open and must NOT be counted (an earlier cut counted it here, so a
+                    # DROP TABLE the built-ins then BLOCKED was mislabeled "ran unscreened" and
+                    # polluted the bypass-hunt metric). Just warn once. A genuine fail-open --
+                    # the built-in scan itself throwing -- is still counted in the except below.
+                    _warn_policy_load_degraded_once(policy_load_error)
+
                 try:
                     # Keyless Layer-0 detection now lives in evaluate_call_keyless()
                     # (the SINGLE home shared with the agentx-mcp proxy so the two
@@ -2062,10 +2514,27 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                             effective_receipt, policy_name, challenge_text,
                             safe_path=ls_safe_path,
                         )
-                # ✅ DO NOT swallow our own intentional routing exceptions
-                except (AgentXSecurityBlock, AgentXCircuitBreakerTripped):
+                # ✅ DO NOT swallow our own intentional routing exceptions.
+                # AgentXPolicyLoadError joins this tuple: it is a FAIL-CLOSED signal
+                # raised from the policy load/coerce path, and swallowing it would put
+                # us straight back in the bug this PR exists to kill.
+                except (AgentXSecurityBlock, AgentXCircuitBreakerTripped,
+                        AgentXPolicyLoadError):
                     raise
                 except Exception as local_shield_error:
+                    # STILL FAIL-OPEN, on purpose. Hard-blocking on ANY shield exception
+                    # was considered and REJECTED: it turns every latent shield bug into
+                    # a hard outage of the user's agent on the free tier, where there is
+                    # no gateway to fall back on. Too blunt for a first move.
+                    #
+                    # So the remaining fall-through is now LOUD and COUNTED instead of
+                    # silent. Instances 1 and 2 of this class were found by luck on an
+                    # end-of-day pass; the counter is how instance 3 finds us. Once the
+                    # pulse shows what actually throws in the wild, we can decide whether
+                    # to close this blanket too -- that data is the precondition. This is the
+                    # ONLY count path on the decorator (the permissive branch no longer
+                    # pre-counts), so a genuine shield crash counts exactly once here.
+                    _record_shield_failopen(func_name, local_shield_error)
                     print(f"⚠️ [Local Shield] Out-of-prompt keyword pre-filter pass bypassed: {str(local_shield_error)}")
 
             # =========================================================

@@ -65,7 +65,7 @@ _ALLOWED_KEYS = {"install_id", "sdk_version", "python", "os", "first_seen", "ts"
 _ALLOWED_SESSION_KEYS = {
     "tools_monitored", "intercepts", "critical_blocks",
     "human_escalations", "self_corrections", "would_blocks",
-    "had_block", "first_block_ever",
+    "had_block", "first_block_ever", "shield_failopens",
 }
 
 
@@ -691,6 +691,16 @@ def build_payload(session_stats, state, first_block_ever=None):
             "would_blocks": int(session_stats.get("would_blocks", 0)),
             "had_block": had_block,
             "first_block_ever": first_block_ever,
+            # SHIELD FAIL-OPENS: tool calls the Local Shield could not screen because it
+            # THREW and fell through, so the call ran unscreened. A shield BUG, not a
+            # policy decision, and on the keyless tier an enforcement BYPASS (nothing sits
+            # behind the fall-through). Instances 1 and 2 of this class were found by luck
+            # on an EOD pass; this counter is how instance 3 finds US.
+            #
+            # A COARSE INT AND NOTHING ELSE. The exception text is deliberately NOT sent:
+            # a traceback can carry a file path, an argument, or a fragment of the user's
+            # data, and this allowlist exists precisely to keep that off the wire.
+            "shield_failopens": int(session_stats.get("shield_failopens", 0)),
         },
     }
 

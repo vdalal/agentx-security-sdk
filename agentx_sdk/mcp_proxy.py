@@ -69,6 +69,16 @@ try:
         _note_block_category,
         _resolve_enforcement,
         evaluate_call_keyless,
+        AgentXPolicyLoadError,
+        # Read the load error through the ACCESSOR, never a by-value global import: it is
+        # re-evaluated per call (so a fixed file un-bricks without a restart) and it is the
+        # single home both surfaces share.
+        current_policy_load_error,
+        _policy_load_posture,
+        # ONE operator message, not two. A near-verbatim copy lived here, in a module whose
+        # own docstring says the point is that the two paths "can never drift" -- so the next
+        # wording/env-var change would have silently updated one surface and staled the other.
+        _policy_load_error_message,
     )
     # Bound at module load, under the same stdout guard, so the atexit _protection_report
     # never does a shutdown-time `from agentx_sdk import pulse` (import machinery can be
@@ -148,6 +158,73 @@ def _block_response(req_id, text):
         "id": req_id,
         "result": {"content": [{"type": "text", "text": text}], "isError": True},
     }
+
+
+# Keys of the once-per-process banners already shown this run: "failopen" / "failclosed" /
+# "degraded". One set + one helper (_mcp_once_banner) replaces the per-banner boolean globals
+# and the copy-pasted frame/guard scaffolding.
+_MCP_BANNERS_SHOWN = set()
+
+
+# NOTE: the operator-facing text lives in decorators._policy_load_error_message and is
+# imported above. A near-verbatim COPY used to live here, in the one module whose docstring
+# says its whole purpose is that "the two paths can never drift".
+
+
+def _mcp_once_banner(key, lines, log):
+    """Print a framed [agentx-mcp] banner ONCE PER PROCESS for `key`, to stderr only (stdout
+    is the JSON-RPC stream). The single home for the frame + once-guard that the three notices
+    below used to copy verbatim -- in the one module whose docstring says its purpose is that
+    the two paths can never drift."""
+    if key in _MCP_BANNERS_SHOWN:
+        return
+    _MCP_BANNERS_SHOWN.add(key)
+    frame = "[agentx-mcp] " + "=" * 60
+    body = "\n".join("[agentx-mcp]  " + line for line in lines)
+    print("\n" + frame + "\n" + body + "\n" + frame, file=log)
+
+
+def _record_mcp_shield_failopen(session_stats, tool_name, error, log):
+    """Count a genuine fail-OPEN on the MCP surface -- a call that RAN UNSCREENED -- and say
+    so ONCE per process.
+
+    `shield_failopens` means exactly one thing on every surface (decorator summary, pulse
+    allowlist, UI, migration): the shield could not screen a call and the call RAN ANYWAY. So
+    this is called ONLY on a real fall-through (a malformed protocol message forwarded, or a
+    shield bug that forwards). A strict fail-CLOSED is a BLOCK (uses _note_mcp_fail_closed),
+    and a PERMISSIVE fall-back to built-ins is still SCREENED (uses _note_mcp_policy_degraded);
+    neither touches the counter, or the founder's `WHERE shield_failopens > 0` bypass hunt
+    fills with safe blocks.
+
+    stderr ONLY: the exception text is logged locally but NEVER pulsed."""
+    session_stats["shield_failopens"] = session_stats.get("shield_failopens", 0) + 1
+    _mcp_once_banner("failopen", [
+        "AgentX Local Shield FAILED OPEN: the call ran UNSCREENED",
+        "while screening '%s': %s" % (tool_name, error),
+        "Counted in this session's protection report.",
+    ], log)
+
+
+def _note_mcp_fail_closed(log):
+    """Say ONCE that the shield is failing CLOSED (strict + malformed: every call BLOCKED).
+    The SAFE outcome, so it does NOT increment shield_failopens."""
+    _mcp_once_banner("failclosed", [
+        "AgentX Local Shield FAILING CLOSED: your policy file is malformed,",
+        "so every tools/call is BLOCKED until you fix it. Nothing ran.",
+        "Fix it, or set AGENTX_POLICY_LOAD=permissive to run unprotected:",
+        "    agentx policies --check",
+    ], log)
+
+
+def _note_mcp_policy_degraded(log):
+    """Say ONCE that permissive + a malformed file means the pulled/org policy is dropped and
+    the BUILT-IN floor screens instead. NOT a fail-open (built-ins still screen), so it does
+    NOT touch shield_failopens -- but the operator should know their org rules are not applied."""
+    _mcp_once_banner("degraded", [
+        "AgentX: your policy file is malformed. Running on the BUILT-IN floor",
+        "(AGENTX_POLICY_LOAD=permissive). Your pulled/org policies are NOT applied.",
+        "    agentx policies --check",
+    ], log)
 
 
 def _harvest_enabled():
@@ -863,11 +940,79 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     except Exception:
         pass
 
+    # === FAIL CLOSED FIRST — before ANYTHING, including params parsing =============
+    # A malformed `params` must NEVER be an escape hatch around the rulebook gate. The
+    # first cut of this PR validated params shape first and returned "forward" on a bad
+    # shape -- so a blind shield in strict mode would FORWARD a tools/call with array
+    # params UNSCREENED, the exact fail-open this PR exists to close. So the fail-closed
+    # decision comes before we even look at the shape.
+    #
+    # THIS check is also what carries the fix to MCP users at all. `evaluate_call_keyless`
+    # only scans the already-loaded keyword list, so it can NEVER raise
+    # AgentXPolicyLoadError -- the loader raises at IMPORT and decorators.py catches it
+    # into a module global. The old `except AgentXPolicyLoadError` around the scan was DEAD
+    # CODE; the accessor below is the live path.
+    #
+    # We do NOT forward on a blind shield: on the keyless MCP wedge nothing sits behind the
+    # proxy, so forwarding IS executing the call. And we never RAISE: agentx-mcp wraps
+    # SOMEONE ELSE'S server, and an uncaught exception kills the proxy and takes the user's
+    # whole agent down. `_block_response` is a CallToolResult with isError: true.
+    load_err = current_policy_load_error()
+    strict = _policy_load_posture() == "strict"
+    if load_err is not None and strict:
+        req_id = msg.get("id")
+        if req_id is not None:
+            writer.send(_block_response(req_id, _policy_load_error_message(load_err)))
+        else:
+            print("[agentx-mcp] dropped id-less call (policy file malformed; failing closed)",
+                  file=log)
+        # A strict fail-CLOSED is a BLOCK, not a fail-open: do NOT touch shield_failopens
+        # (that metric means "ran unscreened"). Just a once-per-process notice.
+        _note_mcp_fail_closed(log)
+        return "block"
+
+    # `name` is read below but bound INSIDE the try. JSON-RPC permits `params` to be an
+    # ARRAY, and this proxy screens an UNTRUSTED client stream -- so `params.get` raises
+    # BEFORE `name` exists, and a handler's `str(name)` then raised UnboundLocalError,
+    # ESCAPED _screen_message, and TORE DOWN the user's whole MCP session. Bind it first,
+    # and never dereference an unvalidated params.
+    #
+    # `failed_open` guards against DOUBLE-COUNTING: one tool call must increment
+    # shield_failopens at most once, even if both the permissive pre-check AND the scan
+    # below fall open for the same call.
+    name = None
     try:
-        params = msg.get("params") or {}
+        params = msg.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise TypeError("tools/call params must be an object, got %s" % type(params).__name__)
         name = params.get("name")
+    except Exception as shape_err:
+        # A malformed protocol message with no coherent (name, arguments) to screen. The
+        # shield is not blind-strict (handled above), so forward and let the wrapped server
+        # reject it -- and count it, because the call DID go out unscreened. This path returns
+        # immediately, so it can never double with the scan-except below.
+        _record_mcp_shield_failopen(session_stats, str(name), shape_err, log)
+        print("[agentx-mcp] shield bypassed (malformed params): %s" % shape_err, file=log)
+        return "forward"
+
+    if load_err is not None:
+        # Reached only in PERMISSIVE posture (strict returned above). The built-in floor is
+        # armed and STILL screens this call, so it is NOT a fail-open -- do NOT count it (an
+        # earlier cut did, so a DROP TABLE the built-ins then BLOCKED was mislabeled "ran
+        # unscreened" and polluted the metric). Warn once; a genuine fail-open is only the
+        # built-in scan itself throwing, counted in the except below.
+        _note_mcp_policy_degraded(log)
+
+    try:
         decision = evaluate_call_keyless(_flatten_call(name, params.get("arguments")))
     except Exception as err:
+        # STILL FAIL-OPEN, on purpose (hard-blocking on ANY shield exception was rejected:
+        # it turns a latent bug into an outage of the user's agent on the free tier). This is
+        # the ONLY count path left besides the malformed-params return above, so a genuine
+        # shield crash counts exactly once.
+        _record_mcp_shield_failopen(session_stats, str(name), err, log)
         print("[agentx-mcp] shield bypassed (fail-open): %s" % err, file=log)
         return "forward"
 
@@ -1191,6 +1336,14 @@ def _protection_report(session_stats, log):
         if recovered_n or abandoned_n or halted_calls:
             print("[agentx-mcp]   -> %d recovered, %d still-open (abandoned), %d runaway-halted call(s)."
                   % (recovered_n, abandoned_n, halted_calls), file=log)
+        # Shield failures: calls the shield could NOT screen because it threw. Surfaces
+        # only when non-zero, so a healthy session stays quiet and this line stands out.
+        # The MCP twin of the decorator's "Shield Fail-Opens" summary line -- BOTH
+        # surfaces report, or a fix wired into one reaches none of the other's users.
+        failopens_n = int(session_stats.get("shield_failopens", 0) or 0)
+        if failopens_n:
+            print("[agentx-mcp]   -> %d call(s) the shield could NOT screen (a shield BUG, not a policy "
+                  "decision). Please report: https://bit.ly/agentfirewall" % failopens_n, file=log)
         protection = pulse.record_protection(session_stats)
         if protection:
             print("[agentx-mcp] protection streak: %s." % pulse.format_protection_line(protection), file=log)

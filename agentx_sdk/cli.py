@@ -1151,10 +1151,51 @@ def execute_policies(args=None):
     print("=" * 75)
 
 
+def _policy_store_check():
+    """Validate `.agentx/policies.json` -- the PULLED RULEBOOK, not the override store.
+
+    This exists because the shield's fail-closed error tells the operator to run
+    `agentx policies --check`, and until now that command validated a DIFFERENT FILE
+    (overrides.json). An operator whose agent was hard-down would run the one command we
+    named, get a green "no override store yet", and learn nothing about the malformed
+    policies.json that was actually stopping every call. The single remediation command we
+    print could not diagnose the fault it was prescribed for.
+
+    Returns True if the rulebook is loadable (or absent, which is fine: the built-ins arm)."""
+    from .decorators import load_local_policy_keywords, AgentXPolicyLoadError
+
+    print("\n🩺 POLICY RULEBOOK CHECK        (validates ./.agentx/policies.json)")
+    print("=" * 75)
+    print("  This is the file `agentx pull` writes. If it is malformed, AgentX fails CLOSED:")
+    print("  your tools do not run, because a shield that cannot read its rules must not")
+    print("  certify a call as safe.")
+    try:
+        policies = load_local_policy_keywords()
+    except AgentXPolicyLoadError as err:
+        print(f"\n  ❌ MALFORMED. Your agent is failing closed until this is fixed.")
+        if getattr(err, "source", None):
+            print(f"     file:  {err.source}")
+        if getattr(err, "field", None):
+            print(f"     field: {err.field}")
+        print(f"     {err}")
+        print("\n  ▶ fix that field, or delete the file to fall back to the built-in policies.")
+        print("     Your agent recovers on the next call. No restart needed.")
+        print("=" * 75)
+        return False
+
+    print(f"\n  ✅ parses. {len(policies)} policy/policies armed.")
+    print("=" * 75)
+    return True
+
+
 def _policies_check():
-    """`agentx policies --check` — validate the override store and list what's active,
-    so a hand-edit typo is LOUD (a single bad comma otherwise silently disables EVERY
-    customized coaching). Exits non-zero on an unparseable store so CI catches it."""
+    """`agentx policies --check` — validate BOTH stores that can silently disarm coaching:
+    the pulled rulebook (policies.json) and the override store (overrides.json).
+
+    A hand-edit typo in either is LOUD here (a single bad comma otherwise silently disables
+    EVERY customized coaching, or hard-fails every call). Exits non-zero so CI catches it."""
+    rulebook_ok = _policy_store_check()
+
     path = _overrides_path()
     print("\n🩺 OVERRIDE STORE CHECK        (validates ./.agentx/overrides.json)")
     print("=" * 75)
@@ -1166,6 +1207,8 @@ def _policies_check():
         print("     Nothing customized, so the built-in floor coaching is in effect.")
         print("     ▶ Customize one:   agentx customize \"<name>\" --edit   (names: agentx policies)")
         print("=" * 75)
+        if not rulebook_ok:
+            sys.exit(1)
         return
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1181,6 +1224,8 @@ def _policies_check():
     if not active:
         print(f"\n  ✅ {path} parses. No active overrides in it yet.")
         print("=" * 75)
+        if not rulebook_ok:
+            sys.exit(1)
         return
 
     catalog = {p["id"]: p["name"] for p in list_customizable_policies()}
@@ -1195,6 +1240,11 @@ def _policies_check():
     print("\n" + "=" * 75)
     print("  ▶ Change one:   agentx customize \"<name>\" --edit")
     print("=" * 75)
+    # A malformed RULEBOOK exits non-zero even when the override store is pristine: the
+    # operator's agent is failing closed, and a green exit code here would say otherwise.
+    # Success just RETURNS: a sys.exit(0) would tear down any caller that imports this.
+    if not rulebook_ok:
+        sys.exit(1)
 
 
 def _customize_usage_exit():
