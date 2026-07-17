@@ -1,9 +1,9 @@
-__version__ = "0.4.19"
+__version__ = "0.4.20"
 # ISO date this version was cut. Drives the OFFLINE staleness notice
 # (pulse.staleness_notice): an old install nags ITSELF to upgrade with no network
 # call, because pip cannot declare a minimum version of the leaf package and so
 # nothing else can reach a pinned install. MUST move with __version__ (BACKLOG C12).
-__released__ = "2026-07-14"
+__released__ = "2026-07-16"
 
 # The version currently LIVE on PyPI. This is what makes "never ship code under an
 # already-published version" checkable OFFLINE (test_version_gate.py).
@@ -18,7 +18,7 @@ __released__ = "2026-07-14"
 # avoiding, and it would have failed this PR.
 #
 # ▶ UPDATE THIS AT `twine upload` TIME, in the same commit as the publish.
-__published__ = "0.4.18"
+__published__ = "0.4.19"
 
 from .decorators import (
     agentx_protect,

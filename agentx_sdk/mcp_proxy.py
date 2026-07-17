@@ -683,15 +683,33 @@ def _tool_fingerprint(tool):
 
 
 def _description_poisoned(tool):
-    """Run the tool's advertised description through the SAME keyless shield the
-    tools/call path uses; a truthy decision means the description itself carries a
-    dangerous payload (injection / invisible-unicode carrier) -- install-time
-    poison (B). Best-effort: never raises."""
+    """Run the tool's advertised description through the keyless shield in DESCRIPTION
+    scope; a truthy decision means the description itself carries a dangerous payload
+    (injection / invisible-unicode carrier) -- install-time poison (B). Best-effort:
+    never raises.
+
+    scan_scope="description" runs ONLY the invisible-unicode carrier check, deliberately
+    NOT the mention-based detectors (the token rails, SSRF, destructive-SQL, and the
+    filesystem credential-FILE floor): a description is text, not an action, and a benign
+    dotenv/ssh/db tool routinely MENTIONS `.env`, a credential path, or "DROP TABLE" in its
+    docs. Flagging that as poison (and, in block mode, quarantining the tool) was a false
+    positive (audit findings #3/#6). A hidden carrier has no benign reason in advertised
+    text, so it is the one deterministic poison signal that survives.
+
+    TRADE-OFF (audit finding #7): skipping the fs-read floor here also means a description
+    that literally INSTRUCTS the client LLM to read `~/.ssh/id_rsa` / `.env` is no longer
+    flagged at first sight. Accepted, because (a) the fs-read PATH floor cannot tell a
+    benign MENTION ("loads from .env") from an imperative INSTRUCTION, so keeping it
+    re-introduces the finding-#6 false positive that breaks every benign dotenv tool;
+    (b) the actual dangerous READ is still floored at CALL time (action scope) the moment
+    the agent invokes a tool with that path; and (c) a determined poisoner rephrases past
+    any substring anyway. The correct fix is a path-agnostic description-INJECTION detector
+    (imperative verb + exfil intent), tracked as separate follow-up, NOT this fs-read floor."""
     try:
         desc = tool.get("description")
         if not isinstance(desc, str) or not desc:
             return False
-        return bool(evaluate_call_keyless(desc))
+        return bool(evaluate_call_keyless(desc, scan_scope="description"))
     except Exception:
         return False
 

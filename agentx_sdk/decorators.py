@@ -1165,9 +1165,23 @@ _BUILTIN_POLICY_KEYWORDS = [
         "id": "11111111-1111-1111-1111-111111111105",
         "name": "Filesystem Path Boundary",
         "category": "DESTRUCTIVE_ACTION",
-        "blocked_intents": ["../../", "/etc/passwd", "/etc/shadow", "id_rsa", ".ssh/", ".aws/credentials"],
-        "socratic_prompt": "This path escapes the working directory with ../ traversal, or reads a system credential file (SSH keys, cloud credentials, /etc/passwd or /etc/shadow).",
-        "preferred_alternative": "Stay inside the project working directory with a relative path that has no '../', and do not read credential or key files.",
+        # DETECTION SPLIT (audit finding #1): the ENTIRE filesystem-boundary floor --
+        # `../` traversal AND all credential/secret-FILE reads (SSH key, cloud creds, .env,
+        # .git-credentials, .netrc, .pgpass, .pypirc, GCP ADC, /etc/shadow, ...) -- is
+        # detected by the UNCONDITIONAL structural passes _detect_path_traversal +
+        # _detect_credfile_read + _detect_dotenv_read, NOT by flat tokens here (blocked_intents
+        # is empty). Reason: a pulled `.agentx/policies.json` WHOLLY REPLACES these built-in
+        # seeds (see _load_local_policy_keywords), so as TOKENS the floor could be silently
+        # shadowed away by a stale/partial pull -- a floor a policy pull can WEAKEN is not a
+        # floor. The structural passes run regardless of the loaded policy set and mirror the
+        # gateway's _PATH_TRAVERSAL_RE / _SENSITIVE_PATH_RE (tripwire:
+        # backend/test_coaching_consistency.py), so the two surfaces cannot drift. This entry
+        # remains the ATTRIBUTION/coaching home for those passes (they return
+        # _keyless_decision(_FS_BOUNDARY_POLICY)). Empty blocked_intents also means a tool
+        # DESCRIPTION mentioning `../../` is not token-matched as poison (audit finding #3).
+        "blocked_intents": [],
+        "socratic_prompt": "This path escapes the working directory with ../ traversal, or reads a credentials or secrets file (an SSH key, cloud credentials, a .env secrets file, /etc/shadow).",
+        "preferred_alternative": "Stay inside the project working directory with a relative path that has no '../', and do not read credential, key, or .env secrets files. Read config through your secrets manager; if you only need the variable names, use .env.example (which holds no real values).",
     },
     {
         "id": "11111111-1111-1111-1111-111111111106",
@@ -1861,6 +1875,9 @@ def _detect_ssrf_encoded(raw):
 # source hygiene). This keyless port is ALSO what makes the agentx-mcp proxy's
 # first-sight tool-description POISON scan real: it runs this same shield on the
 # advertised description, so an install-time invisible-unicode carrier is now caught.
+# KEEP IN SYNC with the gateway (byte-identical); the tripwire backend/test_coaching_consistency.py
+# ::test_invisible_unicode_* asserts the regex is identical AND that a shared carrier corpus reaches
+# the same verdict on the SDK, the MCP poison scan, and the gateway, so they cannot drift silently.
 _INVISIBLE_UNICODE_RE = re.compile("[\u202d\u202e\U000e0000-\U000e007f]")
 
 
@@ -1882,6 +1899,107 @@ def _is_catalog_token(token):
     return bool(_CATALOG_INTROSPECTION_RE.search(str(token)))
 
 
+# ---- Structural filesystem-boundary floor (unconditional) --------------------
+# The WHOLE filesystem floor -- `../` traversal AND credential/secret-FILE reads (a `.env`
+# secrets file, an SSH key, cloud creds, .netrc/.pgpass/.pypirc, a git credential store,
+# etc.) -- runs as STRUCTURAL passes (NOT tokens in _BUILTIN_POLICY_KEYWORDS), so a pulled
+# `.agentx/policies.json` that WHOLLY REPLACES the built-in seeds can never shadow it
+# (audit finding #1). All three passes mirror the gateway's _PATH_TRAVERSAL_RE /
+# _SENSITIVE_PATH_RE / _detect_dotenv_path; the tripwire backend/test_coaching_consistency.py
+# asserts the regexes are logically identical (whitespace/comments-normalized) AND that a
+# shared corpus reaches the same verdict on both surfaces, so they cannot drift silently.
+
+# Directory traversal that climbs out of the sandbox, or a single `../` landing on a known
+# secret. Byte-identical to the gateway's _PATH_TRAVERSAL_RE (the SDK cannot import backend);
+# a single benign `../` (no climbing, no sensitive target) does NOT trip it.
+_PATH_TRAVERSAL_RE = re.compile(
+    r"""(?:
+        (?:\.\./){2,}                 # ../../  climbing out of the root (POSIX)
+      | (?:\.\.\\){2,}                 # ..\..\  (Windows)
+      | (?:%2e%2e(?:%2f|%5c)){1,}       # encoded ../  ..\
+      | \.\.(?:%2f|%5c)                 # mixed literal-dot + encoded slash
+      | \.\./[^\n]*?(?:/etc/|/root/|\.ssh|\.aws|[/\\](?:id_rsa|id_ed25519|shadow|passwd)\b)  # traversal landing on a secret (basenames anchored on a path sep so `notes-passwd.md` does not trip)
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _detect_path_traversal(raw):
+    """True if the payload climbs out of the working sandbox (>=2 `../`, encoded forms, or a
+    single `../` landing on a known secret). Mirrors the gateway's _PATH_TRAVERSAL_RE, so a
+    Windows-backslash / encoded traversal the gateway blocks is no longer allowed on the SDK
+    keyless path (audit finding #1/#6)."""
+    return bool(_PATH_TRAVERSAL_RE.search(str(raw)))
+
+
+# `.env` secrets file. Boundary-aware so the `process.env` / `os.environ` property accessors
+# and a namespaced `foo.env` never trip; the commit-safe template suffixes are exempted when
+# ANY dotted segment is a safe marker (so `.env.example`, `.env.production.template`, and a
+# template backup `.env.example.bak` all pass, while `.env.local` / `.env.production` block --
+# a real secrets file never carries a safe marker). A named `*.env` file (config.env,
+# staging.env) is structurally indistinguishable from a `.env` property accessor by regex
+# alone, so on the keyless path -- which has NO judge behind it -- it is an ACCEPTED residual:
+# catching it would false-block the ubiquitous process.env / import.meta.env / Deno.env
+# accessors. That ambiguity is the judge's to resolve where a judge exists (the gateway), not
+# the floor's (audit finding #2). KEEP IN SYNC with the gateway _DOTENV_* / _detect_dotenv_path.
+_DOTENV_SAFE_SUFFIXES = frozenset({"example", "sample", "template", "dist", "defaults", "schema"})
+_DOTENV_FILE_RE = re.compile(r"(?<![A-Za-z0-9_])\.env((?:\.[A-Za-z0-9_-]+)*)(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def _detect_dotenv_read(raw):
+    """True if the payload references a real `.env` secrets file (bare, or an
+    environment-specific variant like `.env.local`) and NOT a `process.env` / `os.environ`
+    accessor or a commit-safe template. The template exemption fires when ANY dotted segment
+    is a safe marker, so `.env.production.template` / `.env.example.bak` are exempted while a
+    real secrets file (no safe marker in its name) still blocks."""
+    text = str(raw)
+    if ".env" not in text.lower():          # cheap guard: skip the regex on the no-dotenv case
+        return False
+    for m in _DOTENV_FILE_RE.finditer(text):
+        suffix = m.group(1)
+        if suffix:
+            segs = suffix.strip(".").split(".")
+            if any(s.lower() in _DOTENV_SAFE_SUFFIXES for s in segs):
+                continue                    # .env.example / .env.production.template / .env.example.bak
+        return True
+    return False
+
+
+# Credential / system-secret FILE paths -- the SDK mirror of the gateway's
+# _SENSITIVE_PATH_RE (backend/gateway.py). Anchored so a bare `word.netrc` does not trip
+# (the two surfaces agreed only after audit finding #3), and Windows-home paths
+# (`C:\...\.pypirc`, `C:\...\.ssh\authorized_keys`) match via the backslash in the anchor
+# class + the `[/\\]` separator (audit finding #4). KEEP IN SYNC with the gateway.
+_SENSITIVE_PATH_RE = re.compile(
+    r"""(?:
+        /etc/(?:shadow|sudoers|gshadow)\b           # credential / privilege files
+      | /etc/ssh/ssh_host_\w+_key\b
+      | (?:^|[\s'"/=(\\])~?[/\\]?\.ssh[/\\](?:id_\w+|authorized_keys|known_hosts)\b
+      | \bid_rsa\b | \bid_ed25519\b
+      | \.aws/credentials\b | \.aws/config\b
+      | (?:^|[\s'"/=(\\])\.git-credentials\b           # global git credential store (plaintext passwords)
+      | (?:^|[\s'"/=(\\])\.netrc\b                     # machine login/password store
+      | (?:^|[\s'"/=(\\])\.pgpass\b                    # postgres password file
+      | (?:^|[\s'"/=(\\])\.pypirc\b                    # PyPI upload token (POSIX + Windows-home paths)
+      | (?:^|[\s'"/=(\\])\.envrc\b                     # direnv env/secrets file
+      | \bapplication_default_credentials\.json\b      # GCP application-default credentials
+      | \.git/(?:config|hooks|credentials)\b
+      | /proc/self/environ\b | /proc/\d+/environ\b
+      | [A-Za-z]:\\Windows\\System32\\config\\SAM\b
+      | \\Windows\\System32\\config\\(?:SAM|SYSTEM|SECURITY)\b
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _detect_credfile_read(raw):
+    """True if the payload references a known credential / system-secret file (SSH key,
+    cloud creds, .netrc, .pgpass, .pypirc, git credential store, GCP ADC, /etc/shadow, the
+    Windows SAM hive, ...). Unconditional (never shadowed by a policy pull) and mirrors the
+    gateway's _SENSITIVE_PATH_RE."""
+    return bool(_SENSITIVE_PATH_RE.search(str(raw)))
+
+
 # The canonical "Mass Destructive Intent" builtin, used to attribute the structural
 # SQL floor's block so its category/coaching stay stable regardless of pulled policies.
 _MASS_DESTRUCTIVE_POLICY = next(
@@ -1892,6 +2010,13 @@ _MASS_DESTRUCTIVE_POLICY = next(
 # category/coaching stay stable regardless of pulled policies.
 _SSRF_POLICY = next(
     (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Network Sandbox (SSRF)"),
+    _BUILTIN_POLICY_KEYWORDS[0])
+
+# The Filesystem Path Boundary builtin, used to attribute the structural `.env`
+# secrets-file floor (_detect_dotenv_read) so its category/coaching stay stable
+# regardless of pulled policies -- the same pattern as _SSRF_POLICY above.
+_FS_BOUNDARY_POLICY = next(
+    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Filesystem Path Boundary"),
     _BUILTIN_POLICY_KEYWORDS[0])
 
 # The Invisible-Unicode carrier builtin (AFDB #56), used to attribute the structural
@@ -1934,9 +2059,20 @@ def _keyless_decision(policy):
     }
 
 
-def evaluate_call_keyless(query, *, bypass_local_shield=False):
+def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="action"):
     """Keyless Layer-0 detection — the SINGLE home shared by the @agentx_protect
     decorator and the ``agentx-mcp`` stdio proxy so the two paths can never drift.
+
+    ``scan_scope`` selects what the input IS. The default ``"action"`` scans a tool
+    call / payload (an actual filesystem or network access) with the full floor.
+    ``"description"`` scans a tool's advertised DESCRIPTION for install-poison (the
+    agentx-mcp first-sight scan) and runs ONLY the invisible-Unicode carrier check: a
+    description is TEXT, not an action, so every MENTION-based detector (the token rails,
+    SSRF, destructive-SQL, and the filesystem credential-FILE floor) would fire on a benign
+    description that merely names a dangerous pattern — "loads from your .env", "runs a
+    DROP TABLE cleanup" — which is documentation, not poison (audit findings #3/#6/#7). A
+    hidden carrier has no benign reason in advertised text, so it is the one deterministic
+    poison signal that survives; the actual action is still fully floored at call time.
 
     Pure and side-effect-free. It normalizes the ACTION/PAYLOAD (never the
     chain-of-thought — the caller passes only the call), then applies, in order:
@@ -1965,6 +2101,19 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False):
     if not LOCAL_POLICY_KEYWORDS or bypass_local_shield:
         return None
     raw = str(query)
+
+    # Description scope: a tool DESCRIPTION is advertised TEXT, not an action. The only
+    # deterministic install-poison signal meaningful in it is an invisible-unicode carrier
+    # (a hidden char has no benign reason in advertised text). Every other detector — the
+    # token rails, SSRF, the filesystem floor, destructive-SQL — fires on a description that
+    # merely MENTIONS a dangerous pattern ("loads from your .env", "runs a DROP TABLE
+    # cleanup"), which is a false positive, not poison (audit findings #3/#6/#7). The actual
+    # ACTION is still fully floored at CALL time. Early-exit so the mention-prone detectors
+    # below never run on a description.
+    if scan_scope == "description":
+        return (_keyless_decision(_INVISIBLE_UNICODE_POLICY)
+                if _detect_invisible_unicode(raw) else None)
+
     benign_catalog = _is_benign_catalog_read(raw)
     haystack = _normalize_for_match(raw)
 
@@ -1998,6 +2147,22 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False):
     #     advertised description).
     if _detect_invisible_unicode(raw):
         return _keyless_decision(_INVISIBLE_UNICODE_POLICY)
+
+    # 1d) Structural filesystem-boundary floor — `../` traversal out of the sandbox, a `.env`
+    #     secrets file, and any credential / secret FILE (SSH key, cloud creds, .netrc,
+    #     .pgpass, .pypirc, git credential store, GCP ADC, /etc/shadow, the Windows SAM hive,
+    #     ...). Runs UNCONDITIONALLY — never gated by which policies are loaded — so a pulled
+    #     policy set can never shadow it (audit finding #1), and mirrors the gateway's
+    #     _PATH_TRAVERSAL_RE / _SENSITIVE_PATH_RE so the two surfaces agree. Ungated by
+    #     benign_catalog (a credential read is malicious regardless of any catalog text).
+    #     Attributed to the Filesystem Path Boundary policy so its category + coaching are
+    #     stable. (Description scope already early-returned above, so this is action-only.)
+    if _detect_path_traversal(raw):
+        return _keyless_decision(_FS_BOUNDARY_POLICY)
+    if _detect_dotenv_read(raw):
+        return _keyless_decision(_FS_BOUNDARY_POLICY)
+    if _detect_credfile_read(raw):
+        return _keyless_decision(_FS_BOUNDARY_POLICY)
 
     # 2) Structural destructive-SQL FALLBACK for classes no flat token expresses
     #    (DROP of other objects, TRUNCATE, a no-WHERE mass UPDATE/DELETE). Reached only

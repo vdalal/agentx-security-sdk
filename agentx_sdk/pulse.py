@@ -515,19 +515,22 @@ def format_protection_line(protection):
 #
 # THRESHOLD is tuned to the RELEASE CADENCE, not to a round number of days. We
 # ship roughly every 1-2 days in active development (~20 SDK releases between
-# 2026-06-26 and 2026-07-11), so a 15-day-old build is already many releases and
-# several enforcement fixes behind. A 90-day threshold would have let an install
-# sit ~40 releases behind while still reporting itself as fresh.
+# 2026-06-26 and 2026-07-11), so even a 7-day-old build is already several releases
+# and possibly an enforcement fix behind. Lowered 15 -> 7 on 2026-07-16 (founder) to
+# surface the `pip install --upgrade` nudge sooner: the whole value of this channel
+# is reaching a pinned install BEFORE it misses a security fix, and at this cadence a
+# week is already stale.
 #
 # The one hazard of an age-only signal is a release DROUGHT longer than the
-# threshold: it would nag developers who are already current. The longest gap in
-# that window is ~3 days, so 15 has ample headroom. REVISIT this constant if the
-# cadence slows down (post-launch, a stable maintenance line), or the notice
-# turns into wallpaper and stops being read.
+# threshold: it can nag a developer who is already current -- no newer release
+# exists, but the offline notice cannot know that (it only reports "this build is N
+# days old", which stays literally true). At 7 days that window is tighter than at
+# 15, an ACCEPTED tradeoff for the earlier nudge. REVISIT (raise it back up) if the
+# cadence slows to a stable maintenance line and the notice becomes wallpaper.
 #
 # Self-clearing: upgrading resets the age to 0, so the only developers who keep
 # seeing it are the ones who have not upgraded, which is exactly the audience.
-_STALE_AFTER_DAYS = 15
+_STALE_AFTER_DAYS = 7
 
 UPGRADE_COMMAND = "pip install --upgrade agentx-security-sdk"
 
