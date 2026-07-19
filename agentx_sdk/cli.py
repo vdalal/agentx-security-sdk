@@ -510,7 +510,7 @@ def execute_insights(args=None):
         elif census["with_resolution"] == 0:
             print("   • You have self-corrections, but none carry a reusable safe-path.")
             print("     The safe-path (resolution_path) is judge-produced — it only")
-            print("     persists on a gateway built from PR #64+ WITH a Gemini key live")
+            print("     persists on a recent gateway build WITH a Gemini key live")
             print("     at the time of the recovery. Older recoveries won't have it;")
             print("     run a fresh recovery now that your key is set.")
         else:
@@ -1373,7 +1373,7 @@ def execute_customize(args):
 # or payload, because the ledger never stores one.
 
 # Homepage link carries an attribution tag so CLI-share traffic is distinguishable
-# from cards / dev.to (the per-channel attribution leg of Task #3).
+# from cards / dev.to (the per-channel attribution leg).
 _SHARE_LINK = "https://agentx-core.com/?utm_source=cli_share"
 _DISCORD_INVITE = "https://discord.gg/PmWRTtaSx2"
 

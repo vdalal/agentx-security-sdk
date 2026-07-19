@@ -76,14 +76,14 @@ class AgentXClient:
             payload["action"] = action
         if args:
             payload["args"] = args
-        # Cumulative session spend for the budget-ceiling floor (AFDB #17/#23).
+        # Cumulative session spend for the budget-ceiling floor.
         # Sent like strike_count — the gateway owns the ceiling + verdict. Omitted
         # when zero so an un-metered caller's payload is unchanged.
         if session_tokens:
             payload["session_tokens"] = int(session_tokens)
         if session_cost_usd:
             payload["session_cost_usd"] = float(session_cost_usd)
-        # Shared multi-agent budget pool key (AFDB #43). When peers in an A2A swarm
+        # Shared multi-agent budget pool key. When peers in an A2A swarm
         # carry the SAME budget_pool_id, the gateway sums their cumulative spend
         # across the pool. Omitted when unset so a single-agent caller's payload —
         # and verdict path — is byte-identical to today (no pool aggregation runs).

@@ -10,7 +10,7 @@ the gateway:
 
   * HARVEST  — the gateway already extracts a ``resolution_path`` on every
                COMPLIED self-correction (judge-produced; persisted to the local
-               incident store since PR #64). ``harvest_candidates()`` projects
+               incident store). ``harvest_candidates()`` projects
                the *reusable* ones into ranked per-policy safe-path candidates.
   * ADOPT    — the developer reviews candidates (``agentx insights``) and
                promotes one (``agentx adopt``) into ``.agentx/overrides.json``.

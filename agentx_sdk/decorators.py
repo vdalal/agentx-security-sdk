@@ -219,7 +219,7 @@ def _resolve_fail_mode():
 def _resolve_enforcement(override=None):
     """Resolve the ENFORCEMENT LEVEL (posture) to 'audit' or 'enforce'.
 
-    A FOURTH, orthogonal axis (see designs/shadow-audit-mode-spec.md), distinct from
+    A FOURTH, orthogonal axis, distinct from
     AGENTX_MODE (local/linked/cloud), AGENTX_FAIL_MODE (open/closed), and per-detector
     warn/block/off:
       * enforce (default) — a policy catch is terminal: coach-and-continue / HITL /
@@ -458,7 +458,7 @@ _session_stats = {
     "block_category": None,            # <-- Coarse closed-vocab failure class of a block this session (DESTRUCTIVE_ACTION/etc), for the pulse. "What KIND of action got blocked", never the tool name/payload. None = no categorized block. See _BLOCK_CATEGORY_VOCAB.
     "would_blocks": 0,                 # <-- AUDIT posture (AGENTX_ENFORCEMENT=audit): count of catches that WOULD have blocked but were recorded-and-let-through. Distinct from intercepts (an audit install is NOT "protected"): would_blocks>0 with intercepts==0 = an install EVALUATING, not yet enforcing. Rides the pulse as a coarse count. See _resolve_enforcement / _audit_and_proceed.
     "overrides_applied": 0,            # <-- BUILD #2: blocks where an adopted org reframe replaced the gateway's generic challenge
-    # Session budget meter (AFDB #17/#23). The gateway's budget-ceiling floor reads
+    # Session budget meter. The gateway's budget-ceiling floor reads
     # the running total off the payload; we feed it from one of two sources:
     "auto_tokens_estimate": 0,         # coarse ~4-chars/token proxy over inspected payloads — zero-config, catches runaway-loop VOLUME
     "reported_tokens": 0,              # REAL LLM usage fed via record_spend(); authoritative — replaces the estimate when present
@@ -701,7 +701,7 @@ def reset_strike_state():
 
 def record_spend(tokens: int = 0, cost_usd: float = 0.0):
     """Report this session's REAL LLM spend so the gateway's budget-ceiling floor
-    (AFDB #17 AutoGPT $120/8hr, #23 AgentGPT 50-step crash) sees true usage rather
+    (runaway agents burning budget -- AutoGPT $120/8hr, AgentGPT's 50-step crash) sees true usage rather
     than the coarse built-in estimate. Call it with your LLM client's usage after
     each completion — e.g. `agentx.record_spend(tokens=resp.usage.total_tokens)`,
     optionally `cost_usd=...`. Authoritative: once you report real tokens they
@@ -1214,14 +1214,13 @@ _POLICY_ID_TO_CATEGORY = {p["id"]: p["category"] for p in _BUILTIN_POLICY_KEYWOR
 # The deepest honest form of "keeps the run alive" is not "don't", it is "do the
 # REVERSIBLE equivalent and proceed": coach a destructive / irreversible action onto a
 # form the agent can undo, so the run finishes safely instead of just being stopped.
-# Generalizes the ratified Pon soft-delete seam (destructive-write -> soft-delete;
-# designs/recover-depth-and-vertical-integration-spec.md Q2 #1) from hand-written prose on
+# Generalizes the soft-delete seam (destructive-write -> soft-delete) from hand-written prose on
 # one seed into a single-source library keyed by a `reversible_transform` id. A seed (or a
 # pulled policy) opts in; one without it (SSRF, secrets, PII) keeps its specific safe path,
 # because "make it reversible" is not a coherent steer for an exfiltration attempt.
 # The gateway carries a PARALLEL copy of this idea (backend/gateway.py DDL / bulk-delete
 # branches); unifying them is the tracked "canonical coaching per failure_mode" follow-up
-# (designs/keyless-coaching-review.md rec 3), deliberately out of this SDK-only slice. Only
+# deliberately out of this SDK-only slice. Only
 # transforms with a live keyless floor seed ship; the spec's other classes (infra->dry-run,
 # exec->sandbox, comms->staged, db->transaction) are added here AND tagged when they seed a floor.
 _REVERSIBLE_ALTERNATIVES = {
@@ -1782,6 +1781,25 @@ _TAUTOLOGICAL_WHERE_RE = re.compile(
     r"\s*\)?(?!\s*(?:and|or)\b)",
     re.IGNORECASE)
 
+# Pipe-to-shell, including THROUGH a privilege/exec wrapper: `curl … | sudo bash`,
+# `| sudo -u root bash`, `| nice -n 10 bash`, `| env FOO=1 bash`, `| sudo\<newline>bash`,
+# `|bash`, `| sh -c`. The flat "| bash" token (Destructive Shell Command) cannot see these
+# -- anything between the pipe and the interpreter defeats the substring -- and "| sh" cannot
+# be a token without also matching "| shuf" / "| sha256sum". This runs on the normalized
+# haystack: after the pipe, ZERO+ known command-runner wrappers (each free to carry its own
+# flags, flag-ARGUMENTS like `-u root`, env-assigns, and a tolerated line-continuation
+# backslash) may precede a shell interpreter, which must be a WHOLE word -- so `shuf` /
+# `sha256sum` / `ssh` / a bare `| grep bash` never trip it. `command` is deliberately NOT a
+# wrapper: `command -v <shell>` is a benign existence check, not an invocation. Catches
+# `curl … | sudo bash` and other wrapped forms a naive substring match misses:
+# `sudo -u root bash` (flag-with-arg), `sudo\<NL>bash` (line continuation), and `|& bash`
+# (`|&` = bash's pipe-BOTH, i.e. `2>&1 |`, which still feeds the interpreter's stdin).
+_PIPE_TO_SHELL_RE = re.compile(
+    r"\|&?[\s\\]*"                                                  # pipe (incl. `|&` pipe-both), tolerating ws / a line-continuation backslash
+    r"(?:(?:sudo|doas|su|runuser|env|exec|nohup|nice|timeout|setsid|stdbuf|xargs)\b"
+    r"[^|;&\n]*?\s)*"                                               # zero+ wrapper commands with their flags / args
+    r"(?:bash|zsh|ksh|dash|ash|sh)\b")                             # ...ending at a shell interpreter (whole word)
+
 
 def _detect_destructive_sql(normalized):
     """True for a blatant destructive SQL statement in the normalized payload."""
@@ -1861,7 +1879,7 @@ def _detect_ssrf_encoded(raw):
     return False
 
 
-# ---- Structural invisible-Unicode carrier (AFDB #56, Operation Pale Fire) ----
+# ---- Structural invisible-Unicode carrier ----
 # Mirrors the gateway's detect_invisible_unicode EXACTLY (backend/gateway.py) so the
 # keyless client and the server agree. Deliberately NARROW to the two carrier classes
 # with NO legitimate use in any payload, so a content-bearing write (an INSERT of user
@@ -1884,8 +1902,7 @@ _INVISIBLE_UNICODE_RE = re.compile("[\u202d\u202e\U000e0000-\U000e007f]")
 def _detect_invisible_unicode(raw):
     """True if the payload carries a bidi override or a Unicode Tags-block character.
     Presence-based (one override flips a line, so no count threshold). We claim the
-    CARRIER, never the semantic intent — the injection itself stays the judge's (the
-    EchoLeak #12 split)."""
+    CARRIER, never the semantic intent — the injection itself stays the judge's."""
     if not raw:
         return False
     return bool(_INVISIBLE_UNICODE_RE.search(str(raw)))
@@ -1976,14 +1993,14 @@ _SENSITIVE_PATH_RE = re.compile(
       | /etc/ssh/ssh_host_\w+_key\b
       | (?:^|[\s'"/=(\\])~?[/\\]?\.ssh[/\\](?:id_\w+|authorized_keys|known_hosts)\b
       | \bid_rsa\b | \bid_ed25519\b
-      | \.aws/credentials\b | \.aws/config\b
+      | \.aws[/\\]credentials\b | \.aws[/\\]config\b
       | (?:^|[\s'"/=(\\])\.git-credentials\b           # global git credential store (plaintext passwords)
       | (?:^|[\s'"/=(\\])\.netrc\b                     # machine login/password store
       | (?:^|[\s'"/=(\\])\.pgpass\b                    # postgres password file
       | (?:^|[\s'"/=(\\])\.pypirc\b                    # PyPI upload token (POSIX + Windows-home paths)
       | (?:^|[\s'"/=(\\])\.envrc\b                     # direnv env/secrets file
       | \bapplication_default_credentials\.json\b      # GCP application-default credentials
-      | \.git/(?:config|hooks|credentials)\b
+      | \.git[/\\](?:config|hooks|credentials)\b
       | /proc/self/environ\b | /proc/\d+/environ\b
       | [A-Za-z]:\\Windows\\System32\\config\\SAM\b
       | \\Windows\\System32\\config\\(?:SAM|SYSTEM|SECURITY)\b
@@ -2019,7 +2036,15 @@ _FS_BOUNDARY_POLICY = next(
     (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Filesystem Path Boundary"),
     _BUILTIN_POLICY_KEYWORDS[0])
 
-# The Invisible-Unicode carrier builtin (AFDB #56), used to attribute the structural
+# The Destructive Shell Command builtin, used to attribute the structural pipe-to-shell
+# floor (_PIPE_TO_SHELL_RE) so a privilege-prefixed `curl … | sudo bash` blocks with the
+# SAME category/coaching as the flat "| bash" token -- statelessly, on the first strike,
+# regardless of session state or a pulled policy. Same pattern as _SSRF_POLICY above.
+_DESTRUCTIVE_SHELL_POLICY = next(
+    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Destructive Shell Command"),
+    _BUILTIN_POLICY_KEYWORDS[0])
+
+# The Invisible-Unicode carrier builtin, used to attribute the structural
 # carrier floor. Structural-ONLY: no keyword rails (blocked_intents is empty), so it is
 # never token-scanned — `_detect_invisible_unicode` is its only trigger. Same policy_id
 # as the gateway floor (…119) so an adopted org override keys across both paths.
@@ -2080,7 +2105,7 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
     ``LOCAL_POLICY_KEYWORDS`` blocked-intent rails (which preserves the matched
     policy's coaching + any adopted override), then structural fallbacks a flat token
     cannot express: an encoded-IP SSRF check (loopback/metadata inside a URL), an
-    invisible-Unicode carrier check (bidi overrides / the Tags block, AFDB #56), and a
+    invisible-Unicode carrier check (bidi overrides / the Tags block), and a
     destructive-SQL check (DROP/TRUNCATE any object, no-WHERE mass UPDATE/DELETE). Returns
     the FIRST match as a normalized decision dict,
     or ``None`` to allow. The benign
@@ -2131,6 +2156,13 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
                 continue
             return _keyless_decision(policy)
 
+    # 1a2) Structural pipe-to-shell: `curl … | sudo bash` and friends, which the flat
+    #      "| bash" token above cannot see once a sudo/env/flag is interposed. Runs on the
+    #      normalized haystack and is word-boundary anchored, so `| shuf` / `| sha256sum` /
+    #      `| ssh` never trip it. Attributed to the Destructive Shell Command builtin.
+    if _PIPE_TO_SHELL_RE.search(haystack):
+        return _keyless_decision(_DESTRUCTIVE_SHELL_POLICY)
+
     # 1b) Structural SSRF: an encoded / alternate-form private-IP target inside a URL that
     #     no flat literal enumerates (decimal/hex loopback + metadata IPs). Runs on the RAW
     #     payload (URLs survive normalization) and is URL-context-scoped, so a bare numeric
@@ -2139,7 +2171,7 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
         return _keyless_decision(_SSRF_POLICY)
 
     # 1c) Invisible-Unicode carrier: a bidi override or a Unicode Tags-block character
-    #     smuggled into the payload (AFDB #56, Operation Pale Fire). Runs on the RAW
+    #     smuggled into the payload. Runs on the RAW
     #     payload (the codepoints survive normalization) and is NOT gated by the
     #     benign-catalog exemption — a hidden carrier is malicious regardless of the
     #     visible text it rides. This is also what makes the agentx-mcp proxy's
@@ -2304,7 +2336,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
     inherit the global (default 'enforce'); pass ``enforcement="enforce"`` to keep a
     genuinely dangerous tool hard-blocked even while the rest of the app runs in audit,
     or ``enforcement="audit"`` to record-and-proceed for just this tool. An explicit
-    per-tool value ALWAYS wins over the env var. See designs/shadow-audit-mode-spec.md."""
+    per-tool value ALWAYS wins over the env var."""
     def decorator(func):
         # Async tool functions (LangGraph / autogen / asyncio.gather swarms) get an
         # async wrapper; sync tools keep the original synchronous path unchanged.
@@ -2707,7 +2739,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # ✅ UPGRADED FASTAPI EVALUATE INTERFACE PASS
             # We forward our local strike integer payload metadata out-of-band directly to the gateway
             # =========================================================
-            # Budget meter (AFDB #17/#23): add a coarse ~4-chars/token estimate for
+            # Budget meter: add a coarse ~4-chars/token estimate for
             # this call as a zero-config proxy for runaway-loop VOLUME, then forward
             # the session total. Real usage reported via record_spend() is
             # authoritative and replaces the estimate; reported $ drives the dollar
@@ -2720,7 +2752,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             )
             session_cost_total = _session_stats["reported_cost_usd"]
 
-            # Shared multi-agent budget pool (AFDB #43): the decorator arg wins, else
+            # Shared multi-agent budget pool: the decorator arg wins, else
             # the env var, so an orchestrator can set ONE AGENTX_BUDGET_POOL_ID across
             # every swarm peer it spawns with zero code change. Unset => no pooling.
             resolved_pool_id = budget_pool_id or os.environ.get("AGENTX_BUDGET_POOL_ID") or None

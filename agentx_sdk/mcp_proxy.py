@@ -235,7 +235,7 @@ def _harvest_enabled():
 
 def _call_ceiling():
     """Session tools/call ceiling — the keyless runaway-loop guard for the cost-explosion
-    class over MCP (AFDB #17/#23/#55, which the gateway budget floor owns for the decorator
+    class over MCP (which the gateway budget floor owns for the decorator
     but has no keyless signal here). The proxy cannot meter LLM tokens (it never sees usage),
     so it uses tool-call VOLUME as the proxy: once a session crosses the ceiling, every
     further tools/call is halted with coaching. It catches the payload-VARYING runaway loop
@@ -252,8 +252,7 @@ def _call_ceiling():
         return 0
 
 
-# The structural-signature vocab for a recovered call Y (designs/mcp-corpus-intake.md (B),
-# open decision #2 ratified 2026-06-30). Keyless MCP has NO judge to label a call, so the
+# The structural-signature vocab for a recovered call Y. Keyless MCP has NO judge to label a call, so the
 # signature is a LOCAL, coarse heuristic: target_action is read off the tool NAME (word tokens
 # via the shared _name_tokens), scope off the ARG-KEY shape. NEITHER ever inspects an argument
 # VALUE, so no raw payload can enter the record (moat-collection-day0: never raw query / CoT /
@@ -323,7 +322,7 @@ def _abstract_call(tool, arguments):
 
 class _Harvest:
     """Opt-in, tenant-private, LOCAL-ONLY capture of keyless recovery pairs
-    (designs/mcp-corpus-intake.md (B) — the SAFE-DEFAULT skeleton).
+    (the SAFE-DEFAULT skeleton).
 
     On a block it remembers ONLY {tool, policy_category}: policy_category is the closed pulse
     vocab (validated), and tool is the SERVER-DEFINED tool identifier (NOT a vetted enum, so it
@@ -333,8 +332,8 @@ class _Harvest:
     target_action + scope, derived from the tool name and arg-KEY shape only, never a value),
     written at session end to a LOCAL tenant-private file that NEVER crosses the network.
 
-    FOUNDER RATIFICATION: (1) the abstraction RICHNESS is ratified (design-doc open decision #2,
-    2026-06-30) -- a coarse STRUCTURAL signature of the recovered call, never a raw payload;
+    FOUNDER RATIFICATION: (1) the abstraction RICHNESS is ratified -- a coarse STRUCTURAL
+    signature of the recovered call, never a raw payload;
     implemented locally here. STILL founder-gated: how to sanitize the server-defined tool name
     (raw / hashed / dropped) before any NETWORK sink (it stays raw in this local file -- the org's
     own data), and (2) there is NO network sink and no Discovery/adopt-queue integration
@@ -420,7 +419,7 @@ def _flush_harvest(harvest, log):
 # and never reads them back, so until now the corpus was write-only and INVISIBLE.
 # These two functions are the inverse of that contract (they own the same JSONL
 # schema) so the org can SEE the recovery brain it is accumulating -- the honest
-# alternative to defending recover by secrecy (designs/mcp-corpus-intake.md (B)).
+# alternative to defending recover by secrecy.
 # READ-ONLY and LOCAL: no promotion into coaching, no network sink (both still
 # founder-gated). Total best-effort, like the write side -- inspection must never
 # raise.
@@ -910,7 +909,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
 
     session_stats["total_calls"] = session_stats.get("total_calls", 0) + 1
 
-    # Keyless runaway-loop ceiling (AFDB #17/#23/#55 over MCP): once this session's tool-call
+    # Keyless runaway-loop ceiling over MCP: once this session's tool-call
     # VOLUME crosses the operator ceiling, halt every further call with coaching — the runaway
     # is the volume, not any single call, so this catches the payload-varying cost loop the
     # per-tool breaker (identical payloads only) evades. Opt-in: absent/0 ceiling is a no-op, so
@@ -1048,7 +1047,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # this is keyed by tool NAME alone (not (trace, tool)); it can therefore
         # over-attribute a later unrelated clean call on a once-blocked tool that the
         # trace-keyed decorator would not. Counts-only / advisory: harvest-IN
-        # (designs/mcp-corpus-intake.md (B))'s block->allow correlation hook used purely to
+        # block->allow correlation hook used purely to
         # COUNT (capturing the revised-safe call is later).
         if streaks.pop(tool_key, None):
             session_stats["self_corrections"] = session_stats.get("self_corrections", 0) + 1

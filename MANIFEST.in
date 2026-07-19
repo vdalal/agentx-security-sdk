@@ -1,0 +1,10 @@
+# Keep the test suite out of the published sdist. Tests live in the top-level sdk_tests/
+# directory, OUTSIDE the agentx_sdk package -- that LOCATION is the real guard: find_packages()
+# keeps them out of the wheel, and setuptools' sdist builder does not pull a top-level
+# non-package dir into the sdist either. So on the current sdk_tests/ name the prune lines
+# below are a no-op; they are kept as defensive belt-and-suspenders, so that a future rename
+# to a name setuptools auto-includes (test/ or tests/) cannot silently re-add tests to the
+# sdist. The public PyPI + MIT-mirror surface stays shipping-code-only.
+prune sdk_tests
+recursive-exclude sdk_tests *
+global-exclude *.pyc

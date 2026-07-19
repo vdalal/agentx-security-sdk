@@ -513,13 +513,11 @@ def format_protection_line(protection):
 # being offline is that it cannot name the current version, only report that
 # this build is old — which is the actionable half anyway.
 #
-# THRESHOLD is tuned to the RELEASE CADENCE, not to a round number of days. We
-# ship roughly every 1-2 days in active development (~20 SDK releases between
-# 2026-06-26 and 2026-07-11), so even a 7-day-old build is already several releases
-# and possibly an enforcement fix behind. Lowered 15 -> 7 on 2026-07-16 (founder) to
-# surface the `pip install --upgrade` nudge sooner: the whole value of this channel
-# is reaching a pinned install BEFORE it misses a security fix, and at this cadence a
-# week is already stale.
+# THRESHOLD is tuned to the RELEASE CADENCE, not to a round number of days. We ship
+# roughly every 1-2 days in active development, so even a 7-day-old build is already
+# several releases and possibly an enforcement fix behind. 7 days surfaces the
+# `pip install --upgrade` nudge sooner: the whole value of this channel is reaching a
+# pinned install BEFORE it misses a security fix, and at this cadence a week is already stale.
 #
 # The one hazard of an age-only signal is a release DROUGHT longer than the
 # threshold: it can nag a developer who is already current -- no newer release

@@ -3,7 +3,7 @@ agentx_sdk/rules.py — the DETECTION half of the unified learning loop.
 
 Sibling of ``overrides.py`` (the RECOVERY half). The gateway extracts a structural
 ``rule_suggestion`` on every judge-caught incident — the detection analog of
-``resolution_path`` (see designs/unified-learning-loop.md). This module closes the
+``resolution_path``. This module closes the
 loop on the CLI:
 
   * HARVEST — ``harvest_rule_candidates()`` projects the *reusable*
