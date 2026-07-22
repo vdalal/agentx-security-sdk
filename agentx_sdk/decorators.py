@@ -1832,10 +1832,30 @@ def _detect_destructive_sql(normalized):
 _SSRF_URL_RE = re.compile(r"\b[a-z][a-z0-9+.\-]*://([^\s/'\"<>]+)", re.IGNORECASE)
 
 
+# Integer host decoding is an inet_aton IPv4 behaviour, so the decode is bounded to the 32-bit
+# space. UNBOUNDED, `ipaddress.ip_address(int)` silently switches to IPv6 above 2**32; in the
+# ranges ordinary ids occupy (snowflakes ~1e18, epoch-ns ~1.75e18, both < 2**61) the result lands
+# in ::/8, which is is_reserved -> a URL carrying such an id as its host
+# (`http://1234567890123456789/`) hard-blocks with no LLM call. No HTTP client, libc resolver or
+# browser decodes an integer host to IPv6, so bounding this loses nothing real. The encoded
+# targets the rail is meant to catch all sit inside the bound: 127.0.0.1 = 2130706433,
+# 169.254.169.254 = 2852039166, and the 0x forms of each.
+#
+# ASYMMETRY WITH THE GATEWAY, ON PURPOSE: the gateway's _coerce_ip also takes a `bare=` flag with
+# a 2**24 LOWER bound, because it inspects schemeless tokens where a small int is far more likely
+# a resource id than a host. This function has no bare context (it only ever sees a host parsed
+# out of a scheme://URL, see _SSRF_URL_RE), so mirroring that clause would be dead code implying a
+# symmetry that does not exist. The shared invariant is the UPPER bound; the SSRF entry in
+# backend/test_coaching_consistency.py records this divergence in its ledger.
+_INT_HOST_SPACE_KEYLESS = 1 << 32
+
+
 def _coerce_ip_keyless(host):
     """Canonicalize a host token to an ipaddress, decoding the common SSRF-bypass
     encodings (decimal int, hex int, dotted, IPv6). Returns None for a genuine hostname.
-    Kept in step with the gateway's _coerce_ip so client + server agree."""
+    Kept in step with the gateway's _coerce_ip on the UPPER bound; see the note above for the
+    one deliberate divergence (the gateway's schemeless small-int rule, which has no analogue
+    here)."""
     import ipaddress
     h = host.strip().strip("[]")
     if not h:
@@ -1846,6 +1866,11 @@ def _coerce_ip_keyless(host):
         pass
     try:
         as_int = int(h, 16) if h.lower().startswith("0x") else int(h)
+    except (ValueError, OverflowError):
+        return None
+    if not (0 <= as_int < _INT_HOST_SPACE_KEYLESS):
+        return None
+    try:
         return ipaddress.ip_address(as_int)
     except (ValueError, OverflowError):
         return None
@@ -2017,6 +2042,148 @@ def _detect_credfile_read(raw):
     return bool(_SENSITIVE_PATH_RE.search(str(raw)))
 
 
+# ---- Wildcard read of a sensitive table (floor gap A5, closed 2026-07-21) ----
+# KEEP IN SYNC with backend/gateway.py::_SENSITIVE_TABLES (asserted by
+# test_coaching_consistency.py::test_sensitive_tables_are_identical_across_surfaces).
+#
+# WHY: the Secrets/PII builtin (…104) expresses every secret-read intent as a literal
+# `SELECT <column>` substring, so the floor could only see a secret that was (a) read via SQL and
+# (b) NAMED in the projection list. That made the free floor block the NARROW read and permit the
+# BROAD one:
+#     SELECT secret FROM config   -> BLOCK   (matches the `SELECT secret` token)
+#     SELECT * FROM config        -> allow   (names no column)
+# The wildcard returns strictly MORE data. A floor that stops the narrow query and waves through
+# the wider one is inverted, not merely thin, which is why this is a fix and not a widening.
+#
+# The gateway has covered this since it shipped (detect_wildcard_sensitive_read), so closing it
+# here moves the FREE floor toward the paid one and cannot create a paid-weaker-than-free
+# inversion; the direction of the ratified `gateway >= sdk` invariant is preserved.
+_SENSITIVE_TABLES_KEYLESS = frozenset({
+    "users", "system_users", "customers", "accounts", "profiles", "config", "configs",
+    "vault", "secrets", "credentials", "api_keys", "apikeys", "auth",
+    "sessions", "payments", "billing", "payment_methods",
+    "secret_store", "keystore", "tokens",
+})
+
+# REGEX, not an AST, on purpose: sqlglot is an OPTIONAL SDK dependency (the AST fast-path degrades
+# to "not installed" at line ~986), and a floor that silently stops firing when an optional package
+# is absent is not a floor. The gateway parses with sqlglot and keeps this same shape as its own
+# except-branch fallback, so the two agree on the blatant case this floor is scoped to.
+#
+# `SELECT\s+\*` requires the star to be the FIRST thing projected, which is what keeps
+# `SELECT COUNT(*) FROM users` out (the star there is inside a function call, never top-level) --
+# the same exemption the gateway gets from its Star-expression check. DISTINCT/TOP are allowed to
+# sit between, since `SELECT DISTINCT * FROM users` is the same bulk read.
+# `(?:\w+\.)?` catches a QUALIFIED star -- `SELECT users.* FROM users`, `SELECT u.* FROM users u`.
+# That is an ordinary way to write a bulk read and it bypassed this floor entirely (found in
+# review). It does NOT loosen the COUNT(*) exemption: `\w+\.` requires a literal dot, which
+# `COUNT(` does not supply, so an aggregate star still never matches.
+_WILDCARD_SENSITIVE_READ_RE = re.compile(
+    r"\bselect\s+(?:distinct\s+|top\s+\d+\s+)*(?:\w+\.)?\*\s*(?:,[^;]*?)?\bfrom\s+[`\"'\[]?(\w+)",
+    re.IGNORECASE,
+)
+# A schema peek that returns zero rows exposes column NAMES, not row DATA, so it is not
+# exfiltration -- but the exemption has to be EARNED, and the obvious spelling of it is a
+# one-token bypass of the whole floor:
+#
+#     SELECT * FROM config -- LIMIT 0          <- a COMMENT. Returns every row. Was ALLOWED.
+#     SELECT * FROM config /* LIMIT 0 */       <- same
+#     SELECT * FROM config WHERE id IN (SELECT id FROM t LIMIT 0)   <- subquery, outer is unbounded
+#
+# So the exemption is comment-stripped (a LIMIT inside a comment is not a LIMIT) and anchored to
+# the END of the statement, which is the only position a top-level row cap can occupy. A trailing
+# `LIMIT 0` on a UNION still exempts, correctly: the whole statement really does return no rows.
+# KEEP IN SYNC with backend/gateway.py's exemption in detect_wildcard_sensitive_read.
+_LIMIT_ZERO_RE = re.compile(r"\blimit\s+0\b", re.IGNORECASE)
+_LINE_COMMENT_RE = re.compile(r"--[^\n]*")
+# String literals are blanked (to equal-length filler, so offsets survive) before ANY paren or
+# LIMIT analysis. Without this, quoted text is read as SQL structure and both checks are forgeable:
+#   SELECT * FROM config WHERE a = ')' AND id IN (SELECT id FROM t LIMIT 0)
+#     -> the quoted ')' cancels the subquery's real '(', so a NESTED limit reads as top-level and
+#        the bulk read is exempted. Found in review; it defeated both surfaces at once.
+#   SELECT * FROM config WHERE note = 'LIMIT 0'
+#     -> a literal containing the exemption text would grant the exemption.
+_SQL_STRING_LITERAL_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def _blank_sql_strings(s):
+    """Replace quoted literals with equal-length filler, so structural analysis sees only SQL."""
+    return _SQL_STRING_LITERAL_RE.sub(lambda m: " " * len(m.group(0)), str(s))
+
+
+def _has_top_level_limit_zero(s):
+    """True if a `LIMIT 0` caps the STATEMENT rather than a subquery. Caller passes the
+    comment-stripped view.
+
+    Paren depth, NOT an end-of-string anchor. The first cut of this anchored to `$`, which is
+    correct for a bare SQL string and WRONG for every payload that carries anything after the
+    query. The MCP proxy flattens a whole tool call into one string
+    (`_flatten_call` -> `query_db SELECT * FROM config LIMIT 0 30`), so any second argument
+    pushed the LIMIT off the end and FALSE-BLOCKED an ordinary schema peek. Found by asking
+    whether these fixes reach MCP; the SDK-shaped tests could not see it.
+
+    Depth also does the job the anchor was actually there for: it rejects
+    `... WHERE id IN (SELECT id FROM t LIMIT 0)`, where the cap binds the subquery and the outer
+    statement still returns every row. The other two bypasses (`-- LIMIT 0`, `/* LIMIT 0 */`) are
+    handled upstream by comment-stripping, not here."""
+    s = _blank_sql_strings(s)                 # quoted text must not be read as SQL structure
+    for m in _LIMIT_ZERO_RE.finditer(s):
+        if s.count("(", 0, m.start()) <= s.count(")", 0, m.start()):
+            return True                       # not nested inside a subquery -> caps the statement
+    return False
+
+
+# The two checks below stay ASYMMETRIC on purpose, because over-stripping fails in opposite
+# directions for each:
+#   * EXEMPTION view (used to decide "is this a genuine LIMIT 0 peek?") strips BOTH comment
+#     styles aggressively. Over-stripping here only means we decline to grant the exemption,
+#     i.e. we BLOCK. Fail-safe.
+#   * PROJECTION view (used to find `SELECT * FROM <sensitive>`) strips ONLY block comments.
+#     Stripping `--` here would be fail-OPEN, and it demonstrably was: `--` is far more often a
+#     shell long-flag than a SQL comment, so `psql --command "SELECT * FROM config"` had its
+#     entire query eaten and sailed through. That regression was introduced by the first cut of
+#     this fix and caught re-reviewing it; the tests below pin it.
+def _strip_block_comments_only(s):
+    """Projection view: `/* */` removed, `--` left intact. See the asymmetry note above."""
+    return _WS_RUN_RE.sub(" ", _BLOCK_COMMENT_RE.sub(" ", str(s))).strip()
+
+
+def _strip_sql_comments(s):
+    """Exemption view: both comment styles removed. Aggressive on purpose -- see the note above."""
+    s = _BLOCK_COMMENT_RE.sub(" ", str(s))
+    s = _LINE_COMMENT_RE.sub(" ", s)
+    return _WS_RUN_RE.sub(" ", s).strip()
+
+
+def _detect_wildcard_sensitive_read(raw):
+    """True if the payload is a wildcard projection (`SELECT *`) against a table holding
+    secrets or customer PII. Closes floor gap A5(2): the free floor used to block
+    `SELECT secret FROM config` and allow the strictly-wider `SELECT * FROM config`.
+
+    Deliberately scoped to the BLATANT case, in keeping with the keyless floor's blatant-only
+    posture. The sibling gap A5(1) -- a secret fetched by KEY NAME through a config/secret-store
+    tool (`read_config('aws_secret_access_key')`) -- is NOT closed here: it needs a credential-name
+    vocabulary applied to non-SQL payloads, which is the FP-prone half (`api_key_enabled`,
+    `has_signing_key`, a docs lookup) and wants its own sizing pass. Tracked as A5(1)."""
+    if "*" not in str(raw):               # cheap guard: no star, no wildcard projection
+        return False
+    # Match on the comment-stripped view, so neither the projection nor the LIMIT exemption can
+    # be split or hidden by a comment (`SELECT/**/*FROM config` used to slip past this floor
+    # while the gateway's AST caught it).
+    if _has_top_level_limit_zero(_strip_sql_comments(raw)):
+        return False
+    m = _WILDCARD_SENSITIVE_READ_RE.search(_strip_block_comments_only(raw))
+    return bool(m and m.group(1).lower() in _SENSITIVE_TABLES_KEYLESS)
+
+
+# The Secrets and PII Exfiltration builtin (…104), used to attribute the structural wildcard
+# floor so its category/coaching stay stable regardless of pulled policies -- same pattern as
+# _SSRF_POLICY above.
+_SECRETS_POLICY = next(
+    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Secrets and PII Exfiltration"),
+    _BUILTIN_POLICY_KEYWORDS[0])
+
+
 # The canonical "Mass Destructive Intent" builtin, used to attribute the structural
 # SQL floor's block so its category/coaching stay stable regardless of pulled policies.
 _MASS_DESTRUCTIVE_POLICY = next(
@@ -2123,7 +2290,28 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
     Returns ``None`` (allow) or
     ``{policy_id, policy_name, challenge_text, category, preferred_alternative}``
     where ``challenge_text`` is the RAW socratic prompt (pre-override)."""
-    if not LOCAL_POLICY_KEYWORDS or bypass_local_shield:
+    # ONLY the explicit opt-out short-circuits the shield.
+    #
+    # This used to read `if not LOCAL_POLICY_KEYWORDS or bypass_local_shield`, and that guard is
+    # OLDER than every structural floor below it (guard 2026-06-29; destructive-SQL 07-01, SSRF
+    # 07-03, invisible-unicode 07-06, FS credential 07-16, wildcard 07-21). When it was written
+    # this function was ONLY a token scan, so "no policies -> nothing to scan -> allow" was the
+    # whole truth. Five floors were then added underneath it, each documenting itself as
+    # unconditional, and the guard at the top was never revisited -- so an empty rule list would
+    # have taken all five down with it.
+    #
+    # No shipped path can produce an empty list (the loader falls back to the built-ins for an
+    # empty array, all-inactive rules, empty blocked_intents, and no file at all; a malformed file
+    # RAISES and fails closed), so removing that clause is a measured no-op today -- verified
+    # across 1,203 tests, where the only result that changed was the tripwire written to catch
+    # this edit. It is removed anyway, because the floors were safe only by ACCIDENT: they
+    # depended on an unasserted property of load_local_policy_keywords, which is exactly the
+    # function the Control work will rewrite (org rules replacing the local file). If "org-only
+    # mode" ever drops the built-ins, this line is what decides whether five floors survive it.
+    #
+    # The token scan below iterates LOCAL_POLICY_KEYWORDS, so an empty list naturally contributes
+    # no rails -- it just no longer disarms the structural floors on its way past.
+    if bypass_local_shield:
         return None
     raw = str(query)
 
@@ -2195,6 +2383,15 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
         return _keyless_decision(_FS_BOUNDARY_POLICY)
     if _detect_credfile_read(raw):
         return _keyless_decision(_FS_BOUNDARY_POLICY)
+
+    # 1e) Structural wildcard read of a sensitive table -- `SELECT * FROM config`. The …104
+    #     builtin's rails are all spelled `SELECT <column>`, so without this the floor blocked
+    #     the NARROW read and allowed the strictly-WIDER one (floor gap A5(2)). Unconditional
+    #     for the same reason as 1d: a pulled policy set must not be able to shadow it.
+    #     Attributed to the Secrets and PII Exfiltration builtin so category + coaching match
+    #     the token rails it backstops.
+    if _detect_wildcard_sensitive_read(raw):
+        return _keyless_decision(_SECRETS_POLICY)
 
     # 2) Structural destructive-SQL FALLBACK for classes no flat token expresses
     #    (DROP of other objects, TRUNCATE, a no-WHERE mass UPDATE/DELETE). Reached only
