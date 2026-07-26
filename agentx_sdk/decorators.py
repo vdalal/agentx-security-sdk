@@ -18,7 +18,7 @@ from contextvars import ContextVar
 from .client import AgentXClient
 from .db import init_db, log_intercept, get_lifetime_stats, log_self_correction, WOULD_BLOCK_STATUS
 from . import pulse
-from .overrides import get_active_override
+from .overrides import get_active_override, count_reviewable
 
 
 # =====================================================================
@@ -914,11 +914,22 @@ def _print_agentx_summary():
     #     the nudge points devs at this session's freshly-harvested safe paths. ---
     if _session_stats.get("overrides_applied", 0) > 0:
         print(f" 🧭 Org Reframes Applied:  {_session_stats['overrides_applied']:<3} |  your adopted safe-paths replaced the generic challenge")
-    if len(_session_stats["recovered_traces"]) > 0:
+    # Count what's actually waiting in the incident store — blocks needing a verdict +
+    # reframes ready to adopt — and nudge toward the batched one-key review. Defensive
+    # (0 on any error / absent store), so a plain or keyless run stays clean and this
+    # atexit path never raises. Never prompts here — the review is a separate command.
+    _pending = count_reviewable()
+    if _pending > 0:
+        print("─"*60)
+        # "item(s)" not "block(s)": count_reviewable() spans BOTH kinds — blocks needing a
+        # verdict AND reframes ready to adopt — so naming only one under-describes the count.
+        print(f" 💡 {_pending} item(s) from your agents await a quick review —")
+        print("    label a block, or adopt a safe-path it learned:")
+        print("    ▶ agentx review")
+    elif len(_session_stats["recovered_traces"]) > 0:
         print("─"*60)
         print(" 💡 Your agents self-corrected this session — AgentX may have learned")
-        print("    reusable safe-paths (and detection rules, if rule harvest is on).")
-        print("    Review & adopt what it learned:  agentx insights")
+        print("    reusable safe-paths. Review & adopt what it learned:  agentx review")
     print(f" 💰 Tokens Saved:          ~{session_tokens:<3} |  Cumulative: ~{history.get('total_tokens', 0)}")
     print(f" ⏳ Time Saved:            ~{session_time} min |  Cumulative: ~{history.get('total_time', 0)} min")
 
@@ -1162,7 +1173,13 @@ _BUILTIN_POLICY_KEYWORDS = [
         "preferred_alternative": "Select only the non-PII fields you actually need. If you need a population-level answer, aggregate (COUNT or GROUP BY) instead of returning raw rows, or use masked or hashed columns.",
     },
     {
-        "id": "11111111-1111-1111-1111-111111111105",
+        # Realigned 2026-07-25 from ...105 to ...115 to match the gateway/DB canonical id
+        # (backend/gateway.py, db_migrations/seed.sql). ...105 collided with the gateway's
+        # OWN "Schema Boundary" policy (a real, later-added gateway-side policy, unrelated) --
+        # a keyless filesystem block could misattribute to Schema Boundary once it reached the
+        # cloud store. Tracked in backend/test_coaching_consistency.py's KNOWN_ID_DIVERGENCES
+        # ledger (now removed, closing the divergence).
+        "id": "11111111-1111-1111-1111-111111111115",
         "name": "Filesystem Path Boundary",
         "category": "DESTRUCTIVE_ACTION",
         # DETECTION SPLIT (audit finding #1): the ENTIRE filesystem-boundary floor --

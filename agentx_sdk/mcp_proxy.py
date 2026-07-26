@@ -1353,6 +1353,11 @@ def _protection_report(session_stats, log):
         if recovered_n or abandoned_n or halted_calls:
             print("[agentx-mcp]   -> %d recovered, %d still-open (abandoned), %d runaway-halted call(s)."
                   % (recovered_n, abandoned_n, halted_calls), file=log)
+        # Recovery nudge -> the unified review (twin of the decorator's `agentx review`
+        # nudge), so the MCP surface points at the same one-key adopt/label pass. `review`
+        # covers the keyless-MCP wedge's learned safe-paths too (cli._mcp_review_items).
+        if recovered_n:
+            print("[agentx-mcp]   -> adopt the safe-paths it learned (or label a block):  agentx review", file=log)
         # Shield failures: calls the shield could NOT screen because it threw. Surfaces
         # only when non-zero, so a healthy session stays quiet and this line stands out.
         # The MCP twin of the decorator's "Shield Fail-Opens" summary line -- BOTH

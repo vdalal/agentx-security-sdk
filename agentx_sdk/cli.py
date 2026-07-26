@@ -2,11 +2,21 @@ import os
 import sys
 import json
 import requests
+from datetime import datetime, timezone
 
 from .overrides import (harvest_candidates, load_overrides, adopt as adopt_override,
                         incident_db_census, enumerate_candidates,
                         list_customizable_policies, resolve_policy_by_name,
-                        get_active_override, _overrides_path)
+                        get_active_override, _overrides_path, _norm_for_dedup,
+                        record_outcome, list_recent_incidents,
+                        find_incidents_by_receipt_prefix,
+                        delete_incident, delete_incidents,
+                        reconcile_safe_paths, reviewable_items, labeled_items, label_stats,
+                        load_org_rules, apply_org_rules, apply_declared_verdicts,
+                        get_declared_verdict, set_declared_verdict,
+                        clear_declared_verdict, count_policy_verdict_evidence,
+                        count_policy_unlabeled_blocks,
+                        unlabel_declared_verdicts, _resolve_policy_ref)
 from .rules import harvest_rule_candidates, adopt_rule
 
 # Re-exported from the stdlib-only envfile module (kept importable here for
@@ -57,6 +67,7 @@ def _render_offline_dashboard(gateway_url, mode="local"):
         print("   Wrap a tool with @agentx_protect (or one line in mcp.json) and run your")
         print("   agent. Your catches and protection streak show up here.")
 
+    print("\n  " + "─" * 71)
     if local:
         print("\n  Want the full deterministic floor (AST + the whole failure catalog),")
         print("  coached recovery, and the live team dashboard? It runs locally, free:")
@@ -482,7 +493,12 @@ def execute_insights(args=None):
     # rows, so a normal enforce user never sees audit noise.
     from .db import get_would_block_summary
     audit = get_would_block_summary()
-    if audit["total"]:
+    # Gate on the CURRENT posture, not just the presence of rows: would-block rows are an
+    # AUDIT-mode artifact, and once the dev has flipped to enforce, both the "what WOULD have
+    # blocked" framing and the "flip to enforcing" nudge are stale / nonsensical (they are
+    # already enforcing). Same os.environ source the decorator's _resolve_enforcement reads.
+    in_audit = (os.environ.get("AGENTX_ENFORCEMENT") or "").strip().lower() == "audit"
+    if audit["total"] and in_audit:
         print("\n🔍 AUDIT MODE: what AgentX WOULD have blocked        (nothing was blocked)")
         print("=" * 75)
         print(f"  {audit['total']} action(s) recorded under AGENTX_ENFORCEMENT=audit, by policy:")
@@ -600,9 +616,11 @@ def execute_insights(args=None):
                 if rule.get("indicators"):
                     print(f"        indicators: {', '.join(rule['indicators'])}")
 
-    # One primary CTA; advanced forms demoted to a single dim line.
-    print("\n" + "=" * 75)
-    print(f"  ▶ Adopt the one you trust:   agentx adopt <#>{example}")
+    # Lead with the one-key review (lowest friction, and it covers verdicts too, not just
+    # adopt); the numbered `adopt <#>` stays as the precise "target a specific one" form.
+    print("\n  " + "─" * 71)
+    print("  ▶ Review & act on all of these, one key each:   agentx review")
+    print(f"       or adopt a specific one:  agentx adopt <#>{example}")
     print("       tweak first:  agentx adopt <#> --edit        write your own:  agentx adopt <id> --text \"…\"")
     if rule_list:
         print("       author a rule:  agentx adopt --rule --action <a> --desc \"…\"")
@@ -1247,6 +1265,740 @@ def _policies_check():
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# agentx review — the batched, one-key review of what your agents' blocks taught
+# AgentX (the label channel's PRIMARY capture path). Reconciles safe-paths, then
+# walks each pending item: adopt a learned reframe, or record a verdict on a block.
+# Never interrupts a run — the session summary just COUNTS and points here.
+# ---------------------------------------------------------------------------
+_VERDICT_KEYS = {"c": "TRUE_POSITIVE", "w": "FALSE_POSITIVE", "a": "ACCEPTED_RISK"}
+
+
+def _relative_age(iso_ts):
+    """A short 'N days ago' rendering of an ISO timestamp for review context — a receipt id
+    alone gives a user nothing to go on days later. Best-effort: falls back to the raw string
+    on any parse error, and to a plain placeholder when absent, so a malformed/missing
+    timestamp never breaks the walkthrough."""
+    if not iso_ts:
+        return "at an unknown time"
+    try:
+        ts = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - ts
+        days = delta.days
+        if days >= 1:
+            return f"{days} day{'s' if days != 1 else ''} ago"
+        hours = delta.seconds // 3600
+        if hours >= 1:
+            return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        return "less than an hour ago"
+    except (ValueError, TypeError):
+        return str(iso_ts)
+
+
+def _render_payload(raw):
+    """Best-effort rendering of a stored raw_payload (JSON-encoded, arbitrary tool-call args)
+    for review context — the agent's ATTEMPTED action, as opposed to the challenge AgentX
+    issued back. Falls back to the raw string on anything that doesn't decode to a dict, so
+    a malformed/legacy payload never breaks the walkthrough."""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (ValueError, TypeError):
+        return str(raw)
+    if isinstance(data, dict):
+        return ", ".join(f"{k}={v}" for k, v in data.items())
+    return str(data)
+
+
+# Every wrapped field in a review item shares this fixed label width, so the actual VALUE
+# text starts at the SAME column regardless of which label precedes it -- "agent's stated
+# intent:" (the longest) would otherwise push its value further right than "challenge
+# shown:" or "recovered via:", raggeding the left edge of the content down the page.
+_REVIEW_FIELD_LABELS = ("recovered via:", "agent's stated intent:", "attempted action:",
+                        "challenge shown:", "safe path so far:", "current verdict:")
+_REVIEW_LABEL_WIDTH = max(len(l) for l in _REVIEW_FIELD_LABELS)
+
+
+def _field(label):
+    return f"   {label:<{_REVIEW_LABEL_WIDTH}}  "
+
+
+def _print_review_item(n, total, it):
+    label = it.get("policy_violated") or it.get("policy_id") or "policy"
+    if it["kind"] == "adopt":
+        print(f"\n[{n}/{total}] RECOVERY · {label}")
+        print(_wrap(it.get("suggestion", ""), _field("recovered via:")))
+        if (it.get("count") or 1) > 1:
+            print(f"   (the agent found this {it['count']}x)")
+        return
+    if it.get("mcp"):
+        print(f"\n[{n}/{total}] VERDICT · {label}")
+        print("   policy-level verdict for the keyless-MCP wedge (no per-block receipt)")
+        return
+    count = it.get("count") or 1
+    header = f"VERDICT ({count} blocks)" if it["kind"] == "verdict_group" else "VERDICT"
+    print(f"\n[{n}/{total}] {header} · {label}")
+    print(f"   blocked {_relative_age(it.get('created_at'))} — receipt {it.get('receipt_id', '')}"
+          f"  (status: {it.get('status')})"
+          + (f"   (showing the most recent of {count})" if it["kind"] == "verdict_group" else ""))
+    if it.get("agent_cot"):
+        print(_wrap(it["agent_cot"], _field("agent's stated intent:")))
+    payload = _render_payload(it.get("raw_payload"))
+    if payload:
+        print(_wrap(payload, _field("attempted action:")))
+    if it.get("challenge_issued"):
+        print(_wrap(it["challenge_issued"], _field("challenge shown:")))
+    if it.get("label_safe_path"):
+        print(f"{_field('safe path so far:')}{it['label_safe_path']}")
+    if it.get("label_verdict"):
+        print(f"{_field('current verdict:')}{it['label_verdict']}  (choosing again overwrites this)")
+
+
+def _mcp_review_items():
+    """Keyless-MCP wedge recoveries as review 'adopt' items — parity with `insights`, so
+    `agentx review` covers the MCP loop too, not just the incidents.db loop. Empty (never
+    raises) when MCP harvest is off / there is no corpus; skips a policy already carrying an
+    active override. Lives in the CLI layer because overrides.py stays free of the mcp_proxy
+    import (its subprocess/threading must not load on every `agentx` command).
+
+    ONE adopt item per policy (the top-recurrence signature — `mcp_flat` is already sorted
+    highest-count-first per policy bucket, so the first occurrence IS that one), mirroring
+    `reviewable_items`'s dedup: only one override can be active per policy, so offering every
+    surviving (tool, action, scope) signature as an independent decision just means each
+    adopted one clobbers the last."""
+    try:
+        _h, _r, _rules, mcp_flat = _collect_candidates()
+    except Exception:
+        return []
+    out = []
+    seen_adopt = set()
+    seen_verdict = set()
+    for m in mcp_flat:
+        pid = m.get("policy_id")
+        pviol = m.get("policy_violated")
+        akey = pid or pviol
+        # (1) adopt the learned reframe (unless the policy already carries an override).
+        if (akey and akey not in seen_adopt and pid and m.get("suggestion")
+                and not get_active_override(pid, policy_name=pviol)):
+            seen_adopt.add(akey)
+            out.append({
+                "kind": "adopt", "policy_id": pid, "policy_violated": pviol,
+                "suggestion": m.get("suggestion"),
+                "resolution_type": m.get("resolution_type"),
+                "count": m.get("count", 1),
+            })
+        # (2) verdict the POLICY — the MCP wedge has no per-block receipt, so its verdict is
+        # policy-level. One item per policy, skipped once a verdict is already declared.
+        vkey = pid or pviol
+        if vkey and vkey not in seen_verdict and not get_declared_verdict(pid, pviol):
+            seen_verdict.add(vkey)
+            out.append({"kind": "verdict", "policy_id": pid, "policy_violated": pviol, "mcp": True})
+    return out
+
+
+def _print_review_stats():
+    """`agentx review --stats` — where the label channel stands across EVERY incident in
+    the store, not just what's still pending (that's the walkthrough above). It never PROMPTS
+    (safe to run in any context, tty or not), but it is NOT a pure read: it first reconciles
+    the derived safe-path labels (writing label_safe_path from trace history) so the HELD/
+    FAILED counts are current. That write is idempotent, deterministic bookkeeping — never a
+    human decision — so re-running is harmless, but a truly read-only caller should know a
+    reconcile write happens here."""
+    reconcile_safe_paths()                  # freshen derived safe-path labels before summarizing
+    census = incident_db_census()
+    stats = label_stats()
+    print("\n📊 Label channel — outcome summary")
+    print("=" * 75)
+    if not census["exists"] or stats["total"] == 0:
+        print("   No incidents recorded yet — nothing to summarize.")
+        if not census["exists"]:
+            print(f"   (no incident store yet at {census['path']})")
+        print("=" * 75)
+        return
+    v, sp, h = stats["verdict"], stats["safe_path"], stats["harm"]
+    print(f"   {stats['total']} incident(s) in the store")
+    print("\n   Verdict    (was the block right?)")
+    print(f"     ✓ correct:         {v['TRUE_POSITIVE']}")
+    print(f"     ✗ false positive:  {v['FALSE_POSITIVE']}")
+    print(f"     ~ accepted risk:   {v['ACCEPTED_RISK']}")
+    print(f"     ?  unlabeled:      {v['unlabeled']}")
+    print("\n   Safe path  (did the reframe hold?)")
+    print(f"     held:              {sp['HELD']}")
+    print(f"     failed:            {sp['FAILED']}")
+    print(f"     n/a:               {sp['n/a']}")
+    if h["HARM"] or h["NO_HARM"]:
+        print("\n   Harm       (partner outcome / eval judge)")
+        print(f"     harm:              {h['HARM']}")
+        print(f"     no harm:           {h['NO_HARM']}")
+        print(f"     unknown:           {h['unknown']}")
+    print(f"\n   {stats['blocking_open']} block(s) still awaiting a verdict —  agentx review")
+    print("=" * 75)
+
+
+def _identity_keys(it):
+    """The identity signals on a verdict item: its normalized name and its policy_id, when
+    present. Order matters: name first, since it's the more stable cross-path key."""
+    keys = []
+    name = _norm_for_dedup(it.get("policy_violated"))
+    if name:
+        keys.append(("name", name))
+    if it.get("policy_id"):
+        keys.append(("id", it["policy_id"]))
+    return keys
+
+
+def _group_verdict_items(items):
+    """Collapse multiple per-receipt VERDICT items on the SAME policy into one batch-decision
+    item. A real corpus surfaced 190+ individual receipts on a couple of hot policies -- each
+    an independent yes/no when a human almost always wants to answer ONCE per policy, not
+    scroll through near-identical prompts. Singletons (a policy with exactly one open block)
+    and MCP policy-level verdicts (already one-per-policy) pass through unchanged. Ordering
+    is preserved: a group appears at the position of its first-seen item.
+
+    Grouped by a UNION over (normalized name, policy_id): two rows merge if they share
+    EITHER signal. This closes identity drift in BOTH directions -- the same logical policy
+    can carry a DIFFERENT id across the SDK's two block paths (the Layer-0 keyword shield's
+    seed UUID vs the gateway/judge id, the cross-path flicker get_active_override already
+    guards against), and separately, the SAME policy_id can carry a DIFFERENT name after a
+    rename (e.g. a gateway policy renamed post-launch, its older incidents still carrying
+    the old name). Grouping on just one signal silently splits what is really one policy
+    into two "different" groups whenever the other signal also varies."""
+    parent = {}
+
+    def find(k):
+        parent.setdefault(k, k)
+        while parent[k] != k:
+            parent[k] = parent.get(parent[k], parent[k])
+            k = parent[k]
+        return k
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    verdict_only = [it for it in items if it["kind"] == "verdict" and not it.get("mcp")]
+    for it in verdict_only:
+        keys = _identity_keys(it)
+        for k in keys[1:]:
+            union(keys[0], k)
+
+    def group_key(it):
+        keys = _identity_keys(it)
+        return find(keys[0]) if keys else ("solo", id(it))
+
+    slots = []
+    group_by_key = {}
+    for it in items:
+        if it["kind"] != "verdict" or it.get("mcp"):
+            slots.append(it)
+            continue
+        key = group_key(it)
+        g = group_by_key.get(key)
+        if g is None:
+            g = {"kind": "verdict_group", "policy_id": it.get("policy_id"),
+                 "policy_violated": it.get("policy_violated"), "items": []}
+            group_by_key[key] = g
+            slots.append(g)
+        g["items"].append(it)
+    out = []
+    for it in slots:
+        if it.get("kind") != "verdict_group":
+            out.append(it)
+            continue
+        if len(it["items"]) == 1:
+            out.append(it["items"][0])
+            continue
+        rep = it["items"][0]   # most recent (list_recent_incidents is newest-first)
+        it.update({"count": len(it["items"]), "created_at": rep.get("created_at"),
+                   "challenge_issued": rep.get("challenge_issued"), "agent_cot": rep.get("agent_cot"),
+                   "raw_payload": rep.get("raw_payload"), "receipt_id": rep.get("receipt_id"),
+                   "status": rep.get("status"), "label_verdict": rep.get("label_verdict")})
+        out.append(it)
+    return out
+
+
+def _prompt_single_verdict(it):
+    """One receipt, one verdict (or a delete). Returns "labeled", "deleted", or None (skipped).
+    No capitalized default shown -- there IS no safe default for a human call on whether a
+    block was right, so Enter honestly means skip, not a guess. Delete has no MCP form (a
+    policy-level MCP verdict carries no receipt_id -- nothing to delete)."""
+    q = ("   were blocks on this policy right? [c]orrect / [w]rong / [a]ccept-risk / [s]kip / [q]uit: "
+         if it.get("mcp") else
+         "   was the block right? [c]orrect / [w]rong / [a]ccept-risk / [d]elete / [s]kip / [q]uit: ")
+    raw = input(q)
+    ans = raw.strip().lower()
+    if ans == "q":
+        raise _ReviewQuit()
+    if ans == "d" and not it.get("mcp"):
+        delete_incident(it["receipt_id"])
+        print("   ✓ deleted — removed from the local store, not just skipped")
+        return "deleted"
+    verdict = _VERDICT_KEYS.get(ans[:1])
+    if not verdict:
+        print("   – skipped")
+        return None
+    if it.get("receipt_id"):
+        record_outcome(it["receipt_id"], verdict=verdict, source="human")   # per-block (incidents.db)
+    else:
+        set_declared_verdict(it.get("policy_id"), verdict,          # per-policy (MCP wedge)
+                             policy_name=it.get("policy_violated"))
+    print(f"   ✓ labeled {verdict}")
+    return "labeled"
+
+
+class _ReviewQuit(Exception):
+    """Raised by the 'q' keystroke, at any nesting level, to stop the whole walkthrough."""
+
+
+def _print_review_help():
+    print("\nUsage:  agentx review [--stats | --recover | --block | --labeled | -h]")
+    print("=" * 75)
+    print("  (no flags)   walk every pending item -- recoveries to adopt + blocks needing a verdict")
+    print("  --recover    only the pending RECOVERY items (learned safe-paths ready to adopt)")
+    print("  --block      only the pending VERDICT items (blocks awaiting a human call)")
+    print("  --labeled    RE-REVIEW items that already have a verdict -- pick again to overwrite it")
+    print("  --stats      a summary across every incident in the store, not just what's pending")
+    print("  -h / --help  show this message")
+    print()
+    print("  In a terminal, each item is one keystroke:")
+    print("    RECOVERY item     [Y]es adopt / [n]o / [s]kip / [q]uit")
+    print("    VERDICT item      [c]orrect / [w]rong / [a]ccept-risk / [d]elete / [s]kip / [q]uit")
+    print("    a GROUP of blocks on one policy also offers:")
+    print("      [c]orrect-all / [w]rong-all / [a]ccept-risk-all / [d]elete-all / [i]ndividually")
+    print()
+    print("  Piped / non-interactive (CI, a script): lists pending items and never prompts.")
+    print()
+    print("  Change a POLICY's STANDING rule directly (works even with no items shown here):")
+    print("    agentx verdict --policy \"<name>\" --correct|--wrong|--accept-risk|--clear")
+    print("=" * 75)
+
+
+def execute_review(args=None):
+    """`agentx review` — the batched, one-key review of the label channel, covering BOTH the
+    incidents.db loop and the keyless-MCP wedge. Reconciles safe-paths, gathers pending items
+    (recoveries to adopt + blocks needing a verdict), groups repeat per-receipt verdicts on the
+    same policy into one batch decision, then walks each with a single keystroke.
+    Non-interactive (piped / CI): prints the list and exits WITHOUT prompting, so it never
+    blocks an automated run. ``--stats`` prints a summary across every incident instead.
+    ``--recover`` / ``--block`` narrow the walkthrough to just one kind of item, for a store
+    with enough of one kind that mixing them in is more scrolling than deciding. ``--labeled``
+    re-opens items that already have a verdict, so a past call is never a dead end."""
+    args = args or []
+    if any(a in ("-h", "--help", "help", "?") for a in args):
+        _print_review_help()
+        return
+    if "--stats" in args:
+        _print_review_stats()
+        return
+    reconcile_safe_paths()                 # refresh safe-path labels before we show them
+    apply_declared_verdicts()              # auto-label blocks the org's rules pre-declared
+    if "--labeled" in args:
+        items = labeled_items()
+    else:
+        items = reviewable_items() + _mcp_review_items()
+        if "--recover" in args:
+            items = [it for it in items if it["kind"] == "adopt"]
+        elif "--block" in args:
+            items = [it for it in items if it["kind"] == "verdict"]
+    items = _group_verdict_items(items)
+    if not items:
+        census = incident_db_census()
+        print("\n✅ Nothing to review — no blocks awaiting a verdict, no new safe-paths to adopt.")
+        if not census["exists"]:
+            print(f"   (no incident store yet at {census['path']} — blocks appear here once the")
+            print("    gateway records them; keyless Shield runs keep local stats in `agentx status`.)")
+        print("=" * 75)
+        return
+
+    if not sys.stdin.isatty():
+        # Automated / piped: show the list, never block on input.
+        print(f"\n📋 {len(items)} item(s) await review — run `agentx review` at a terminal to act:")
+        for n, it in enumerate(items, 1):
+            _print_review_item(n, len(items), it)
+        print("=" * 75)
+        return
+
+    print(f"\n📋 {len(items)} item(s) to review — one key each. Enter accepts the CAPITALIZED"
+          " default where one is shown; 'q' stops here and leaves the rest untouched.")
+    adopted = labeled = deleted = 0
+    for n, it in enumerate(items, 1):
+        _print_review_item(n, len(items), it)
+        try:
+            if it["kind"] == "adopt":
+                raw = input("   teach this recovery? [Y]es / [n]o / [s]kip / [q]uit: ")
+                if raw.strip().lower() == "q":
+                    raise _ReviewQuit()
+                ans = raw.strip().lower()
+                if ans in ("", "y", "yes"):
+                    adopt_override(it["policy_id"], challenge=it.get("suggestion") or "",
+                                   resolution_type=it.get("resolution_type"),
+                                   policy_violated=it.get("policy_violated"), source="review")
+                    adopted += 1
+                    print("   ✓ adopted — it will coach your agents on the next block")
+                else:
+                    print("   – skipped")
+            elif it["kind"] == "verdict_group":
+                count = it["count"]
+                print(f"   {count} blocks on this policy await a verdict.")
+                raw = input(f"   declare ONE verdict for all {count}, or go one at a time?"
+                            " [c]orrect-all / [w]rong-all / [a]ccept-risk-all / [d]elete-all"
+                            " / [i]ndividually / [s]kip / [q]uit: ")
+                ans = raw.strip().lower()
+                if ans == "q":
+                    raise _ReviewQuit()
+                if ans == "i":
+                    for sub in it["items"]:
+                        _print_review_item(1, 1, sub)
+                        outcome = _prompt_single_verdict(sub)
+                        if outcome == "labeled":
+                            labeled += 1
+                        elif outcome == "deleted":
+                            deleted += 1
+                    continue
+                if ans == "d":
+                    # Deliberately scoped to exactly the receipts shown in this group (see
+                    # delete_incidents) -- unlike batch labeling, deletion is irreversible,
+                    # so it must never reach beyond what the human actually saw.
+                    n_deleted = delete_incidents([sub["receipt_id"] for sub in it["items"]])
+                    deleted += n_deleted
+                    print(f"   ✓ deleted {n_deleted} block(s) for this policy")
+                    continue
+                verdict = _VERDICT_KEYS.get(ans[:1])
+                if verdict:
+                    # 1. Label every VISIBLE receipt DIRECTLY -- guaranteed, regardless of any
+                    #    policy_id/name variation among them. A name/id-keyed declared verdict
+                    #    alone is not enough: it only reaches rows matching ONE identity, and a
+                    #    group can span several (the keyword-shield-vs-gateway id flicker, OR a
+                    #    historical policy rename leaving the same policy_id under two names) --
+                    #    a batch answer must never leave something you just saw unlabeled.
+                    direct = sum(1 for sub in it["items"] if sub.get("receipt_id")
+                                and record_outcome(sub["receipt_id"], verdict=verdict, source="human"))
+                    # 2. Declare under EVERY distinct identity actually seen in this group (not
+                    #    just the representative's), so apply_declared_verdicts' broader sweep
+                    #    (beyond the display window) can match a row carrying ANY of them.
+                    for nm in {s.get("policy_violated") for s in it["items"] if s.get("policy_violated")}:
+                        set_declared_verdict(nm, verdict, policy_name=nm)
+                    for pid in {s.get("policy_id") for s in it["items"] if s.get("policy_id")}:
+                        set_declared_verdict(pid, verdict)
+                    swept = apply_declared_verdicts()   # skips the already-labeled direct ones
+                    total = direct + swept
+                    labeled += total
+                    print(f"   ✓ labeled {verdict} on {total} block(s) for this policy")
+                    # A batch answer is a standing decision — disclose it (parity with
+                    # `verdict --policy`, which is explicit about the forward effect).
+                    print(f"     (future blocks on this policy get {verdict} too; change or"
+                          " clear it with `agentx verdict --policy`)")
+                else:
+                    print("   – skipped (all)")
+            else:
+                outcome = _prompt_single_verdict(it)
+                if outcome == "labeled":
+                    labeled += 1
+                elif outcome == "deleted":
+                    deleted += 1
+        except _ReviewQuit:
+            remaining = len(items) - n + 1
+            print(f"   – stopping; {remaining} remaining item(s) untouched.")
+            break
+        except (EOFError, KeyboardInterrupt):
+            print("\n   (stopped — nothing further changed)")
+            break
+    rec_word = "recovery" if adopted == 1 else "recoveries"
+    print(f"\n✓ Review done: {adopted} {rec_word} adopted, {labeled} block(s) labeled, "
+          f"{deleted} block(s) deleted.")
+    print("=" * 75)
+
+
+# ---------------------------------------------------------------------------
+# agentx rules — the org rules file (.agentx/rules.json) cold-start seed. Plain-language
+# reframes + pre-declared verdicts, human-authored so poisoning-safe; reframe-and-label
+# only (a loosening rule is rejected). `check` validates + previews (safe in any mode);
+# `apply` ingests into the override store.
+# ---------------------------------------------------------------------------
+_RULES_TEMPLATE = '''{
+  "reframes": [
+    { "policy": "Mass Destructive Intent",
+      "safe_path": "Use a soft delete (UPDATE ... SET deleted=1); never DROP a live table" }
+  ],
+  "verdicts": [
+    { "policy": "Budget Ceiling Approval", "verdict": "ACCEPTED_RISK",
+      "note": "our nightly batch legitimately spends above the soft ceiling" }
+  ]
+}'''
+
+
+def execute_rules(args):
+    """`agentx rules check | apply` — seed the org brain from .agentx/rules.json before any
+    harvest data exists. check = validate + dry-run preview (safe in audit or enforce);
+    apply = ingest reframes (become active overrides) + verdicts (pre-label matching blocks)."""
+    sub = (args[0].lower() if args else "check")
+    if sub not in ("check", "apply"):
+        print("\n⚠️  Usage:")
+        print("   agentx rules check   validate + preview .agentx/rules.json (dry-run, any mode)")
+        print("   agentx rules apply   ingest its reframes + verdicts into your override store")
+        print("=" * 75)
+        sys.exit(2)
+
+    rules, errors = load_org_rules()
+    if errors:
+        print("\n❌ .agentx/rules.json has problems (nothing was applied):")
+        for e in errors:
+            print(f"   • {e}")
+        print("=" * 75)
+        sys.exit(1)
+    if not rules:
+        print("\n📄 No .agentx/rules.json yet. It seeds your org's safe-paths + known verdicts")
+        print("   before any recovery data exists. A starter (reframe-and-label only):\n")
+        print(_RULES_TEMPLATE)
+        print("\n   Save it to .agentx/rules.json, then:  agentx rules apply")
+        print("=" * 75)
+        return
+
+    reframes = rules.get("reframes") or []
+    verdicts = rules.get("verdicts") or []
+    print(f"\n📋 .agentx/rules.json — {len(reframes)} reframe(s), {len(verdicts)} verdict(s):")
+    for r in reframes:
+        print(_wrap(r.get("safe_path") or r.get("challenge") or "", f"   reframe · {r['policy']}: "))
+    for v in verdicts:
+        note = f"  ({v['note']})" if v.get("note") else ""
+        print(f"   verdict · {v['policy']} = {v['verdict']}{note}")
+
+    if sub == "check":
+        print("\n✓ Valid. Run `agentx rules apply` to ingest (nothing changed yet).")
+        print("=" * 75)
+        return
+
+    summary = apply_org_rules()
+    print(f"\n✓ Applied: {summary['reframes_adopted']} reframe(s) adopted, "
+          f"{summary['verdicts_declared']} verdict(s) declared, "
+          f"{summary['blocks_labeled']} existing block(s) pre-labeled.")
+    print("   Reframes now coach your agents; declared verdicts skip those blocks in review.")
+    print("=" * 75)
+
+
+# ---------------------------------------------------------------------------
+# agentx verdict — record a human VERDICT on a block (the outcome/label channel).
+# The primary capture path is `agentx review`; this is the escape hatch for a
+# specific receipt / scripting. Writes the verdict to the same incident store the
+# gateway populates.
+# ---------------------------------------------------------------------------
+_VERDICT_FLAGS = {
+    "--wrong": "FALSE_POSITIVE",       # a false block — a defect signal
+    "--accept-risk": "ACCEPTED_RISK",  # the block was right; proceeding anyway (NOT a defect)
+    "--correct": "TRUE_POSITIVE",      # the block was right
+}
+
+
+_VERDICT_FLAG_BY_VERDICT = {v: k for k, v in _VERDICT_FLAGS.items()}
+
+
+def _verdict_usage_exit():
+    print("\n⚠️  Usage:")
+    print("   Label ONE block (by receipt id):")
+    print("     agentx verdict <receipt_id> --wrong | --accept-risk | --correct")
+    print("   Change/clear a POLICY's STANDING rule (also governs FUTURE blocks):")
+    print("     agentx verdict --policy \"<name>\" --wrong | --accept-risk | --correct [--force]")
+    print("     agentx verdict --policy \"<name>\" --clear     stop auto-labeling; future blocks re-surface")
+    print("     agentx verdict --policy \"<name>\"             show the current standing rule")
+    print("   --force sets a standing rule even when few labeled blocks support it — a")
+    print("   deliberate call on limited data. Receipt ids prefix-match; see pending blocks:")
+    print("     agentx review")
+    print("=" * 75)
+    sys.exit(2)
+
+
+def _resolve_policy_target(ref):
+    """Map a user-typed policy ref (a built-in NAME or a raw policy id, as shown by
+    ``agentx review`` / ``agentx policies``) to ``(policy_id, policy_name, known)``. ``known``
+    is True only when the ref matches a built-in policy OR a policy actually present in the
+    local incident store — so a typo can't silently mint a junk standing rule when SETTING."""
+    pid, pname = _resolve_policy_ref(ref)          # built-in name -> (id, name); else (ref, None)
+    if pname is not None:
+        return pid, pname, True
+    target = _norm_for_dedup(ref)
+    for r in list_recent_incidents(limit=100000):
+        if r.get("policy_id") == ref or _norm_for_dedup(r.get("policy_violated") or "") == target:
+            return r.get("policy_id") or ref, r.get("policy_violated") or None, True
+    return ref, None, False
+
+
+def _verdict_policy(ref, verdict, do_clear, force):
+    """The --policy grain of `agentx verdict`: change / clear / show a policy's STANDING
+    rule (the declared verdict apply_declared_verdicts uses to auto-label blocks). Directly
+    reachable regardless of how many blocks are in front of you — the gap the per-item review
+    flow can't close (a single-item correction moves only that row, and a quiet policy shows
+    no items at all)."""
+    pid, pname, known = _resolve_policy_target(ref)
+    label = pname or ref
+
+    if do_clear:
+        if verdict is not None:
+            print("\n❌ Use EITHER --clear OR a verdict flag, not both.")
+            _verdict_usage_exit()
+        removed = clear_declared_verdict(policy_id=pid, policy_name=pname)
+        # Provenance lets us undo exactly what the rule stamped: re-surface the blocks it
+        # auto-labeled (source 'declared'), never the human calls (source 'human').
+        resurfaced = unlabel_declared_verdicts(policy_id=pid, policy_name=pname)
+        if removed:
+            print(f"\n✓ Cleared the standing rule ({removed}) on '{label}'.")
+        elif resurfaced:
+            print(f"\n✓ Cleared {resurfaced} rule-applied label(s) on '{label}'.")
+        else:
+            print(f"\n– No standing rule set on '{label}' — nothing to clear.")
+            print("=" * 75)
+            return
+        if resurfaced:
+            print(f"   Re-surfaced {resurfaced} block(s) the rule had auto-labeled — they")
+            print("   return to `agentx review`. Your OWN verdicts (human calls) are kept.")
+        else:
+            print("   Future blocks on this policy re-surface for review instead of being")
+            print("   auto-labeled.")
+        print("=" * 75)
+        return
+
+    if verdict is None:                            # bare `--policy "<name>"` -> show
+        current = get_declared_verdict(pid, pname)
+        if current:
+            print(f"\n📋 Standing rule on '{label}': {current}")
+            print("   Auto-labels future blocks on this policy. Change it with a verdict flag,")
+            print("   remove it with --clear.")
+        else:
+            print(f"\n📋 No standing rule on '{label}'.")
+        print("=" * 75)
+        return
+
+    # set / change
+    if not known:
+        print(f"\n❌ No policy named or id '{ref}' in your catalog or incident store.")
+        print("   Check the exact name in `agentx review` / `agentx policies`.")
+        print("=" * 75)
+        sys.exit(1)
+    evidence = count_policy_verdict_evidence(policy_id=pid, policy_name=pname, verdict=verdict)
+    if evidence < 2 and not force:
+        flag = _VERDICT_FLAG_BY_VERDICT[verdict]
+        print(f"\n⚠️  Only {evidence} labeled block(s) on '{label}' support {verdict} —")
+        print("   a standing rule normally reflects a PATTERN of blocks, not one example.")
+        print("   Re-run with --force to set it from limited data:")
+        print(f"     agentx verdict --policy \"{label}\" {flag} --force")
+        print("=" * 75)
+        sys.exit(1)
+    prev = get_declared_verdict(pid, pname)
+    # Count THIS policy's pending blocks before applying — apply_declared_verdicts() is
+    # store-wide (it labels every policy carrying a declared verdict), so its return value
+    # would over-count and misattribute other policies' blocks to this one.
+    mine = count_policy_unlabeled_blocks(pid, pname)
+    set_declared_verdict(pid, verdict, policy_name=pname)
+    # Also declare under the raw NAME (mirrors the batch-review path): the same logical policy
+    # can carry blocks under DIFFERENT policy_ids with this name (the cross-path flicker), and
+    # a name-key lets apply_declared_verdicts reach ALL of them via get_declared_verdict's
+    # raw-name check -- matching what count_policy_unlabeled_blocks counts, so `mine` can't
+    # over-report and no same-name block is left unlabeled.
+    if pname:
+        set_declared_verdict(pname, verdict)
+    apply_declared_verdicts()
+    if prev and prev != verdict:
+        print(f"\n✓ Changed the standing rule on '{label}': {prev} → {verdict}.")
+    elif prev == verdict:
+        print(f"\n✓ Standing rule on '{label}' is {verdict} (unchanged).")
+    else:
+        print(f"\n✓ Set the standing rule on '{label}': {verdict}.")
+    print(f"   Auto-labeled {mine} pending block(s) on this policy; future blocks get this")
+    print("   verdict too. Change it with another verdict, remove it with --clear.")
+    print("=" * 75)
+
+
+def execute_verdict(args):
+    """Record a human VERDICT — the label channel's escape hatch, at two grains:
+      • per BLOCK:   agentx verdict <receipt> --wrong|--accept-risk|--correct
+      • per POLICY:  agentx verdict --policy "<name>" --wrong|--accept-risk|--correct [--force]
+                     agentx verdict --policy "<name>" --clear   (remove the standing rule)
+                     agentx verdict --policy "<name>"           (show the standing rule)
+    A per-block verdict labels that one receipt (record_outcome). A per-policy verdict is the
+    STANDING rule apply_declared_verdicts uses to auto-label current-unlabeled AND future
+    blocks — the direct way to change or clear it no matter how many blocks are in front of
+    you. Setting one from thin evidence (<2 agreeing labeled blocks) requires --force. The
+    verdict is a human judgment (never auto-inferred), so every grain is an explicit gesture;
+    batched `agentx review` is the friendlier primary path."""
+    args = args or []
+    receipt = policy_ref = None
+    verdict = None
+    do_clear = force = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in _VERDICT_FLAGS:
+            if verdict is not None:
+                print("\n❌ Pass exactly one verdict flag.")
+                _verdict_usage_exit()
+            verdict = _VERDICT_FLAGS[tok]
+            i += 1
+        elif tok == "--policy":
+            if i + 1 >= len(args):
+                print("\n❌ --policy needs a policy name or id.")
+                _verdict_usage_exit()
+            policy_ref = args[i + 1]
+            i += 2
+        elif tok == "--clear":
+            do_clear = True
+            i += 1
+        elif tok == "--force":
+            force = True
+            i += 1
+        elif tok == "--reason":
+            # Accepted for ergonomics but NOT stored — the incident row stays de-identified.
+            # Consume the following token as its value ONLY if that token isn't itself a flag,
+            # so `verdict <rec> --reason --wrong` can't swallow the verdict flag as the reason.
+            i += 2 if (i + 1 < len(args) and not args[i + 1].startswith("--")) else 1
+        elif tok.startswith("--"):
+            print(f"\n❌ Unknown option '{tok}'.")
+            _verdict_usage_exit()
+        else:
+            if receipt is not None:
+                print(f"\n❌ Unexpected extra argument '{tok}'.")
+                _verdict_usage_exit()
+            receipt = tok
+            i += 1
+
+    if policy_ref and receipt:
+        print("\n❌ Use EITHER a receipt id OR --policy, not both.")
+        _verdict_usage_exit()
+    if not policy_ref and (do_clear or force):
+        print("\n❌ --clear / --force apply only to --policy.")
+        _verdict_usage_exit()
+
+    if policy_ref:
+        _verdict_policy(policy_ref, verdict, do_clear, force)
+        return
+
+    # ---- per-block path ----
+    if not receipt or verdict is None:
+        _verdict_usage_exit()
+
+    matches = find_incidents_by_receipt_prefix(receipt)
+    if not matches:
+        print(f"\n❌ No block found for receipt '{receipt}'.")
+        print("   See recent blocks with:  agentx review")
+        print("=" * 75)
+        sys.exit(1)
+    if len(matches) > 1:
+        print(f"\n❌ '{receipt}' matches {len(matches)} blocks — use more of the receipt id.")
+        print("=" * 75)
+        sys.exit(1)
+
+    rid = matches[0]["receipt_id"]
+    if record_outcome(rid, verdict=verdict, source="human"):
+        print(f"\n✓ Recorded verdict {verdict} on block {rid}.")
+        print("=" * 75)
+    else:
+        print("\n❌ Could not record the verdict (incident store missing or not writable).")
+        print("=" * 75)
+        sys.exit(1)
+
+
 def _customize_usage_exit():
     print("\n⚠️  Usage:")
     print("   agentx customize \"<policy name>\" --text \"<coaching>\"   set the coaching inline")
@@ -1590,46 +2342,33 @@ def _demo_next_steps(mcp):
     or None. Split out so the MCP-vs-decorator branch is unit-testable without running the
     whole demo.
 
-    ONE primary next step (protect a real surface, framed so the protection streak GROWS —
-    the return hook the post-demo funnel was missing) plus audit as the safe-first variant,
-    then a single Discord support line. Deliberately NOT here: Recover is already taught in
-    the 'What this shows' paragraph, so it is not repeated as a competing CTA; and
+    ONE primary next step: try it on YOUR surface in AUDIT mode — it blocks nothing and
+    records what it WOULD catch, the risk-free on-ramp. Deliberately a single CTA + one
+    support line: the demo is the FIRST surface, so it must not scatter attention across
+    competing next steps. Recover is already taught in the 'What this shows' paragraph;
     `agentx share` is omitted because the demo's catch is SYNTHETIC (identical every run),
-    not a unique war-story worth posting. The MCP branch says 'Have {name}?' rather than
-    'You're running {name}' — the detector only found a client CONFIG on disk, which does
-    not mean the dev ran the demo from that client (they may be evaluating the Python SDK)."""
+    not a war story. The MCP branch fronts a real server; None is the Python decorator."""
     lines = []
     if mcp:
         name, cfg = mcp
         lines += [
-            f" Have {name}? Protect a REAL MCP server the same way: one line, no code, no key.",
-            f"   In {cfg}, front any server's command with agentx-mcp:",
-            '       "command": "agentx-mcp",',
-            '       "args": ["npx", "-y", "your-mcp-server", "..."]',
-            f" 1 ▶ Then use {name} as usual. Every real tool call is screened, and your",
-            "     protection streak grows each session:  agentx status",
-            " 2 ▶ Not sure it's safe to enforce on a real server? Front it in audit first:",
-            "       AGENTX_ENFORCEMENT=audit   (records what it WOULD block, blocks nothing)",
-            "     Then see what it caught, risk-free:  agentx insights",
-            " ▶ Prefer to wrap Python tools directly?  https://agentx-core.com/docs",
+            " Try it on your own tools, risk-free — AUDIT mode records what it WOULD block,",
+            f"   and blocks nothing. Front any MCP server in {cfg}:",
+            '       "command": "agentx-mcp",  "args": ["npx", "-y", "your-mcp-server", "..."]',
+            "       AGENTX_ENFORCEMENT=audit",
+            f"   Use {name} as usual, then see what it caught:  agentx insights",
         ]
     else:
         lines += [
-            " 1 ▶ Protect your own agent. Wrap any tool, then coach and retry on a block:",
-            "       from agentx_sdk import agentx_protect, is_block",
-            '       @agentx_protect(agent_id="my_agent")',
-            "       def your_tool(arg): ...",
-            "       out = your_tool(risky_input)",
-            "       if is_block(out):",
-            "           revised = your_llm(out.challenge)   # coach it to a safe path",
-            "           out = your_tool(revised, receipt_id=out.receipt_id)   # then retry",
-            " 2 ▶ Wrap a tool, run your agent, then watch your protection streak grow:  agentx status",
-            " 3 ▶ Not sure it's safe to enforce on a real agent? Run it in audit first:",
-            "       AGENTX_ENFORCEMENT=audit   (records what it WOULD block, blocks nothing)",
-            "     Then see what it caught, risk-free:  agentx insights",
+            " Try it on your own agent, risk-free — AUDIT mode records what it WOULD block,",
+            "   and blocks nothing. Wrap any tool, then run in audit:",
+            '       @agentx_protect(agent_id="my_agent")   # around any tool function',
+            "       AGENTX_ENFORCEMENT=audit",
+            "   Run your agent, then see what it caught:  agentx insights",
         ]
     lines += [
-        f" ▶ A bug or feature request? #bugs / #feature-requests on Discord: {_DISCORD_INVITE}",
+        "",
+        f" ▶ Docs: https://agentx-core.com/docs   ·   Bugs / ideas: #bugs-and-feature-requests  {_DISCORD_INVITE}",
     ]
     return lines
 
@@ -1686,7 +2425,7 @@ def execute_demo():
         if not is_block(blocked):
             print(" ⚠️  NOT BLOCKED. That's unexpected; the demo should always block.")
             print(f"      tool returned: {blocked}")
-            print(f"      Please report this in #bugs on Discord: {_DISCORD_INVITE}")
+            print(f"      Please report this in #bugs-and-feature-requests on Discord: {_DISCORD_INVITE}")
             print("=" * 75)
             return
 
@@ -1716,28 +2455,46 @@ def execute_demo():
     print("   agent to a safe path, so the run SURVIVED. Zero keys, zero gateway.")
     print("   That's SHIELD (keyless). RECOVER (gateway + your own key) writes the")
     print("   task-fitting challenge for you and runs the retry automatically.")
-    print("=" * 75)
+    print("\n  " + "─" * 71)
     for _ln in _demo_next_steps(_detect_mcp_client()):
         print(_ln)
     print("=" * 75)
 
 
-def _print_cli_usage():
+def _print_cli_usage(advanced=False):
     """Single source of truth for the `agentx` command list — printed by
-    `agentx help` and on an unknown command, so the two can never drift."""
+    `agentx help` and on an unknown command, so the two can never drift.
+
+    The DEFAULT view is deliberately tiny: a new user needs exactly
+    demo -> wrap-your-tool -> status, and curation is meant to happen through the
+    session-end review nudge, not a memorized command. `agentx help --advanced`
+    reveals the rest (curation, floor tuning, org sync, share), grouped by job."""
     print("\nUsage:  agentx <command>\n")
     print("  demo        10-second offline 'aha': watch a DROP TABLE get blocked (no key, no gateway)")
-    print("  share       Turn your most recent block into a postable card + share draft")
     print("  status      Local protection stats + armed policies (default; live view needs the gateway)")
-    print("  pull        Pull your org's policy config from the control plane")
-    print("  push        Contribute abstract threat signals to shared immunity (opt-in: AGENTX_CONTRIBUTE)")
-    print("  sync        pull + push")
-    print("  insights    Review your agents' learned safe-paths (numbered) for adoption")
-    print("  mcp-insights  Review + adopt safe-paths from the keyless MCP wedge (sibling of insights)")
-    print("  adopt       Adopt a learned safe-path: 'adopt <#>' (--edit to tweak) or 'adopt <policy_id> --text ...'")
-    print("  policies    List the customizable floor policies + your active coaching ('--check' to validate)")
-    print("  customize   Customize a floor policy's coaching by name: 'customize \"<name>\" --text ...' (or --edit)")
+    print("  review      One-key pass over pending blocks: adopt a safe-path, or label a block")
+    print("                ('--stats' for a summary of every incident's outcome, not just what's pending)")
     print("  help        Show this message (also: -h, --help)")
+    if not advanced:
+        print("\n  More commands:  agentx help --advanced   (curation, floor tuning, org sync)")
+    if advanced:
+        print("\n  ── Advanced ─────────────────────────────────────────────────────────")
+        print("\n  Teach & tune your firewall")
+        print("    insights      Review your agents' learned safe-paths (numbered) for adoption")
+        print("    adopt         Adopt a learned safe-path: 'adopt <#>' (--edit to tweak) or 'adopt <policy_id> --text ...'")
+        print("    verdict       Record a verdict: 'verdict <receipt> --wrong | --accept-risk | --correct',")
+        print("                  or a policy's standing rule: 'verdict --policy \"<name>\" <verdict> | --clear'")
+        print("    mcp-insights  Review + adopt safe-paths from the keyless MCP wedge (sibling of insights)")
+        print("    policies      List the customizable floor policies + your active coaching ('--check' to validate)")
+        print("    customize     Customize a floor policy's coaching by name: 'customize \"<name>\" --text ...' (or --edit)")
+        print("    rules         Seed org reframes + known verdicts from .agentx/rules.json ('check' or 'apply')")
+        print("\n  Team & org sync")
+        print("    pull          Pull your org's policy config from the control plane")
+        print("    push          Contribute abstract threat signals to shared immunity (opt-in: AGENTX_CONTRIBUTE)")
+        print("    sync          pull + push")
+        print("\n  Share")
+        print("    share         Turn your most recent block into a postable card + share draft")
+    print("\n  " + "─" * 71)
     print("\n  Protect your own agent. Wrap any tool function, then handle the block:")
     print("       from agentx_sdk import agentx_protect, is_block")
     print("       @agentx_protect(agent_id=\"my_agent\")")
@@ -1824,6 +2581,12 @@ def main():
         execute_mcp_insights()
     elif command == "adopt":
         execute_adopt(args[1:])
+    elif command == "verdict":
+        execute_verdict(args[1:])
+    elif command == "review":
+        execute_review(args[1:])
+    elif command == "rules":
+        execute_rules(args[1:])
     elif command == "policies":
         execute_policies(args[1:])
     elif command == "customize":
@@ -1835,7 +2598,9 @@ def main():
     elif command in ["status", "inspect"]:
         execute_status_inspection(gateway_url, api_key, mode)
     elif command in ("help", "-h", "--help"):
-        _print_cli_usage()
+        advanced = any(a.lower() in ("--advanced", "-a", "advanced", "all", "--all")
+                       for a in args[1:])
+        _print_cli_usage(advanced=advanced)
     else:
         print(f"⚠️  Unknown command: '{command}'")
         _print_cli_usage()
