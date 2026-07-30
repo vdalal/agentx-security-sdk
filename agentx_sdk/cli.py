@@ -2127,7 +2127,8 @@ def execute_customize(args):
 # Homepage link carries an attribution tag so CLI-share traffic is distinguishable
 # from cards / dev.to (the per-channel attribution leg).
 _SHARE_LINK = "https://agentx-core.com/?utm_source=cli_share"
-_DISCORD_INVITE = "https://discord.gg/PmWRTtaSx2"
+from .links import DISCORD_URL
+_DISCORD_INVITE = DISCORD_URL  # module-local alias; canonical value lives in links.py
 
 # Coarse, payload-free phrasing of WHAT class of action was caught, keyed by the
 # closed block-category vocab. Honest at the category level (never claims to quote
@@ -2299,7 +2300,7 @@ def execute_share(args=None):
     from urllib.parse import quote
     tweet = quote(f"{draft}\n{_SHARE_LINK}")
     print("\n" + "=" * 75)
-    print(f"  ▶ Post it in #show-your-agent-app:  {_DISCORD_INVITE}")
+    print(f"  ▶ Post it in #welcome:  {_DISCORD_INVITE}")
     print(f"  ▶ Tweet it (pre-filled):            https://twitter.com/intent/tweet?text={tweet}")
     if note is None:
         print("\n  Want to show the actual attempt?  agentx share --note \"DROP TABLE users; ...\"")

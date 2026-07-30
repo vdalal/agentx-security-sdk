@@ -1950,6 +1950,55 @@ def _detect_invisible_unicode(raw):
     return bool(_INVISIBLE_UNICODE_RE.search(str(raw)))
 
 
+# Reverse-shell / raw-socket C2 egress — mirror of the gateway's detect_reverse_shell so
+# the FREE keyless floor catches a compromised/injected agent opening a reverse shell,
+# not only the paid gateway (keeps gateway-blocks superset sdk-blocks). Distinct from the
+# pipe-to-shell floor above (`curl | bash`, a fetch-and-run install): this is the outbound
+# interactive-shell / raw-socket C2 primitive. Runs on the RAW payload (like the SSRF and
+# invisible-unicode floors) so exact command spelling survives. Scope ceiling: catches a
+# socket-shaped COMMAND, never an agent's own in-process socket (that is Layer-3).
+_REVSHELL_DEV_TCP_RE = re.compile(r"/dev/(?:tcp|udp)/[^\s/]", re.IGNORECASE)
+# netcat execute flag, generously bounded (200 chars) so a long host/option list can't slip it.
+_REVSHELL_NC_EXEC_RE = re.compile(
+    r"\b(?:nc|ncat|netcat)\b[^|;&\n]{0,200}?\s(?:-e|-c|--exec|--sh-exec)\b", re.IGNORECASE)
+_REVSHELL_SOCAT_RE = re.compile(r"\bsocat\b[^\n]*\b(?:exec|system)\s*:", re.IGNORECASE)
+# mkfifo backpipe = mkfifo AND a netcat binary AND a shell interpreter (a bare mkfifo+nc with
+# no shell is ordinary IPC, not a reverse shell). In-code socket revshell = an OUTBOUND connect
+# AND a dup2 of a socket fd onto a standard stream. Both tightened in the PR #273 review.
+_REVSHELL_MKFIFO_RE = re.compile(r"\bmkfifo\b", re.IGNORECASE)
+_REVSHELL_NC_BIN_RE = re.compile(r"\b(?:nc|ncat|netcat)\b", re.IGNORECASE)
+_REVSHELL_SHELL_RE = re.compile(
+    r"/bin/(?:ba|z|da|a)?sh\b|\b(?:ba|z|da|a)?sh\s+-i\b|\|\s*(?:ba|z|da|a)?sh\b", re.IGNORECASE)
+_REVSHELL_CONNECT_RE = re.compile(r"\.connect\s*\(|\bcreate_connection\s*\(", re.IGNORECASE)
+_REVSHELL_DUP2_STDIO_RE = re.compile(
+    r"\bos\.dup2\s*\([^)\n]*\.fileno\s*\(\s*\)\s*,\s*[0-2]\b", re.IGNORECASE)
+
+
+def _detect_reverse_shell(raw):
+    """True for a reverse-shell / raw-socket C2 egress primitive: a bash `/dev/tcp`|`/dev/udp`
+    device, a netcat `-e`/`-c`/`--exec` execute flag, a `socat EXEC:`/`SYSTEM:` shell, a
+    `mkfifo`+netcat+shell backpipe, or an in-code socket that connects out AND dups its fd onto
+    stdio (`os.dup2(s.fileno(), 0..2)`). FP-safe: a plain `nc -z` port check, a bare `mkfifo`
+    (or mkfifo+nc with no shell), an ordinary socket client (connect+recv, no dup2), and a
+    daemonizing socket server (bind/listen + dup2 of a non-socket fd) do NOT match. Mirror of
+    the gateway detect_reverse_shell."""
+    if not raw:
+        return False
+    s = str(raw)
+    if _REVSHELL_DEV_TCP_RE.search(s):
+        return True
+    if _REVSHELL_NC_EXEC_RE.search(s):
+        return True
+    if _REVSHELL_SOCAT_RE.search(s):
+        return True
+    if (_REVSHELL_MKFIFO_RE.search(s) and _REVSHELL_NC_BIN_RE.search(s)
+            and _REVSHELL_SHELL_RE.search(s)):
+        return True
+    if _REVSHELL_CONNECT_RE.search(s) and _REVSHELL_DUP2_STDIO_RE.search(s):
+        return True
+    return False
+
+
 def _is_catalog_token(token):
     """True for a DB-catalog introspection token (information_schema / pg_catalog /
     sqlite_master / a read PRAGMA). Used to NARROW the benign-catalog exemption so it
@@ -2253,6 +2302,35 @@ _INVISIBLE_UNICODE_POLICY = {
     ),
 }
 
+# The Reverse Shell Egress builtin, used to attribute the structural reverse-shell floor
+# (_detect_reverse_shell). Same policy_id as the gateway floor (…122) so an adopted org
+# override keys across both paths, and so backend/test_coaching_consistency.py sees the
+# shared name agree on id + failure category (NETWORK_ABUSE). category=NETWORK_ABUSE is
+# deliberately OFF the keyless pulse vocab (_BLOCK_CATEGORY_VOCAB, same as …120 the
+# gateway scan floor): _note_block_category drops it fail-safe, so the block still fires
+# and coaches but no coarse pulse tag is emitted and no UI pulse-receiver change is needed.
+# Structural-ONLY: blocked_intents is empty (never token-scanned); _detect_reverse_shell is
+# its only trigger. Coaching mirrors the gateway's Reverse Shell Egress text (house style,
+# no em dashes).
+_REVERSE_SHELL_POLICY = {
+    "id": "11111111-1111-1111-1111-111111111122",
+    "name": "Reverse Shell Egress",
+    "category": "NETWORK_ABUSE",
+    "blocked_intents": [],
+    "socratic_prompt": (
+        "This payload opens an interactive shell or a raw network channel to a remote host "
+        "(a bash /dev/tcp device, a netcat -e execute flag, a socat EXEC shell, a "
+        "mkfifo-and-netcat pipe, or a socket wired to os.dup2 / pty.spawn). That is the "
+        "signature of a reverse shell handing an attacker control, not a legitimate agent "
+        "action."
+    ),
+    "preferred_alternative": (
+        "Reach an external service through its published API over HTTPS. Opening an "
+        "interactive shell or a raw socket to an arbitrary host requires explicit human "
+        "authorization."
+    ),
+}
+
 
 def _keyless_decision(policy):
     """Build the normalized keyless decision dict from a matched policy."""
@@ -2367,6 +2445,14 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
     #      `| ssh` never trip it. Attributed to the Destructive Shell Command builtin.
     if _PIPE_TO_SHELL_RE.search(haystack):
         return _keyless_decision(_DESTRUCTIVE_SHELL_POLICY)
+
+    # 1a3) Structural reverse-shell / raw-socket C2 egress: a bash /dev/tcp device, a netcat
+    #      -e execute flag, a socat EXEC shell, a mkfifo+netcat pipe, or a socket wired to
+    #      os.dup2/pty.spawn. Distinct from pipe-to-shell (a fetch-and-run install) — this is
+    #      the outbound interactive-shell primitive. Runs on the RAW payload so exact command
+    #      spelling survives. Attributed to the Reverse Shell Egress builtin (…122).
+    if _detect_reverse_shell(raw):
+        return _keyless_decision(_REVERSE_SHELL_POLICY)
 
     # 1b) Structural SSRF: an encoded / alternate-form private-IP target inside a URL that
     #     no flat literal enumerates (decimal/hex loopback + metadata IPs). Runs on the RAW

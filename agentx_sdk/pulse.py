@@ -37,6 +37,8 @@ import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+from .links import DISCORD_URL  # canonical community link (leaf module, stdlib-safe)
+
 # Anonymous, machine-local identity + send bookkeeping. NOT derived from
 # hostname / MAC / username / path — a random token that only says "this
 # install came back", never "who".
@@ -348,7 +350,7 @@ def _show_notice(state=None):
         print(" AgentX shares ANONYMOUS usage by default — SDK version, OS, and")
         print(" block COUNTS only. Never your code, queries, or data.")
         print(" Opt out anytime:  AGENTX_TELEMETRY=off")
-        print(" New here? Try:  agentx demo   ·   Questions/feedback: https://discord.gg/PmWRTtaSx2")
+        print(f" New here? Try:  agentx demo   ·   Questions/feedback: {DISCORD_URL}")
         print("─" * 60)
         state["notice_shown"] = True
         _ensure_identity(state)
@@ -395,7 +397,7 @@ def maybe_emit_nudge(session_stats):
             print("   adds the judge that catches what keywords miss, auto-runs the retry,")
             print("   and escalates the biggest calls to a human.")
             print("   Unlock Recover: agentx-core.com/#request-access")
-            print("   Community: discord.gg/PmWRTtaSx2")
+            print(f"   Community: {DISCORD_URL}")
             state["last_nudge_ts"] = now
             changed = True
         if changed:
