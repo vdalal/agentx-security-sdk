@@ -505,6 +505,8 @@ def set_atexit_summary_quiet(quiet=True):
     global _atexit_summary_quiet
     _atexit_summary_quiet = quiet
 
+
+
 # Thread-safety for the shared session state (audit finding F2). The block
 # DECISION never depends on these numbers, but `_session_stats` is one process-
 # global dict and a read-modify-write `+= 1` is not atomic. Multiple agents in
@@ -737,7 +739,7 @@ def _apply_org_override(policy_id, challenge_text, safe_path, policy_name=None):
     if new_challenge == challenge_text and new_safe == safe_path:
         return challenge_text, safe_path          # adopted override is a no-op — don't count it
     _incr("overrides_applied")
-    print(f"🧭 [AgentX SDK] Applied your org's adopted safe-path for policy '{policy_id}'.")
+    print("🧭 [AgentX SDK] Using your adopted safe-path for this policy.")
     return new_challenge, new_safe
 
 
@@ -1694,19 +1696,31 @@ def _policy_load_posture():
         "AGENTX_POLICY_LOAD", "strict").strip().lower() == "permissive" else "strict"
 
 
-def _policy_load_error_message(err):
+def _policy_load_error_message(err, mcp=False):
     """Operator-facing. Not a Socratic challenge: the agent cannot fix this by
-    choosing another tool, so we address the human and name the file and the fix."""
+    choosing another tool, so we address the human and name the file and the fix.
+
+    ``mcp`` selects the MCP door's wording. `agentx policies --check` does not exist there --
+    uvx and pipx install the `agentx-mcp` script only -- and this message is the body of the
+    tool error the agent hands back, so it is read by the person whose server is jammed. On
+    that door the command is OMITTED rather than swapped for an invented one: the file path is
+    already named above it and is the actionable thing. Same call #287 made for adopt / verdict
+    / rules / status. (2026-07-31.)"""
     where = f"\n   file:  {err.source}" if getattr(err, "source", None) else ""
     field = f"\n   field: {err.field}" if getattr(err, "field", None) else ""
+    fix = (
+        "   ▶ fix the field above, or remove the file to fall back to the built-in policies.\n"
+        if mcp else
+        "   ▶ fix the field, or remove the file to fall back to the built-in policies:\n"
+        "       agentx policies --check\n"
+    )
     return (
         f"🛑 [AgentX] Shield disabled: your policy file is malformed, so the call was NOT run."
         f"{where}{field}\n"
         f"   {err}\n"
         f"   AgentX fails closed here on purpose: it will not certify a tool call as safe\n"
         f"   while it cannot read its own rules.\n"
-        f"   ▶ fix the field, or remove the file to fall back to the built-in policies:\n"
-        f"       agentx policies --check\n"
+        f"{fix}"
         f"   (to run unprotected instead:  AGENTX_POLICY_LOAD=permissive)"
     )
 
@@ -2860,8 +2874,15 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # REASONING_ENGINE_UNREACHABLE branch), which reads consecutive_strikes
             # directly. We surface it here purely for debug visibility — read inline so
             # no stale local is left around to be mistaken for live online state.
-            print(f"\n🛡️ [AgentX SDK] Intercepting tool call to '{func_name}' and "
-                  f"active_stats = {_session_stats['consecutive_strikes'].get(func_name, 0)}...")
+            # "active_stats" NAMED THE WRONG THING. The value is consecutive_strikes for this
+            # tool -- how many times in a row it has been blocked -- and calling it
+            # "active_stats" made every log line carrying it slightly false for anyone
+            # debugging from it. Now it says what it is, and only when it is non-zero: on the
+            # first call it was always "= 0", a constant that cost a line and told nobody
+            # anything. (Founder-flagged 2026-07-31.)
+            _strikes = _session_stats['consecutive_strikes'].get(func_name, 0)
+            print(f"\n🛡️ [AgentX SDK] Checking '{func_name}'..."
+                 + (f" (blocked {_strikes}x in a row already)" if _strikes else ""))
 
             # =====================================================================
             # 🪶 LAYER 0: OUT-OF-PROMPT LOCAL KEYWORD / INTENT PRE-FILTER
@@ -2974,8 +2995,11 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
 
                         log_intercept(current_trace_id, agent_id, func_name, policy_id, policy_name, "CHALLENGED")
 
-                        print(f"⚡ [LOCAL KEYWORD SHIELD] Fast-path intercept engaged on policy '{policy_name}' (offline, no LLM judge).")
-                        print(f"🛑 [LOCAL BLOCK] Policy '{policy_name}' matched a blocked intent locally.")
+                        # ONE line, not two. These said the same thing twice ("fast-path
+                        # intercept engaged on policy X" / "policy X matched a blocked intent")
+                        # under two different prefixes for one subsystem, which read as two
+                        # events to anyone scanning a log.
+                        print(f"🛑 [AgentX SDK] Stopped '{func_name}': {policy_name} (local check, no LLM).")
 
                         # Persist the CHALLENGED incident so this block is recorded and a
                         # later self-correction can flip it to COMPLIED (moving the
@@ -3002,7 +3026,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                             # (the block itself already stood regardless).
                             print(f"🧾 [LOCAL KEYWORD SHIELD] Incident park dispatched (async, best-effort — off the block path). Receipt: {effective_receipt}")
                         else:
-                            print(f"📝 [LOCAL KEYWORD SHIELD] Offline (no API key) — using local receipt: {effective_receipt}")
+                            print("📝 [AgentX SDK] Recorded locally (no key needed).")
 
                         # Route via the shared delivery function, which assembles the block
                         # string (marker + coaching + safe path + retry) once for every path,
@@ -3130,7 +3154,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     # visible AND countable on the pulse (self_corrections).
                     if _credit_recovery(current_trace_id, func_name):
                         log_self_correction(current_trace_id, agent_id, func_name)
-                        print(f"🔄 [AgentX SDK] Recovered: the agent revised its approach after the block and the safe '{func_name}' call cleared the keyless shield.")
+                        print(f"🔄 [AgentX SDK] Recovered: '{func_name}' was revised and ran.")
                     return _ExecuteTool()
 
                 _trip_breaker_if_ceiling(
@@ -3300,7 +3324,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
 
             # 3. Check for the "Success" path
             elif isinstance(eval_res, dict) and eval_res.get("status") in ["success", "ALLOWED"]:
-                print(f"✅ [AgentX SDK] Intent safe. Executing '{func_name}'.")
+                print(f"✅ [AgentX SDK] Allowed '{func_name}'.")
 
                 _reset_strike(strike_key)
 

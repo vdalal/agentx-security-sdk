@@ -1,6 +1,8 @@
 import os
 import sys
 import json
+import shutil
+import tempfile
 import requests
 from datetime import datetime, timezone
 
@@ -468,6 +470,39 @@ def _wrap(text, prefix, width=84):
                          break_long_words=False, break_on_hyphens=False)
 
 
+# --------------------------------------------------------------------------------------
+# WHICH COMMANDS THE CURRENT READER CAN ACTUALLY RUN
+#
+# `agentx-mcp` sets this to True before dispatching --review / --insights. It matters because
+# the MCP door and the Python door hand the reader DIFFERENT commands, and until 2026-07-31
+# this output assumed everyone had the `agentx` script:
+#
+#   pip install agentx-mcp     -> `agentx` AND `agentx-mcp` on PATH (the SDK is a dependency)
+#   pipx install agentx-mcp    -> `agentx-mcp` only
+#   uvx (the documented mcp.json: "command": "uvx")  -> NEITHER, nothing persists on PATH
+#
+# So an MCP reader following our own CTA reached `agentx adopt 3` and got command-not-found,
+# at the exact moment we asked them to close the learning loop.
+#
+# WHY A FLAG AND NOT A PATH PROBE: `shutil.which()` cannot answer this from inside the
+# process. Under uvx the ephemeral env's Scripts dir is on the CHILD's PATH by construction,
+# so `which("agentx-mcp")` resolves into uv's cache for a user whose shell has no such
+# command -- verified 2026-07-31, it reports success in exactly the direction that hurts.
+#
+# WHY `uvx agentx-mcp --x` AND NOT `agentx-mcp --x`: the uvx form works on ALL THREE install
+# paths above, and it is already the form /docs teaches. Mildly redundant for someone who
+# installed globally; correct for everyone.
+MCP_ENTRY = False
+
+
+def _review_cmd():
+    return "uvx agentx-mcp --review" if MCP_ENTRY else "agentx review"
+
+
+def _insights_cmd():
+    return "uvx agentx-mcp --insights" if MCP_ENTRY else "agentx insights"
+
+
 def execute_insights(args=None):
     """`agentx insights` — the unified local learning loop review.
 
@@ -498,14 +533,32 @@ def execute_insights(args=None):
     # blocked" framing and the "flip to enforcing" nudge are stale / nonsensical (they are
     # already enforcing). Same os.environ source the decorator's _resolve_enforcement reads.
     in_audit = (os.environ.get("AGENTX_ENFORCEMENT") or "").strip().lower() == "audit"
-    if audit["total"] and in_audit:
-        print("\n🔍 AUDIT MODE: what AgentX WOULD have blocked        (nothing was blocked)")
+    # ...but an MCP reader's env is NOT this process's env. AGENTX_ENFORCEMENT=audit is set in
+    # their mcp.json, for the SERVER process the client spawns; the terminal they run
+    # `uvx agentx-mcp --insights` in has never seen it. Gating on it there hid the audit
+    # section from exactly the person the audit banner had just sent to look at it, over a
+    # ledger with rows in it. On that door the ROWS are the evidence that audit ran, so they
+    # are sufficient on their own. (Caught in review of #287.)
+    if audit["total"] and (in_audit or MCP_ENTRY):
+        # The heading states a fact about the ROWS, not about the reader's current posture.
+        # `or MCP_ENTRY` shows this block to an MCP reader whose audit setting lives in their
+        # mcp.json rather than their shell -- but MCP_ENTRY says nothing about whether they are
+        # STILL in audit. An operator who ran audit for a week and has since flipped to enforce
+        # was being told "AUDIT MODE ... nothing was blocked ... flip to enforcing" about a
+        # server that is enforcing. Past tense fixes that: these rows WERE recorded in audit,
+        # which is true whatever they are running now. (Third review of #287.)
+        print("\n🔍 RECORDED IN AUDIT MODE: calls AgentX would have stopped, that ran")
         print("=" * 75)
         print(f"  {audit['total']} action(s) recorded under AGENTX_ENFORCEMENT=audit, by policy:")
         for row in audit["policies"]:
             print(f"     {row['would_blocks']:>4}x   {row['policy_name']}")
-        print("\n  These ran normally; audit takes zero risk. When the catches look right,")
-        print("  flip to enforcing:   AGENTX_ENFORCEMENT=enforce")
+        # The nudge is the one part that DOES assert a current posture, so it stays gated on
+        # the reader's own env. On the MCP door we cannot see that, so we say nothing rather
+        # than guess -- telling someone to "flip to enforcing" when they already have is the
+        # failure this whole block just had.
+        if in_audit:
+            print("\n  These ran normally; audit takes zero risk. When the catches look right,")
+            print("  flip to enforcing:   AGENTX_ENFORCEMENT=enforce")
         print("=" * 75)
 
     print("\n🧠 SAFE-PATHS YOUR AGENTS LEARNED        (local to this machine)")
@@ -533,7 +586,13 @@ def execute_insights(args=None):
             print("   • Self-corrections carry a resolution_path, but none were marked")
             print("     reusable by the judge yet. Keep running — reusable ones accrue.")
         if mcp_flat:
-            print(f"\n  ▶ You DO have {len(mcp_flat)} keyless MCP recovery path(s): agentx mcp-insights")
+            # `agentx mcp-insights` has no MCP-door equivalent, and telling a reader who is
+            # ALREADY inside --insights to go run another view is noise anyway. State the fact,
+            # point at the command that acts on them.
+            if MCP_ENTRY:
+                print(f"\n  ▶ You DO have {len(mcp_flat)} keyless MCP recovery path(s): {_review_cmd()}")
+            else:
+                print(f"\n  ▶ You DO have {len(mcp_flat)} keyless MCP recovery path(s): agentx mcp-insights")
         print("=" * 75)
         return
 
@@ -562,9 +621,12 @@ def execute_insights(args=None):
     # Summary line carries the headline numbers AND the one command that matters.
     policy_ids = sorted(set(harvest.keys()) | set(active.keys()))
     n = len(policy_ids)
+    # The headline CTA names the command THIS reader has. On the MCP door `agentx adopt` does
+    # not exist, and --review adopts too (it calls adopt_override itself), so point there
+    # rather than at a command that would not run.
     print(f"\n  {census['complied']} recoveries · {census['with_resolution']} reusable fixes · "
           f"{n} {'policy' if n == 1 else 'policies'}"
-          f"        ▶ adopt with:  agentx adopt <#>")
+          f"        ▶ adopt with:  {_review_cmd() if MCP_ENTRY else 'agentx adopt <#>'}")
     if verbose:
         print(f"     store: {census['path']}")
 
@@ -591,7 +653,7 @@ def execute_insights(args=None):
                     seq = seq_by_pid.get(pid, {}).get(c["suggestion"], "?")
                     print(_wrap(c["suggestion"] + meta(c), f"        #{seq}  "))
                 if len(alts) > 2:
-                    print(f"        +{len(alts) - 2} more  →  agentx insights --verbose")
+                    print(f"        +{len(alts) - 2} more  →  {_insights_cmd()} --verbose")
         elif candidates:
             # Not coaching yet: this is where the dev actually needs to act.
             print("     ⚠️  Not coaching this block yet — adopt one so AgentX coaches it:")
@@ -599,7 +661,7 @@ def execute_insights(args=None):
                 seq = seq_by_pid.get(pid, {}).get(c["suggestion"], "?")
                 print(_wrap(c["suggestion"] + meta(c), f"        #{seq}  "))
             if len(candidates) > 3:
-                print(f"        +{len(candidates) - 3} more  →  agentx insights --verbose")
+                print(f"        +{len(candidates) - 3} more  →  {_insights_cmd()} --verbose")
 
     # --- DETECTION RULES (the other half of the loop) — what to CATCH going
     # forward, vs the reframes above (how to RECOVER). Same global #N, same gate.
@@ -619,20 +681,43 @@ def execute_insights(args=None):
     # Lead with the one-key review (lowest friction, and it covers verdicts too, not just
     # adopt); the numbered `adopt <#>` stays as the precise "target a specific one" form.
     print("\n  " + "─" * 71)
-    print("  ▶ Review & act on all of these, one key each:   agentx review")
-    print(f"       or adopt a specific one:  agentx adopt <#>{example}")
-    print("       tweak first:  agentx adopt <#> --edit        write your own:  agentx adopt <id> --text \"…\"")
-    if rule_list:
-        print("       author a rule:  agentx adopt --rule --action <a> --desc \"…\"")
+    print(f"  ▶ Review & act on all of these, one key each:   {_review_cmd()}")
+    # The `adopt <#>` / `--rule` forms are the PRECISE alternatives to the one-key pass above.
+    # They are `agentx` subcommands with no MCP equivalent, so on that door they are omitted
+    # rather than printed as a command-not-found. Nothing is lost: the line above adopts,
+    # labels and takes verdicts, and it reads the MCP corpus (cli._mcp_review_items).
+    if not MCP_ENTRY:
+        print(f"       or adopt a specific one:  agentx adopt <#>{example}")
+        print("       tweak first:  agentx adopt <#> --edit        write your own:  agentx adopt <id> --text \"…\"")
+        if rule_list:
+            print("       author a rule:  agentx adopt --rule --action <a> --desc \"…\"")
     print()
-    print("  Adopted coaching lands in ./.agentx/overrides.json. Commit it to share with your")
-    print("  repo. A rule lands in your local policy store (the gateway enforces it next start).")
+    # WHERE it lands differs by door, so this sentence cannot be one string. The Python door
+    # anchors the store to your project root precisely so you can commit it; the MCP door has
+    # no project (an editor spawns the proxy from an arbitrary directory), so it keeps one
+    # per-user store and there is nothing to commit. Printing the repo advice there sent people
+    # looking for a file that is not in their repo. (2026-07-31, with the store fix.)
+    if MCP_ENTRY:
+        print("  Adopted coaching lands in your per-user store (~/.agentx/overrides.json) and")
+        print("  applies to every server you front. A rule lands in your local policy store")
+        print("  (the gateway enforces it next start).")
+    else:
+        print("  Adopted coaching lands in ./.agentx/overrides.json. Commit it to share with your")
+        print("  repo. A rule lands in your local policy store (the gateway enforces it next start).")
     print("\n  Share adopted safe-paths across your team + add the full deterministic floor:")
     print("     https://bit.ly/agentfirewall")
     if mcp_flat:
-        print(f"\n  Also: {len(mcp_flat)} safe-path(s) from your keyless MCP wedge → agentx mcp-insights")
+        # Same reason as the branch above: no MCP-door equivalent, and this reader is here.
+        if MCP_ENTRY:
+            # NOT "(listed above)" -- that was false. mcp_flat comes from
+            # mcp_recovery_candidates() and is a SEPARATE list from `harvest`; this body renders
+            # harvest/active only, so those safe-paths appear nowhere above. Point at the command
+            # that actually reads that corpus rather than claiming they were shown.
+            print(f"\n  Also: {len(mcp_flat)} safe-path(s) from your keyless MCP wedge → {_review_cmd()}")
+        else:
+            print(f"\n  Also: {len(mcp_flat)} safe-path(s) from your keyless MCP wedge → agentx mcp-insights")
     if not verbose:
-        print("\n  (agentx insights --verbose for ids, dates, counts, store path & full wording)")
+        print(f"\n  ({_insights_cmd()} --verbose for ids, dates, counts, store path & full wording)")
     print("=" * 75)
 
 
@@ -1434,7 +1519,7 @@ def _print_review_stats():
         print(f"     harm:              {h['HARM']}")
         print(f"     no harm:           {h['NO_HARM']}")
         print(f"     unknown:           {h['unknown']}")
-    print(f"\n   {stats['blocking_open']} block(s) still awaiting a verdict —  agentx review")
+    print(f"\n   {stats['blocking_open']} block(s) still awaiting a verdict —  {_review_cmd()}")
     print("=" * 75)
 
 
@@ -1555,7 +1640,7 @@ class _ReviewQuit(Exception):
 
 
 def _print_review_help():
-    print("\nUsage:  agentx review [--stats | --recover | --block | --labeled | -h]")
+    print(f"\nUsage:  {_review_cmd()} [--stats | --recover | --block | --labeled | -h]")
     print("=" * 75)
     print("  (no flags)   walk every pending item -- recoveries to adopt + blocks needing a verdict")
     print("  --recover    only the pending RECOVERY items (learned safe-paths ready to adopt)")
@@ -1572,9 +1657,47 @@ def _print_review_help():
     print()
     print("  Piped / non-interactive (CI, a script): lists pending items and never prompts.")
     print()
-    print("  Change a POLICY's STANDING rule directly (works even with no items shown here):")
-    print("    agentx verdict --policy \"<name>\" --correct|--wrong|--accept-risk|--clear")
+    # `agentx verdict` has no MCP form. On that door the standing-rule shortcut is omitted
+    # rather than printed as a command-not-found; the one-key pass above sets the same rule.
+    if not MCP_ENTRY:
+        print("  Change a POLICY's STANDING rule directly (works even with no items shown here):")
+        print("    agentx verdict --policy \"<name>\" --correct|--wrong|--accept-risk|--clear")
     print("=" * 75)
+
+
+def _warn_if_mcp_corpus_is_stranded():
+    """Tell a user whose MCP corpus predates the per-user store where it went.
+
+    THIS PATH IS THE ONE THAT SURPRISES PEOPLE. In SDK 0.4.25 the MCP stores moved to a
+    cwd-independent per-user location, because the proxy and the reviewer are separate
+    processes with separate working directories and a project-relative path resolved
+    differently in each. `agentx-mcp --review` says so when it spots an older corpus.
+
+    `agentx review` reaches the SAME corpus (_mcp_review_items -> _collect_candidates ->
+    mcp_recovery_candidates -> read_harvest_pairs), so a Python user who also ran the proxy
+    in their project sees those MCP items simply STOP APPEARING after upgrading. Silently,
+    which reads as lost history rather than a moved file. The advisory belongs on both
+    readers or it is not an advisory, it is a coin flip on which command you happened to run.
+
+    Never raises and never blocks the review: an import or filesystem problem here must not
+    take down the command it is only annotating."""
+    # The try guards the IMPORT, not the call. _legacy_project_harvest swallows its own
+    # errors and returns None, so the call cannot raise; the import can, and it is lazy on
+    # purpose because mcp_proxy pulls in subprocess/threading that must not load on every
+    # `agentx` command. Flagged twice in review as redundant, so: it is one line of scope,
+    # and the prints are deliberately OUTSIDE it, since a format error there is a bug we
+    # want to see rather than swallow.
+    try:
+        from .mcp_proxy import _legacy_project_harvest
+    except Exception:
+        return
+    stranded = _legacy_project_harvest()
+    if not stranded:
+        return
+    print(f"\n   Note: an older MCP corpus sits at {stranded}, which is not what this reads.")
+    print("   Since 0.4.25 the MCP store is per-user, so the proxy and this command agree")
+    print("   from any directory. To keep using the older one, set:")
+    print(f"     AGENTX_MCP_HARVEST_PATH={stranded}")
 
 
 def execute_review(args=None):
@@ -1605,18 +1728,24 @@ def execute_review(args=None):
         elif "--block" in args:
             items = [it for it in items if it["kind"] == "verdict"]
     items = _group_verdict_items(items)
+    _warn_if_mcp_corpus_is_stranded()
     if not items:
         census = incident_db_census()
         print("\n✅ Nothing to review — no blocks awaiting a verdict, no new safe-paths to adopt.")
         if not census["exists"]:
             print(f"   (no incident store yet at {census['path']} — blocks appear here once the")
-            print("    gateway records them; keyless Shield runs keep local stats in `agentx status`.)")
+            # `agentx status` is a bare subcommand with no MCP form. It is informational, not
+            # the loop, so on that door the sentence keeps its meaning and drops the command.
+            if MCP_ENTRY:
+                print("    gateway records them; keyless Shield runs keep local stats too.)")
+            else:
+                print("    gateway records them; keyless Shield runs keep local stats in `agentx status`.)")
         print("=" * 75)
         return
 
     if not sys.stdin.isatty():
         # Automated / piped: show the list, never block on input.
-        print(f"\n📋 {len(items)} item(s) await review — run `agentx review` at a terminal to act:")
+        print(f"\n📋 {len(items)} item(s) await review — run `{_review_cmd()}` at a terminal to act:")
         for n, it in enumerate(items, 1):
             _print_review_item(n, len(items), it)
         print("=" * 75)
@@ -2338,35 +2467,49 @@ def _detect_mcp_client():
     return None
 
 
-def _demo_next_steps(mcp):
-    """The demo's closing next-steps as a list of lines. `mcp` is (client_name, config_hint)
-    or None. Split out so the MCP-vs-decorator branch is unit-testable without running the
-    whole demo.
+def _demo_next_steps():
+    """The demo's closing next-steps as a list of lines.
 
-    ONE primary next step: try it on YOUR surface in AUDIT mode — it blocks nothing and
-    records what it WOULD catch, the risk-free on-ramp. Deliberately a single CTA + one
-    support line: the demo is the FIRST surface, so it must not scatter attention across
-    competing next steps. Recover is already taught in the 'What this shows' paragraph;
-    `agentx share` is omitted because the demo's catch is SYNTHETIC (identical every run),
-    not a war story. The MCP branch fronts a real server; None is the Python decorator."""
-    lines = []
-    if mcp:
-        name, cfg = mcp
-        lines += [
-            " Try it on your own tools, risk-free — AUDIT mode records what it WOULD block,",
-            f"   and blocks nothing. Front any MCP server in {cfg}:",
-            '       "command": "agentx-mcp",  "args": ["npx", "-y", "your-mcp-server", "..."]',
-            "       AGENTX_ENFORCEMENT=audit",
-            f"   Use {name} as usual, then see what it caught:  agentx insights",
-        ]
-    else:
-        lines += [
-            " Try it on your own agent, risk-free — AUDIT mode records what it WOULD block,",
-            "   and blocks nothing. Wrap any tool, then run in audit:",
-            '       @agentx_protect(agent_id="my_agent")   # around any tool function',
-            "       AGENTX_ENFORCEMENT=audit",
-            "   Run your agent, then see what it caught:  agentx insights",
-        ]
+    ONE next step, on the reader's OWN door: try it in AUDIT mode, which blocks nothing and
+    records what it WOULD catch. Then Docs and Discord. Nothing else.
+
+    THE MCP BRANCH WAS REMOVED (founder call 2026-07-31), for two reasons.
+
+    Wrong door. This is `agentx demo`, the PYTHON SDK's command. Detecting a Cursor config
+    and answering with "front an MCP server in ~/.cursor/mcp.json" sends someone who just
+    installed the Python SDK to a different product surface. It also made two CTAs compete on
+    the first screen a stranger sees, which is exactly what this function's own docstring said
+    not to do.
+
+    And it was WRONG, twice over, which is how it got noticed. It ended with
+    `see what it caught: agentx insights`, but the MCP proxy writes its audit rows to the
+    per-user ledger (~/.agentx/mcp-ledger.db) while `agentx insights` reads the cwd-relative
+    `.agentx.db` — different files. And the audit section only renders when
+    AGENTX_ENFORCEMENT=audit is set in the READER's shell, whereas that branch had just told
+    them to set it in mcp.json, for the server process. So it pointed at a command that would
+    show nothing, for two independent reasons.
+
+    The MCP door has its own demo (`agentx-mcp --demo`) whose footer teaches the MCP on-ramp
+    correctly, with the `"command": "uvx"` config this project actually ships. That is where
+    an MCP reader should meet it.
+
+    The old `mcp` parameter is GONE, not ignored: a caller passing it now gets a TypeError,
+    which is the point -- silently handing them the Python branch when they asked for the MCP
+    one is the worse failure. _detect_mcp_client() is now called by nothing but its own test; it is kept rather
+    than deleted because detecting the reader's client is the obvious input to any future
+    personalised onboarding, and it is 25 self-contained lines. If that never arrives, delete
+    it and its test together.
+    """
+    lines = [
+        " Try it on your own agent, risk-free — AUDIT mode records what it WOULD block,",
+        "   and blocks nothing. Wrap any tool, then run in audit:",
+        '       @agentx_protect(agent_id="my_agent")   # around any tool function',
+        "       AGENTX_ENFORCEMENT=audit",
+        # Correct on THIS door: the decorator writes to the same cwd-relative store
+        # `agentx insights` reads, so a reader who runs both from their project directory
+        # sees their catches. (The MCP proxy does not, which is what broke the old branch.)
+        "   Run your agent, then see what it caught:  agentx insights",
+    ]
     lines += [
         "",
         f" ▶ Docs: https://agentx-core.com/docs   ·   Bugs / ideas: #bugs-and-feature-requests  {_DISCORD_INVITE}",
@@ -2389,7 +2532,27 @@ def execute_demo():
     # while it STILL records the streak and fires the activation pulse (P3).
     set_atexit_summary_quiet(True)
 
-    print("🛡️  AGENTX DEMO:  a blocked agent that RECOVERS and finishes (no key, no gateway)")
+    # The per-call narration is deliberately NOT suppressed (founder call 2026-07-31), and the
+    # reasoning is worth keeping because it reversed once.
+    #
+    # It WAS suppressed for a day, on the grounds that the demo prints its own framed account
+    # of the same two events and the reader was hearing the story twice. True at the time --
+    # but the thing being suppressed was five lines carrying two raw UUIDs and a counter
+    # labelled `active_stats` that actually held consecutive_strikes. That was noise, so
+    # hiding it read as an improvement.
+    #
+    # Tidying those lines (5 -> 3, no identifiers, correct label) changed what the choice was
+    # about. What is left is EVIDENCE:
+    #     🛡️ [AgentX SDK] Checking 'run_sql'...
+    #     🛑 [AgentX SDK] Stopped 'run_sql': Mass Destructive Intent (local check, no LLM).
+    #     📝 [AgentX SDK] Recorded locally (no key needed).
+    # The framed ✅ blocks are our INTERPRETATION of those events. A first run that carries
+    # only the interpretation asks a security buyer to take our word for it, which is the
+    # opposite of what this product argues. So the shield speaks first, then we explain.
+
+    # No shield and no "AGENTX" here: the brand line from main() sits directly above, so both
+    # were doubled the moment that banner stopped being a box.
+    print("DEMO: a destructive call is stopped, and the agent still finishes the job")
     print("=" * 75)
 
     start_secure_session()
@@ -2405,7 +2568,10 @@ def execute_demo():
     # attacker smuggled a destructive statement into the payload.
     poisoned = "Update notes for client 99401; DROP TABLE users;"
     print("\n A poisoned agent tool call is about to run:")
-    print(f"   run_sql(query={poisoned!r})\n")
+    # No trailing blank: the decorator's own narration opens with a newline and supplies the
+    # separation. A blank here as well left a two-line hole on the day that narration was
+    # briefly suppressed.
+    print(f"   run_sql(query={poisoned!r})")
 
     # Run as a pure LOCAL sandbox: temporarily clear AGENTX_API_KEY so this synthetic
     # block uses the in-process keyword shield with a local receipt and does NOT park
@@ -2418,46 +2584,78 @@ def execute_demo():
     # recovery), regardless of the caller's env, and never parks a synthetic
     # 'demo_cli' incident into a cloud plane. Restored in finally so we never mutate
     # the caller's environment past this call.
+    # mkdtemp FIRST. It used to sit between the pop and the try, so a raise (read-only or
+    # full temp dir, a bad TMPDIR) dropped AGENTX_API_KEY from the process with no restore --
+    # and execute_demo runs in-process in the tests, so the loss propagated to everything after.
+    _ov_dir = tempfile.mkdtemp(prefix="agentx-demo-")
     saved_key = os.environ.pop("AGENTX_API_KEY", None)
+
+    # ...and point the OVERRIDE STORE somewhere empty, so this shows the SHIPPED keyless floor
+    # rather than the running dev's customizations.
+    #
+    # An adopted safe-path REPLACES the coaching text, which is the exact thing this demo
+    # exists to demonstrate. Anyone who had ever run `agentx adopt` was shown their own
+    # wording while the screen claimed to be what a fresh install does, plus a stray
+    # "Using your adopted safe-path for this policy" line that means nothing on a first run.
+    # Verified 2026-07-31: run from C:\ the demo printed 3 SDK lines; run from a repo holding
+    # .agentx/overrides.json it printed 4.
+    #
+    # NB the MCP demo (mcp_demo.py) solves the same class by chdir-ing into a temp dir for its
+    # whole run. THIS demo does not chdir at all -- so the guard has to be explicit here, and
+    # assuming the sibling's protection applied was wrong.
+    saved_overrides = os.environ.get("AGENTX_OVERRIDES")
+    os.environ["AGENTX_OVERRIDES"] = os.path.join(_ov_dir, "overrides.json")
     try:
         blocked = run_sql(query=poisoned, db_session="<live SqlAlchemy session>")
 
         print()
         if not is_block(blocked):
-            print(" ⚠️  NOT BLOCKED. That's unexpected; the demo should always block.")
+            print(" ⚠️  NOT STOPPED. That's unexpected; the demo should always stop this call.")
             print(f"      tool returned: {blocked}")
             print(f"      Please report this in #bugs-and-feature-requests on Discord: {_DISCORD_INVITE}")
             print("=" * 75)
             return
 
-        print(" ✅ BLOCKED before execution. Deterministic floor: no LLM, no network.")
+        # "STOPPED", matching `agentx-mcp --demo`: the two demos describe the same event and
+        # should use the same word. "Deterministic floor" was a term of ours doing the work
+        # that "no LLM call, nothing left your machine" does plainly.
+        print(" ✅ STOPPED before it ran. No LLM call, nothing left your machine.")
         print(f"      policy:   {getattr(blocked, 'policy', None)}")
-        print("      The DROP TABLE never reached your database, and it came back as")
-        print("      coaching your agent can act on, not a fatal 403.")
+        print("      The DROP TABLE never reached your database, and your agent was")
+        print("      told what to do instead.")
 
         # THE RECOVERY (the whole point): the agent reads the coaching, revises to a
         # safe call, and it RUNS. Keyless, same session, so AgentX credits the
         # self-correction and narrates the heal beat above the summary.
-        print("\n Now the agent does what a 403 never allows: it revises and retries:")
+        print("\n The agent revises the call and tries again:")
         safe_query = "UPDATE notes SET status='reviewed' WHERE client_id='CLI-99401'"
         print(f"   run_sql(query={safe_query!r})")
         recovered = run_sql(query=safe_query, db_session="<live SqlAlchemy session>")
         print()
         if not is_block(recovered):
-            print(" ✅ RECOVERED. The safe call cleared the shield and ran. The task")
-            print("    CONTINUED instead of crashing: no 403, no wiped table, no dead run.")
+            print(" ✅ RECOVERED. The safe call ran and the job finished. Your table is")
+            print("    intact and the task is done.")
         else:
             print(" (the revised call was also blocked; pick a safer revision and retry.)")
     finally:
         if saved_key is not None:
             os.environ["AGENTX_API_KEY"] = saved_key
+        # Restore rather than just unset: execute_demo is called IN-PROCESS by the tests, and
+        # an env var left pointing at a deleted temp dir would leak into everything after it.
+        if saved_overrides is None:
+            os.environ.pop("AGENTX_OVERRIDES", None)
+        else:
+            os.environ["AGENTX_OVERRIDES"] = saved_overrides
+        shutil.rmtree(_ov_dir, ignore_errors=True)
 
-    print("\n What this shows: AgentX blocked a catastrophic call offline AND coached your")
-    print("   agent to a safe path, so the run SURVIVED. Zero keys, zero gateway.")
-    print("   That's SHIELD (keyless). RECOVER (gateway + your own key) writes the")
-    print("   task-fitting challenge for you and runs the retry automatically.")
+    # Was a "What this shows:" paragraph that restated both ✅ blocks above and then named
+    # two tiers (SHIELD / RECOVER) and a "task-fitting challenge" -- our vocabulary, in the
+    # first command a new user runs. The two outcome lines already said what happened, so
+    # this keeps only what they do NOT say: what it cost, and what the paid step adds.
+    print("\n That ran with no key and no signup. With the gateway and your own")
+    print("   Gemini key, AgentX writes the fix and runs the retry for you.")
     print("\n  " + "─" * 71)
-    for _ln in _demo_next_steps(_detect_mcp_client()):
+    for _ln in _demo_next_steps():
         print(_ln)
     print("=" * 75)
 
@@ -2509,8 +2707,14 @@ def _print_cli_usage(advanced=False):
 
 
 def main():
-    print("=" * 75)
-    print("🛡️  AGENTX LOCAL OBSERVABILITY ENGINE")
+    # ONE brand line, not a boxed category. This prints before EVERY `agentx` command, and
+    # every subcommand already announces itself underneath it -- so the old three-line box
+    # ("AGENTX LOCAL OBSERVABILITY ENGINE") meant a reader met two stacked headers and five
+    # lines of chrome before any content, on the first screen of the first command they run.
+    # "Local observability engine" also named a category we use nowhere else, in the position
+    # where a stranger decides what this thing is. The brand mark stays because the
+    # subcommand headers below carry no product name of their own. (Founder call 2026-07-31.)
+    print("🛡️  AgentX")
     print("=" * 75)
 
     # --- OFFLINE STALENESS NOTICE (the third surface) ---

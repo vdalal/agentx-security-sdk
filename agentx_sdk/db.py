@@ -1,15 +1,15 @@
 import sqlite3
 import time
 import os
-
-# Hidden file in the directory where the developer runs their agent
-DB_PATH = ".agentx.db"
-
-import sqlite3
-import time
-import os
 from contextlib import contextmanager
 
+# Hidden file in the directory where the developer runs their agent.
+#
+# RELATIVE on purpose: it resolves against the process cwd, which is what you want for the
+# @agentx_protect decorator, where the process runs in the developer's project. It is the WRONG
+# default for MCP, where the host launches the proxy from an arbitrary directory, so the proxy
+# overrides this global at startup (see mcp_proxy._mcp_ledger_path). The default is deliberately
+# left alone so no existing decorator user's ledger moves.
 DB_PATH = ".agentx.db"
 
 # Concurrency: agents sharing one process each open their own short-lived

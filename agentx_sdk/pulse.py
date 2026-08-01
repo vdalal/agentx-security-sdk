@@ -337,7 +337,7 @@ def _note_first_block(session_stats, state=None):
         pass
 
 
-def _show_notice(state=None):
+def _show_notice(state=None, integration="decorator"):
     """Print the one-time transparency notice for a default-on install and mark it
     shown (``notice_shown`` in ~/.agentx/pulse.json) so it never repeats. This is the
     disclosure half of the notify + opt-out posture: the developer is told what is
@@ -350,7 +350,13 @@ def _show_notice(state=None):
         print(" AgentX shares ANONYMOUS usage by default — SDK version, OS, and")
         print(" block COUNTS only. Never your code, queries, or data.")
         print(" Opt out anytime:  AGENTX_TELEMETRY=off")
-        print(f" New here? Try:  agentx demo   ·   Questions/feedback: {DISCORD_URL}")
+        # DOOR-AWARE. This is the FIRST thing a new install ever prints, and it ran on both
+        # surfaces while naming `agentx demo` -- a command an MCP user does not have, because
+        # uvx and pipx install the `agentx-mcp` script only. So the very first sentence AgentX
+        # said to an MCP user was an instruction that fails. `integration` is the same coarse
+        # value the pulse already carries, so this needs no new signal. (2026-07-31.)
+        _try_it = ("uvx agentx-mcp --demo" if integration == "mcp" else "agentx demo")
+        print(f" New here? Try:  {_try_it}   ·   Questions/feedback: {DISCORD_URL}")
         print("─" * 60)
         state["notice_shown"] = True
         _ensure_identity(state)
@@ -534,6 +540,29 @@ _STALE_AFTER_DAYS = 7
 
 UPGRADE_COMMAND = "pip install --upgrade agentx-security-sdk"
 
+# The MCP door's form. `pip install --upgrade agentx-security-sdk` is wrong there twice: it
+# names a package that reader did not install (they installed agentx-mcp), and on the two
+# doors /docs actually documents it does NOTHING -- uvx builds a fresh ephemeral env per run
+# and pipx keeps its own venv, so neither one reads the user's global pip environment. The
+# command succeeds, the version does not move, and nothing on screen says so. `@latest` is
+# what makes uvx re-resolve instead of serving its cache. (2026-07-31.)
+#
+# BOTH doors named, because the first cut of this line said `uvx agentx-mcp@latest --version`
+# and repeated the original sin one door over: that PRINTS a version, it does not upgrade
+# anything, and a pipx user who ran it would have seen a NEWER number reported while their
+# proxy kept launching the old build. Exactly the "it succeeded and changed nothing" failure
+# this constant exists to remove. (Code review of #288.)
+#
+# NOT `uvx agentx-mcp@latest` either, which the second cut said. Run bare in a terminal it
+# reaches `if not argv` in mcp_proxy.main(), DUMPS THE USAGE TEXT AND EXITS 2 -- so the one
+# instruction we hand a user in an upgrade notice looks like it failed. Verified by running
+# it. And it would not have upgraded them anyway: their mcp.json launches `uvx agentx-mcp`
+# UNPINNED, so warming uv's cache for the pinned requirement `agentx-mcp@latest` leaves the
+# entry the host actually resolves untouched. `uv cache clean agentx-mcp` drops that entry,
+# exits 0, and makes the next host launch re-resolve -- the action that actually moves the
+# version on this door. (Code review of #288, second pass.)
+MCP_UPGRADE_COMMAND = "uv cache clean agentx-mcp  (pipx: pipx upgrade agentx-mcp)"
+
 
 def build_age_days(released=None, today=None):
     """Days since this build was cut, from the ``__released__`` constant. None when the
@@ -602,7 +631,7 @@ def on_session_end(session_stats):
             # pulse leaves, whether or not that run had activity. An explicit
             # opt-in already knows, so it skips the notice.
             if _is_default_on(state) and not state.get("notice_shown", False):
-                _show_notice(state)
+                _show_notice(state, _integration(session_stats))
             maybe_send(session_stats, block=True, state=state)
             return
 

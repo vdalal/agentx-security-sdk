@@ -95,13 +95,24 @@ finally:
 _USAGE = (
     "usage: agentx-mcp <command> [args...]\n"
     "\n"
-    "Wrap a real MCP server so every tools/call is screened by AgentX's keyless\n"
-    "shield before it runs. A blocked call is returned to the agent as a coaching\n"
-    "error it can self-correct on; the dangerous call never reaches the server.\n"
+    "Puts AgentX in front of an MCP server. Every tool call is checked first, and\n"
+    "the destructive ones are stopped before they run. Your agent is told what to\n"
+    "do instead, so it can fix the call and carry on.\n"
     "\n"
-    "  example (mcp.json):\n"
-    "    \"command\": \"agentx-mcp\",\n"
-    "    \"args\": [\"npx\", \"-y\", \"@modelcontextprotocol/server-filesystem\", \"/data\"]\n"
+    # Every command here carries the `uvx` prefix and the mcp.json uses "command": "uvx",
+    # matching ui/utils/mcp.ts. This screen is shown by `uvx agentx-mcp --help` -- to a reader
+    # who by construction has NEITHER script on PATH -- so the bare forms it used to print
+    # were not runnable by the person reading them. (Caught in review of #287.)
+    "  Start here:\n"
+    "    uvx agentx-mcp --demo       watch a DROP TABLE get stopped. No key, no signup.\n"
+    "\n"
+    "  Then wrap your server, in mcp.json:\n"
+    "    \"command\": \"uvx\",\n"
+    "    \"args\": [\"agentx-mcp\", \"npx\", \"-y\", \"@modelcontextprotocol/server-filesystem\", \"/data\"]\n"
+    "\n"
+    "  uvx agentx-mcp --review     see what was stopped. Approve a fix your agent found,\n"
+    "                              or mark a block right or wrong.\n"
+    "  uvx agentx-mcp --insights   see what your agents have learned to do instead.\n"
 )
 
 
@@ -208,11 +219,16 @@ def _record_mcp_shield_failopen(session_stats, tool_name, error, log):
 def _note_mcp_fail_closed(log):
     """Say ONCE that the shield is failing CLOSED (strict + malformed: every call BLOCKED).
     The SAFE outcome, so it does NOT increment shield_failopens."""
+    # NO `agentx policies --check` here. This is the MCP door, where that command does not
+    # exist (uvx and pipx install `agentx-mcp` only), and it fires at the worst possible
+    # moment: every tools/call is being blocked, and the one instruction on screen for
+    # unjamming the server was a command the reader cannot run. The file path is the
+    # actionable thing and _policy_load_error_message already names it. (2026-07-31.)
     _mcp_once_banner("failclosed", [
         "AgentX Local Shield FAILING CLOSED: your policy file is malformed,",
         "so every tools/call is BLOCKED until you fix it. Nothing ran.",
-        "Fix it, or set AGENTX_POLICY_LOAD=permissive to run unprotected:",
-        "    agentx policies --check",
+        "Fix the file named in the error above, or delete it to fall back to the",
+        "built-in policies. To run unprotected instead: AGENTX_POLICY_LOAD=permissive",
     ], log)
 
 
@@ -220,10 +236,11 @@ def _note_mcp_policy_degraded(log):
     """Say ONCE that permissive + a malformed file means the pulled/org policy is dropped and
     the BUILT-IN floor screens instead. NOT a fail-open (built-ins still screen), so it does
     NOT touch shield_failopens -- but the operator should know their org rules are not applied."""
+    # Same reason as the fail-closed banner: no `agentx` script on this door.
     _mcp_once_banner("degraded", [
         "AgentX: your policy file is malformed. Running on the BUILT-IN floor",
         "(AGENTX_POLICY_LOAD=permissive). Your pulled/org policies are NOT applied.",
-        "    agentx policies --check",
+        "Fix the file named in the error above to get them back.",
     ], log)
 
 
@@ -379,17 +396,131 @@ class _Harvest:
             self.pairs.append(pair)
 
 
+def _user_store_dir():
+    """The per-user MCP store: ``~/.agentx``. CWD-INDEPENDENT ON PURPOSE, and that is the whole
+    point of it.
+
+    The proxy and ``agentx-mcp --review`` are two different PROCESSES with two different current
+    directories: an MCP host launches the proxy from somewhere arbitrary (often $HOME or /), while
+    the human runs review from wherever they happen to be. Any project-relative default therefore
+    resolves differently in the two, so the proxy wrote a ledger review could not open, and the MCP
+    door had no working loop at all. A per-user path is the only default that both sides compute
+    the same answer for with zero configuration.
+
+    Override with AGENTX_MCP_HARVEST_PATH / AGENTX_MCP_PINS_PATH (per file) when you genuinely want
+    a per-project store and can set the same value in both places.
+
+    The expanduser fallback matters more than it looks. With HOME and USERPROFILE both unset (a bare
+    container, some service managers), ``os.path.expanduser("~")`` returns the LITERAL "~", which
+    would make this store "~/.agentx" RELATIVE TO CWD and silently reintroduce the exact bug this
+    function exists to remove, with no signal. So fall back to an absolute temp-dir location.
+
+    Scoped honestly: that fallback is BETTER, not perfect. ``tempfile.gettempdir()`` reads TMPDIR /
+    TEMP / TMP, so two processes started with different values for those could still disagree. It
+    beats the relative path, which diverges whenever the two cwds differ (i.e. always, in the MCP
+    case). If you have no home directory, set AGENTX_MCP_HARVEST_PATH / AGENTX_MCP_PINS_PATH
+    explicitly rather than relying on this."""
+    home = os.path.expanduser("~")
+    if not os.path.isabs(home):
+        import tempfile
+        home = os.path.join(tempfile.gettempdir(), "agentx-home")
+    return os.path.join(home, ".agentx")
+
+
+def _mcp_ledger_path():
+    """Where the MCP proxy's flight-recorder ledger lives.
+
+    Same cwd problem, different file. Left alone, the proxy drops a `.agentx.db` into whatever
+    directory the MCP host launched it from, so a user's stats scatter across $HOME, / and
+    anywhere else, and none of them is the one they see when they run `agentx insights` in their
+    project.
+
+    SCOPE, said plainly: `agentx review` does NOT read this file (it reads the harvest corpus and
+    incidents.db), so this does not affect the review loop. It is here so the MCP door has one
+    ledger instead of a trail of them.
+
+    Only the MCP path uses this. `agentx_sdk.db.DB_PATH` keeps its cwd-relative default, so the
+    Python decorator path is untouched and no existing user's ledger moves."""
+    explicit = os.environ.get("AGENTX_MCP_LEDGER_PATH")
+    if explicit:
+        return explicit
+    return os.path.join(_user_store_dir(), "mcp-ledger.db")
+
+
+def _mcp_overrides_path():
+    """Where the MCP door keeps ADOPTED safe-paths (the org brain).
+
+    The last cwd-derived store on this door, and the one that made the loop lie. The ledger
+    (_mcp_ledger_path) and the harvest corpus (_harvest_path) were both moved per-user because
+    the proxy and the reader are two processes with two different current directories. The
+    OVERRIDES store was left on `overrides._overrides_path()`, which falls back to a project
+    root walked up from cwd -- so it inherited the exact defect its two siblings were fixed for.
+
+    What that cost, measured 2026-07-31 rather than argued: `uvx agentx-mcp --insights` run from
+    a repo printed `1 policy / Active: ...`; run from C:\\ it printed `No reusable safe-paths to
+    show yet`. Same machine, same user, same store-in-principle. The second is the one answer
+    this surface must never give, and the audit banner sends people straight to it.
+
+    It is also a WRITER/READER split, not just a display bug: the proxy's auto-coach calls
+    adopt_override() from the MCP host's launch directory while the human runs --review from
+    their terminal, so a promoted safe-path could be written where the reader never looks.
+
+    Per-user, matching the ledger (founder call 2026-07-31). The Python door keeps its
+    project-root anchoring: there, "the directory you are in" IS your project, and the
+    commit-overrides.json-to-your-repo model depends on it. On the MCP door there is no project
+    -- an editor spawns the proxy from somewhere arbitrary -- so per-user is the only default
+    both sides compute the same answer for with zero configuration.
+
+    NO cwd-derived component, not even a read. `_harvest_path` documents why: a "prefer an
+    existing project-root file" back-compat branch silently reintroduces the whole bug, because
+    from one launch directory it finds a legacy file and from another it does not.
+
+    MIGRATING an older project-local store: set **AGENTX_MCP_OVERRIDES_PATH**, not
+    AGENTX_OVERRIDES. The first draft of this docstring said the latter and was wrong in a way
+    that would have wasted a user's afternoon: `_point_stores_at_mcp_home` pins AGENTX_OVERRIDES
+    unconditionally on BOTH the proxy and the reader, so anything a user exported there is
+    overwritten and they would see no effect and no explanation. AGENTX_MCP_OVERRIDES_PATH is
+    the knob that actually survives, and it is the one .env.example documents. (Code review of
+    #288.) There is no automatic advisory for a stranded legacy file yet, unlike the harvest
+    corpus's `_legacy_project_harvest()` -- tracked as BACKLOG P-15."""
+    explicit = os.environ.get("AGENTX_MCP_OVERRIDES_PATH")
+    if explicit:
+        return explicit
+    return os.path.join(_user_store_dir(), "overrides.json")
+
+
 def _harvest_path():
-    """Where the local recovery-pair file lives. An explicit AGENTX_MCP_HARVEST_PATH wins (the
-    opt-in user controls it — RECOMMENDED for MCP hosts, which launch the proxy from an unrelated
-    cwd, often $HOME or /); otherwise it sits in .agentx/ under the project root, beside the
-    overrides store. NB: launched outside a project (no .git/.agentx) the root falls back to cwd,
-    so the explicit path is preferred in the MCP execution context."""
+    """Where the local recovery-pair file lives: AGENTX_MCP_HARVEST_PATH if set, else the
+    per-user store. Exactly two branches, and NEITHER depends on the current directory.
+
+    A "prefer an existing project-root file" back-compat branch was written here first and
+    REMOVED, because it silently reintroduced the whole bug. `_find_project_root()` walks up from
+    cwd, so from one launch directory it finds a legacy file and from another it does not: the
+    proxy and the reviewer go back to computing different paths, which is the defect this function
+    exists to fix. A test caught it (test_mcp_review_loop.py). Any cwd-derived component, even one
+    that only reads, breaks the guarantee.
+
+    Migrating an older project-local corpus is therefore explicit, not magic: point
+    AGENTX_MCP_HARVEST_PATH at it, or move the file. `--review` says so when it spots one."""
     explicit = os.environ.get("AGENTX_MCP_HARVEST_PATH")
     if explicit:
         return explicit
-    from agentx_sdk.overrides import _find_project_root
-    return os.path.join(_find_project_root(), ".agentx", "mcp_harvest.jsonl")
+    return os.path.join(_user_store_dir(), "mcp_harvest.jsonl")
+
+
+def _legacy_project_harvest():
+    """A pre-existing project-local corpus, if the CURRENT directory sits under one. Advisory
+    ONLY -- never used for resolution (see _harvest_path), just to tell a user with an older
+    corpus where it went and how to keep using it. Returns None when there is nothing to say."""
+    try:
+        from agentx_sdk.overrides import _find_project_root
+        candidate = os.path.join(_find_project_root(), ".agentx", "mcp_harvest.jsonl")
+        if os.path.exists(candidate) and os.path.abspath(candidate) != os.path.abspath(
+                _harvest_path()):
+            return candidate
+    except Exception:
+        pass
+    return None
 
 
 def _flush_harvest(harvest, log):
@@ -569,8 +700,8 @@ def auto_coach(path=None, log=None):
     SAFE BY CONSTRUCTION:
       * value-free, minimal-privilege reframe (never lateral) -> a wrong signal still coaches safe;
       * recurrence-gated (>= AGENTX_MCP_AUTO_COACH_MIN, default 3) -> one-offs never promote;
-      * writes source='mcp_auto' ONLY when a real project root resolves (has .git/.agentx), so an
-        MCP host launched from an odd cwd ($HOME, /) never scatters an overrides.json;
+      * writes to the PER-USER store, so an MCP host launched from an odd cwd ($HOME, /) cannot
+        scatter an overrides.json and no longer needs a project-root gate (see below);
       * a HUMAN-authored override always WINS -- an existing non-'mcp_auto' entry is never touched
         (hand-adopt beats auto), and an unchanged auto entry is left alone (no churn);
       * AGENTX_MCP_AUTO_COACH=off disables it entirely.
@@ -579,14 +710,33 @@ def auto_coach(path=None, log=None):
     if not _auto_coach_enabled():
         return
     try:
-        from agentx_sdk.overrides import _find_project_root, load_overrides, adopt as adopt_override
-        root = _find_project_root()
-        if not (os.path.isdir(os.path.join(root, ".git")) or os.path.isdir(os.path.join(root, ".agentx"))):
-            return                                     # no real project root -> don't scatter files
+        from agentx_sdk.overrides import load_overrides, adopt as adopt_override
+        # THE PROJECT-ROOT GATE IS GONE (2026-07-31), and removing it is the other half of the
+        # per-user store fix. It used to return early unless a `.git`/`.agentx` resolved by
+        # walking up from CWD, on the stated grounds that "an MCP host launched from an odd cwd
+        # ($HOME, /) never scatters an overrides.json". That rationale died the moment the write
+        # target stopped being cwd-derived: adopt_override now writes to the per-user store
+        # (_mcp_overrides_path, pinned by _point_stores_at_mcp_home), so there is nothing left to
+        # scatter and nowhere else for it to go.
+        #
+        # Left in place it INVERTED the fix. The exact case the fix targets -- a host launching
+        # the proxy from $HOME or / -- is the case the guard rejects, so blocks and recoveries
+        # were recorded, the reader opened the right store, and NOTHING was ever promoted into
+        # it. `--insights` would still say "No reusable safe-paths to show yet", which is the one
+        # answer this surface must never give. The store fix would have looked done and changed
+        # nothing for exactly the users it was written for. (Found by a code review of #288; the
+        # PR's own new test is a source grep for the shared resolver and is blind to this.)
+        # EXPLICIT PATH, not the ambient env. _point_stores_at_mcp_home() pins AGENTX_OVERRIDES
+        # for the whole proxy process, so reading it would usually work -- but "usually, because
+        # something else ran first" is the dependency that produced every bug in this file. Pass
+        # the per-user path directly and auto_coach cannot scatter a file into an odd cwd no
+        # matter who calls it, which is the property the old project-root gate was reaching for
+        # and got by blocking the write entirely.
+        overrides_path = _mcp_overrides_path()
         candidates = mcp_recovery_candidates(path, log)
         if not candidates:
             return
-        active = load_overrides().get("overrides", {})
+        active = load_overrides(path=overrides_path).get("overrides", {})
         threshold = _auto_coach_min()
         promoted = 0
         for key, bucket in candidates.items():
@@ -601,12 +751,16 @@ def auto_coach(path=None, log=None):
                 continue                               # identical auto entry already live; no churn
             adopt_override(bucket["policy_id"], challenge=top["suggestion"],
                            safe_path=top.get("safe_path"), resolution_type="mcp_recovery",
-                           policy_violated=bucket.get("policy_violated"), source="mcp_auto")
+                           policy_violated=bucket.get("policy_violated"), source="mcp_auto",
+                           path=overrides_path)
             promoted += 1
         if promoted:
+            # `uvx agentx-mcp --review`, not `agentx mcp-insights`: same reachability rule as
+            # the rest of this door, and --review is what ACTS on these (adopt / reject) rather
+            # than just listing them. (2026-07-31.)
             print("[agentx-mcp] auto-coach promoted %d recovery path(s) into the org-brain "
-                  "(source=mcp_auto; `agentx mcp-insights` to review, AGENTX_MCP_AUTO_COACH=off "
-                  "to stop)." % promoted, file=log)
+                  "(source=mcp_auto; review them:  uvx agentx-mcp --review  ·  "
+                  "AGENTX_MCP_AUTO_COACH=off to stop)." % promoted, file=log)
     except Exception as err:
         print("[agentx-mcp] auto-coach skipped: %s" % err, file=log)
 
@@ -644,16 +798,15 @@ def _tool_pinning_mode():
 
 
 def _pins_path():
-    """Where the persistent tool-fingerprint manifest lives. An explicit
-    AGENTX_MCP_PINS_PATH wins (RECOMMENDED for MCP hosts, which launch the proxy
-    from an unrelated cwd -- often $HOME or / -- the same gotcha _harvest_path
-    documents); otherwise .agentx/mcp_tool_pins.json under the project root, beside
-    the overrides + harvest stores."""
+    """Where the persistent tool-fingerprint manifest lives. Same two branches as _harvest_path
+    and for the same reason: AGENTX_MCP_PINS_PATH, else the per-user store, neither derived from
+    cwd. Pins are compared ACROSS RUNS, so a path that moved with the launch directory would
+    re-pin every tool as new the moment the host started the proxy somewhere else, turning drift
+    detection into noise."""
     explicit = os.environ.get("AGENTX_MCP_PINS_PATH")
     if explicit:
         return explicit
-    from agentx_sdk.overrides import _find_project_root
-    return os.path.join(_find_project_root(), ".agentx", "mcp_tool_pins.json")
+    return os.path.join(_user_store_dir(), "mcp_tool_pins.json")
 
 
 def _server_key(child_cmd):
@@ -979,7 +1132,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     if load_err is not None and strict:
         req_id = msg.get("id")
         if req_id is not None:
-            writer.send(_block_response(req_id, _policy_load_error_message(load_err)))
+            writer.send(_block_response(req_id, _policy_load_error_message(load_err, mcp=True)))
         else:
             print("[agentx-mcp] dropped id-less call (policy file malformed; failing closed)",
                   file=log)
@@ -1103,8 +1256,10 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
             except Exception:
                 pass
         try:
-            print("[agentx-mcp] AUDIT: would have blocked '%s' (%s); AGENTX_ENFORCEMENT=audit, "
-                  "forwarded and recorded. Review: agentx insights"
+            # `agentx-mcp --insights`, never `agentx insights`: under uvx the SDK's `agentx`
+            # script is not on PATH, so the bare form sent this reader to a command not found.
+            print("[agentx-mcp] AUDIT: would have stopped '%s' (%s), but AGENTX_ENFORCEMENT=audit, "
+                  "so it ran. Recorded. See it: uvx agentx-mcp --insights"
                   % (tool_key, decision.get("policy_name")), file=log)
         except Exception:
             pass
@@ -1335,7 +1490,7 @@ def _protection_report(session_stats, log):
         calls = int(session_stats.get("total_calls", 0) or 0)
         if calls <= 0:
             return
-        print("[agentx-mcp] shield report: %d call(s) screened, %d blocked, %d self-corrected after a block."
+        print("[agentx-mcp] %d call(s) checked, %d stopped, %d fixed and retried by your agent."
               % (calls,
                  int(session_stats.get("critical_blocks", 0) or 0),
                  int(session_stats.get("self_corrections", 0) or 0)), file=log)
@@ -1357,15 +1512,19 @@ def _protection_report(session_stats, log):
         # nudge), so the MCP surface points at the same one-key adopt/label pass. `review`
         # covers the keyless-MCP wedge's learned safe-paths too (cli._mcp_review_items).
         if recovered_n:
-            print("[agentx-mcp]   -> adopt the safe-paths it learned (or label a block):  agentx review", file=log)
+            # `agentx-mcp --review`, not `agentx review`. A uvx user does not have the second
+            # one, so the loop dead-ended at exactly the moment we asked them to close it.
+            print("[agentx-mcp]   -> %d fix(es) your agent found. Approve or reject:  uvx agentx-mcp --review"
+                  % recovered_n, file=log)
         # Shield failures: calls the shield could NOT screen because it threw. Surfaces
         # only when non-zero, so a healthy session stays quiet and this line stands out.
         # The MCP twin of the decorator's "Shield Fail-Opens" summary line -- BOTH
         # surfaces report, or a fix wired into one reaches none of the other's users.
         failopens_n = int(session_stats.get("shield_failopens", 0) or 0)
         if failopens_n:
-            print("[agentx-mcp]   -> %d call(s) the shield could NOT screen (a shield BUG, not a policy "
-                  "decision). Please report: https://bit.ly/agentfirewall" % failopens_n, file=log)
+            print("[agentx-mcp]   -> %d call(s) could NOT be checked and were allowed through (a BUG on "
+                  "our side, not a policy decision). Please report: https://bit.ly/agentfirewall"
+                  % failopens_n, file=log)
         protection = pulse.record_protection(session_stats)
         if protection:
             print("[agentx-mcp] protection streak: %s." % pulse.format_protection_line(protection), file=log)
@@ -1375,7 +1534,100 @@ def _protection_report(session_stats, log):
         # decorator, on `log` (stderr): a banner on stdout would corrupt the JSON-RPC stream.
         stale = pulse.staleness_notice()
         if stale:
-            print("[agentx-mcp] update: %s. -> %s" % (stale, pulse.UPGRADE_COMMAND), file=log)
+            # MCP_UPGRADE_COMMAND, not UPGRADE_COMMAND. The shared one is
+            # `pip install --upgrade agentx-security-sdk`, which on this door names the wrong
+            # package (they installed agentx-mcp) AND is a no-op on two of the three install
+            # paths: uvx resolves a fresh ephemeral env per run and pipx has its own venv, so
+            # neither reads the user's global pip. It succeeded and changed nothing, which is
+            # worse than a command-not-found because nothing looks wrong. (2026-07-31.)
+            print("[agentx-mcp] update: %s. -> %s" % (stale, pulse.MCP_UPGRADE_COMMAND), file=log)
+    except Exception:
+        pass
+
+
+def _reader_globals(fn, argv):
+    """Run a reader command (execute_review / execute_insights) with the MCP door's globals
+    set, and PUT THEM BACK.
+
+    cli.MCP_ENTRY and AGENTX_INCIDENT_DB were set process-globally with no restore. Harmless
+    in the real one-shot CLI, which exits immediately -- but these paths run IN-PROCESS in the
+    test suite, so one --review call permanently flipped every later execute_insights /
+    execute_review in that process to the MCP rendering and to the home-dir ledger. That is the
+    same leak class execute_demo's finally block had just been fixed for; I fixed it there and
+    reintroduced it here in the same PR. (Fourth review of #287.)
+    """
+    from agentx_sdk import cli, db as _db
+    saved_entry = cli.MCP_ENTRY
+    saved_db = os.environ.get("AGENTX_INCIDENT_DB")
+    # AGENTX_OVERRIDES joined the list 2026-07-31 with the store fix. Everything this wrapper
+    # sets must be restorable, or the next in-process caller inherits the MCP door's view.
+    saved_overrides = os.environ.get("AGENTX_OVERRIDES")
+    # db.DB_PATH too. _point_stores_at_mcp_home mutates FOUR things and the first version of
+    # this restore put back two -- caught immediately by test_decorator_ledger_default_is_
+    # untouched, which is the existing suite doing what my own new test did not.
+    saved_path = _db.DB_PATH
+    try:
+        cli.MCP_ENTRY = True          # render CTAs this reader can actually run
+        _point_stores_at_mcp_home()
+        getattr(cli, fn)(argv)
+    finally:
+        cli.MCP_ENTRY = saved_entry
+        _db.DB_PATH = saved_path
+        for _var, _saved in (("AGENTX_INCIDENT_DB", saved_db),
+                             ("AGENTX_OVERRIDES", saved_overrides)):
+            if _saved is None:
+                os.environ.pop(_var, None)
+            else:
+                os.environ[_var] = _saved
+
+
+def _point_stores_at_mcp_home():
+    """Point EVERY store a reader command touches at the per-user MCP home.
+
+    Renamed from `_point_db_at_mcp_ledger` when it stopped being only about the db: the name
+    described one of the things it did, which is how the missing one stayed invisible.
+
+    The --review / --insights flags dispatch early, BEFORE the proxy-session setup further
+    down that normally does this. Without it those commands open the cwd-relative default
+    `.agentx.db` -- an empty file in whatever directory the user happened to be standing in --
+    while the proxy writes its WOULD_BLOCK rows to ~/.agentx/mcp-ledger.db. The reader then
+    prints "nothing to see" over a ledger full of catches, which is worse than an error: it
+    reads as "the shield found nothing", the one wrong answer this surface must never give.
+
+    Caught in review of #287, not by the tests, because the gate ran against an empty corpus
+    where a wrong path and an empty path look identical.
+
+    THREE stores, and the count is the lesson. Each was found only after the previous fix
+    shipped looking complete:
+      1. db.DB_PATH            -- get_would_block_summary(), i.e. the audit block.
+      2. AGENTX_INCIDENT_DB    -- overrides._incident_db_path(), behind incident_db_census(),
+                                  harvest_candidates() via _collect_candidates(), and
+                                  reviewable_items(). Setting only (1) fixed the audit section
+                                  and left "SAFE-PATHS YOUR AGENTS LEARNED" and `--review`
+                                  reporting an empty store -- half a bug, fixed loudly enough
+                                  to look done. (Caught on the THIRD review of #287.)
+      3. AGENTX_OVERRIDES      -- overrides._overrides_path(), the ADOPTED safe-paths the
+                                  "SAFE-PATHS YOUR AGENTS LEARNED" section actually renders,
+                                  and what adopt_override() writes. Setting (1)+(2) left the
+                                  audit counts correct and that section still answering off
+                                  the caller's cwd, so half the screen was authoritative and
+                                  half was silently empty. (Caught on the FIFTH review, by
+                                  RUNNING the command from two directories -- four read-based
+                                  passes over this same function missed it.)
+
+    If a fourth resolver ever appears, it belongs here. The test that guards this asserts the
+    reader and the proxy agree from two DIFFERENT working directories, which is the property
+    that actually matters and the one a source grep cannot check.
+    """
+    try:
+        from agentx_sdk import db as _db
+        ledger = _mcp_ledger_path()
+        _db.DB_PATH = ledger
+        os.makedirs(os.path.dirname(ledger) or ".", exist_ok=True)
+        os.environ["AGENTX_INCIDENT_DB"] = ledger
+        overrides_path = _mcp_overrides_path()
+        os.makedirs(os.path.dirname(overrides_path) or ".", exist_ok=True)
+        os.environ["AGENTX_OVERRIDES"] = overrides_path
     except Exception:
         pass
 
@@ -1392,6 +1644,34 @@ def main(argv=None):
             sys.stderr.write("agentx-mcp %s\n" % __version__)
         except Exception:
             sys.stderr.write("agentx-mcp\n")
+        return 0
+    if argv and argv[0] == "--demo":
+        # Dispatch BEFORE the proxy session setup below (stdout aliasing, ledger init,
+        # atexit pulse/report): the demo is a self-contained run against a bundled stub,
+        # not a wrapped server, so it must not register a session or emit a pulse.
+        from agentx_sdk.mcp_demo import run_demo
+        return run_demo()
+    if argv and argv[0] == "--review":
+        # The uvx door installs exactly ONE console script (agentx-mcp), never `agentx`, so
+        # without this an MCP user has no way to reach `agentx review` at all and the loop
+        # dead-ends after the block. Same command they already have, same review code the
+        # Python path uses -- this is a reachable entry point, not a second implementation.
+        # Dispatched here, before the session setup, for the same reason as --demo.
+        #
+        # The stranded-corpus advisory is NOT printed here. It lives in execute_review, which
+        # both readers go through, so it is emitted exactly once no matter which command you
+        # ran. It was briefly in both places and MCP users saw the migration notice twice.
+        _reader_globals("execute_review", argv[1:])
+        return 0
+    if argv and argv[0] == "--insights":
+        # Same reachability problem as --review, and it bit harder: the AUDIT-mode banner
+        # tells an operator their server is NOT protected and points at `agentx insights`
+        # to see what would have been stopped. Under `uvx agentx-mcp` that command does not
+        # exist, so the one moment we most need someone to look at their catches sent them
+        # to a command not found. (pip install agentx-mcp does pull the SDK's `agentx`
+        # script, so this only ever failed on the uvx door -- which is the door /docs
+        # documents.) Same reader, same code, reachable from the entry point they have.
+        _reader_globals("execute_insights", argv[1:])
         return 0
     if argv and argv[0] == "--":          # explicit end-of-options separator
         argv = argv[1:]
@@ -1435,6 +1715,18 @@ def main(argv=None):
     # coaching error, so a team can run the shield non-blocking in staging first. Resolved
     # once at startup (a long-lived process; no per-tool override on the proxy path).
     session_stats["_enforcement"] = _resolve_enforcement(None)
+    # Point every store at the per-user MCP home BEFORE init_db creates one, or the proxy
+    # leaves a .agentx.db in whatever directory the MCP host launched it from. The proxy owns
+    # this whole process, so these are set globally rather than passed around. The decorator
+    # path never runs this, so its cwd-relative defaults are untouched.
+    #
+    # THE SAME FUNCTION THE READER CALLS, deliberately. This used to set db.DB_PATH here and
+    # let _point_stores_at_mcp_home do its own thing over in the reader, which is precisely how
+    # the two sides came to disagree about where adopted safe-paths live: the proxy's
+    # auto-coach wrote them through the cwd-derived default while `--review` read the per-user
+    # one. Two call sites computing "the same" answer separately is the bug, so there is now
+    # one function and both callers use it. (2026-07-31.)
+    _point_stores_at_mcp_home()
     try:
         init_db()
     except Exception:
@@ -1456,10 +1748,11 @@ def main(argv=None):
         # decorator's _emit_audit_banner).
         print("[agentx-mcp] "
               "============================================================", file=sys.stderr)
-        print("[agentx-mcp]  AGENTX AUDIT MODE (AGENTX_ENFORCEMENT=audit): tool calls are "
-              "RECORDED but NOT blocked.", file=sys.stderr)
-        print("[agentx-mcp]  The server is NOT protected. See catches: agentx insights  |  "
-              "Block for real: set AGENTX_ENFORCEMENT=enforce", file=sys.stderr)
+        print("[agentx-mcp]  AUDIT MODE (AGENTX_ENFORCEMENT=audit): destructive tool calls are "
+              "RECORDED and still RUN.", file=sys.stderr)
+        print("[agentx-mcp]  Your server is NOT protected.", file=sys.stderr)
+        print("[agentx-mcp]  See what would have been stopped:  uvx agentx-mcp --insights", file=sys.stderr)
+        print("[agentx-mcp]  Start stopping them:  set AGENTX_ENFORCEMENT=enforce", file=sys.stderr)
         print("[agentx-mcp] "
               "============================================================", file=sys.stderr)
     print("[agentx-mcp] AgentX shield active (%s), wrapping: %s"
