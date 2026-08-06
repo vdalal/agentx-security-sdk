@@ -62,10 +62,18 @@ sys.stdout = sys.stderr
 try:
     from agentx_sdk.decorators import (
         _BLOCK_CATEGORY_VOCAB,
+        _abstract_call,
         _apply_org_override,
+        _call_signature,
         _coerce_arg_value,
         _max_cognitive_turns,
-        _name_tokens,
+        # _scope / _target_action read as unused HERE — the module body calls neither directly,
+        # only _abstract_call does, from decorators. They are re-exported on purpose: the MCP
+        # classifier tests drive them as `mp._scope(...)` / `mp._target_action(...)`, which is the
+        # right surface for them (the behaviour under test is MCP harvest classification, even
+        # though the code now lives one module down). Removing them as "dead" breaks 20 tests.
+        _scope,
+        _target_action,
         _note_block_category,
         _resolve_enforcement,
         evaluate_call_keyless,
@@ -269,72 +277,11 @@ def _call_ceiling():
         return 0
 
 
-# The structural-signature vocab for a recovered call Y. Keyless MCP has NO judge to label a call, so the
-# signature is a LOCAL, coarse heuristic: target_action is read off the tool NAME (word tokens
-# via the shared _name_tokens), scope off the ARG-KEY shape. NEITHER ever inspects an argument
-# VALUE, so no raw payload can enter the record (moat-collection-day0: never raw query / CoT /
-# args). NOTE: this is a SEPARATE keyless action vocab -- it does NOT match the gateway's
-# rule-shape target_action values (execute_database_query / fetch_url / send_message / ...), so
-# generalizing a harvested pair into a shared gateway rule needs a CROSSWALK, not a direct join
-# (see the design doc). The vocab is CLOSED (the value is always one of these tokens).
-_ACTION_KEYWORDS = (   # first match wins; ordered most-destructive-first (a "delete_and_log"
-                       # tool classifies as DELETE, not WRITE/READ)
-    ("DELETE",  ("delete", "drop", "remove", "destroy", "truncate", "purge", "wipe")),
-    ("EXECUTE", ("exec", "run", "shell", "command", "spawn", "eval", "invoke")),
-    ("SEND",    ("send", "post", "upload", "email", "publish", "notify", "transfer", "push", "export")),
-    ("WRITE",   ("write", "update", "insert", "put", "create", "save", "edit", "modify", "patch", "append", "upsert", "set")),
-    ("LIST",    ("list", "search", "find", "browse", "scan", "enumerate", "glob")),
-    ("READ",    ("read", "get", "query", "select", "fetch", "load", "view", "show", "retrieve", "describe", "cat", "download", "dump")),
-)
-
-# Arg-key WORD TOKENS that NARROW the blast radius -> the recovered call looks "scoped". Matched
-# as whole tokens from the SAME _name_tokens split as the tool name (so camelCase accountId and
-# snake_case account_id both surface the "id" token), never as raw substrings (so "unlimited" /
-# "pathology" are not false "limit" / "path" hits). A bare payload key (query/body/content/data)
-# is deliberately absent: carrying a query is not the same as scoping it. We test only KEY tokens,
-# never store the key, never read the value.
-_NARROWING_TOKENS = frozenset((
-    "id", "ids", "key", "keys", "where", "filter", "limit", "scope", "path",
-    "name", "prefix", "since", "after", "before", "page", "cursor", "offset",
-    "top", "first", "target", "recipient", "to", "dest", "destination", "channel",
-))
-
-
-def _target_action(tool):
-    """Coarse action class read off the tool NAME only (never a value), by exact word token
-    (shared _name_tokens). Closed vocab; OTHER when nothing matches."""
-    toks = set(_name_tokens(tool))
-    for action, keys in _ACTION_KEYWORDS:
-        if toks.intersection(keys):
-            return action
-    return "OTHER"
-
-
-def _scope(arguments):
-    """Coarse blast-radius shape read off the ARG-KEY names only (never a value): 'scoped' if any
-    key carries a narrowing/target WORD TOKEN, else 'broad'. Named 'scope' (NOT effect_*) so it
-    does not collide with the gateway's effect_category threat taxonomy. It is the structural
-    signal for WHY the recovered call was safe (it narrowed the action), beyond the bare category.
-    Coarse + value-free: it sees a narrowing KEY is present, never that a value targets everything."""
-    if not isinstance(arguments, dict) or not arguments:
-        return "broad"
-    for raw in arguments.keys():
-        if _NARROWING_TOKENS.intersection(_name_tokens(str(raw))):
-            return "scoped"
-    return "broad"
-
-
-def _abstract_call(tool, arguments):
-    """The structural signature of a recovered call Y: ``{target_action, scope}``. Purely
-    structural + closed-vocab; inspects ONLY the tool name and the arg-KEY names, NEVER an
-    argument value (moat-collection-day0). A coarse local heuristic, not a judge verdict. Total
-    best-effort: any unexpected input falls back to the safe default so harvest CAPTURE can never
-    raise into the proxy session (upholding the _flush_harvest 'never affect the run' invariant,
-    which the widened capture would otherwise weaken vs the old pure-append)."""
-    try:
-        return {"target_action": _target_action(tool), "scope": _scope(arguments)}
-    except Exception:
-        return {"target_action": "OTHER", "scope": "broad"}
+# The structural-signature vocab (_ACTION_KEYWORDS / _NARROWING_TOKENS / _target_action /
+# _scope / _abstract_call) MOVED to decorators.py and is imported at the top of this module.
+# It grew a second consumer — the decorator's two block paths, for context-scoped overrides —
+# and mcp_proxy imports FROM decorators, so the shared vocabulary has to live on that side of
+# the edge. Behaviour is unchanged; this is the SAME code, one module down.
 
 
 class _Harvest:
@@ -710,7 +657,8 @@ def auto_coach(path=None, log=None):
     if not _auto_coach_enabled():
         return
     try:
-        from agentx_sdk.overrides import load_overrides, adopt as adopt_override
+        from agentx_sdk.overrides import (load_overrides, adopt as adopt_override,
+                                          _norm_for_dedup)
         # THE PROJECT-ROOT GATE IS GONE (2026-07-31), and removing it is the other half of the
         # per-user store fix. It used to return early unless a `.git`/`.agentx` resolved by
         # walking up from CWD, on the stated grounds that "an MCP host launched from an odd cwd
@@ -736,7 +684,20 @@ def auto_coach(path=None, log=None):
         candidates = mcp_recovery_candidates(path, log)
         if not candidates:
             return
-        active = load_overrides(path=overrides_path).get("overrides", {})
+        _store = load_overrides(path=overrides_path)
+        active = _store.get("overrides", {})
+        # The "human-authored wins" gate has to see SCOPED rules too. Reading only the bare map
+        # meant an author who deliberately narrowed a policy to one situation -- and therefore has
+        # no bare entry -- got a policy-WIDE auto reframe installed on that same policy. The scoped
+        # rule still wins on its own calls, so nothing is lost; but coaching now fires everywhere on
+        # a policy a human explicitly narrowed, which is a widening and the opposite of the intent
+        # the gate exists to respect. Deliberate narrowing is a stronger signal than no opinion.
+        _human_scoped = {e.get("policy_id") for e in (_store.get("scoped_overrides") or [])
+                         if isinstance(e, dict) and e.get("source") != "mcp_auto"}
+        _human_scoped_names = {_norm_for_dedup(e.get("policy_violated"))
+                               for e in (_store.get("scoped_overrides") or [])
+                               if isinstance(e, dict) and e.get("source") != "mcp_auto"
+                               and e.get("policy_violated")}
         threshold = _auto_coach_min()
         promoted = 0
         for key, bucket in candidates.items():
@@ -744,6 +705,9 @@ def auto_coach(path=None, log=None):
             top = cands[0] if cands else None
             if not top or top.get("count", 0) < threshold:
                 continue                               # recurrence gate
+            if (bucket.get("policy_id") in _human_scoped
+                    or _norm_for_dedup(bucket.get("policy_violated")) in _human_scoped_names):
+                continue                               # a human already scoped this policy
             existing = active.get(key)
             if existing and existing.get("source") != "mcp_auto":
                 continue                               # human-authored wins; never overwrite it
@@ -1311,9 +1275,17 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # it reads the local .agentx/overrides.json (no gateway). Total best-effort — it
         # returns the inputs unchanged when nothing is adopted, so the cold install (the
         # funnel target, no overrides) is completely unaffected.
+        # ...including a CONTEXT-SCOPED one. The agent_id dimension is the literal
+        # "mcp_proxy" this surface logs its intercepts under -- there is no per-agent identity on
+        # the keyless MCP door, so a scope written for a named agent correctly does NOT match
+        # here, and `tool` is the dimension that carries org specificity on this path.
+        _mcp_args = params.get("arguments")
         ch, safe = _apply_org_override(
             decision.get("policy_id"), decision.get("challenge_text"),
-            decision.get("preferred_alternative"), policy_name=decision.get("policy_name"))
+            decision.get("preferred_alternative"), policy_name=decision.get("policy_name"),
+            signature=_call_signature(
+                "mcp_proxy", tool_key,
+                _mcp_args.keys() if isinstance(_mcp_args, dict) else ()))
         coached = dict(decision, challenge_text=ch, preferred_alternative=safe)
         writer.send(_block_response(req_id, _coaching_text(coached, tripped, name)))
     else:

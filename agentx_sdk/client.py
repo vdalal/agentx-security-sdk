@@ -111,10 +111,130 @@ class AgentXClient:
                              # (first Next.js route compile + cold Gemini can exceed 15s)
             )
             
+            # AUTH IS NOT AVAILABILITY, and the availability contract must not swallow it.
+            # 401 was always a hard error; review found the new non-verdict gate below had
+            # quietly annexed the rest of the class. An SSO proxy in front of the gateway
+            # answering 403 {"detail":"SSO session expired"}, or a 407 from a corporate
+            # proxy, is JSON that carries no verdict — so it took the availability path, and
+            # under the ratified fail-OPEN default the protected tool RAN. That is strictly
+            # worse than before this branch existed, where the same response hard-errored and
+            # the tool did not run. Reproduced by review: a money-transfer tool executed on a
+            # 403 with only a WARNING.
+            #
+            # These belong to a human, not to a retry: nobody's session expires their way out
+            # of it and no amount of waiting fixes a bad credential. Safe to hard-error
+            # because the gateway itself NEVER returns 401/403/407 (verified against every
+            # response path in backend/gateway.py), so one of these can only have come from
+            # something standing in front of it.
+            #
+            # 429 deliberately NOT here: rate limiting IS a transient capacity condition, and
+            # that is exactly what the availability contract is for.
             if response.status_code == 401:
+                # Unchanged wording: this string predates the class and is what an existing
+                # test and anyone's log-grep expects. Widening the CLASS must not silently
+                # reword the member that was already right.
                 return {"status": "ERROR", "message": "Invalid AgentX API Key."}
-                
-            result = response.json()
+            if response.status_code in (403, 407):
+                return {"status": "ERROR",
+                        "message": f"AgentX gateway request was rejected "
+                                   f"(HTTP {response.status_code}). That is an authorization "
+                                   f"or proxy-authentication problem, not an outage: the "
+                                   f"tool was NOT run, and retrying will not help.",
+                        "detail": (response.text or "")[:300]}
+
+            # A 5xx, or ANY non-JSON body (a proxy's HTML error page, a bare
+            # "Internal Server Error"), means the gateway could not return a verdict.
+            # That is the SAME situation as unreachable, so it takes the SAME contract
+            # instead of a hard ERROR. Previously `.json()` raised straight into the
+            # generic handler below, which returns status ERROR, and the decorator turns
+            # ERROR into "AgentX System Error" and DOES NOT RUN THE TOOL. So one
+            # malformed field — or an ordinary cold-start 502 — silently disabled a
+            # protected tool AND skipped the AGENTX_FAIL_MODE decision entirely, so the
+            # default (open: run the tool, count a degraded execution) never got to apply
+            # and nothing recorded that we were running unprotected. Found 2026-08-02;
+            # see BACKLOG P-21. NOTE: this is NOT an audit-posture issue — audit
+            # deliberately covers POLICY blocks, not availability (see
+            # decorators._audit_and_proceed) — it is fail-mode routing.
+            # `gateway_reached` and `detail` matter and were lost in the first cut of this
+            # fix. Review found two consequences. (1) decorators.py treats
+            # REASONING_ENGINE_UNREACHABLE as "the gateway was never reached", so a PAYING
+            # install whose gateway answers but answers badly emitted a pulse
+            # byte-identical to one that never configured a gateway at all — corrupting the
+            # very activation funnel we read to judge the paid tier. (2) dropping
+            # response.text discarded the only clue that the gateway is UP and crashing,
+            # which is exactly how P-21 was found in the first place. Carry both: the
+            # verdict is availability, the FACTS say the server answered.
+            #
+            # TWO PROOF LEVELS, because one flag was being asked two different questions and
+            # gave the wrong answer to one of them whichever way it was set.
+            #   gateway_answered   -- SOMETHING replied at that URL. The funnel's question
+            #                         ("did this install reach a gateway at all") wants this,
+            #                         and a cold-start 502 answers YES, which is the whole
+            #                         point of P-21.
+            #   gateway_identified -- what replied was demonstrably OURS, i.e. it carried
+            #                         X-AgentX-Reasoning. The precision consumers want this:
+            #                         the steered-fault counter, and any advice of the form
+            #                         "go read the engine's logs".
+            # Review proposed gating the 5xx branch on the header outright. PROBED FIRST, and
+            # the premise does not hold: gateway.py's middleware stamps the header AFTER
+            # `await call_next(...)`, so an HTTPException(500) keeps it but an UNHANDLED
+            # exception never reaches the stamp — and an unhandled exception is precisely the
+            # P-21 shape (`.strip()` on a JSON number). Gating 5xx on the header would
+            # therefore have re-broken the exact case this branch was written for. Splitting
+            # the two levels gets the reviewer's real point (a 502 from an ALB with no
+            # backend must not fill the steered-fault counter) without that cost.
+            if response.status_code >= 500:
+                out = {"status": "REASONING_ENGINE_UNREACHABLE",
+                       "reason": f"gateway_{response.status_code}",
+                       "gateway_answered": True,
+                       "detail": (response.text or "")[:300]}
+                if response.headers.get("X-AgentX-Reasoning") is not None:
+                    out["gateway_identified"] = True
+                return out
+            try:
+                result = response.json()
+            except ValueError:      # requests' JSONDecodeError subclasses ValueError
+                # `gateway_answered` here, but ONLY if what answered is plausibly OUR
+                # gateway. A 2xx/4xx with an unparseable body is the shape a corporate proxy
+                # login page, a stale service returning HTML, or a plain 404 page has, and
+                # none of those is a gateway. Setting the flag unconditionally traded P-21's
+                # false negative for a false POSITIVE on the same signal: a developer with a
+                # wrong `gateway_url` would have reported the paid-tier funnel stage as
+                # reached without ever reaching a gateway. /v1/evaluate advertises
+                # X-AgentX-Reasoning on every response, so the header is the cheap proof that
+                # something of ours is on the other end. The 5xx branch above needs no such
+                # proof: it is the cold-start / crashing-engine case P-21 was filed for, and
+                # is claimed as answered on the strength of the status alone.
+                out = {"status": "REASONING_ENGINE_UNREACHABLE",
+                       "reason": "non_json_response",
+                       "detail": (response.text or "")[:300]}
+                if response.headers.get("X-AgentX-Reasoning") is not None:
+                    out["gateway_answered"] = True
+                    out["gateway_identified"] = True
+                return out
+            # THE THIRD MEMBER OF THE CLASS, and gating on the body's ENCODING is what hid
+            # it. P-21 is "the gateway could not return a verdict"; that has three shapes, not
+            # two — a 5xx, a body that will not parse, and a body that parses fine and is not
+            # a verdict. The third is the COMMONEST misconfiguration of the three: point
+            # gateway_url at the right host and the wrong path and FastAPI answers a JSON 404,
+            # which parsed cleanly, carried no `status`, and fell through to the decorator as
+            # a dict with nothing it recognises — so the tool was replaced by "AgentX System
+            # Error", no fail-mode decision ran, and nothing was counted. Exactly the P-21
+            # symptom the 5xx fix was written for, reached by a different door. Any unrelated
+            # JSON API at that URL does the same.
+            #
+            # Every real /v1/evaluate answer carries `status` (ALLOWED / ESCALATED / …) or the
+            # `error` a policy block uses, so that is the gate: a VERDICT, not an encoding.
+            # Stated as one rule on purpose rather than a third special case, because a fourth
+            # spelling of "not a verdict" is otherwise just a matter of time.
+            if not isinstance(result, dict) or not ("status" in result or "error" in result):
+                out = {"status": "REASONING_ENGINE_UNREACHABLE",
+                       "reason": "non_verdict_body",
+                       "detail": (response.text or "")[:300]}
+                if response.headers.get("X-AgentX-Reasoning") is not None:
+                    out["gateway_answered"] = True
+                    out["gateway_identified"] = True
+                return out
             # Reasoning-tier capability (Recover vs keyless Shield) is advertised as a
             # header on EVERY /v1/evaluate response, so the SDK learns it on any verdict
             # (block/escalate/allow) — not just the body paths that used to mention it.
@@ -133,7 +253,24 @@ class AgentXClient:
             # Gateway is UP but did not answer in time — it may have been mid-evaluation
             # and about to block. Riskier than a clean connection failure. Signal fail-open.
             return {"status": "REASONING_ENGINE_UNREACHABLE", "reason": "timeout"}
+        except requests.exceptions.RequestException as e:
+            # CLASS CLOSE, not another instance (2026-08-02). The two handlers above name
+            # two transport failures; `requests` has many more that mean the SAME thing —
+            # SSLError (a proxy doing cert interception), ProxyError, TooManyRedirects,
+            # ChunkedEncodingError, ContentDecodingError, RetryError. Every one of them is
+            # "we could not get a verdict", and every one of them used to fall into the
+            # bare `except Exception` below and come back as a hard ERROR, which the
+            # decorator renders IN PLACE OF THE TOOL'S RESULT while skipping the
+            # AGENTX_FAIL_MODE decision entirely. P-21 was found as one member of this
+            # class (a plain-text 500); fixing only that member would have left the
+            # template. RequestException is the honest boundary: everything under it is
+            # the transport failing, so it is availability.
+            return {"status": "REASONING_ENGINE_UNREACHABLE",
+                    "reason": f"transport_{type(e).__name__.lower()}"}
         except Exception as e:
+            # Deliberately still a hard ERROR: anything that is NOT a transport failure is
+            # a bug in our own code (a TypeError here, a bad payload we built), and that
+            # should be loud rather than silently degraded into "gateway unavailable".
             return {"status": "ERROR", "message": f"AgentX unexpected error: {e}"}
 
     def register_incident(self, agent_id, query, chain_of_thought, policy_id,
@@ -302,7 +439,33 @@ class AgentXClient:
                 headers=headers,
                 timeout=3.0,
             )
+            # A 2xx does NOT mean anything was stored — see the same guard in cli.py and
+            # BACKLOG P-41. Two of the route's three 2xx shapes carry {accepted: 0}: an
+            # airgapped plane (no shared corpus off-cloud) and a batch whose rows all fail
+            # the server-side allowlist. This path matters MORE than the CLI one because it
+            # is automatic: it fires during ordinary SDK operation with no user command, so
+            # a false success stamps the contribute leg for someone who never asked to
+            # contribute. It also ADVANCES THE DELTA CURSOR, which is the worse half — a
+            # cursor advanced past signals that were never stored means the next genuine
+            # push silently skips them. Both effects are gated on the real count.
             if post.status_code in (200, 201, 202):
-                pulse.mark_contributed(cursor=body.get("cursor"))   # advance delta cursor + stamp the leg
+                try:
+                    accepted = (post.json() or {}).get("accepted")
+                except ValueError:
+                    accepted = None
+                # THE TRADE, stated because it is a real cost and not free (review of this
+                # change): when `accepted` is falsy we neither stamp nor advance, so the SAME
+                # delta is re-pulled and re-pushed on the next run. That is deliberate — an
+                # unconfirmed cursor advance is the silent-skip failure this whole change
+                # exists to remove — and it is BOUNDED: `last_auto_contribute` is stamped
+                # BEFORE the push, so the 24h debounce applies whatever the outcome, making
+                # the worst case one retry per install per day, not a loop.
+                # The one shape it costs: a plane that STORES rows but omits `accepted` would
+                # be re-sent the same batch daily and could accumulate duplicates. Every
+                # branch of our own route returns `accepted`, so that requires a forked plane,
+                # and at-least-once against a plane that will not confirm beats at-most-once
+                # that silently drops. Revisit only if a partner runs such a plane.
+                if accepted:
+                    pulse.mark_contributed(cursor=body.get("cursor"))   # advance delta cursor + stamp the leg
         except Exception:
             pass

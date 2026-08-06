@@ -58,6 +58,10 @@ _ensure_utf8_console()
 # =====================================================================
 logger = logging.getLogger("agentx")
 _FAILOPEN_BANNER_SHOWN = False
+# The (cause class, answered) the last fail-open banner described. A NEW cause re-arms the
+# banner, because the banner now carries the remedy and the server's own words, so the first
+# failure of a session was silently deciding both for every failure after it.
+_FAILOPEN_BANNER_CLASS = None
 _FAILMODE_WARNED = False
 _ENFORCEMENT_WARNED = False
 _AUDIT_BANNER_SHOWN = False
@@ -135,22 +139,200 @@ def _record_shield_failopen(tool_name, error):
         _SHIELD_FAILOPEN_BANNER_SHOWN = True
 
 
-def _emit_failopen_warning(reason, tool_name):
-    """Warn that a tool ran without gateway-side semantic checks (fail-open)."""
-    global _FAILOPEN_BANNER_SHOWN
+def _degraded_detail(reason):
+    """ONE mapping from a `reason` token to how a degraded run is described, in every
+    place we describe one. Returns a dict:
+
+        short        one-line label for the throttled follow-up
+        sentence     the banner's plain cause
+        answered     did something at that URL reply (drives the remedy line)
+        needs_proof  is `answered` a GUESS FROM THE BODY'S SHAPE that the caller must
+                     confirm? See below — this is the field the first fix lacked.
+        engine_fault a FAULT response, i.e. steerable; the narrow counting subset
+        cls          cause CLASS, coarser than `short`, for banner re-arming
+
+    A record and not a tuple because this grew from 3 fields to 6 in two review rounds, and
+    positional unpacking is one silent misread away from shipping the wrong flag.
+
+    Plain cause, so the operator is not told the opposite of what happened. A gateway that
+    returns a 5xx or an unparseable body IS reachable — it answered and could not produce a
+    verdict — and calling that "engine unreachable" sent people to check whether the container
+    was up when it was up and crashing. That misdirection is how P-21 stayed hidden.
+
+    `answered` is the fact the NEXT-STEP line turns on: "start the engine" is the wrong
+    advice for an engine that is already running and failing, and it was the advice the
+    banner gave.
+
+    `engine_fault` is narrower than `answered` and exists for counting, not for copy: the
+    engine returned a FAULT response (a 5xx, or a body that is not a verdict). That subset is
+    the one an attacker can steer. `backend/gateway.py` raises HTTPException(500) when the
+    evaluator itself crashes, which is exactly how P-21 was found, so any payload shape that
+    reliably trips an evaluator bug converts "the gateway vets this" into "the tool runs"
+    with only the Layer-0 keyword shield left. Under the default fail-open posture that is
+    worth SEEING separately from a cold-start 502, and `degraded_executions` alone counts
+    them identically. A timeout is `answered` but NOT an engine_fault: it is genuinely
+    ambiguous between a slow engine and a slow network, and folding it in would blunt the
+    signal this exists to sharpen.
+
+    `needs_proof` is the field the first cut of this did not have, and its absence made two
+    halves of one fix contradict each other. A 5xx and a timeout are self-proving: the status
+    line or the hang IS the evidence that something is running. A BODY is not. An unparseable
+    body and a verdict-less body are exactly what a captive portal, a stale HTML service and a
+    plain 404 return, so calling those "the engine answered" told a developer who had merely
+    mistyped `gateway_url` to go read the logs of an engine that does not exist. For those the
+    caller must supply proof (client.py's `gateway_answered`, which it sets only on our own
+    response header); with no proof, `answered` and `engine_fault` both collapse to False.
+
+    `cls` is coarser than `short` on purpose. A gateway flapping 502 → 503 → 504 is ONE cause,
+    and keying the banner on `short` re-announced it three times.
+
+    Anything that adds a new `reason` prefix adds it HERE and all the renderings move
+    together. Two adjacent copies of this mapping is what review found, and they had already
+    drifted apart in vocabulary (`startswith("non_json")` against `== "non_json_response"`),
+    which is the drift shape before it does damage."""
+    reason = str(reason or "")
+    if reason == "timeout":
+        # Gateway is UP but didn't answer in time — it may have been mid-evaluation
+        # and about to block. This is the riskier of the failure modes. Self-proving: the
+        # hang happened against something. NOT an engine_fault — genuinely ambiguous between
+        # a slow engine and a slow network, and folding it in would blunt the signal.
+        return dict(short="timeout",
+                    sentence="Reasoning Engine did not respond in time. It is running but "
+                             "slow, and may have been mid-evaluation.",
+                    next_step="Check the engine's logs:  docker-compose logs -f",
+                    answered=True, needs_proof=False, engine_fault=False, cls="timeout")
+    if reason.startswith("gateway_"):
+        code = reason.split("_", 1)[1]
+        return dict(short=f"engine answered {code} (up, but could not vet)",
+                    sentence=f"Reasoning Engine answered {code}. It is running and could not "
+                             "return a verdict, so this is a fault in the engine, not an "
+                             "outage.",
+                    next_step="Check the engine's logs:  docker-compose logs -f",
+                    # A 5xx WITHOUT our header is genuinely ambiguous and saying otherwise is
+                    # how P-21 started. Two different worlds produce exactly this: our own
+                    # gateway raising an unhandled exception (the P-21 shape — probed, the
+                    # capability header is stamped after `await call_next`, so a raise never
+                    # reaches it), and a load balancer with nothing behind it. Neither the
+                    # status nor the body distinguishes them. So say so and give both next
+                    # steps, rather than picking one and being confidently wrong half the
+                    # time — which is what both the original banner and the first fix did, in
+                    # opposite directions.
+                    short_unproven=f"something answered {code}, unidentified",
+                    sentence_unproven=f"Something answered {code} at that URL and did not "
+                                      "identify itself as the Reasoning Engine. That is "
+                                      "either the engine up and failing, or a proxy or load "
+                                      "balancer with nothing behind it, and this response "
+                                      "cannot tell the two apart.",
+                    next_step_unproven="Check both:  docker-compose ps  and  "
+                                       "docker-compose logs -f",
+                    answered=True, needs_proof=True, engine_fault=True, cls="gateway_fault")
+    if reason == "non_json_response":
+        return dict(short="engine answered with a non-JSON body (up, but could not vet)",
+                    sentence="Reasoning Engine answered with a body that is not JSON. "
+                             "Something is running at that URL and it did not return a "
+                             "verdict, so check that the URL points at the gateway and not "
+                             "at a proxy or an error page.",
+                    # Words for when the proof is ABSENT. Review found the gate was applied
+                    # to the remedy line and the counter but not to the copy, so a banner
+                    # could refuse to claim an answer and then describe one two lines up:
+                    # "engine answered ... (up, but could not vet)" is exactly the claim the
+                    # gate had just declined to make.
+                    next_step="Check the engine's logs:  docker-compose logs -f",
+                    next_step_unproven="Check AGENTX_GATEWAY_URL points at the gateway.",
+                    short_unproven="no gateway found at that URL",
+                    sentence_unproven="Nothing that looks like the Reasoning Engine is at "
+                                      "that URL. Something replied and it was not a verdict "
+                                      "and did not identify itself as the gateway, which is "
+                                      "what a proxy login page or an unrelated service looks "
+                                      "like. Check AGENTX_GATEWAY_URL.",
+                    answered=True, needs_proof=True, engine_fault=True, cls="non_json")
+    if reason == "non_verdict_body":
+        return dict(short="engine answered without a verdict (up, but could not vet)",
+                    sentence="Reasoning Engine answered with JSON that carries no verdict. "
+                             "The usual cause is the right host with the wrong path, which "
+                             "answers a JSON 404, so check that AGENTX_GATEWAY_URL points at "
+                             "the gateway itself.",
+                    next_step="Check the engine's logs:  docker-compose logs -f",
+                    next_step_unproven="Check AGENTX_GATEWAY_URL points at the gateway.",
+                    short_unproven="no gateway found at that URL",
+                    sentence_unproven="Nothing that looks like the Reasoning Engine is at "
+                                      "that URL. Something replied with JSON that is not a "
+                                      "verdict and did not identify itself as the gateway. "
+                                      "Check AGENTX_GATEWAY_URL.",
+                    answered=True, needs_proof=True, engine_fault=True, cls="non_verdict")
+    if reason.startswith("transport_"):
+        kind = reason.split("_", 1)[1]
+        return dict(short=f"transport failure ({kind})",
+                    sentence=f"Reasoning Engine could not be reached: {kind}.",
+                    answered=False, needs_proof=False, engine_fault=False, cls="transport")
+    return dict(short="engine unreachable",
+                sentence="Reasoning Engine is unreachable (down or not routable).",
+                answered=False, needs_proof=False, engine_fault=False, cls="unreachable")
+
+
+# `_degraded_cause` lived here as a thin wrapper returning _degraded_detail(reason)[0]. It
+# was kept "so existing callers keep working" and had none the moment the banner inlined the
+# short form, which is how a compatibility shim for nobody survives review. Deleted; call
+# _degraded_detail and take what you need.
+
+
+# A remote string is not display text. `detail` is response.text from whatever is at
+# gateway_url, so it is attacker-influenced, and rendering it into a WARNING gave the failing
+# endpoint a write primitive on our own banner. With "\n" alone stripped, a body of
+# "\r\x1b[2K\x1b[A\x1b[2K ✅ AgentX: all clear" erases the Engine-said line AND the line above
+# it -- the one that says the tool ran with NO AgentX checks -- and leaves a forged all-clear
+# in its place. So: strip every C0/C1 control byte including ESC, not the one we happened to
+# think of. Enumerating escape sequences would be the same treadmill; drop the whole class.
+_DETAIL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+# Servers echo the request. A proxy debug page, a 400 handler, a misconfigured logger: any of
+# them can reflect our Authorization header back, and this line goes to a logger that people
+# ship to aggregators. The project already keeps exception text off the pulse for this exact
+# reason; a local WARNING is not meaningfully safer than a pulse once it leaves the machine.
+_DETAIL_SECRET_RE = re.compile(
+    r"(?i)(bearer\s+|authorization\s*[:=]\s*|api[-_]?key\s*[:=]\s*|agentx_sk_|sk-)\S+")
+
+
+def _sanitize_detail(detail, limit=160):
+    """Make a remote server's body safe to print: no control bytes, no obvious credentials,
+    bounded. Returns "" when there is nothing worth showing."""
+    if not detail:
+        return ""
+    text = _DETAIL_CONTROL_RE.sub(" ", str(detail))
+    text = _DETAIL_SECRET_RE.sub(r"\1[redacted]", text)
+    return text.strip()[:limit]
+
+
+def _emit_failopen_warning(reason, tool_name, detail=None, answered=None):
+    """Warn that a tool ran without gateway-side semantic checks (fail-open).
+
+    `answered` is the CALLER's evidence that something of OURS replied (client.py's
+    `gateway_identified`). It wins over the reason-shape guess, because the two disagreed: a
+    header-less non-JSON body is shaped like an answer and is NOT one, and the banner was
+    telling a developer who mistyped gateway_url to go read the logs of an engine that does
+    not exist.
+
+    Falsy — an explicit False, or omitted entirely — reads as "no evidence", and for a
+    body-shaped reason that IS the answer, so the copy, the remedy line and the counter all
+    step back together. (An earlier version of this docstring said an omitted argument "falls
+    back to the reason shape". It never did: `bool(None)` is False. The words were describing
+    an intention rather than the line beneath them.)
+    """
+    global _FAILOPEN_BANNER_SHOWN, _FAILOPEN_BANNER_CLASS
 
     # Is the in-process deterministic floor still up? It is, unless the developer
     # explicitly disabled it — in which case this call truly had NO AgentX checks.
     shield_active = bool(LOCAL_POLICY_KEYWORDS) and \
         os.environ.get("AGENTX_BYPASS_LOCAL_SHIELD", "false").lower() != "true"
 
-    if reason == "timeout":
-        # Gateway is UP but didn't answer in time — it may have been mid-evaluation
-        # and about to block. This is the riskier of the two failure modes.
-        cause = ("Reasoning Engine did not respond in time — it is running but slow "
-                 "and may have been mid-evaluation.")
-    else:
-        cause = "Reasoning Engine is unreachable (down or not routable)."
+    d = _degraded_detail(reason)
+    # A shape-guess that needs proof gets it, or it is not claimed. `answered` falsy (an
+    # explicit False, or omitted by a caller with no evidence) reads the same on purpose:
+    # for a body-shaped reason, having no evidence IS the answer.
+    answered = d["answered"] and (bool(answered) or not d["needs_proof"])
+    # The COPY moves with the verdict, not just the remedy line and the counter.
+    unproven = d["needs_proof"] and not answered
+    short = d.get("short_unproven", d["short"]) if unproven else d["short"]
+    cause = d.get("sentence_unproven", d["sentence"]) if unproven else d["sentence"]
 
     if shield_active:
         floor = ("Offline keyword shield STILL ENFORCED for deterministic threats; "
@@ -158,7 +340,38 @@ def _emit_failopen_warning(reason, tool_name):
     else:
         floor = "Offline shield is DISABLED — this tool ran with NO AgentX checks."
 
-    if not _FAILOPEN_BANNER_SHOWN:
+    # The BANNER is the loud surface and, on a short run, the ONLY message an operator sees.
+    # It used to hardcode "is unreachable" + "start the engine" for every reason, so the
+    # 5xx / non-JSON cases the P-21 fix exists to distinguish were described as an outage
+    # and the operator was sent to start a container that was already up and crashing. The
+    # first cut of that fix wired the distinction into the throttled follow-up line only,
+    # which is the quiet path — it fixed the message almost nobody reads.
+    # The remedy now comes out of the same record as the words, so a reason cannot end up
+    # described one way and remediated another.
+    if unproven:
+        next_step = d.get("next_step_unproven", "Start the engine:  docker-compose up -d")
+    else:
+        next_step = d.get("next_step", "Start the engine:  docker-compose up -d")
+
+    # What the server actually said. `detail` is carried all the way from client.py for
+    # exactly this and was, until now, read by nobody: the response body was captured,
+    # threaded through the return value, and then dropped, so the clue that found P-21 in
+    # the first place still never reached an operator. One line, bounded, sanitized, and
+    # only when the server said something — an empty body adds noise and no information.
+    said = _sanitize_detail(detail)
+
+    # RE-ARM ON A NEW CAUSE, not once per session. Once-per-session throttling was written
+    # when every banner said the same words, so suppressing repeats lost nothing. Now that
+    # the banner carries the cause, the remedy AND the server's own words, the first failure
+    # of a session permanently decided all three. Both directions were wrong: a cold-start
+    # `connection_error` first meant every later payload-steered 500 got only the one-line
+    # form, so the traceback this feature exists to surface still never reached an operator
+    # in the very scenario that motivated it; and a `timeout` first meant a genuinely dead
+    # engine was still being answered with "check its logs". Keyed on the CAUSE CLASS, not
+    # the reason string, so a flapping gateway cycling 502/503/504 re-banners once, not
+    # three times. The throttled line still carries the cause for everything after that.
+    banner_class = (d["cls"], answered)
+    if not _FAILOPEN_BANNER_SHOWN or banner_class != _FAILOPEN_BANNER_CLASS:
         logger.warning(
             "\n"
             "════════════════════════════════════════════════════════════\n"
@@ -167,29 +380,42 @@ def _emit_failopen_warning(reason, tool_name):
             f" {cause}\n"
             f" Tool '{tool_name}' was executed.\n"
             f" {floor}\n"
-            " Start the engine:  docker-compose up -d\n"
+            + (f" Engine said: {said}\n" if said else "")
+            + f" {next_step}\n"
             "════════════════════════════════════════════════════════════"
         )
         _FAILOPEN_BANNER_SHOWN = True
+        _FAILOPEN_BANNER_CLASS = banner_class
     else:
-        mode = "timeout" if reason == "timeout" else "engine unreachable"
         tail = "offline shield active" if shield_active else "NO checks"
         logger.warning(
             f"[AgentX] DEGRADED: '{tool_name}' ran with gateway bypassed "
-            f"({mode}; {tail})."
+            f"({short}; {tail})."
+            + (f" Engine said: {said}" if said else "")
         )
 
 
-def _emit_failclosed_warning(reason, tool_name):
+def _emit_failclosed_warning(reason, tool_name, answered=None):
     """Warn that a tool was BLOCKED (fail-closed) because the engine couldn't vet it.
 
     No banner/throttle needed — under AGENTX_FAIL_MODE=closed the block itself is
     the loud signal; this line just explains why the action was held.
+
+    Takes `answered` for the same reason the fail-open half does. Review found the proof gate
+    had been fitted to one of the two paths: under AGENTX_FAIL_MODE=closed, a developer who
+    mistyped gateway_url was still told "Something is running at that URL" about a URL where
+    nothing of ours is — the exact misdirection the other half had just been fixed to stop.
+    Half a fix, and the half that ships to the more safety-conscious operator.
     """
-    cause = "did not respond in time" if reason == "timeout" else "is unreachable"
+    # Same mapping as the fail-open path, not a second copy of it. The copy that used to
+    # live here also leaked the raw token into user copy ("could not vet it (gateway_500)")
+    # while the other path rendered plain words for the same event.
+    d = _degraded_detail(reason)
+    proven = d["answered"] and (bool(answered) or not d["needs_proof"])
+    cause = d["sentence"] if proven else d.get("sentence_unproven", d["sentence"])
     logger.warning(
-        f"[AgentX] FAIL-CLOSED: '{tool_name}' BLOCKED — Reasoning Engine {cause}; "
-        f"action NOT executed (AGENTX_FAIL_MODE=closed). Set AGENTX_FAIL_MODE=open to allow."
+        f"[AgentX] FAIL-CLOSED: '{tool_name}' BLOCKED. {cause} "
+        f"Action NOT executed (AGENTX_FAIL_MODE=closed). Set AGENTX_FAIL_MODE=open to allow."
     )
 
 
@@ -453,6 +679,7 @@ _session_stats = {
     "human_escalations": 0,            # <-- SURGICAL REFACTOR: Local tracker variable added
     "degraded_executions": 0,          # <-- Tool calls that ran fail-open (gateway unreachable / timed out)
     "shield_failopens": 0,             # <-- Tool calls the LOCAL SHIELD failed to screen because it THREW (a shield BUG, not a policy decision) and fell through, so the tool ran unscreened. Distinct from degraded_executions (that is the gateway being unreachable, an infrastructure fact; this is our own code crashing). Counted so instance 3 of the fail-open class finds US instead of a customer's database — instances 1 and 2 were both found by luck on an EOD pass. Pulsed as a coarse int, NEVER the exception text (a traceback can carry a path, an argument, a fragment of the user's data).
+    "degraded_engine_faults": 0,       # <-- SUBSET of degraded_executions where the engine ANSWERED with a fault (5xx / non-verdict body) rather than being unreachable. Split out 2026-08-02: an unreachable gateway is an infrastructure fact nobody chose, but backend/gateway.py raises HTTPException(500) when the evaluator itself CRASHES -- which is how P-21 was found -- so a payload shape that reliably trips an evaluator bug converts "the gateway vets this" into "the tool runs" under the default fail-OPEN posture. Folded into one counter, a steered fault and a cold-start 502 were indistinguishable. Coarse int; carries no payload.
     "gateway_reached": False,          # <-- True once any real gateway verdict came back this session (NOT unreachable). Coarse funnel-stage signal for the anonymous pulse: distinguishes "SDK only" from "SDK + gateway". Never carries identity.
     "reasoning_enabled": None,         # <-- Tri-state Recover signal for the pulse: None = no gateway ever advertised it (old gateway / SDK-only), False = gateway reported keyless, True = judge seen active (sticky). Never identity.
     "block_category": None,            # <-- Coarse closed-vocab failure class of a block this session (DESTRUCTIVE_ACTION/etc), for the pulse. "What KIND of action got blocked", never the tool name/payload. None = no categorized block. See _BLOCK_CATEGORY_VOCAB.
@@ -703,20 +930,46 @@ def reset_strike_state():
 
 def record_spend(tokens: int = 0, cost_usd: float = 0.0):
     """Report this session's REAL LLM spend so the gateway's budget-ceiling floor
-    (runaway agents burning budget -- AutoGPT $120/8hr, AgentGPT's 50-step crash) sees true usage rather
-    than the coarse built-in estimate. Call it with your LLM client's usage after
-    each completion — e.g. `agentx.record_spend(tokens=resp.usage.total_tokens)`,
-    optionally `cost_usd=...`. Authoritative: once you report real tokens they
-    replace the auto-estimate, and reported dollars enable the dollar ceiling
-    (there is no built-in $ estimate, since that requires a per-model rate). Safe
-    to leave unused — the token proxy still catches runaway loops by volume."""
+    (runaway agents burning budget -- AutoGPT $120/8hr, AgentGPT's 50-step crash) sees true usage.
+
+    CALL THIS. It is not an optimisation, it is what makes the ceiling work.
+    Report after each completion, passing your provider's own TOTAL:
+
+        # Gemini (verified 2026-08-03: total_token_count INCLUDES thoughtsTokenCount)
+        agentx.record_spend(tokens=resp.usage_metadata.total_token_count)
+
+        # OpenAI-shaped clients
+        agentx.record_spend(tokens=resp.usage.total_tokens)
+
+    Prefer the provider's own *total* field over summing prompt+completion by
+    hand, and check that the total includes REASONING/THINKING tokens — on
+    current models those are frequently the majority of the bill, and a
+    hand-rolled sum of the parts you can see will miss them.
+
+    ⚠️ WHY THE FALLBACK IS NOT ENOUGH, stated plainly because the name flatters it.
+    With nothing reported the SDK estimates from the length of the payload it was
+    handed, `(len(query) + len(chain_of_thought)) // 4`. That is not your model
+    spend and is not a slightly-low version of it, it is a different quantity:
+
+      * it sees ONE tool call, never your system prompt, conversation history, or
+        tool schemas, which is what you are actually billed for each turn;
+      * it CANNOT see thinking tokens at all — structurally, not by oversight.
+        Those are burned inside your own model call and never transit this
+        decorator. Measured on gemini-3.5-flash: 121 thinking tokens against 1
+        output token for a 5-token prompt.
+
+    So the fallback undercounts on every model and dramatically so on a reasoning
+    one. Reported tokens are authoritative and replace it entirely. The DOLLAR
+    ceiling has no fallback whatever (a $ estimate needs per-model rates), so it
+    is inert until you pass `cost_usd`. See BACKLOG P-37."""
     with _stats_lock:
         if tokens:
             _session_stats["reported_tokens"] += int(tokens)
         if cost_usd:
             _session_stats["reported_cost_usd"] += float(cost_usd)
 
-def _apply_org_override(policy_id, challenge_text, safe_path, policy_name=None):
+def _apply_org_override(policy_id, challenge_text, safe_path, policy_name=None,
+                        signature=None):
     """BUILD #2 — swap an adopted org reframe into a block before delivery. The
     SINGLE home for the override logic, shared by BOTH block paths (the gateway
     "Policy Violation" path and the Layer-0 keyword shield) so they can't drift.
@@ -727,11 +980,16 @@ def _apply_org_override(policy_id, challenge_text, safe_path, policy_name=None):
     the two paths (keyword-shield seed UUID vs gateway/judge id), and an override
     adopted under one would otherwise flicker out on the other.
 
+    ``signature`` (see ``_call_signature``) describes the BLOCK's context, letting a
+    context-scoped override attach to a situation instead of to the whole policy. A caller that
+    passes none gets the policy-wide behaviour unchanged. Scoped overrides are REDIRECT only:
+    they change the coaching and the safe path, never whether the call was blocked.
+
     Total best-effort: no/blank override → inputs returned unchanged. Counts and
     announces a swap ONLY when it actually changes the delivered block, so the
     'Org Reframes Applied' proof metric never inflates on a no-op override whose
     text already equals the generic challenge."""
-    override = get_active_override(policy_id, policy_name=policy_name)
+    override = get_active_override(policy_id, policy_name=policy_name, signature=signature)
     if not override:
         return challenge_text, safe_path
     new_challenge = override.get("challenge") or challenge_text
@@ -865,6 +1123,13 @@ def _print_agentx_summary():
     #     so a fully-protected run stays clean and this line stands out when it appears ---
     if _session_stats.get("degraded_executions", 0) > 0:
         print(f" ⚠️  Degraded Executions:   {_session_stats['degraded_executions']:<3} |  ran WITHOUT gateway semantic checks (fail-open)")
+        faults = _session_stats.get("degraded_engine_faults", 0)
+        if faults:
+            # Say WHICH, because the two need different responses. An unreachable gateway is
+            # someone's infrastructure; a gateway that answered with a fault is running and
+            # crashing, and if it crashes on a particular payload then an agent has a way to
+            # get that payload past the gateway. That deserves a log, not a shrug.
+            print(f"     -> {faults} of these: the engine ANSWERED but could not vet the call. Check its logs; a repeat on one payload is a bypass, not an outage.")
         print("     -> the gateway would have evaluated these — get it (free, runs locally): https://bit.ly/agentfirewall")
 
     # --- SHIELD FAIL-OPENS: the shield itself THREW and the call ran unscreened.
@@ -2584,6 +2849,146 @@ def _name_tokens(name):
     return re.findall(r"[a-z0-9]+", spaced.lower())
 
 
+# ---------------------------------------------------- structural call signature
+# The structural-signature vocab for a call. Keyless there is NO judge to label a call, so the
+# signature is a LOCAL, coarse heuristic: target_action is read off the tool NAME (word tokens
+# via the shared _name_tokens), scope off the ARG-KEY shape. NEITHER ever inspects an argument
+# VALUE, so no raw payload can enter the record (moat-collection-day0: never raw query / CoT /
+# args). NOTE: this is a SEPARATE keyless action vocab -- it does NOT match the gateway's
+# rule-shape target_action values (execute_database_query / fetch_url / send_message / ...), so
+# generalizing a harvested pair into a shared gateway rule needs a CROSSWALK, not a direct join
+# (see the design doc). The vocab is CLOSED (the value is always one of these tokens).
+#
+# HOME: this lived in mcp_proxy.py while MCP harvest was its only consumer. It moved HERE when
+# context-scoped overrides made the decorator's two block paths consumers too — mcp_proxy
+# imports FROM this module, never the reverse, so the shared vocabulary has to sit on this side
+# of that edge or the import cycles.
+_ACTION_KEYWORDS = (   # first match wins; ordered most-destructive-first (a "delete_and_log"
+                       # tool classifies as DELETE, not WRITE/READ)
+    ("DELETE",  ("delete", "drop", "remove", "destroy", "truncate", "purge", "wipe")),
+    ("EXECUTE", ("exec", "run", "shell", "command", "spawn", "eval", "invoke")),
+    ("SEND",    ("send", "post", "upload", "email", "publish", "notify", "transfer", "push", "export")),
+    ("WRITE",   ("write", "update", "insert", "put", "create", "save", "edit", "modify", "patch", "append", "upsert", "set")),
+    ("LIST",    ("list", "search", "find", "browse", "scan", "enumerate", "glob")),
+    ("READ",    ("read", "get", "query", "select", "fetch", "load", "view", "show", "retrieve", "describe", "cat", "download", "dump")),
+)
+
+# The CLOSED set of target_action values, derived from the table above rather than hand-typed —
+# a hand-typed copy is a hole exactly where the vocabulary changes. Used to validate a
+# human-authored scope in `.agentx/rules.json`, so a typo is an error the author sees instead of
+# a scope that silently matches nothing.
+TARGET_ACTIONS = frozenset([action for action, _ in _ACTION_KEYWORDS] + ["OTHER"])
+SCOPES = frozenset(("scoped", "broad"))
+
+# Arg-key WORD TOKENS that NARROW the blast radius -> the call looks "scoped". Matched
+# as whole tokens from the SAME _name_tokens split as the tool name (so camelCase accountId and
+# snake_case account_id both surface the "id" token), never as raw substrings (so "unlimited" /
+# "pathology" are not false "limit" / "path" hits). A bare payload key (query/body/content/data)
+# is deliberately absent: carrying a query is not the same as scoping it. We test only KEY tokens,
+# never store the key, never read the value.
+_NARROWING_TOKENS = frozenset((
+    "id", "ids", "key", "keys", "where", "filter", "limit", "scope", "path",
+    "name", "prefix", "since", "after", "before", "page", "cursor", "offset",
+    "top", "first", "target", "recipient", "to", "dest", "destination", "channel",
+))
+
+
+def _target_action(tool):
+    """Coarse action class read off the tool NAME only (never a value), by exact word token
+    (shared _name_tokens). Closed vocab; OTHER when nothing matches."""
+    toks = set(_name_tokens(tool))
+    for action, keys in _ACTION_KEYWORDS:
+        if toks.intersection(keys):
+            return action
+    return "OTHER"
+
+
+def _scope_from_keys(keys):
+    """The blast-radius shape for a set of argument KEY NAMES. Split out from ``_scope`` so the
+    decorator paths — which hold ``*args``/``**kwargs`` rather than one dict — can pass the
+    parameter NAMES they resolved without first fabricating a dict whose values would then be in
+    scope for a future reader to accidentally read. Keys only, always."""
+    for raw in keys or ():
+        if _NARROWING_TOKENS.intersection(_name_tokens(str(raw))):
+            return "scoped"
+    return "broad"
+
+
+def _scope(arguments):
+    """Coarse blast-radius shape read off the ARG-KEY names only (never a value): 'scoped' if any
+    key carries a narrowing/target WORD TOKEN, else 'broad'. Named 'scope' (NOT effect_*) so it
+    does not collide with the gateway's effect_category threat taxonomy. It is the structural
+    signal for WHY a call was safe (it narrowed the action), beyond the bare category.
+    Coarse + value-free: it sees a narrowing KEY is present, never that a value targets everything."""
+    if not isinstance(arguments, dict) or not arguments:
+        return "broad"
+    return _scope_from_keys(arguments.keys())
+
+
+def _abstract_call(tool, arguments):
+    """The structural signature of a recovered call Y: ``{target_action, scope}``. Purely
+    structural + closed-vocab; inspects ONLY the tool name and the arg-KEY names, NEVER an
+    argument value (moat-collection-day0). A coarse local heuristic, not a judge verdict. Total
+    best-effort: any unexpected input falls back to the safe default so harvest CAPTURE can never
+    raise into the proxy session (upholding the _flush_harvest 'never affect the run' invariant,
+    which the widened capture would otherwise weaken vs the old pure-append)."""
+    try:
+        return {"target_action": _target_action(tool), "scope": _scope(arguments)}
+    except Exception:
+        return {"target_action": "OTHER", "scope": "broad"}
+
+
+def _call_signature(agent_id, tool, arg_keys):
+    """The four-dimension context signature a scoped override is matched against:
+    ``{agent_id, tool, target_action, scope}``.
+
+    ``agent_id`` and ``tool`` are the dimensions that carry ORG specificity — the developer
+    names their own agent and their own tools, so "our nightly cleanup job" is expressible.
+    ``target_action`` + ``scope`` are the coarse structural pair above, and on their own they
+    describe a CLASS of call ("a delete-shaped tool with a narrowing argument"), never one job.
+    That asymmetry is worth knowing before writing a scope: the last two alone are broad.
+
+    Value-free like everything else here — ``arg_keys`` is KEY NAMES, never values. Total
+    best-effort: it can never raise into a block path, and an unusable input degrades to the
+    same safe default ``_abstract_call`` uses, which simply matches fewer overrides."""
+    try:
+        return {
+            "agent_id": agent_id,
+            "tool": tool,
+            "target_action": _target_action(tool),
+            "scope": _scope_from_keys(arg_keys),
+        }
+    except Exception:
+        return {"agent_id": agent_id, "tool": tool,
+                "target_action": "OTHER", "scope": "broad"}
+
+
+def _bound_arg_keys(func_sig, args, kwargs):
+    """The call's argument KEY NAMES for a decorated function, with POSITIONAL arguments bound
+    to their parameter names via the signature captured at decoration time.
+
+    Without the binding, a tool called positionally — ``purge(account_id)`` rather than
+    ``purge(account_id=...)`` — surfaces no keys at all and every such call reads as 'broad',
+    which would make the scope dimension useless on exactly the ordinary calling convention.
+    Best-effort: no signature, or a call that does not bind (the *args passthrough case), falls
+    back to the keyword names alone."""
+    names = list(kwargs.keys())
+    if func_sig is None or not args:
+        return names
+    try:
+        params = list(func_sig.parameters.values())
+        for i, _ in enumerate(args):
+            if i >= len(params):
+                break
+            p = params[i]
+            if p.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                break
+            names.append(p.name)
+    except Exception:
+        pass
+    return names
+
+
 def _is_fs_destructive_func(func_name: str) -> bool:
     """True when a function name contains a filesystem-destruction verb as a
     discrete token (delete_files / removeDir / rmtree), not a substring."""
@@ -2983,10 +3388,16 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         # the incident is logged under this same policy_id, so the adopted
                         # reframe is keyed identically). Centralised in _apply_org_override
                         # so this path and the gateway path can never drift apart.
+                        # ...and the org reframe may be CONTEXT-SCOPED, so hand
+                        # the lookup this block's signature. Computed here, not earlier: it is
+                        # only ever needed on a block, and the un-blocked call is the hot path.
                         challenge_text, ls_safe_path = _apply_org_override(
                             policy_id, challenge_text,
                             matched_policy.get("preferred_alternative"),
-                            policy_name=policy_name)
+                            policy_name=policy_name,
+                            signature=_call_signature(
+                                agent_id, func_name,
+                                _bound_arg_keys(_func_sig, args, kwargs)))
 
                         _incr("intercepts")
                         _incr("critical_blocks")
@@ -3068,6 +3479,19 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # the session total. Real usage reported via record_spend() is
             # authoritative and replaces the estimate; reported $ drives the dollar
             # ceiling. The gateway owns the ceiling + the ESCALATE verdict.
+            #
+            # ⚠️ BE HONEST ABOUT WHAT THIS ESTIMATE IS (BACKLOG P-37). It measures the
+            # payload WE were handed, not the agent's model spend, so it misses the
+            # prompt, the history and the tool schemas the caller is actually billed
+            # for — and it cannot see THINKING tokens at all, since those are burned
+            # inside the caller's own model call and never reach this decorator. On a
+            # reasoning model that is most of the bill (measured: 121 thinking vs 1
+            # output token). Calling it a "proxy for volume" is the charitable reading;
+            # it is a different quantity wearing a spend meter's name, and a ceiling it
+            # never trips reads as a ceiling that was never crossed. Whether it should
+            # REFUSE rather than lowball is an open founder call in P-37, and refusing
+            # must not simply go quiet — an unmetered session has to be visibly
+            # unmetered, or we trade a wrong number for silence, which is worse.
             _incr("auto_tokens_estimate", max(
                 1, (len(str(query)) + len(str(chain_of_thought))) // 4
             ))
@@ -3100,7 +3524,16 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # A real verdict came back (allow OR block) — the gateway was reached.
             # UNREACHABLE is the one status that means it was NOT. Recorded once per
             # session as the anonymous pulse's coarse "SDK + gateway" funnel signal.
-            if isinstance(eval_res, dict) and status != "REASONING_ENGINE_UNREACHABLE":
+            # `gateway_answered` closes a hole this test opened. A gateway that responds
+            # with a 5xx or an unparseable body IS reached — it answered, it just could not
+            # give a verdict — but its verdict is availability, so the status is UNREACHABLE
+            # and the funnel signal used to flip to False. A PAYING Recover install behind a
+            # proxy returning HTML, or cold-starting into 502s, then emitted a pulse
+            # byte-identical to an install that never configured a gateway. The funnel
+            # question is "did this install reach a gateway at all", and a 502 answers YES.
+            if isinstance(eval_res, dict) and (
+                    status != "REASONING_ENGINE_UNREACHABLE"
+                    or eval_res.get("gateway_answered") is True):
                 _session_stats["gateway_reached"] = True
                 # The gateway advertises whether the judge (Recover tier) is active
                 # (reasoning_enabled). Capture once-True for the session — mirrors
@@ -3167,7 +3600,9 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     # FAIL CLOSED: do NOT execute — the engine could not vet this action.
                     # Retries accrue strikes so a wedged/down engine trips the circuit
                     # breaker instead of the agent looping blindly forever.
-                    _emit_failclosed_warning(reason, func_name)
+                    _emit_failclosed_warning(
+                        reason, func_name,
+                        answered=eval_res.get("gateway_identified") is True)
                     # Accrue a strike so a wedged engine still trips the breaker, but do
                     # NOT mark the trace recoverable: a fail-closed block is an
                     # availability event, not a policy challenge. Crediting a later
@@ -3187,8 +3622,32 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
 
                 # FAIL OPEN (default), gateway expected but unreachable: genuinely
                 # degraded (the keyless no-key case already returned above).
-                _emit_failopen_warning(reason, func_name)
+                # `gateway_answered` is the CALLER's evidence and it OVERRIDES the reason
+                # shape, in the banner and in the counter alike. Review found the two saying
+                # opposite things about one event: client.py refuses to call a header-less
+                # non-JSON body our gateway, while _degraded_detail called the same reason an
+                # engine fault unconditionally. So a developer who mistyped gateway_url and
+                # has no engine at all was told the engine answered and sent to read its
+                # logs — the exact misdirection this whole commit exists to remove — and the
+                # counter for payload-STEERED faults was being filled by plain typos.
+                # `gateway_identified`, NOT `gateway_answered`. The two now say different
+                # things: something replied vs what replied was demonstrably OURS. The funnel
+                # signal below still takes the generous one (a cold-start 502 did reach a
+                # gateway); the COPY and the steered-fault counter take the strict one,
+                # because "go read the engine's logs" and "a payload steered this" are both
+                # claims about OUR engine.
+                _answered = eval_res.get("gateway_identified") is True
+                _emit_failopen_warning(reason, func_name,
+                                       detail=eval_res.get("detail"), answered=_answered)
                 _incr("degraded_executions")
+                # An engine that ANSWERED with a fault is steerable in a way an outage is
+                # not; count it separately so a payload-correlated 5xx is visible instead of
+                # averaging into infrastructure noise. A body-shaped reason needs the caller's
+                # proof before it counts, by the same rule the banner uses — otherwise a
+                # mistyped gateway_url fills the column meant for steered faults.
+                _d = _degraded_detail(reason)
+                if _d["engine_fault"] and (_answered or not _d["needs_proof"]):
+                    _incr("degraded_engine_faults")
                 _reset_strike(strike_key)
                 return _ExecuteTool()
 
@@ -3232,7 +3691,10 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 _gateway_safe_path = eval_res.get("safe_path") or eval_res.get("preferred_alternative")
                 challenge_text, _gateway_safe_path = _apply_org_override(
                     actual_policy_id, challenge_text, _gateway_safe_path,
-                    policy_name=policy_name)
+                    policy_name=policy_name,
+                    signature=_call_signature(
+                        agent_id, func_name,
+                        _bound_arg_keys(_func_sig, args, kwargs)))
                 
                 critical_policies = [
                     "Mass Destructive Intent", 

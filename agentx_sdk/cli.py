@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from .overrides import (harvest_candidates, load_overrides, adopt as adopt_override,
                         incident_db_census, enumerate_candidates,
                         list_customizable_policies, resolve_policy_by_name,
+                        describe_scope, has_human_coaching,
                         get_active_override, _overrides_path, _norm_for_dedup,
                         record_outcome, list_recent_incidents,
                         find_incidents_by_receipt_prefix,
@@ -194,16 +195,69 @@ def execute_policy_pull(control_plane_url, api_key):
             print("=" * 75)
             sys.exit(1)
 
-        policies = response.json().get("policies", [])
-        
+        payload = response.json() or {}
+        policies = payload.get("policies", [])
+        # `payload_sync_active` is the plane telling us WHY there is nothing to send, and
+        # the old code discarded it. Same shape as the contribution push (BACKLOG P-41):
+        # the server computed the truth, put it on the wire, and the client threw it away
+        # and printed success. Three outcomes were collapsed into one "Success" line.
+        sync_active = payload.get("payload_sync_active")
+
         target_dir = ".agentx"
-        os.makedirs(target_dir, exist_ok=True)
         target_file = os.path.join(target_dir, "policies.json")
 
+        # AN EMPTY LIST IS WRITTEN ONLY WHEN THE PLANE SAYS ITS ANSWER IS AUTHORITATIVE.
+        #
+        # What an empty file actually does, PROBED rather than assumed (an earlier version
+        # of this comment asserted the opposite and was wrong): it does NOT empty the
+        # shield. `load_local_policy_keywords` gates on `if policies: return policies` and
+        # otherwise falls through to `_BUILTIN_POLICY_KEYWORDS`, so an empty file and no
+        # file are identical, 6 built-in seeds either way. It is a NON-EMPTY pull that
+        # wholly replaces the seeds. The stake here is therefore the ORG rulebook, not the
+        # floor, and the floor is never at risk in this function.
+        #
+        #   sync_active TRUE + []  AUTHORITATIVE. The org has zero active policies, which
+        #                          is exactly what an operator sees after deactivating the
+        #                          last rule. WRITE it. Refusing would mean a revocation
+        #                          never reaches this machine and deactivated rules keep
+        #                          enforcing forever, with the CLI reassuring the operator
+        #                          that nothing changed.
+        #   sync_active FALSE      NOT authoritative. The plane reports itself air-gapped
+        #                          OR could not reach its policy store: ui/app/api/edge/
+        #                          sync/route.ts returns this same flag from its DB-error
+        #                          catch-all, so the copy must cover both. Writing [] here
+        #                          would discard a good org rulebook on a transient outage.
+        #   flag ABSENT            Every branch of our own route sets it, so its absence
+        #                          means this probably is not an AgentX control plane.
+        #
+        # The original defect stands and is unchanged by all this: all three outcomes used
+        # to print "Success: Successfully synchronized 0 policies".
+        if not policies and sync_active is not True:
+            if sync_active is False:
+                why = ("The control plane reports itself air-gapped, or could not reach its "
+                       "policy store.")
+            else:
+                why = ("The control plane answered without a payload_sync_active flag, so it may "
+                       f"not be an AgentX control plane. Check CONTROL_PLANE_URL ({control_plane_url}).")
+            print(f"\nℹ️  Nothing to synchronize. {why}")
+            print(f"   ./{target_file} was NOT overwritten, so any org rules you already "
+                  f"pulled still apply.")
+            print("=" * 75)
+            return
+
+        os.makedirs(target_dir, exist_ok=True)
         with open(target_file, "w", encoding="utf-8") as f:
             json.dump(policies, f, indent=2)
 
-        print(f"✅ Success: Successfully synchronized {len(policies)} policies down to your local footprint.")
+        if policies:
+            print(f"✅ Success: Successfully synchronized {len(policies)} policies down to your local footprint.")
+        else:
+            # Authoritative zero. Say what happened rather than "Success: 0 policies",
+            # which was the original defect, and name the thing that is still armed so an
+            # operator does not read "cleared" as "unprotected".
+            print("\n✅ Synchronized: this control plane has 0 active policies.")
+            print("   Your local org rulebook is now cleared, which is how a revocation")
+            print("   reaches this machine. The built-in floor stays armed.")
         print(f"💾 Local configuration footprint cached at: ./{target_file}")
         print("=" * 75)
 
@@ -391,14 +445,49 @@ def execute_contribution_push(gateway_url, control_plane_url, api_key, env):
             timeout=10.0,
         )
         if post.status_code in (200, 201, 202):
-            print(f"\n   ✅ Contributed {len(contributions)} abstract signal(s) to shared immunity. Thank you.")
-            # Mark the CONTRIBUTE funnel leg on the anonymous pulse (install-local,
-            # abstract — the next pulse reports it). Best-effort; never break push.
+            # A 2xx does NOT mean anything was stored, and we used to read it that way.
+            # The route answers with THREE different 2xx shapes and TWO of them store
+            # nothing: an airgapped control plane returns 200 {accepted: 0, note: ...}
+            # because there is no shared corpus off-cloud, and a batch whose rows all
+            # fail the server-side allowlist returns 202 {accepted: 0}. Treating either
+            # as success told the developer something untrue AND stamped the pulse's
+            # contribute leg, so an install that stored nothing counted as a contributor
+            # (BACKLOG P-41 — found live: an install with 0 blocks and 0 intercepts
+            # flagged contributed). The real count is already on the wire. Read it.
+            # NAMED resp_body, not `body`: `body` is already bound above to the GATEWAY's
+            # projection response, and shadowing it here would leave two different payloads
+            # under one name in the same function. Nothing reads the outer one after this
+            # point today, which is exactly what makes the shadow a trap for the next edit.
             try:
-                from . import pulse
-                pulse.mark_contributed()
-            except Exception:
-                pass
+                resp_body = post.json() or {}
+            except ValueError:
+                resp_body = {}
+            accepted = resp_body.get("accepted")
+            if accepted:
+                print(f"\n   ✅ Contributed {accepted} abstract signal(s) to shared immunity. Thank you.")
+                # Mark the CONTRIBUTE funnel leg on the anonymous pulse (install-local,
+                # abstract — the next pulse reports it). Best-effort; never break push.
+                try:
+                    from . import pulse
+                    pulse.mark_contributed()
+                except Exception:
+                    pass
+            else:
+                # Neither branch stamps the leg — we cannot claim a contribution we did not
+                # see confirmed — but they are DIFFERENT facts and saying so matters, because
+                # "we stored nothing" and "we could not tell" send the reader to different
+                # places. Every branch of our own route returns `accepted`, so an ABSENT one
+                # means the responder was not that route (a proxy, an error page served 200,
+                # a forked plane), which is a connectivity/config question, not a posture one.
+                note = resp_body.get("note") or (
+                    "Your control plane has no shared corpus to write to (local or "
+                    "linked posture), or every signal was filtered server-side."
+                    if accepted == 0 else
+                    "The control plane answered without a stored-signal count, so this may "
+                    f"not be an AgentX control plane. Check CONTROL_PLANE_URL ({control_plane_url})."
+                )
+                print(f"\n   ℹ️  Nothing was contributed. {note}")
+                print(f"      Your signals are still saved locally at ./{artifact} for inspection.")
         else:
             print(f"\n   ⚠️  Shared corpus returned {post.status_code}. Saved locally; will retry next sync.")
     except requests.exceptions.RequestException as e:
@@ -593,6 +682,15 @@ def execute_insights(args=None):
                 print(f"\n  ▶ You DO have {len(mcp_flat)} keyless MCP recovery path(s): {_review_cmd()}")
             else:
                 print(f"\n  ▶ You DO have {len(mcp_flat)} keyless MCP recovery path(s): agentx mcp-insights")
+        # P-18, and this is the branch that needed it MOST. The first cut put the advisory
+        # only on the populated path below, so the one screen that says "No reusable
+        # safe-paths to show yet" — to a user who may have adopted every one of theirs over
+        # MCP — was the one screen that never mentioned the other store. That is the "we lost
+        # your work" reading this note exists to prevent, shown in the exact case it applies.
+        # The `mcp_flat` line above does NOT cover it: per the comment there, mcp_flat counts
+        # harvest CANDIDATES, and this counts safe-paths already ADOPTED. A user who adopted
+        # all of theirs has zero candidates left and would still see nothing.
+        _note_that_the_two_doors_keep_separate_brains()
         print("=" * 75)
         return
 
@@ -716,6 +814,11 @@ def execute_insights(args=None):
             print(f"\n  Also: {len(mcp_flat)} safe-path(s) from your keyless MCP wedge → {_review_cmd()}")
         else:
             print(f"\n  Also: {len(mcp_flat)} safe-path(s) from your keyless MCP wedge → agentx mcp-insights")
+    # P-18. Distinct from the `mcp_flat` line above, which counts CANDIDATES harvested from
+    # the MCP wedge; this counts safe-paths already ADOPTED into the per-user MCP store, which
+    # this reader never resolves. Fires only when that store has entries, so it stays quiet
+    # for the overwhelmingly common single-door user.
+    _note_that_the_two_doors_keep_separate_brains()
     if not verbose:
         print(f"\n  ({_insights_cmd()} --verbose for ids, dates, counts, store path & full wording)")
     print("=" * 75)
@@ -1236,7 +1339,14 @@ def execute_policies(args=None):
     print("       agentx customize \"<name>\" --text \"...\"        (or --edit to open your editor)")
 
     for p in policies:
-        tag = "   ✏️  customized" if p["customized"] else ""
+        # A policy carrying ONLY scoped coaching used to render untagged, directly above the
+        # scoped block listing that coaching — the header contradicting the two lines beneath it.
+        if p["customized"]:
+            tag = "   ✏️  customized"
+        elif p.get("scoped"):
+            tag = "   ✏️  customized (scoped)"
+        else:
+            tag = ""
         print(f"\n  📋 {p['name']}{tag}")
         challenge = p["active_challenge"] or p["default_challenge"]
         safe = p["active_safe_path"] or p["default_safe_path"]
@@ -1244,6 +1354,16 @@ def execute_policies(args=None):
             print(_wrap(challenge, "     coaching:   "))
         if safe:
             print(_wrap(safe, "     safe path:  "))
+        # Scoped coaching is listed under its policy WITH the situation it fires in. Without
+        # this it is written and never shown, so a scope with a typo looks exactly like no
+        # scope at all: the policy just reports the shipped default and the author has nothing
+        # to check their rule against.
+        for s in p.get("scoped") or []:
+            print(f"     └ when {describe_scope(s['when'])}")
+            if s.get("challenge"):
+                print(_wrap(s["challenge"], "       coaching: "))
+            if s.get("safe_path"):
+                print(_wrap(s["safe_path"], "       safe path: "))
 
     print("\n" + "=" * 75)
     first = policies[0]["name"] if policies else "<name>"
@@ -1251,6 +1371,8 @@ def execute_policies(args=None):
     print("  ▶ Validate your store:  agentx policies --check")
     print("  Customized coaching lands in ./.agentx/overrides.json. Commit it to share with")
     print("  your team. It applies keyless on BOTH the SDK decorator and agentx-mcp.")
+    print("  To coach one job rather than a whole policy, add a `when` to a reframe in")
+    print("  ./.agentx/rules.json, then run: agentx rules apply")
     print("=" * 75)
 
 
@@ -1323,8 +1445,17 @@ def _policies_check():
         print("=" * 75)
         sys.exit(1)
 
-    active = load_overrides(warn=True).get("overrides", {})
-    if not active:
+    store = load_overrides(warn=True)
+    active = store.get("overrides", {})
+    # Scoped overrides are live coaching and have to be counted HERE. Reading only the bare map
+    # made this gate report "no active overrides" for a store whose scoped rules were firing on
+    # every matching block — and `agentx policies` points the author at this command two lines
+    # after listing those very rules. A validator that says "nothing here" about live coaching is
+    # the same "a rule you cannot see is a rule you cannot debug" failure the scoping work closed.
+    scoped = [e for e in (store.get("scoped_overrides") or [])
+              if isinstance(e, dict) and e.get("challenge")]
+    real = [(pid, e) for pid, e in active.items() if isinstance(e, dict) and e.get("challenge")]
+    if not real and not scoped:
         print(f"\n  ✅ {path} parses. No active overrides in it yet.")
         print("=" * 75)
         if not rulebook_ok:
@@ -1332,14 +1463,21 @@ def _policies_check():
         return
 
     catalog = {p["id"]: p["name"] for p in list_customizable_policies()}
-    real = [(pid, e) for pid, e in active.items() if isinstance(e, dict) and e.get("challenge")]
-    print(f"\n  ✅ {path} parses.  {len(real)} active override(s):")
+    print(f"\n  ✅ {path} parses.  {len(real)} policy-wide + {len(scoped)} scoped override(s):")
     for pid, entry in real:
         label = entry.get("policy_violated") or catalog.get(pid) or pid
         print(f"\n  📋 {label}   (source: {entry.get('source', '?')})")
         print(_wrap(entry["challenge"], "     coaching:   "))
         if entry.get("safe_path"):
             print(_wrap(entry["safe_path"], "     safe path:  "))
+    for entry in scoped:
+        label = (entry.get("policy_violated") or catalog.get(entry.get("policy_id"))
+                 or entry.get("policy_id") or "?")
+        print(f"\n  📋 {label}   (source: {entry.get('source', '?')})")
+        print(f"     └ when {describe_scope(entry.get('when'))}")
+        print(_wrap(entry["challenge"], "       coaching: "))
+        if entry.get("safe_path"):
+            print(_wrap(entry["safe_path"], "       safe path: "))
     print("\n" + "=" * 75)
     print("  ▶ Change one:   agentx customize \"<name>\" --edit")
     print("=" * 75)
@@ -1466,8 +1604,13 @@ def _mcp_review_items():
         pviol = m.get("policy_violated")
         akey = pid or pviol
         # (1) adopt the learned reframe (unless the policy already carries an override).
+        # has_human_coaching, not the bare lookup: a policy the user deliberately SCOPED has no
+        # bare entry, so this used to keep offering "adopt this learned reframe" for it — and
+        # accepting installs a POLICY-WIDE override over the narrow rule they wrote. The automated
+        # path (mcp auto-coach) got this guard; the human-facing one is worse without it, because
+        # here a person clicks yes.
         if (akey and akey not in seen_adopt and pid and m.get("suggestion")
-                and not get_active_override(pid, policy_name=pviol)):
+                and not has_human_coaching(pid, policy_name=pviol)):
             seen_adopt.add(akey)
             out.append({
                 "kind": "adopt", "policy_id": pid, "policy_violated": pviol,
@@ -1700,6 +1843,96 @@ def _warn_if_mcp_corpus_is_stranded():
     print(f"     AGENTX_MCP_HARVEST_PATH={stranded}")
 
 
+def _note_that_the_two_doors_keep_separate_brains():
+    """Say out loud that the MCP door and the Python door learn into SEPARATE stores.
+
+    BACKLOG P-18. Since #288 the MCP proxy's auto-coach writes adopted safe-paths to the
+    per-user ~/.agentx/overrides.json, while `agentx insights`, `agentx review` and the
+    @agentx_protect block path all resolve <project>/.agentx/overrides.json. So a reframe
+    learned over MCP never appears in the Python door's insights and never coaches a
+    Python-door block.
+
+    That split is DELIBERATE (founder call 2026-07-31) and is not a bug: the MCP door has no
+    project -- an editor spawns the proxy from an arbitrary directory -- so per-user is the
+    only default both of its processes compute the same answer for. What was missing is
+    anyone SAYING so, which leaves the product looking like it lost your work.
+
+    Do NOT "fix" this by merging the stores. A cwd-derived read is exactly the bug
+    _mcp_overrides_path was created to kill, and it comes back the moment either side
+    prefers a project file it can only sometimes see.
+
+    Speaks only when there is something to speak about (entries actually exist), so an empty
+    store stays quiet. Never raises: this annotates a command, it must not take one down."""
+    # WHICH DOOR is an explicit fact, not something to infer from a path coincidence.
+    # Review found the first cut read "paths are equal" as "we are on the MCP door", but
+    # _find_project_root() returns any directory containing .agentx/ — which is exactly what
+    # the MCP door creates under $HOME. So running `agentx insights` from there made the
+    # PYTHON door announce that these safe-paths "do NOT coach the Python door", while the
+    # Python door was reading that very file. The message was the reverse of the truth.
+    on_the_mcp_door = MCP_ENTRY
+    try:
+        from .mcp_proxy import _mcp_overrides_path
+        from .overrides import _find_project_root, DEFAULT_OVERRIDES_PATH
+        mcp_path = _mcp_overrides_path()
+        entries = load_overrides(path=mcp_path).get("overrides", {}) or {}
+        if on_the_mcp_door:
+            # NOT _overrides_path() on this door. _point_stores_at_mcp_home() pins
+            # AGENTX_OVERRIDES to the MCP store for the whole proxy process, and pins it
+            # UNCONDITIONALLY (it overwrites even a user-exported value, as its own docstring
+            # says). So _overrides_path() answers "the MCP store" here no matter what the
+            # Python door reads, same_store was ALWAYS True, and this entire branch was dead
+            # code for every real MCP user: `uvx agentx-mcp --insights` never printed the
+            # note. Found by running it, not by reading it.
+            # ON THIS DOOR, SILENCE REQUIRES AN EXPLICIT RELOCATION. Nothing else.
+            #
+            # Two heuristics were tried here and both went silent in the commonest directory.
+            # Comparing against _overrides_path() lost to the pin. Comparing against the
+            # project root lost because _find_project_root() falls back to the nearest
+            # .agentx ancestor, which under $HOME is the store this door just created — and
+            # then requiring a .git root lost too, because plenty of people keep $HOME in a
+            # dotfiles repo, which makes $HOME "a real project" and hands the silence
+            # straight back. Three attempts, same silence, because the question was wrong.
+            #
+            # The question is not "are these two paths equal here". The MCP proxy's cwd is
+            # arbitrary, so where the PYTHON door will later resolve its store is genuinely
+            # unknowable from inside this process — the user runs it in their project, which
+            # is somewhere else. What IS knowable: the MCP store is per-user by construction,
+            # and a project's store is not, so unless the user deliberately pointed them at
+            # one file the split is real and worth saying. AGENTX_MCP_OVERRIDES_PATH is that
+            # deliberate act, and .env.example already tells anyone setting it to set the
+            # same value on both sides.
+            other_path = os.path.join(_find_project_root(), DEFAULT_OVERRIDES_PATH)
+            relocated_on_purpose = bool(os.environ.get("AGENTX_MCP_OVERRIDES_PATH"))
+            paths_match = os.path.abspath(mcp_path) == os.path.abspath(other_path)
+            same_store = paths_match and relocated_on_purpose
+        else:
+            other_path = _overrides_path()
+            same_store = os.path.abspath(mcp_path) == os.path.abspath(other_path)
+    except Exception:
+        return
+    if not entries:
+        return
+    if same_store:
+        # Both doors resolve the SAME file here, so there is no split to warn about and the
+        # honest thing is to say nothing rather than describe a division that isn't there.
+        # Applies on BOTH doors: review found the first fix cured the Python side and left
+        # the MCP side still announcing "they do NOT coach the Python door" while the Python
+        # door reads that very file. Same bug, mirrored.
+        return
+    if on_the_mcp_door:
+        print(f"\n   Note: these {len(entries)} safe-path(s) live in your per-user MCP store,")
+        print("   which is separate from any project's .agentx/overrides.json. They travel")
+        print("   with you across servers and projects, and they do NOT coach the Python")
+        print("   door's @agentx_protect blocks.")
+        return
+    # "not shown here", never "not listed above": this is called from BOTH readers, and in
+    # execute_review it runs BEFORE anything has been listed, so "above" referred to output
+    # that did not exist yet.
+    print(f"\n   Note: {len(entries)} safe-path(s) learned over MCP are kept in a separate")
+    print("   per-user store, so they are not shown here and do not coach a block here.")
+    print("   See them with:  uvx agentx-mcp --insights")
+
+
 def execute_review(args=None):
     """`agentx review` — the batched, one-key review of the label channel, covering BOTH the
     incidents.db loop and the keyless-MCP wedge. Reconciles safe-paths, gathers pending items
@@ -1729,6 +1962,7 @@ def execute_review(args=None):
             items = [it for it in items if it["kind"] == "verdict"]
     items = _group_verdict_items(items)
     _warn_if_mcp_corpus_is_stranded()
+    _note_that_the_two_doors_keep_separate_brains()
     if not items:
         census = incident_db_census()
         print("\n✅ Nothing to review — no blocks awaiting a verdict, no new safe-paths to adopt.")
@@ -1851,13 +2085,43 @@ def execute_review(args=None):
 _RULES_TEMPLATE = '''{
   "reframes": [
     { "policy": "Mass Destructive Intent",
-      "safe_path": "Use a soft delete (UPDATE ... SET deleted=1); never DROP a live table" }
+      "safe_path": "Use a soft delete (UPDATE ... SET deleted=1); never DROP a live table" },
+
+    { "policy": "Mass Destructive Intent",
+      "when": { "agent_id": "nightly_cleanup", "tool": "purge_stale_rows" },
+      "safe_path": "Our nightly cleanup filters by date: add WHERE created_at < now() - interval '90 days'" }
   ],
   "verdicts": [
     { "policy": "Budget Ceiling Approval", "verdict": "ACCEPTED_RISK",
       "note": "our nightly batch legitimately spends above the soft ceiling" }
   ]
 }'''
+
+def _scope_help():
+    """The `when` explainer, with both closed vocabularies DERIVED rather than typed.
+
+    The same PR that added this deliberately derives TARGET_ACTIONS from the classifier table,
+    with the comment that a hand-typed copy is a hole exactly where the vocabulary changes — and
+    then hand-typed it again here, three files away. Help text that lists a stale set of values is
+    worse than none: it is the one place an author looks to find the spelling."""
+    # BOTH closed vocabularies live in decorators, next to the classifier that produces them.
+    # `SCOPES` was imported from .overrides here, where it is only a function-local name inside
+    # normalize_scope and never becomes a module attribute — so this raised ImportError on the
+    # FIRST-RUN path (`agentx rules check` with no rules.json), which is the exact path the new
+    # `agentx policies` footer points a new user at. The whole suite stayed green because nothing
+    # drove this function; a test now does.
+    from .decorators import TARGET_ACTIONS, SCOPES
+    from .overrides import _SCOPE_DIMENSIONS
+    named = ", ".join(_SCOPE_DIMENSIONS[:-2])
+    return (
+        "  A reframe with a `when` coaches ONE situation instead of the whole policy. It can name\n"
+        "  %s, target_action (%s) and scope\n"
+        "  (%s); every field it names has to match for it to fire. %s are\n"
+        "  the ones that pin it to one job — target_action and scope on their own describe a whole\n"
+        "  class of call. It changes the coaching only; the block still fires either way."
+        % (named, "/".join(sorted(TARGET_ACTIONS)), "/".join(sorted(SCOPES)),
+           " and ".join(_SCOPE_DIMENSIONS[:-2]))
+    )
 
 
 def execute_rules(args):
@@ -1883,6 +2147,8 @@ def execute_rules(args):
         print("\n📄 No .agentx/rules.json yet. It seeds your org's safe-paths + known verdicts")
         print("   before any recovery data exists. A starter (reframe-and-label only):\n")
         print(_RULES_TEMPLATE)
+        print()
+        print(_scope_help())
         print("\n   Save it to .agentx/rules.json, then:  agentx rules apply")
         print("=" * 75)
         return
@@ -1891,7 +2157,21 @@ def execute_rules(args):
     verdicts = rules.get("verdicts") or []
     print(f"\n📋 .agentx/rules.json — {len(reframes)} reframe(s), {len(verdicts)} verdict(s):")
     for r in reframes:
-        print(_wrap(r.get("safe_path") or r.get("challenge") or "", f"   reframe · {r['policy']}: "))
+        print(_wrap(r.get("safe_path") or r.get("challenge") or "",
+                    f"   reframe · {r['policy']}: "))
+        # The SCOPE goes on its OWN line, never into the wrap prefix: _wrap uses the prefix as
+        # the hanging indent, so folding a scope into it leaves almost no width for the text and
+        # renders one word per line. `rules check` is the dry run and the last place an author
+        # sees the rule before it goes live, so this line has to stay readable.
+        if r.get("when"):
+            print(f"       └ fires only when {describe_scope(r['when'])}")
+            # Which DOORS the rule can reach. A scope naming agent_id cannot fire over
+            # agentx-mcp — that door has no per-agent identity — and without this line the
+            # author only discovers it by noticing coaching that never appears. Told here
+            # because `rules check` is the dry run, before the rule goes live.
+            if r["when"].get("agent_id"):
+                print("         (reaches the SDK decorator only — agentx-mcp has no "
+                      "per-agent identity)")
     for v in verdicts:
         note = f"  ({v['note']})" if v.get("note") else ""
         print(f"   verdict · {v['policy']} = {v['verdict']}{note}")
@@ -1902,10 +2182,16 @@ def execute_rules(args):
         return
 
     summary = apply_org_rules()
-    print(f"\n✓ Applied: {summary['reframes_adopted']} reframe(s) adopted, "
+    # The two reframe counts are DISJOINT (policy-wide vs scoped), so they are worded as a sum.
+    # "1 reframe adopted, 1 scoped" reads as 1 total of which 1 was scoped, which is wrong.
+    scoped_note = (f" + {summary['scoped_reframes_adopted']} scoped to a situation"
+                   if summary.get("scoped_reframes_adopted") else "")
+    print(f"\n✓ Applied: {summary['reframes_adopted']} policy-wide reframe(s){scoped_note}, "
           f"{summary['verdicts_declared']} verdict(s) declared, "
           f"{summary['blocks_labeled']} existing block(s) pre-labeled.")
     print("   Reframes now coach your agents; declared verdicts skip those blocks in review.")
+    if summary.get("scoped_reframes_adopted"):
+        print("   See where each scoped one fires:  agentx policies")
     print("=" * 75)
 
 

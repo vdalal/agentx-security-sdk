@@ -131,23 +131,27 @@ def load_overrides(path=None, warn=False):
         # never warn: warning on the normal empty state trains users to ignore a warning that
         # should only ever mean "your JSON is actually broken".
         if not raw.strip():
-            return {"version": _SCHEMA_VERSION, "overrides": {}}
+            return {"version": _SCHEMA_VERSION, "overrides": {}, "scoped_overrides": []}
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("override store is not a JSON object")
         data.setdefault("version", _SCHEMA_VERSION)
         if not isinstance(data.get("overrides"), dict):
             data["overrides"] = {}
+        # Scoped overrides live in their OWN container, never inside the `overrides` map. See
+        # _SCOPE_DIMENSIONS for why that separation is the safety property and not just tidiness.
+        if not isinstance(data.get("scoped_overrides"), list):
+            data["scoped_overrides"] = []
         return data
     except FileNotFoundError:
-        return {"version": _SCHEMA_VERSION, "overrides": {}}
+        return {"version": _SCHEMA_VERSION, "overrides": {}, "scoped_overrides": []}
     except (OSError, ValueError, json.JSONDecodeError) as e:
         if warn:
             print(f"⚠️  [AgentX] Could not read your override store at {p}: {e}\n"
                   f"    Your adopted org reframes are NOT being applied until this "
                   f"is fixed (it's plain JSON — check for a trailing comma or an "
                   f"unclosed quote).", file=sys.stderr)
-        return {"version": _SCHEMA_VERSION, "overrides": {}}
+        return {"version": _SCHEMA_VERSION, "overrides": {}, "scoped_overrides": []}
 
 
 def save_overrides(data, path=None):
@@ -178,9 +182,229 @@ def _entry_to_override(entry):
     return {"challenge": challenge, "safe_path": entry.get("safe_path")}
 
 
-def get_active_override(policy_id, policy_name=None, path=None):
+# --------------------------------------------------------- context-scoped overrides
+# A scoped override attaches a reframe to a SITUATION rather than to a whole policy.
+# The match key is four optional dimensions:
+#
+#   agent_id       the name the developer gave their own agent   -- carries org specificity
+#   tool           the tool / function name                      -- carries org specificity
+#   target_action  DELETE / EXECUTE / SEND / WRITE / LIST / READ / OTHER  -- a coarse CLASS
+#   scope          scoped | broad (does any argument KEY narrow the blast radius)  -- coarse
+#
+# Read the asymmetry before writing one: the last two describe a class of call ("a delete-shaped
+# tool called with some narrowing argument"), not one job. "Our nightly cleanup is fine" needs
+# agent_id and/or tool; target_action + scope alone will match a great deal more than the author
+# expects. This is stated here rather than only in the docs because the coarse pair is the one
+# that is easiest to write and the least likely to mean what it looks like it means.
+#
+# REDIRECT ONLY. These change the coaching text and the safe path, never the block/allow verdict.
+# That is what makes them safe to adopt without a governance gate: a reframe cannot turn a block
+# into an allow. It is NOT free of consequence, though — a scoped reframe still reaches the agent
+# and still steers its next action, so coaching that fires in the wrong place is a real cost even
+# though it is not a loosened floor.
+#
+# WHY A SEPARATE CONTAINER. Scoped entries live in `scoped_overrides`, never in the `overrides`
+# map. The invariant "a scoped override must never silently widen to the bare policy" is then
+# STRUCTURAL: the bare lookup reads a different container, so there is no code path that could
+# read a scoped entry as an unscoped one, and no rule anyone has to remember. The alternative
+# (one list per policy id, scoped and bare together) would make that widening a live bug the
+# whole time it stayed unwritten.
+_SCOPE_DIMENSIONS = ("agent_id", "tool", "target_action", "scope")
+
+
+# The two dimensions that are CODE IDENTIFIERS, compared exactly (after trimming) rather than
+# case-folded. `billing` and `Billing` are two different agents, so case-folding them would fire a
+# rule on something its author did not write — the same widening this whole mechanism exists to
+# prevent, arriving through a convenience. The other two are CLOSED VOCABULARIES with one true
+# spelling each, so those ARE case-normalized: a hand-edited store never passes through
+# ``normalize_scope``, and `"delete"` there plainly means DELETE.
+_EXACT_DIMENSIONS = ("agent_id", "tool")
+
+
+def _canon_dimension(dimension, value):
+    """One dimension's value in its comparable form. Identifiers keep their case; closed vocabs
+    are folded to the single spelling ``normalize_scope`` would have produced."""
+    text = "" if value is None else str(value).strip()
+    if dimension in _EXACT_DIMENSIONS:
+        return text
+    return text.upper() if dimension == "target_action" else text.lower()
+
+
+def _scope_matches(when, signature):
+    """True iff EVERY dimension the override NAMES equals the block's signature.
+
+    Two refusals matter more than the match itself:
+      * an override that names NO dimension returns False, never "matches everything". An empty
+        or stripped ``when`` is a malformed scoped entry, and the only safe reading of it is
+        that it fires nowhere. This is the second half of the never-widen invariant: the
+        container keeps a scoped entry out of the bare lookup, and this keeps an EMPTIED scoped
+        entry from becoming a de-facto bare one inside its own container.
+      * a missing signature returns False, so any caller that cannot describe the block simply
+        gets the bare override — the behaviour that shipped before scoping existed.
+
+    See ``_canon_dimension`` for why the two identifier dimensions are compared case-SENSITIVELY
+    while the two closed vocabularies are not."""
+    if not isinstance(when, dict) or not isinstance(signature, dict):
+        return False
+    named = [d for d in _SCOPE_DIMENSIONS if when.get(d)]
+    if not named:
+        return False
+    return all(_canon_dimension(d, when[d]) == _canon_dimension(d, signature.get(d))
+               for d in named)
+
+
+def _scope_specificity(when):
+    """How many dimensions an override names — the sort key for most-specific-first. Ties break
+    on the fixed ``_SCOPE_DIMENSIONS`` ORDER (an agent_id-named scope outranks a same-sized one
+    named on target_action), then on adoption time, so the winner is fully deterministic and two
+    runs of the same store can never disagree."""
+    return (
+        sum(1 for d in _SCOPE_DIMENSIONS if isinstance(when, dict) and when.get(d)),
+        tuple(1 if isinstance(when, dict) and when.get(d) else 0 for d in _SCOPE_DIMENSIONS),
+    )
+
+
+def _policy_matches(entry, policy_id, policy_name):
+    """Whether a scoped entry belongs to this policy — the SAME id-or-name union
+    ``get_active_override`` uses on the bare map, because the same logical policy carries
+    different ids across the two block paths (keyword-shield seed UUID vs gateway/judge id).
+
+    The name arm guards on the NORMALIZED name, matching what the bare lookup does. Guarding on
+    the raw one instead lets a whitespace-only policy name normalize to "" and match an entry
+    whose ``policy_violated`` is null — which every scoped adopt produces when the caller does
+    not pass a name. It is a narrow case and it widens, which is the direction that matters."""
+    if policy_id and entry.get("policy_id") == policy_id:
+        return True
+    target = _norm_for_dedup(policy_name)
+    if target and _norm_for_dedup(entry.get("policy_violated")) == target:
+        return True
+    return False
+
+
+def _sort_key(entry):
+    """Ordering key for one scoped entry: most dimensions first, then most recently adopted.
+
+    ``adopted_at`` is forced to ``str``. The store is a documented HAND-EDITABLE file, so a
+    number there is reachable, and two entries with the same specificity would then compare int
+    against str and raise TypeError straight out onto the block path — breaking this module's
+    standing contract that a bad override never breaks a protected call. It survived a first
+    probe because entries of DIFFERENT specificity resolve on the tuple and never reach this
+    field; it takes two identically-scoped entries to see it."""
+    return (_scope_specificity(entry.get("when")), str(entry.get("adopted_at") or ""))
+
+
+def get_scoped_override(policy_id, policy_name=None, signature=None, path=None, store=None):
+    """The most specific scoped reframe matching this block, as ``{challenge, safe_path}``, or
+    ``None``. Best-effort like every read on the block path: any error yields ``None`` and the
+    caller falls back to the bare override.
+
+    ``store`` lets a caller that has already loaded the store pass it in. Without it this reads
+    the file a second time on every block, since ``get_active_override`` needs it too."""
+    if signature is None:
+        return None
+    try:
+        if store is None:
+            store = load_overrides(path)
+        entries = store.get("scoped_overrides") or []
+        matches = [e for e in entries
+                   if isinstance(e, dict)
+                   and _policy_matches(e, policy_id, policy_name)
+                   and _scope_matches(e.get("when"), signature)]
+        # The sort is INSIDE the try with everything else: it reads store data, so it is as
+        # exposed to a malformed file as the parse is.
+        for entry in sorted(matches, key=_sort_key, reverse=True):
+            hit = _entry_to_override(entry)
+            if hit:
+                return hit
+    except Exception:
+        return None
+    return None
+
+
+def list_scoped_overrides(policy_id=None, policy_name=None, path=None, store=None):
+    """Every scoped override for a policy (or, with neither argument, the whole store), as
+    ``[{when, challenge, safe_path, source, adopted_at}]``, most specific first.
+
+    This exists because a scoped override is otherwise INVISIBLE to the person who wrote it:
+    ``agentx policies`` asks ``get_active_override`` with no signature, so a policy carrying
+    only scoped rules reads as "not customized", which is the same thing it reads as when the
+    author's scope has a typo in it. A rule you cannot see is a rule you cannot debug.
+
+    ``store`` lets a caller iterating every policy load the file once instead of once per policy
+    (``agentx policies`` walks 20+ floors)."""
+    try:
+        if store is None:
+            store = load_overrides(path)
+        entries = store.get("scoped_overrides") or []
+        out = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if (policy_id or policy_name) and not _policy_matches(entry, policy_id, policy_name):
+                continue
+            out.append({
+                "policy_id": entry.get("policy_id"),
+                "policy_violated": entry.get("policy_violated"),
+                "when": entry.get("when") or {},
+                "challenge": entry.get("challenge"),
+                "safe_path": entry.get("safe_path"),
+                "source": entry.get("source"),
+                "adopted_at": entry.get("adopted_at"),
+            })
+        # Same str-forced key as _sort_key, for the same reason: a hand-edited numeric
+        # `adopted_at` beside a string one would otherwise raise out of a plain listing.
+        return sorted(out, key=lambda e: (_scope_specificity(e["when"]),
+                                          str(e["adopted_at"] or "")), reverse=True)
+    except Exception:
+        return []
+
+
+def describe_scope(when):
+    """A scope rendered for a human: ``agent nightly_cleanup · tool purge_stale_rows``. Empty
+    scope renders as an explicit warning rather than a blank, because a blank would read as
+    'applies everywhere' — the opposite of what an empty scope actually does (match nothing)."""
+    if not isinstance(when, dict) or not any(when.get(d) for d in _SCOPE_DIMENSIONS):
+        return "⚠ no scope — matches nothing"
+    labels = {"agent_id": "agent", "tool": "tool",
+              "target_action": "action", "scope": "shape"}
+    return " · ".join("%s %s" % (labels[d], when[d])
+                      for d in _SCOPE_DIMENSIONS if when.get(d))
+
+
+def has_human_coaching(policy_id, policy_name=None, path=None, store=None):
+    """Does this policy already carry coaching a human chose — of ANY kind, bare or scoped?
+
+    This is the question every GATE actually wants, and asking it as
+    ``get_active_override(pid, name)`` gets it wrong in one specific and consequential way: that
+    call reads only the bare map, so a policy a human deliberately NARROWED to one situation looks
+    untouched. The gates then offer, or install, a POLICY-WIDE override on it — widening exactly
+    the policy someone took the trouble to scope. Deliberate narrowing is a stronger statement of
+    intent than no opinion at all, and it has to read that way.
+
+    Every gate should call THIS, not the lookup. The lookup answers "what fires for this block",
+    which is a different question and needs a signature to answer honestly.
+
+    ``store`` matters more here than it looks: this asks TWO questions, so without it each call is
+    two file reads, and the gates call it once PER POLICY in a loop. That is the same read
+    amplification already fixed in ``list_customizable_policies``, and it came straight back one
+    function along."""
+    if store is None:
+        try:
+            store = load_overrides(path)
+        except Exception:
+            return False
+    if get_active_override(policy_id, policy_name=policy_name, store=store):
+        return True
+    return bool(list_scoped_overrides(policy_id, policy_name=policy_name, store=store))
+
+
+def get_active_override(policy_id, policy_name=None, path=None, signature=None, store=None):
     """The adopted org reframe for this policy as ``{challenge, safe_path}``, or
     ``None``.
+
+    When a ``signature`` describes the block (see ``_SCOPE_DIMENSIONS``), the most specific
+    matching SCOPED override wins; the bare policy-wide override is the fallback. A caller that
+    passes no signature gets exactly the pre-scoping behaviour.
 
     Lookup is by ``policy_id`` FIRST (exact, strongest). If that misses and a
     ``policy_name`` is supplied, fall back to matching the stored
@@ -200,39 +424,104 @@ def get_active_override(policy_id, policy_name=None, path=None):
     if not policy_id and not policy_name:
         return None
     try:
-        store = load_overrides(path)["overrides"]
+        # ONE read, shared by the scoped and bare lookups. Two reads would double the file I/O
+        # on every block, and would let the two halves answer from different states of a file
+        # the user is allowed to edit while their agent runs. ``store`` extends that to a caller
+        # walking every policy, which would otherwise read the file once per policy.
+        data = load_overrides(path) if store is None else store
     except Exception:
         return None
-    if policy_id:
-        hit = _entry_to_override(store.get(policy_id))
-        if hit:
-            return hit                              # exact id wins
-    if policy_name:
-        target = _norm_for_dedup(policy_name)
-        if target:
-            matches = [
-                (entry.get("adopted_at") or "", pid, entry)
-                for pid, entry in store.items()
-                if isinstance(entry, dict)
-                and _norm_for_dedup(entry.get("policy_violated")) == target
-            ]
-            # Most-recently-adopted first, tie-break on id — fully deterministic.
-            for _, _, entry in sorted(matches, reverse=True):
-                hit = _entry_to_override(entry)
-                if hit:
-                    return hit
+    scoped = get_scoped_override(policy_id, policy_name=policy_name,
+                                 signature=signature, store=data)
+    if scoped:
+        return scoped
+    try:
+        store = data["overrides"]
+        if policy_id:
+            hit = _entry_to_override(store.get(policy_id))
+            if hit:
+                return hit                              # exact id wins
+        if policy_name:
+            target = _norm_for_dedup(policy_name)
+            if target:
+                matches = [
+                    (str(entry.get("adopted_at") or ""), str(pid), entry)
+                    for pid, entry in store.items()
+                    if isinstance(entry, dict)
+                    and _norm_for_dedup(entry.get("policy_violated")) == target
+                ]
+                # Most-recently-adopted first, tie-break on id — fully deterministic. Both key
+                # parts are forced to str for the same reason the scoped sort is (see
+                # _sort_key): this store is hand-editable, so a number in `adopted_at` is
+                # reachable, and comparing int against str raises onto the block path. The
+                # third element is a dict and is NOT part of the key — reaching it would raise
+                # too, which is why the sort is keyed on the first two explicitly.
+                for _, _, entry in sorted(matches, key=lambda m: (m[0], m[1]), reverse=True):
+                    hit = _entry_to_override(entry)
+                    if hit:
+                        return hit
+    except Exception:
+        return None
     return None
 
 
+def normalize_scope(when):
+    """Validate + clean a human-written scope into the stored ``when`` shape, or raise
+    ValueError naming what is wrong. Returns ``None`` for "no scope given" (an unscoped adopt).
+
+    Validation exists because a scope that matches NOTHING fails silently — the block just gets
+    the generic challenge, exactly as if the author had never written the rule. A typo in
+    ``target_action`` is the likely case, so the closed vocabularies are checked against the
+    ones DERIVED from the classifier itself, never a hand-copied list."""
+    if not when:
+        return None
+    if not isinstance(when, dict):
+        raise ValueError("a scope must be an object with any of %s" % (list(_SCOPE_DIMENSIONS),))
+    from .decorators import TARGET_ACTIONS, SCOPES
+    cleaned, unknown = {}, []
+    for k, v in when.items():
+        if k not in _SCOPE_DIMENSIONS:
+            unknown.append(k)
+            continue
+        if v is None or not str(v).strip():
+            continue
+        cleaned[k] = str(v).strip()
+    if unknown:
+        raise ValueError("unknown scope field(s) %s — a scope names any of %s"
+                         % (sorted(unknown), list(_SCOPE_DIMENSIONS)))
+    ta = cleaned.get("target_action")
+    if ta and ta.upper() not in TARGET_ACTIONS:
+        raise ValueError("target_action %r is not one of %s" % (ta, sorted(TARGET_ACTIONS)))
+    if ta:
+        cleaned["target_action"] = ta.upper()
+    sc = cleaned.get("scope")
+    if sc and sc.lower() not in SCOPES:
+        raise ValueError("scope %r is not one of %s" % (sc, sorted(SCOPES)))
+    if sc:
+        cleaned["scope"] = sc.lower()
+    if not cleaned:
+        raise ValueError(
+            "this scope names no dimension, so it would match nothing. Name at least one of %s "
+            "— agent_id or tool for a specific job, target_action or scope for a whole class."
+            % (list(_SCOPE_DIMENSIONS),))
+    return cleaned
+
+
 def adopt(policy_id, *, challenge, safe_path=None, resolution_type=None,
-          policy_violated=None, source="harvest", path=None):
+          policy_violated=None, source="harvest", when=None, path=None):
     """Promote a reframe to the ACTIVE override for ``policy_id`` — the human
-    gate. Overwrites any prior active override for that policy. Returns the
-    stored entry."""
+    gate. Returns the stored entry.
+
+    Without ``when`` this is the policy-wide override it has always been, and it overwrites any
+    prior policy-wide override for that policy. With ``when`` (see ``_SCOPE_DIMENSIONS``) it
+    stores a CONTEXT-SCOPED override instead, into the separate ``scoped_overrides`` container,
+    replacing only a prior entry for the SAME policy and the SAME scope — a store can hold as
+    many scoped overrides per policy as there are distinct scopes."""
     if not policy_id:
         raise ValueError("policy_id is required to adopt an override")
     if not challenge or not str(challenge).strip():
         raise ValueError("challenge text is required to adopt an override")
+    cleaned_when = normalize_scope(when)
     data = load_overrides(path)
     entry = {
         "policy_violated": policy_violated,
@@ -242,7 +531,18 @@ def adopt(policy_id, *, challenge, safe_path=None, resolution_type=None,
         "source": source,
         "adopted_at": _now_iso(),
     }
-    data["overrides"][policy_id] = entry
+    if cleaned_when is None:
+        data["overrides"][policy_id] = entry
+    else:
+        entry = dict(entry, policy_id=policy_id, when=cleaned_when)
+        # Replace the same (policy, scope) rather than appending, so re-adopting a scope the
+        # author already wrote updates it instead of silently stacking a second entry that the
+        # most-specific-first sort would then have to break a tie between.
+        data["scoped_overrides"] = [
+            e for e in (data.get("scoped_overrides") or [])
+            if not (isinstance(e, dict) and e.get("policy_id") == policy_id
+                    and e.get("when") == cleaned_when)
+        ] + [entry]
     save_overrides(data, path)
     return entry
 
@@ -265,8 +565,15 @@ def list_customizable_policies(path=None):
     """
     from .decorators import builtin_policy_catalog
     out = []
+    # Read the store ONCE for the whole listing. Both lookups below take it, so a 20+ floor
+    # listing is one file read rather than two per policy.
+    store = load_overrides(path)
     for p in builtin_policy_catalog():
-        override = get_active_override(p["id"], policy_name=p["name"], path=path)
+        override = get_active_override(p["id"], policy_name=p["name"], store=store)
+        # Scoped rules are reported SEPARATELY rather than folded into active_challenge: which
+        # one applies depends on the call, so there is no single "active" answer to give here,
+        # and picking one would misreport three of them as the policy's coaching.
+        scoped = list_scoped_overrides(p["id"], policy_name=p["name"], store=store)
         out.append({
             "id": p["id"],
             "name": p["name"],
@@ -276,6 +583,7 @@ def list_customizable_policies(path=None):
             "active_challenge": override.get("challenge") if override else None,
             "active_safe_path": override.get("safe_path") if override else None,
             "customized": override is not None,
+            "scoped": scoped,
         })
     return out
 
@@ -693,11 +1001,15 @@ def reviewable_items(db_path=None, cluster=True):
     decisions on an LLM-paraphrased corpus, which rarely produces byte-identical text).
     The rest stay browsable by number via ``agentx insights`` / ``agentx adopt <#>``."""
     items = []
+    _store = load_overrides()          # once for the whole loop, not twice per policy
     for pid, bucket in harvest_candidates(db_path, cluster=cluster).items():
         candidates = bucket.get("candidates") or []
         if not candidates:
             continue
-        if get_active_override(pid, policy_name=bucket.get("policy_violated")):
+        # Any human coaching counts, scoped included — see has_human_coaching. Offering "adopt
+        # this" for a policy the human already narrowed leads them to install a policy-wide rule
+        # over their own scoped one.
+        if has_human_coaching(pid, policy_name=bucket.get("policy_violated"), store=_store):
             continue
         top = candidates[0]
         items.append({
@@ -796,8 +1108,23 @@ def label_stats(db_path=None):
 # (only auto-applying AGENT-generated text is forbidden). REFRAME-AND-LABEL ONLY: a rule
 # may add a reframe or pre-declare a verdict; it may NOT loosen/suppress a floor block --
 # that is a higher-bar, explicitly-audited action, never a config line.
+#
+# A reframe may carry an optional "when" that scopes it to a SITUATION rather than the whole
+# policy -- this is the authoring surface for context-scoped overrides (_SCOPE_DIMENSIONS):
+#
+#   {"reframes": [{"policy": "Mass Destructive Intent",
+#                  "when": {"agent_id": "nightly_cleanup", "tool": "purge_stale_rows"},
+#                  "safe_path": "Our nightly cleanup runs with a date filter -- add
+#                                `WHERE created_at < now() - interval '90 days'` and retry."}]}
+#
+# It stays REDIRECT-only even when scoped: the block still fires, the coaching changes.
 DEFAULT_ORG_RULES_PATH = os.path.join(".agentx", "rules.json")
 _ORG_RULES_KEYS = ("reframes", "verdicts")
+# The fields each entry may carry. Enforced as an ALLOWLIST because the failure mode of a
+# misspelled key here is not "the field is ignored" -- it is "the rule applies to the whole policy
+# instead of the one situation you wrote".
+_ORG_RULES_REFRAME_KEYS = frozenset(("policy", "when", "challenge", "safe_path", "note"))
+_ORG_RULES_VERDICT_KEYS = frozenset(("policy", "verdict", "note"))
 # Keys that would LOOSEN the floor — rejected with a pointer to the higher-bar gate.
 _ORG_RULES_LOOSENING_KEYS = ("suppress", "allow", "never_block", "unblock", "exceptions")
 
@@ -838,9 +1165,54 @@ def load_org_rules(rules_path=None):
     for r in (data.get("reframes") or []):
         if not isinstance(r, dict) or not r.get("policy") or not (r.get("safe_path") or r.get("challenge")):
             errors.append(f"a reframe needs 'policy' and 'safe_path' (or 'challenge'): {r!r}")
+            continue
+        # 🔴 An unknown key on the reframe ITSELF is an ERROR, not something to ignore, and this is
+        # the highest-consequence check in the file. Misspell `when` as `whn` and the reframe simply
+        # reads as unscoped -- so a rule the author wrote for ONE situation is adopted POLICY-WIDE.
+        # That is maximal widening, arriving silently, in the one feature whose stated property is
+        # that it never silently widens. `normalize_scope` already rejects unknown fields INSIDE a
+        # scope; nothing was checking the level above it, which is where the damage is worse.
+        unknown = sorted(set(r) - _ORG_RULES_REFRAME_KEYS)
+        if unknown:
+            errors.append(
+                f"reframe for '{r.get('policy')}' has unknown field(s) {unknown} "
+                f"(expected {sorted(_ORG_RULES_REFRAME_KEYS)}). If you meant to scope it, the "
+                f"field is 'when' — a misspelling here would silently make the rule apply to the "
+                f"WHOLE policy instead of the situation you wrote.")
+        # An optional 'when' scopes the reframe to a SITUATION instead of the whole policy. It is
+        # validated HERE, at authoring time, because a scope that matches nothing fails SILENTLY
+        # at block time: the agent just gets the generic challenge, indistinguishable from never
+        # having written the rule at all. A typo has to be an error the author sees.
+        if "when" in r:
+            # A `when` that is PRESENT but names nothing ({} / [] / "" / 0 / null) is an ERROR, not
+            # an unscoped adopt. normalize_scope returns None for anything falsy, which made the
+            # reframe land in the bare map — so an author who wrote a scope and left it empty got
+            # the rule applied to the WHOLE policy. That is the same silent widening the key
+            # allowlist above exists to stop, arriving one level down, and it contradicts the code
+            # beside it: `{"tool": "  "}` already errors with "would match nothing". Writing the
+            # key at all is a statement of intent to scope; honour it or refuse it, never widen it.
+            if not r.get("when"):
+                errors.append(
+                    f"reframe for '{r.get('policy')}' has an EMPTY 'when' ({r.get('when')!r}). "
+                    f"A scope that names nothing would silently apply the rule to the WHOLE "
+                    f"policy. Name at least one of {list(_SCOPE_DIMENSIONS)}, or remove the "
+                    f"'when' key entirely if you meant the rule to be policy-wide.")
+            else:
+                try:
+                    normalize_scope(r["when"])
+                except ValueError as e:
+                    errors.append(f"reframe for '{r.get('policy')}': {e}")
     for v in (data.get("verdicts") or []):
         if not isinstance(v, dict) or not v.get("policy") or v.get("verdict") not in _VERDICT_VOCAB:
             errors.append(f"a verdict needs 'policy' and 'verdict' in {sorted(_VERDICT_VOCAB)}: {v!r}")
+            continue
+        # Same check on the verdict side. It is lower-consequence (a misspelled 'verdict' already
+        # fails the vocab test above, so it cannot silently widen) but an unknown key still means
+        # the author wrote something that does nothing, and silence teaches them it worked.
+        unknown = sorted(set(v) - _ORG_RULES_VERDICT_KEYS)
+        if unknown:
+            errors.append(f"verdict for '{v.get('policy')}' has unknown field(s) {unknown} "
+                          f"(expected {sorted(_ORG_RULES_VERDICT_KEYS)})")
     return data, errors
 
 
@@ -1057,16 +1429,71 @@ def apply_org_rules(rules_path=None, path=None, db_path=None):
     """Ingest `.agentx/rules.json` into the override store — the cold-start seed. REFRAMES
     become active overrides (human-authored, so always allowed); VERDICTs are declared and
     applied to any matching CURRENT unlabeled blocks. Raises ValueError on validation
-    errors. Returns ``{reframes_adopted, verdicts_declared, blocks_labeled}``."""
+    errors. Returns ``{reframes_adopted, scoped_reframes_adopted, verdicts_declared,
+    blocks_labeled}``.
+
+    A reframe carrying a ``when`` is CONTEXT-SCOPED (``_SCOPE_DIMENSIONS``) and lands in the
+    separate ``scoped_overrides`` container; the two counts are reported separately because
+    "3 reframes" hides whether any of them will actually fire where the author meant."""
     rules, errors = load_org_rules(rules_path)
     if errors:
         raise ValueError("; ".join(errors))
     data = load_overrides(path)
     data.setdefault("verdicts", {})
-    reframes = verdicts = 0
+    data.setdefault("scoped_overrides", [])
+    # `rules.json` is DECLARATIVE: what the file says is what is active. So every entry this file
+    # previously produced is withdrawn FIRST, and only the current contents are written back.
+    #
+    # Matching the old entry by its exact (policy, scope) instead was wrong in both directions and
+    # in the dangerous direction. EDIT a rule's scope and the old, BROADER entry stayed live
+    # forever — so narrowing "this tool" to "this agent AND this tool" left the tool-wide rule
+    # coaching every other agent, which is the precise opposite of what the author just asked for.
+    # DELETE a reframe from the file and it kept firing with nothing on disk to explain why. The
+    # count printed "1 scoped" on every run, so neither showed up as anything the author could see.
+    #
+    # Scoped AND bare are both swept, because both had it — the bare map has kept a policy-wide
+    # reframe alive across an emptied `rules.json` since that path shipped, and fixing only the
+    # container this review happened to look at would leave the same bug one line away.
+    #
+    # Guarded on ``source == "rules"``: an override adopted via `agentx adopt` or written by
+    # `agentx customize` did NOT come from this file and must survive an apply untouched.
+    data["overrides"] = {k: v for k, v in data["overrides"].items()
+                         if not (isinstance(v, dict) and v.get("source") == "rules")}
+    data["scoped_overrides"] = [e for e in (data.get("scoped_overrides") or [])
+                                if not (isinstance(e, dict) and e.get("source") == "rules")]
+    # VERDICTS TOO. The first cut of this sweep did the two override containers and stopped, in the
+    # same change whose message claimed to be fixing the template rather than the instance — so the
+    # bug it named as "one line away" was left exactly one line away. A declared verdict carries
+    # MORE consequence than a reframe: it pre-labels blocks and skips them in `agentx review`, so a
+    # verdict withdrawn from the file but still live means blocks are being silently auto-labeled
+    # by a rule that no longer exists on disk.
+    #
+    # Unlike the override containers, verdicts carry no `source` (the store holds a bare
+    # policy_id -> verdict map, written by both this path and `set_declared_verdict`). So the
+    # sweep is keyed on WHAT THIS FILE DECLARED LAST TIME, tracked explicitly.
+    #
+    # 🔴 Tracked as key->VALUE, not just the key. Tracking keys alone destroyed a human decision:
+    # the file declares a verdict for P1, the developer then overrides it by hand with
+    # `agentx verdict --policy`, the verdict is later removed from the file, and the sweep threw
+    # away the HUMAN's call because the key still matched. A withdrawal may only retract a value
+    # this file actually put there and that nobody has changed since.
+    _prev = data.get("_rules_verdicts")
+    if isinstance(_prev, list):                 # older shape (keys only) — treat as unknown values
+        _prev = {k: None for k in _prev}
+    if isinstance(_prev, dict) and _prev:
+        _verdicts = dict(data.get("verdicts") or {})
+        for k, previously_written in _prev.items():
+            # Only if it is still OURS: same key AND still the value we wrote. A None means the
+            # old key-only shape, where we cannot prove ownership — leave those alone rather than
+            # guess, because the failure direction of guessing wrong is deleting a human's call.
+            if previously_written is not None and _verdicts.get(k) == previously_written:
+                _verdicts.pop(k, None)
+        data["verdicts"] = _verdicts
+    data.pop("_rules_verdict_keys", None)       # retire the old key shape if a store carries it
+    reframes = scoped = verdicts = 0
     for r in (rules.get("reframes") or []):
         pid, pname = _resolve_policy_ref(r["policy"])
-        data["overrides"][pid] = {
+        entry = {
             "policy_violated": pname,
             "challenge": (r.get("challenge") or r.get("safe_path") or "").strip(),
             "safe_path": r.get("safe_path"),
@@ -1074,11 +1501,24 @@ def apply_org_rules(rules_path=None, path=None, db_path=None):
             "source": "rules",
             "adopted_at": _now_iso(),
         }
-        reframes += 1
+        when = normalize_scope(r.get("when"))     # already validated by load_org_rules
+        if when is None:
+            data["overrides"][pid] = entry
+            reframes += 1
+        else:
+            data["scoped_overrides"].append(dict(entry, policy_id=pid, when=when))
+            scoped += 1
+    _declared_now = {}
     for v in (rules.get("verdicts") or []):
         pid, _ = _resolve_policy_ref(v["policy"])
         data["verdicts"][pid] = v["verdict"]
+        _declared_now[pid] = v["verdict"]
         verdicts += 1
+    # Record what THIS file wrote, key AND value, so the next apply can withdraw exactly what it
+    # put there and can tell a value someone has since changed by hand. Stored rather than
+    # inferred because the verdicts map itself carries no provenance.
+    data["_rules_verdicts"] = _declared_now
     save_overrides(data, path)
     labeled = apply_declared_verdicts(path=path, db_path=db_path)
-    return {"reframes_adopted": reframes, "verdicts_declared": verdicts, "blocks_labeled": labeled}
+    return {"reframes_adopted": reframes, "scoped_reframes_adopted": scoped,
+            "verdicts_declared": verdicts, "blocks_labeled": labeled}
