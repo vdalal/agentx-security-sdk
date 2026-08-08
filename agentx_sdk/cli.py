@@ -1,5 +1,6 @@
 import os
 import sys
+import hashlib
 import json
 import shutil
 import tempfile
@@ -203,18 +204,30 @@ def execute_policy_pull(control_plane_url, api_key):
         # and printed success. Three outcomes were collapsed into one "Success" line.
         sync_active = payload.get("payload_sync_active")
 
-        target_dir = ".agentx"
+        # BACKLOG P-78: project-root-anchored, so `agentx pull` from a subdirectory writes
+        # the file the shield actually reads. This was a bare ".agentx", resolved against
+        # the process working directory, so where your org policies landed depended on
+        # which directory you happened to be standing in.
+        from .decorators import _project_root_cached
+        target_dir = os.path.join(_project_root_cached(), ".agentx")
         target_file = os.path.join(target_dir, "policies.json")
 
         # AN EMPTY LIST IS WRITTEN ONLY WHEN THE PLANE SAYS ITS ANSWER IS AUTHORITATIVE.
         #
-        # What an empty file actually does, PROBED rather than assumed (an earlier version
-        # of this comment asserted the opposite and was wrong): it does NOT empty the
-        # shield. `load_local_policy_keywords` gates on `if policies: return policies` and
-        # otherwise falls through to `_BUILTIN_POLICY_KEYWORDS`, so an empty file and no
-        # file are identical, 6 built-in seeds either way. It is a NON-EMPTY pull that
-        # wholly replaces the seeds. The stake here is therefore the ORG rulebook, not the
-        # floor, and the floor is never at risk in this function.
+        # What a pulled file actually does, PROBED rather than assumed (two earlier versions
+        # of this comment asserted things that were wrong, in both directions):
+        #
+        # 🔴 UPDATED BY BACKLOG P-49, IN THIS SAME PR. This used to say the loader "gates on
+        # `if policies: return policies`" and that "a NON-EMPTY pull wholly replaces the
+        # seeds". Both were true when written and both are FALSE now: that gate is gone and
+        # `load_local_policy_keywords` merges a pulled file ON TOP OF the built-in floor
+        # (`_merge_pulled_over_floor`). Data may add policies, add intents and change
+        # coaching; it can no longer remove any of them.
+        #
+        # So the conclusion below survives but for a stronger reason: an empty file and no
+        # file are still identical, and now a NON-EMPTY file cannot weaken the floor either.
+        # The stake in this function is the ORG rulebook, and the floor is not at risk here
+        # -- which is now enforced by construction rather than by this function being careful.
         #
         #   sync_active TRUE + []  AUTHORITATIVE. The org has zero active policies, which
         #                          is exactly what an operator sees after deactivating the
@@ -240,7 +253,11 @@ def execute_policy_pull(control_plane_url, api_key):
                 why = ("The control plane answered without a payload_sync_active flag, so it may "
                        f"not be an AgentX control plane. Check CONTROL_PLANE_URL ({control_plane_url}).")
             print(f"\nℹ️  Nothing to synchronize. {why}")
-            print(f"   ./{target_file} was NOT overwritten, so any org rules you already "
+            # No "./" prefix: `target_file` is ABSOLUTE since P-78 anchored the pull to the
+            # project root, so the old f"./{target_file}" rendered "./C:\\Projects\\...\\
+            # policies.json" -- not copy-pasteable, on the one path where the operator is
+            # most likely to go looking for the file.
+            print(f"   {target_file} was NOT overwritten, so any org rules you already "
                   f"pulled still apply.")
             print("=" * 75)
             return
@@ -266,12 +283,20 @@ def execute_policy_pull(control_plane_url, api_key):
         print("=" * 75)
         sys.exit(1)
 
-def execute_vector_seed_compilation(gateway_url, api_key, output_dir=".agentx"):
+def execute_vector_seed_compilation(gateway_url, api_key, output_dir=None):
     """
-    Surgically compiles armed security rules from the gateway cache into an 
+    Surgically compiles armed security rules from the gateway cache into an
     optimized binary float32 weights matrix file for offline lookups.
+
+    BACKLOG P-78: the default is the project's `.agentx/`, resolved from the project ROOT
+    rather than the working directory. `load_local_vector_shield_cache` reads it from the
+    root, so compiling into a cwd-relative directory produced seeds the shield would not
+    find. `output_dir` stays overridable for callers and tests that pass one explicitly.
     """
     import numpy as np
+    if output_dir is None:
+        from .decorators import _project_root_cached
+        output_dir = os.path.join(_project_root_cached(), ".agentx")
     print("\n🧬 Initializing AgentX Vector Seed Matrix Compilation Pass...")
     headers = {"Authorization": f"Bearer {api_key}"}
     
@@ -592,6 +617,404 @@ def _insights_cmd():
     return "uvx agentx-mcp --insights" if MCP_ENTRY else "agentx insights"
 
 
+def _env_prefix_cmd(var, value, cmd):
+    """A one-line 'set VAR then run cmd' the reader's actual shell will accept.
+
+    POSIX takes the inline `VAR=value cmd` form. PowerShell needs a separate assignment
+    and rejects the inline one outright, so a copy-paste hint that ignores the platform is
+    a hint the reader cannot use. Values are quoted because these are absolute paths.
+    """
+    if os.name == "nt":
+        # PowerShell is the Windows default; `;` sequences the two statements on one line.
+        return '$env:%s="%s"; %s' % (var, value, cmd)
+    return "%s='%s' %s" % (var, value, cmd)
+
+
+def _human_bytes(n):
+    """Size in the largest unit that keeps a non-zero leading digit."""
+    for unit, scale in (("MB", 1024 * 1024), ("KB", 1024)):
+        if n >= scale:
+            return "%.1f %s" % (n / scale, unit)
+    return "%d bytes" % n
+
+
+def _print_strays(census):
+    """Name other incident stores on disk when this one has nothing to say. BACKLOG P-76.
+
+    🔴 THE SILENCE THIS BREAKS IS A FALSE STATEMENT, NOT A MISSING FEATURE. The reader and
+    the gateway used to resolve their store differently -- the reader anchored to the
+    project root, the gateway to whatever directory it was started from -- so a developer
+    whose gateway was recording correctly was told "No blocks recorded yet" about their own
+    data. Both halves now agree (backend/agentx_home.py), so a stray means an OLD store from
+    before the fix, or a compose mount pointing elsewhere. Either way the honest move is to
+    say which files exist and let the developer choose, never to read one of them and hope.
+    """
+    strays = census.get("strays") or []
+    if not strays:
+        return
+    print("")
+    print("  ⚠️  Other incident stores exist in this project, and this readout is NOT")
+    print("      reading them:")
+    for s in strays:
+        # Scale the unit. A 24 KB store printed as "0.0 MB" reads as empty, which is the
+        # same false-empty impression this whole warning exists to correct.
+        print("        %s  (%s)" % (s["path"], _human_bytes(s["bytes"])))
+    print("      A gateway started from a different directory wrote those. If that is")
+    print("      where your blocks are, point at one and re-run:")
+    # Platform-correct and QUOTED. `VAR=path cmd` is a parse error in PowerShell and cmd,
+    # and this bug was found on Windows -- printing a POSIX-only line to the person most
+    # likely to hit it defeats the point of the hint. Quoting matters independently: these
+    # are absolute paths and any of them can contain a space.
+    print("        %s" % _env_prefix_cmd("AGENTX_INCIDENT_DB", strays[0]["path"],
+                                         _insights_cmd()))
+
+
+def _print_recovery_section(census):
+    """What happened AFTER a block (BACKLOG P-59).
+
+    THE THREE SILENCES ARE DIFFERENT AND MUST READ DIFFERENTLY. "No store on disk" means
+    nothing has ever recorded this -- and that is the NORMAL case, because the keyless shield
+    does not write here and most installs are keyless. "Blocks but nothing settled" means the
+    outcomes have not resolved yet. Only the third is "nothing recovered". Printing a bare 0%
+    for all three would tell a keyless user their agents never recover, which is not a finding
+    about their agents, it is a finding about what we are not recording.
+    """
+    from .overrides import recovery_summary, refine_recoveries, settle_stale_blocks
+
+    print("")
+    print("🔁 WHAT HAPPENED AFTER A BLOCK           (local to this machine)")
+    print("=" * 75)
+
+    if not census["exists"]:
+        print("  Nothing recorded this yet. The keyless shield does not write recovery")
+        print("  outcomes -- run your agents against the local gateway to collect them.")
+        _print_strays(census)
+        print("=" * 75)
+        return
+
+    # 🔴 THE SWEEPS RUN HERE, AT READ TIME, AND THIS IS THEIR ONLY CALLER. They shipped with
+    # none at all, so nothing settled in a real deployment and "none settled yet" was permanent
+    # rather than passing. Read-time is the right home: both are idempotent and neither needs a
+    # daemon, so the readout cannot depend on a gateway having been alive at the right moment.
+    # Same placement and same reason as reconcile_safe_paths before `agentx review`.
+    settle_stale_blocks()
+    refine_recoveries()
+
+    summary = recovery_summary()
+    if not summary:
+        print("  No blocks recorded yet, so there is nothing to have recovered from.")
+        _print_strays(census)
+        print("=" * 75)
+        return
+
+    # 🔴 A FOURTH SILENCE, and it used to print as one of the other three. A store written by an
+    # older gateway has no outcome columns at all, and saying "no blocks recorded yet" to
+    # someone holding tens of thousands of them is simply false.
+    if summary.get("state") == "not_upgraded":
+        print("  %d block(s) recorded, but this store predates the outcome columns, so there"
+              % summary["blocks_all_time"])
+        print("  is nothing recorded about what happened after them. The gateway adds the")
+        print("  columns on its next write -- blocks from then on will be tracked.")
+        _print_strays(census)
+        print("=" * 75)
+        return
+
+    o = summary["overall"]
+    # Blocks written before we started watching what came next. They cannot have recovered, so
+    # counting them would drag the headline to zero; they are named instead of hidden.
+    if summary["blocks_before_window"]:
+        print("  %d earlier block(s) are not counted below: they were recorded before we"
+              % summary["blocks_before_window"])
+        print("  started tracking what happened next, so nothing about them is known.")
+
+    # 🔴 PRINTED BEFORE THE EARLY EXITS, because escalations are lifted OUT of `overall`. A store
+    # whose in-window blocks were all human approvals had overall["blocks"] == 0 and printed
+    # "Nothing has been recorded since we started tracking outcomes" over the top of them --
+    # the same false silence this whole section exists to eliminate, reintroduced by the lift-out.
+    esc = summary["escalations"]
+    if esc["total"]:
+        line = ("  %d went to a human: %d proceeded after approval, %d still waiting"
+                % (esc["total"], esc["proceeded"], esc["open"]))
+        if esc["closed_other"]:
+            line += ", %d closed otherwise" % esc["closed_other"]
+        print(line)
+
+    if o["blocks"] == 0:
+        if not esc["total"]:
+            print("  Nothing has been recorded since we started tracking outcomes.")
+        else:
+            print("  Nothing else has been recorded since we started tracking outcomes.")
+        print("=" * 75)
+        return
+    if o["settled"] == 0:
+        print("  %d block(s) recorded, none settled yet. Outcomes settle once a run goes"
+              % o["blocks"])
+        print("  quiet; there is nothing to read until then.")
+        print("=" * 75)
+        return
+
+    # By class FIRST and always. The blended figure is the least useful cut: "our advice on
+    # destructive writes works and our advice on network calls does not" is a work item,
+    # "62%" is not.
+    for name, b in sorted(summary["by_class"].items(), key=lambda kv: -kv[1]["blocks"]):
+        if not b["readable"]:
+            print("  %-22s %4d blocks   not enough data yet" % (name, b["blocks"]))
+            continue
+        print("  %-22s %4d blocks   %d recovered (%s)"
+              % (name, b["blocks"], b["recovered"], _share_pct(b["recovered"], b["settled"])))
+
+    print("")
+    if o["readable"]:
+        print("  Overall: %d settled - %d recovered (%s) - %d blocked again"
+              % (o["settled"], o["recovered"], _share_pct(o["recovered"], o["settled"]),
+                 o["reblocked"]))
+    else:
+        print("  Overall: %d settled -- not enough data for a rate yet" % o["settled"])
+    # NOT a failure count. It covers an agent that gave up, a run that finished the job
+    # another way, and a crashed process. The window is stamped because it MOVES this number:
+    # a shorter one settles more blocks into it, so two runs under different windows are not
+    # comparable.
+    print("  %d saw no further activity after %d min (we cannot tell why), %d still open"
+          % (o["no_further_activity"], summary["settle_window_seconds"] // 60, o["open"]))
+    # Loud rather than diluted. Vocabulary is enforced on write, so a value arriving here means
+    # something drifted -- most likely a store written by a newer gateway than this SDK. These
+    # are held OUT of `settled`, so they cannot quietly move the rate above.
+    if o["unrecognised"]:
+        print("  %d have an outcome this version does not recognise and are not counted in"
+              % o["unrecognised"])
+        print("  the rate. Upgrade the SDK (pip install -U agentx-security).")
+
+    runs = summary["runs"]
+    if runs["readable"]:
+        # Both numbers, because they answer different questions and collapsing them hides an
+        # open run inside a "did not finish". The denominator is SETTLED runs, matching every
+        # other rate here.
+        print("  %d runs hit a block - of the %d settled, %d finished after their last one"
+              % (runs["with_a_block"], runs["settled"], runs["ended_on_a_recovery"]))
+
+    # Never the recovery rate alone. The two fastest ways to raise it are to block more
+    # loosely and to suggest something trivially safe, and only this line shows the first.
+    if summary["block_rate"] is not None:
+        print("  Blocked %s of observed calls since %s"
+              % (_pct_text(summary["block_rate"]), summary["block_rate_since"][:10]))
+    else:
+        print("  Block rate: not measurable yet (allowed calls have only just started being")
+        print("  recorded, so there is no period covering both).")
+    _print_coaching_scoreboard()
+    print("=" * 75)
+
+
+def _shorten(text, width):
+    """Left-aligned to `width`, middle-elided so a UUID stays recognisable at both ends.
+
+    🔴 A TRUNCATED LABEL MUST STILL IDENTIFY ONE THING. Plain middle-elision collides for any two
+    strings sharing a head and a tail, and it did: `11111111-aaaa-1111-1111-111111111101` and
+    `11111111-bbbb-2222-2222-111111111101` both rendered `11111111...111111101`, version included.
+    That is the ambiguity the numbered rewrite queue was written to remove, relocated into the
+    renderer -- naming the coaching version buys nothing if the id beside it is not unique.
+
+    So a truncated label carries three hex characters of a digest of the WHOLE string. Cryptic,
+    and the alternative is two rows a reader cannot tell apart in the one place this output asks
+    them to go and open something. Untruncated labels are unchanged.
+    """
+    text = str(text)
+    if len(text) <= width:
+        return text.ljust(width)
+    tag = "#" + hashlib.sha1(text.encode("utf-8")).hexdigest()[:3]
+    body = width - len(tag)
+    head = (body - 3) // 2
+    return text[:head] + "..." + text[len(text) - (body - 3 - head):] + tag
+
+
+def _pct_text(fraction):
+    """A share as text, never rounding a real observation away.
+
+    🔴 A ROUNDED 0% IS THE ZERO THIS READOUT SPENT ITS WHOLE DESIGN REFUSING TO PRINT.
+    `round(100 * 3 / 2000)` is 0, so three real recoveries print as "never once", which is a claim
+    we did not measure. "<1%" carries the same decision -- still worst in the queue, still says
+    rewrite it -- without asserting a zero. The collapse runs the other way too: 1,999 of 2,000
+    rounds to 100%, reading as "never failed" for text that did.
+
+    🔴 FIVE CALL SITES, NOT TWO. Found as two defects in the scoreboard and fixed there first,
+    which left the template standing: the per-class table, the overall line and the block rate all
+    ran their own `round(100 * ...)`. The dev store was printing `1 recovered (0%)` on the
+    per-class table the whole time, in output that was read many times without anyone noticing.
+    Every percentage in this section goes through here.
+    """
+    if fraction > 0 and fraction < 0.005:
+        return "<1%"
+    if fraction < 1 and fraction > 0.995:
+        return ">99%"
+    return "%d%%" % round(100.0 * fraction)
+
+
+def _share_pct(part, whole):
+    """`_pct_text` for the common case of a part over a whole. Zero whole is the caller's job."""
+    return _pct_text(float(part) / whole)
+
+
+def _stops_runs(group, min_sample):
+    """Did more runs END than continue after this advice? The "safe and useless" tell.
+
+    🔴 THE COMPARISON NEEDS ITS OWN EVIDENCE BAR, and running this against a populated store is
+    what showed why: one group had six stopped and zero continued out of two thousand blocks, and
+    a bare `stopped > continued` fired a scary sentence on six observations. The claim is only
+    about the runs that actually TOOK our advice, so those are what must clear the floor. Reusing
+    min_sample rather than inventing a second threshold.
+    """
+    return (group["stopped"] > group["continued"]
+            and group["stopped"] + group["continued"] >= min_sample)
+
+
+def _print_coaching_scoreboard():
+    """Which piece of coaching worked, and what to rewrite first. P-59 criteria 11 and 12.
+
+    The per-class table above says WHERE our advice works. This says WHICH TEXT works, and it is
+    the half that compounds: a low scorer is a rewrite candidate, and the rewrite is measured
+    against the version it replaced.
+
+    🔴 EVERY NUMBER HERE IS SCOPED BY THE SAMPLE FLOOR, and the floor is the point. The queue is
+    ranked worst-first, so without it the groups with the least evidence sort straight to the top
+    and we would rewrite working text on the strength of three observations.
+    """
+    from .overrides import coaching_scoreboard
+
+    board = coaching_scoreboard()
+    # 🔴 FOUR SILENCES COLLAPSED INTO ONE `return`, WHICH IS THE DEFECT THIS WHOLE SECTION
+    # EXISTS TO NOT COMMIT. A section that answers by printing nothing is indistinguishable
+    # from a section that had nothing to say: no header, no line, no signal that an answer is
+    # missing at all. `_print_recovery_section` above names each of its four silences
+    # separately for exactly this reason; this one regressed against the good example sitting
+    # twenty lines up.
+    #
+    # `not_upgraded` is the REACHABLE one and it is not theoretical: the two readers test
+    # DIFFERENT schema conditions (`outcome_next` there, `outcome_next` OR `coaching_version`
+    # here), and `_reconcile_columns` adds columns one bare ALTER at a time with no rollback, so
+    # an upgrade interrupted mid-loop leaves precisely that split. Measured against such a store:
+    # 30 blocks, a full per-class table printed, and this entire section absent.
+    if board is None:
+        # The ONLY one left silent, and deliberately: the caller has already returned for every
+        # store that produces it (no file, no incidents table, nothing readable). Reaching here
+        # would mean the two readers disagree about the same store, which is a bug in one of
+        # them rather than a state worth narrating to a user.
+        return
+    print("")
+    print("  WHICH COACHING WORKED")
+    if board.get("state") == "not_upgraded":
+        print("  This store records blocks but not which coaching issued them, so")
+        print("  none of it can be scored. The gateway stamps that from its next write on.")
+        return
+    if board.get("state") == "no_window":
+        # Its OWN sentence. Lumping it in with "no blocks carrying a stamp" says something FALSE
+        # about it -- there may be plenty of stamped blocks; what is missing is a period where we
+        # watched both the blocks and what came after. Unreachable through the caller today, and
+        # named anyway, because the docstring one module over promises these silences stay
+        # distinct and collapsing two of them here is how that promise quietly stops being true.
+        print("  Not watching both sides yet, so nothing here can be scored.")
+        return
+    if board.get("state") != "ok" or not board["groups"]:
+        print("  No blocks carrying a coaching stamp yet, so there is nothing to score.")
+        return
+    # Said once, here, rather than implied by the column heading. "Kept going" is the honest
+    # reading of recovered_continued: the next call was allowed AND the run did more work
+    # afterwards. It is NOT "the job succeeded" -- we do not observe that and must not imply it.
+    print("  \"Kept going\" means the agent was allowed through and carried on")
+    print("  working. It does not mean the job succeeded; we are not there for that.")
+    print("  \"Went quiet\" is a run we stopped seeing: evidence of nothing, and it")
+    print("  stays out of the percentage.")
+    # 🔴 EVERY LINE BELOW STAYS INSIDE THE 75-COLUMN FENCE the rest of this section is framed by.
+    # The first cut ran to 116 characters, so in an 80-column terminal every row wrapped and the
+    # column alignment these format strings exist for was destroyed on the only screen most people
+    # will read this on.
+    # 🔴 THE kept/seen CELL IS SIZED FOR THE STORES THIS RUNS ON, not for the toy one it was
+    # written against. An over-long %s does not truncate -- it SHIFTS every column to its
+    # right, which is the alignment this whole block was re-flowed to protect. "%11s" fit
+    # "9/20 (45%)" and nothing bigger; widening to 17 fixed the four-digit case and still
+    # shifted at five ("19996/20000 (100%)" is 18), which the dev store can reach. 20 holds
+    # six digits either side and keeps the row at 74, inside the same 75-column fence.
+    # Guarded by test_the_kept_seen_cell_does_not_shift_the_row.
+    print("  %-20s %-15s %20s %7s %6s"
+          % ("coaching", "version", "kept/seen", "stopped", "quiet"))
+    for g in board["groups"]:
+        pid, ver = _shorten(g["policy_id"], 20), _shorten(g["coaching_version"], 15)
+        if not g["readable"]:
+            # 🔴 Criterion 11. Not a rate, not a zero, and not silently omitted either: a group
+            # we cannot score still tells the reader that this coaching is being issued -- and
+            # BOTH counts are printed, because the gap between them is the whole story on a
+            # populated store, where a coaching item had 32 blocks and not one observed outcome.
+            print("  %s %s  %d of %d back, too few to score"
+                  % (pid, ver, g["observed"], g["blocks"]))
+            continue
+        print("  %s %s %20s %7d %6d"
+              % (pid, ver, "%d/%d (%s)" % (g["continued"], g["observed"],
+                                           _share_pct(g["continued"], g["observed"])),
+                 g["stopped"], g["went_quiet"]))
+    print("  Scoring needs %d outcomes back; \"quiet\" runs are not in the percentage."
+          % board["min_sample"])
+
+    queue = board["rewrite_queue"]
+    if not queue:
+        print("")
+        print("  No coaching has enough outcomes back to score yet, so there is nothing to")
+        print("  rank. That is too little evidence, not a verdict on the advice.")
+        return
+
+    # 🔴 THE VERSION IS PART OF THE ANSWER, NOT DECORATION. Groups are keyed by
+    # (policy_id, coaching_version), so two generations of one policy are two rows -- and the
+    # first cut printed only the id, which rendered "Rewrite first: POL-001 (25%), POL-001 (38%)".
+    # The worst-ranked entry there is the SUPERSEDED text and the reader cannot tell which is
+    # which, so the single line a human acts on was unactionable in precisely the
+    # two-versions-in-window case criterion 12 exists to create.
+    #
+    # A numbered list rather than a comma run, because naming id AND version for three entries
+    # does not fit on one line inside the fence, and because it gives the safe-but-useless flag
+    # somewhere to attach instead of repeating the same names in a second sentence.
+    print("")
+    print("  Rewrite first:")
+    for i, g in enumerate(queue[:3], start=1):
+        # Counted over the whole scored set below; the marker only shows on the rows printed.
+        mark = ("  [stops runs]" if _stops_runs(g, board["min_sample"]) else "")
+        print("   %d. %s %s %4s kept%s"
+              % (i, _shorten(g["policy_id"], 20), _shorten(g["coaching_version"], 15),
+                 _share_pct(g["continued"], g["observed"]), mark))
+    if len(queue) > 3:
+        print("      and %d more scored below these." % (len(queue) - 3))
+    print("  These are the texts agents were least likely to get moving after.")
+    print("  Rewriting one is a person's job; this only says which one to open.")
+
+    # 🔴 THE "SAFE AND USELESS" TELL, and it is the failure mode this loop is most likely to
+    # reward: the easiest way to score well is to suggest something trivially permitted that does
+    # not do what the user wanted. A group whose runs mostly STOP right after taking our advice
+    # looks like a success in every other view, so it is flagged rather than folded into the
+    # score. Counted over every SCORED group, not over the three printed above, so the sentence
+    # and the number describe the same set.
+    #
+    # 🔴 THE COMPARISON NEEDS ITS OWN EVIDENCE BAR, and running this against a populated store is
+    # what showed why: one group had six stopped and zero continued out of two thousand blocks, and
+    # `stopped > continued` fired a scary sentence on six observations. The runs that actually
+    # TOOK our advice are the only ones this claim is about, so they must clear the same floor
+    # the score does. Reusing min_sample rather than inventing a second threshold.
+    #
+    # Marked on the rows above rather than re-listed by name in a sentence. Naming them twice was
+    # what forced the "and N more" hedge, and it repeated ids that were already ambiguous without
+    # their version.
+    safe_but_useless = [g for g in queue if _stops_runs(g, board["min_sample"])]
+    if safe_but_useless:
+        # 🔴 THE COUNT AND THE VISIBLE MARKS MUST BE RECONCILABLE. Only the top three rows are
+        # printed, so a bare "5 of the 5 scored" sat under three marks with no way to square the
+        # two. Same claim-versus-visible mismatch the "and N more" name list was dropped for,
+        # back in a different shape; saying where the rest are is the whole fix.
+        print("  [stops runs] = more runs ENDED than continued after this advice,")
+        print("  which is what safe-but-useless looks like. %d of the %d scored carry it,"
+              % (len(safe_but_useless), len(queue)))
+        # Keyed on identity, not dict equality: `g in safe_but_useless` compares every field,
+        # which is both quadratic and true for two genuinely distinct groups that happen to
+        # match on all counts.
+        marked = {id(g) for g in safe_but_useless}
+        print("  %d of them marked above. Open those first."
+              % sum(1 for g in queue[:3] if id(g) in marked))
+
+
 def execute_insights(args=None):
     """`agentx insights` — the unified local learning loop review.
 
@@ -649,6 +1072,8 @@ def execute_insights(args=None):
             print("\n  These ran normally; audit takes zero risk. When the catches look right,")
             print("  flip to enforcing:   AGENTX_ENFORCEMENT=enforce")
         print("=" * 75)
+
+    _print_recovery_section(census)
 
     print("\n🧠 SAFE-PATHS YOUR AGENTS LEARNED        (local to this machine)")
     print("=" * 75)

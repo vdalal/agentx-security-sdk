@@ -18,7 +18,196 @@ from contextvars import ContextVar
 from .client import AgentXClient
 from .db import init_db, log_intercept, get_lifetime_stats, log_self_correction, WOULD_BLOCK_STATUS
 from . import pulse
-from .overrides import get_active_override, count_reviewable
+from .overrides import get_active_override, count_reviewable, _anchored_root
+
+# ---------------------------------------------------------------- policy file location
+# BACKLOG P-78. Every reader of the pulled policy file used to resolve it against the
+# PROCESS WORKING DIRECTORY (`<cwd>/.agentx/...`, then `<cwd>/../.agentx/...`), and so did
+# the writer (`agentx pull`). Both halves were wrong in the SAME direction, which is why it
+# never bit: pull from a directory, run your agent from that directory, and they agree.
+#
+# They are anchored to the PROJECT ROOT now, so the file you pull is the file that arms, no
+# matter which subdirectory either command runs from.
+#
+# 🔴 THE LEGACY LOCATIONS STAY AS A FALLBACK, AND THAT IS NOT THE "first candidate that
+# EXISTS" ANTI-PATTERN P-76 REMOVED. The difference is who chose the path. P-76's candidate
+# list was two locations WE picked, neither of which the user knew about, so guessing
+# between them was guessing about our own bug. These legacy paths are locations we
+# previously told users to write to; a developer may have a working `.agentx/policies.json`
+# three directories down right now. Dropping it silently would DISARM a live shield and the
+# banner would still say it was up -- a worse defect than the one being fixed, and in the
+# security direction.
+#
+# So: canonical wins when present, legacy still works, and using legacy is announced ONCE
+# per process (see _note_policy_location). Silence is what makes a fallback rot.
+# One-shot flag so the legacy-location notice cannot become per-call spam on the hot path.
+# (There was a `_LEGACY_POLICY_LOCATION` global here that recorded the path for a surface
+# that was never built: assigned in three places, read in none. Dead state that LOOKS like a
+# feature is worse than no state -- the next reader assumes something consumes it. The stderr
+# notice below is the whole mechanism; if a surface ever wants the path, it should read it
+# from a return value rather than a module global.)
+_legacy_warned = False
+
+# _find_project_root walks up the tree, and _policy_file_signature calls this per PROTECTED
+# CALL. Memoised per cwd so the hot path pays one dict lookup rather than a directory walk.
+_root_cache = {}
+
+
+def _project_root_cached():
+    """The project root to anchor `.agentx/` to, or the CWD when there is no project.
+
+    🔴 THE HOME-DIRECTORY GUARD IS NOT OPTIONAL, and leaving it out made this change WORSE
+    than the bug it fixes. `_find_project_root` walks up until it finds `.git` or `.agentx`,
+    and `~/.agentx` exists for anyone who has ever run keyless `agentx adopt`. So for a
+    developer running in a scratch directory that is not inside a checkout, the "project
+    root" resolves to their HOME, and `agentx pull` would have written
+    `~/.agentx/policies.json` -- a machine-wide file, silently shared across every unrelated
+    project. Caught by the existing pull tests, which run in a bare tmp dir.
+
+    Anchoring is only meaningful inside something that is actually a project. When the walk
+    escapes to home or above, there is no project, and the honest answer is the working
+    directory -- which is also exactly the pre-P-78 behaviour, so nothing moves for that
+    user.
+    """
+    cwd = os.getcwd()
+    root = _root_cache.get(cwd)
+    if root is None:
+        # Delegates to overrides._anchored_root -- THE single guarded entry point. This
+        # used to re-implement the guard here, which is how three resolvers ended up with
+        # it and three without.
+        root = _anchored_root(cwd)
+        _root_cache[cwd] = root
+    return root
+
+
+def _policy_search_paths(seed_dir, filename):
+    """Ordered locations for a pulled artifact: CANONICAL first, then legacy.
+
+    Deduplicated, because when the process is already at the project root the canonical and
+    legacy-cwd paths are the same string and a caller reporting "found at a legacy location"
+    off a duplicate would be wrong.
+    """
+    canonical = os.path.join(_project_root_cached(), seed_dir, filename)
+    ordered = [canonical,
+               os.path.join(seed_dir, filename),
+               os.path.join("..", seed_dir, filename)]
+    seen, out = set(), []
+    for p in ordered:
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
+def _note_policy_location(path, seed_dir, filename):
+    """Record that a LEGACY location supplied the file, and say so once."""
+    global _legacy_warned
+    canonical = os.path.join(_project_root_cached(), seed_dir, filename)
+    if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(canonical)):
+        return
+    if not _legacy_warned:
+        _legacy_warned = True
+        # stderr, once per process. The shield runs on a hot path and this must never
+        # become per-call spam -- a warning printed on every protected call is a warning
+        # people silence, which is how the legacy path would become permanent.
+        print(
+            "⚠️  [AgentX] Reading policies from a legacy location: %s\n"
+            "    Policies now resolve from the project root. Move the file to %s\n"
+            "    (or re-run `agentx pull` from anywhere) so every command agrees on it."
+            % (os.path.abspath(path), os.path.abspath(canonical)),
+            file=sys.stderr)
+
+
+def _merge_pulled_over_floor(pulled):
+    """Union a pulled policy list ON TOP OF the built-in floor. BACKLOG P-49.
+
+    🔴 THE RULE, AND IT IS A RULE RATHER THAN A LIST OF CASES: **the built-in floor is CODE
+    and a pulled policy file is DATA. Data may ADD a policy, ADD blocked intents, and CHANGE
+    coaching. Data may never REMOVE a policy, REMOVE an intent, or DEACTIVATE a shipped
+    one.** Stating it as a rule is the point -- the previous attempt at this defect fixed
+    the `blocked_intents` door and left the others open, which is the enumeration treadmill.
+
+    **The defect this closes is live and user-facing.** `load_local_policy_keywords` ended
+    with `if policies: return policies`, so a pulled file WHOLLY REPLACED the floor. The
+    cloud's "Mass Destructive Intent" row is missing the shell/filesystem teardown intents
+    the shipped built-in carries (`rm -rf /`, `--no-preserve-root`, `mkfs`, `| bash`,
+    `:(){`). Verified 2026-07-19: fresh built-ins BLOCK `curl … | bash` and `rm -rf ~`;
+    after `agentx pull`, both were ALLOWED, and the boot banner still said the shield was
+    up. **A user who ran `agentx pull` silently lost protection a bare `pip install` had
+    given them**, and it made the published AREDB `keyless_pip` claim false post-pull.
+
+    Subtraction doors, each closed explicitly:
+      * an OMITTED policy stays armed        -- the floor is the base, not the fallback
+      * `is_active: false` on a SHIPPED id is ignored -- data cannot deactivate code
+      * `blocked_intents` UNION, never replace -- a shorter cloud list cannot shorten ours
+      * coaching may still be overridden      -- text is not enforcement
+
+    ⚠️ `pii_targets` / `target_action` are named in P-49 but are NOT fields this loader
+    carries (they are gateway-side; the keyless shield's rows are id/name/category/
+    blocked_intents/coaching). Claiming to close them here would be a claim outrunning the
+    code, so they are called out and left to the gateway's own load path.
+
+    A pulled row for an UNKNOWN id is added as before, subject to being active and carrying
+    intents -- adding is exactly what data is allowed to do.
+    """
+    merged, floor_order, new_order = {}, [], []
+    for seed in _BUILTIN_POLICY_KEYWORDS:
+        row = dict(seed)
+        row["blocked_intents"] = list(seed.get("blocked_intents") or [])
+        merged[str(seed.get("id"))] = row
+        floor_order.append(str(seed.get("id")))
+
+    for p in pulled:
+        pid = str(p.get("id"))
+        base = merged.get(pid)
+        if base is None:
+            merged[pid] = p
+            new_order.append(pid)
+            continue
+        # UNION, order-stable, case-sensitive as stored: an intent is a matching token and
+        # lowercasing here would silently change what matches.
+        have = {i for i in base["blocked_intents"]}
+        for intent in (p.get("blocked_intents") or []):
+            if intent not in have:
+                base["blocked_intents"].append(intent)
+                have.add(intent)
+        # Coaching may be overridden by data; enforcement and IDENTITY may not.
+        #
+        # 🔴 `category` AND `name` USED TO BE IN THIS LIST AND SHOULD NOT HAVE BEEN. The rule
+        # in the docstring is "data may add policies, add intents, and change COACHING", and
+        # neither of those is coaching:
+        #   * `category` is the coarse pulse/telemetry class -- `_POLICY_ID_TO_CATEGORY` is
+        #     built from the SHIPPED floor, so letting a cloud row rewrite it means data can
+        #     silently relabel what a built-in block is REPORTED AS. The block still fires;
+        #     the telemetry about it changes underneath us.
+        #   * `name` is how a shipped policy identifies itself in incidents and in the
+        #     readout. Renaming a built-in from data makes our own records disagree with our
+        #     own code.
+        # Both are cases of the rule being stated correctly and the code quietly exceeding
+        # it, which is the failure this whole PR keeps finding. A pulled row with a NEW id
+        # still carries its own name and category untouched -- that is data ADDING, which is
+        # allowed.
+        for field in ("socratic_prompt", "preferred_alternative", "reversible_transform"):
+            if p.get(field):
+                base[field] = p[field]
+
+    # 🔴 NEW ORG POLICIES COME FIRST, AND THE ORDER IS ENFORCEMENT-VISIBLE, not cosmetic.
+    # `evaluate_call_keyless` RETURNS ON THE FIRST MATCHING POLICY, so position decides which
+    # policy is attributed and whose coaching the agent is shown. Before P-49 a pull REPLACED
+    # the floor, so an org rule owned every token it declared. Emitting the floor first would
+    # have made an org policy that declares a token a floor policy also carries permanently
+    # unreachable -- the block still happens, but it is attributed to the built-in and the
+    # org's own coaching never fires. That is a silent downgrade for exactly the paying
+    # customers who wrote the rule, introduced by a fix meant to protect them.
+    #
+    # Ordering pulled-first restores the pre-P-49 attribution while keeping every floor
+    # policy present, so it cannot weaken enforcement: anything an org rule does not match
+    # still falls through to the floor immediately behind it.
+    return [merged[i] for i in new_order + floor_order]
+
+
 
 
 # =====================================================================
@@ -66,6 +255,13 @@ _FAILMODE_WARNED = False
 _ENFORCEMENT_WARNED = False
 _AUDIT_BANNER_SHOWN = False
 _SHIELD_FAILOPEN_BANNER_SHOWN = False
+_REFLECTION_FAILOPEN_BANNER_SHOWN = False
+
+# Distinguishes "we never obtained a query" from "the extractor returned None". Using None
+# for both made a caller whose extractor legitimately returns None look like a reflection
+# failure: it got the wrong fallback text AND incremented reflection_failopens. A counter
+# that cries wolf is worse than no counter, because it teaches people to ignore it.
+_QUERY_UNSET = object()
 _POLICY_DEGRADED_WARNED = False
 
 
@@ -137,6 +333,84 @@ def _record_shield_failopen(tool_name, error):
             "════════════════════════════════════════════════════════════"
         )
         _SHIELD_FAILOPEN_BANNER_SHOWN = True
+
+
+def _record_reflection_failopen(tool_name, error):
+    """Argument reflection produced NEITHER usable scan text NOR structured args, so the
+    call shipped a constant placeholder that no detector can match. The request is still
+    made and a verdict still comes back, which is exactly why this was invisible: an
+    unscanned call and a clean call look identical in every log.
+
+    A SEPARATE counter from `shield_failopens` on purpose. That one means "the shield
+    threw and the tool ran unscreened", a meaning `mcp_proxy` depends on being identical
+    on every surface. This one means "we could not build anything worth scanning".
+
+    Local only, deliberately: it is loud in the session summary but NOT pulsed, so
+    shipping it needs no schema change. Same privacy rule as the shield banner — the
+    exception text is printed for the developer and never leaves the machine.
+    """
+    global _REFLECTION_FAILOPEN_BANNER_SHOWN
+    _incr("reflection_failopens")
+
+    if not _REFLECTION_FAILOPEN_BANNER_SHOWN:
+        logger.warning(
+            "\n"
+            "════════════════════════════════════════════════════════════\n"
+            " ⚠️  AgentX could not read the arguments of a call\n"
+            "────────────────────────────────────────────────────────────\n"
+            f" Reflection failed on '{tool_name}', so the call was sent with\n"
+            " no scannable text and no structured arguments. It was NOT\n"
+            " screened on content. Raised ONLY when both are missing — a call\n"
+            " that still carried structured arguments is not reported here.\n"
+            " This is a bug in AgentX, not a policy decision. Please report it:\n"
+            f"   {error}\n"
+            " Counted in your session summary as 'Unreadable Calls'.\n"
+            "════════════════════════════════════════════════════════════"
+        )
+        _REFLECTION_FAILOPEN_BANNER_SHOWN = True
+
+
+def _json_safe_arg(value):
+    """True when `value` can survive the gateway payload's JSON encoding.
+
+    `structured_args` stores the RAW value, and the client hands the whole payload to
+    `requests.post(json=...)`, which calls `json.dumps` on it. A value that cannot encode
+    there does not degrade the scan — it raises, the client turns it into a hard ERROR,
+    and the decorator returns that error INSTEAD OF RUNNING THE TOOL. A `datetime`
+    argument was enough to do it.
+
+    ONE RULE, not a case per type: does `json.dumps(value, allow_nan=False)` succeed. The
+    type gate below only preserves structured_args' historical SHAPE (scalars + dict, never
+    lists/tuples/sets); it decides nothing about encodability.
+
+    `allow_nan=False` is the whole point of routing every accepted type through the same
+    call. json.dumps ENCODES NaN/Infinity by default as bare `NaN`/`Infinity`, which are not
+    valid JSON — it does not raise locally, it puts an unparseable body on the wire. An
+    earlier version special-cased that for a BARE float only, so `{"score": float("nan")}`
+    passed the dict branch and shipped exactly the unparseable body this guard exists to
+    prevent. Depth is not a property of the harm, so it must not be a property of the check.
+
+    None is REJECTED, and that is not an oversight. Review filed its exclusion as a
+    regression on the grounds that "an omitted optional arg becomes None via
+    apply_defaults and reached structured_args before this guard existed". Checked against
+    the code rather than the report: `_coerce_arg_value(None)` returns None, so the caller's
+    `if coerced is None: continue` fires first and a None-valued argument has never been
+    stored — not before P-68, not after. Admitting it here made the two paths disagree on
+    the SAME call (no-extractor `{'x': 'hello'}` vs extractor `{'x': 'hello', 'opt': None}`),
+    because only the no-extractor path runs that `continue`.
+
+    Membership across the two paths is pinned by
+    sdk_tests/test_structured_args_survive_extractor.py, which compares what the CALLERS
+    produce rather than what these helpers return in isolation. Lists are excluded by the
+    caller (they ride the flattened text only).
+    """
+    if value is None or not isinstance(value, (str, bool, int, float, dict)):
+        return False
+    try:
+        json.dumps(value, allow_nan=False)
+        return True
+    except Exception:
+        return False
 
 
 def _degraded_detail(reason):
@@ -678,6 +952,7 @@ _session_stats = {
     "circuit_breakers_tripped": 0,     # <-- Stable initialization key preserved
     "human_escalations": 0,            # <-- SURGICAL REFACTOR: Local tracker variable added
     "degraded_executions": 0,          # <-- Tool calls that ran fail-open (gateway unreachable / timed out)
+    "reflection_failopens": 0,         # <-- Calls where argument reflection produced NEITHER scan text NOR structured args, so a constant placeholder shipped and the call went out effectively unscanned. Distinct from shield_failopens (the shield THREW) and from degraded_executions (the gateway was unreachable): here our own reflection could not read the call. LOCAL ONLY, not pulsed — see _record_reflection_failopen.
     "shield_failopens": 0,             # <-- Tool calls the LOCAL SHIELD failed to screen because it THREW (a shield BUG, not a policy decision) and fell through, so the tool ran unscreened. Distinct from degraded_executions (that is the gateway being unreachable, an infrastructure fact; this is our own code crashing). Counted so instance 3 of the fail-open class finds US instead of a customer's database — instances 1 and 2 were both found by luck on an EOD pass. Pulsed as a coarse int, NEVER the exception text (a traceback can carry a path, an argument, a fragment of the user's data).
     "degraded_engine_faults": 0,       # <-- SUBSET of degraded_executions where the engine ANSWERED with a fault (5xx / non-verdict body) rather than being unreachable. Split out 2026-08-02: an unreachable gateway is an infrastructure fact nobody chose, but backend/gateway.py raises HTTPException(500) when the evaluator itself CRASHES -- which is how P-21 was found -- so a payload shape that reliably trips an evaluator bug converts "the gateway vets this" into "the tool runs" under the default fail-OPEN posture. Folded into one counter, a steered fault and a cold-start 502 were indistinguishable. Coarse int; carries no payload.
     "gateway_reached": False,          # <-- True once any real gateway verdict came back this session (NOT unreachable). Coarse funnel-stage signal for the anonymous pulse: distinguishes "SDK only" from "SDK + gateway". Never carries identity.
@@ -1139,6 +1414,8 @@ def _print_agentx_summary():
     #     when non-zero, so a healthy run stays clean and this line stands out.
     if _session_stats.get("shield_failopens", 0) > 0:
         print(f" ⚠️  Shield Fail-Opens:     {_session_stats['shield_failopens']:<3} |  ran WITHOUT keyword screening (a shield BUG, not a policy decision)")
+    if _session_stats.get("reflection_failopens", 0) > 0:
+        print(f" ⚠️  Unreadable Calls:      {_session_stats['reflection_failopens']:<3} |  sent with NO scannable text or arguments (a reflection BUG, not a policy decision)")
         print("     -> this is an AgentX defect. Please report it: https://bit.ly/agentfirewall")
     
     # --- CIRCUIT BREAKER METRICS ---
@@ -1336,17 +1613,25 @@ def load_local_vector_shield_cache(seed_dir=".agentx"):
     import os
     import json
 
-    # Traverse directory escalation paths cleanly to safely capture workspace anchors
-    weights_path = os.path.join(seed_dir, "intent_seeds.bin")
-    manifest_path = os.path.join(seed_dir, "seeds_manifest.json")
-    
-    if not os.path.exists(weights_path) or not os.path.exists(manifest_path):
-        # Escalate up to parent footprint layer block if executing out of examples folder
-        weights_path = os.path.join("..", seed_dir, "intent_seeds.bin")
-        manifest_path = os.path.join("..", seed_dir, "seeds_manifest.json")
-        if not os.path.exists(weights_path) or not os.path.exists(manifest_path):
-            return None, None
-        
+    # Canonical (project-root) first, then the legacy cwd locations. BACKLOG P-78.
+    #
+    # 🔴 THE PAIR MUST COME FROM THE SAME DIRECTORY. The old code advanced weights and
+    # manifest together, but a naive rewrite that resolved each file independently could
+    # take weights from the project root and the manifest from a stale `../.agentx/` -- a
+    # matrix described by the wrong manifest, which is worse than loading neither. So the
+    # loop is over DIRECTORIES and both files must exist in the same one.
+    weights_path = manifest_path = None
+    for cand in _policy_search_paths(seed_dir, "intent_seeds.bin"):
+        d = os.path.dirname(cand)
+        w = cand
+        m = os.path.join(d, "seeds_manifest.json")
+        if os.path.exists(w) and os.path.exists(m):
+            weights_path, manifest_path = w, m
+            break
+    if weights_path is None:
+        return None, None
+
+
     try:
         # numpy is imported lazily here (not at module/function entry) so the
         # keyword Layer 0 stays truly dependency-free: a clean `pip install`
@@ -1722,10 +2007,8 @@ def load_local_policy_keywords(seed_dir=".agentx"):
     import os
     import json
 
-    candidate_paths = [
-        os.path.join(seed_dir, "policies.json"),
-        os.path.join("..", seed_dir, "policies.json"),
-    ]
+    # Canonical (project-root) first, then the legacy cwd locations. BACKLOG P-78.
+    candidate_paths = _policy_search_paths(seed_dir, "policies.json")
 
     builtins_by_key = _builtin_coaching_index()
 
@@ -1741,6 +2024,7 @@ def load_local_policy_keywords(seed_dir=".agentx"):
     # file -- fix or delete the child file; the error names it.
     for path in candidate_paths:
         if os.path.exists(path):
+            _note_policy_location(path, seed_dir, "policies.json")
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     loaded = json.load(f)
@@ -1849,8 +2133,17 @@ def load_local_policy_keywords(seed_dir=".agentx"):
                             pulled_tid if pulled_tid
                             else (seed.get("reversible_transform") if seed else None)),
                     })
-            if policies:
-                return policies
+            # 🔴 WAS `if policies: return policies` -- the whole of BACKLOG P-49 in one line.
+            # A pulled file REPLACED the shipped floor, so `agentx pull` silently removed
+            # protection a bare `pip install` had given the user. The floor is the BASE now
+            # and pulled data merges on top of it; see _merge_pulled_over_floor for the rule
+            # and for each subtraction door it closes.
+            #
+            # Returned unconditionally, NOT gated on `if policies`. A pulled file that
+            # yields zero usable rows (all inactive, all intent-less) must still leave the
+            # floor armed, and the old early-return made "some rows" and "no rows" take
+            # different paths for no reason.
+            return _merge_pulled_over_floor(policies)
 
     return list(_BUILTIN_POLICY_KEYWORDS)
 
@@ -1892,8 +2185,13 @@ def _policy_file_signature(seed_dir=".agentx"):
     none. Uses (path, mtime_ns, inode, size): nanosecond mtime + inode catch an in-place
     edit of identical byte-length that a coarse (mtime, size) tuple would miss (a same-size
     swap within the filesystem's 1-2s mtime granularity). Cheap: at most two stats."""
-    for path in (os.path.join(seed_dir, "policies.json"),
-                 os.path.join("..", seed_dir, "policies.json")):
+    # 🔴 THE SAME ORDERED LIST load_local_policy_keywords USES, and that is a correctness
+    # requirement rather than tidiness (BACKLOG P-78). This function decides WHEN to reload;
+    # if it stats a different file from the one the loader reads, the shield either reloads
+    # on a change to a file it is not using, or -- worse -- never notices a change to the
+    # file it IS using. Both halves must resolve identically or the cache is watching the
+    # wrong thing.
+    for path in _policy_search_paths(seed_dir, "policies.json"):
         try:
             st = os.stat(path)
         except OSError:
@@ -3193,38 +3491,115 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # `query` text below, so a wrong/empty action can never starve the
             # gateway's text-scanning floor. (See the action/args contract note in
             # client.evaluate_intent.)
-            structured_args = {}
-            try:
-                if extract_query_func:
-                    query = extract_query_func(*args, **kwargs)
-                else:
-                    if _func_sig is None:
-                        raise ValueError("uninspectable signature")
-                    bound_args = _func_sig.bind(*args, **kwargs)
-                    bound_args.apply_defaults()
+            # POP (not get): receipt_id is a decorator CONTROL kwarg — the caller passes it
+            # on a retry to correlate the incident, per the README pattern
+            # `your_tool(revised, receipt_id=out.receipt_id)` — NOT a tool argument.
+            #
+            # 🔴 This MUST happen before reflection binds the signature. It used to run
+            # after, and the comment there claimed the ordering was harmless because "the
+            # query/args reflection already ran above". It was not harmless: on any typed
+            # tool without **kwargs — the normal case — bind() raised TypeError on the
+            # unexpected keyword, so query collapsed to a constant no detector can match and
+            # args shipped as None. The documented retry pattern was a one-kwarg bypass of
+            # the keyless shield AND every gateway detector. Verified: run_sql(q="DROP TABLE
+            # users") blocks, run_sql(q="DROP TABLE users", receipt_id="r1") executed.
+            receipt_id = kwargs.pop("receipt_id", None)
 
-                    extracted_text_elements = []
-                    for param_name, param_value in bound_args.arguments.items():
-                        # Filter database/network context objects that poison hyper-space weights
-                        if param_name in ("self", "cls", "conn", "cursor", "db_session", "client"):
+            # TWO INDEPENDENT FAILURE DOMAINS, and that separation is the point.
+            #
+            # structured_args answers "what were the arguments"; extract_query_func answers
+            # "what text should we scan". They were never mutually exclusive by design, only
+            # by control flow — supplying an extractor used to leave structured_args empty,
+            # shipping `args: None` and switching off every structured detector on the
+            # gateway (BACKLOG P-68). The first fix for that ran the argument loop AHEAD of
+            # the extractor, which traded one silent failure for another: a single
+            # unflattenable argument then threw the caller's intended scan text away.
+            #
+            # So neither may destroy the other. Each runs in its own try, and a call is only
+            # left genuinely unscanned when BOTH fail — which is now counted and loud instead
+            # of silent (_record_reflection_failopen).
+            structured_args = {}
+            extracted_text_elements = []
+            query = _QUERY_UNSET
+            reflect_err = None
+
+            # --- domain 1: the bound signature -> structured args (+ flattened text) ------
+            try:
+                if _func_sig is None:
+                    raise ValueError("uninspectable signature")
+                bound_args = _func_sig.bind(*args, **kwargs)
+                bound_args.apply_defaults()
+
+                for param_name, param_value in bound_args.arguments.items():
+                    # Filter database/network context objects that poison hyper-space weights
+                    if param_name in ("self", "cls", "conn", "cursor", "db_session", "client"):
+                        continue
+
+                    if extract_query_func is None:
+                        # Only the no-extractor path needs the flattened text. Building it
+                        # anyway meant a full json.dumps of every dict arg on exactly the
+                        # path integrators choose BECAUSE their payloads are large.
+                        try:
+                            coerced = _coerce_arg_value(param_value)
+                        except Exception:
+                            # A value whose json AND str both raise is unscannable, not
+                            # fatal. Skip it rather than lose every other argument.
                             continue
-                        coerced = _coerce_arg_value(param_value)
                         if coerced is None:
                             continue
                         extracted_text_elements.append(coerced)
-                        # structured_args feeds the gateway's structured detectors; keep its
-                        # historical shape (scalars + dict, never lists) so gateway behavior is
-                        # unchanged. A list now rides the keyword-scan `query` only (closing the
-                        # prior gap where a list-valued arg was dropped from the scan entirely).
-                        if not isinstance(param_value, list):
-                            structured_args[param_name] = param_value
 
-                    query = " ".join(extracted_text_elements) if extracted_text_elements else str(args)
+                    # structured_args feeds the gateway's structured detectors; keep its
+                    # historical shape (scalars + dict, never lists) so gateway behavior is
+                    # unchanged. A list rides the keyword-scan `query` only.
+                    #
+                    # Only values the transport can ENCODE go in. The client hands this
+                    # straight to requests' json=, so a raw datetime raised there, became a
+                    # hard ERROR, and the decorator returned that error INSTEAD OF RUNNING
+                    # THE TOOL. That predates P-68 on the no-extractor path; P-68 merely
+                    # removed extractor users' accidental immunity to it. The flattened text
+                    # still carries the value, so nothing stops being scanned.
+                    if not isinstance(param_value, list) and _json_safe_arg(param_value):
+                        structured_args[param_name] = param_value
+            except Exception as arg_err:
+                reflect_err = arg_err
 
-                if not query or str(query).strip() in ("()", "", "None"):
-                    query = f"Interception trace summary for tool function: {func_name}"
-            except Exception as reflect_err:
+            # --- domain 2: the caller's extractor owns `query` ---------------------------
+            if extract_query_func:
+                try:
+                    query = extract_query_func(*args, **kwargs)
+                except Exception as extract_err:
+                    # The EXTRACTOR's exception wins. `reflect_err or extract_err` kept the
+                    # earlier signature error, so a developer debugging their own extractor
+                    # was shown "uninspectable signature" instead of their own traceback —
+                    # we reported our diagnostic over the one they can act on.
+                    reflect_err = extract_err
+            elif reflect_err is None:
+                query = " ".join(extracted_text_elements) if extracted_text_elements else str(args)
+
+            if query is _QUERY_UNSET:
+                # Nothing usable to scan. Byte-identical text to the pre-P-68 fallback, but
+                # no longer silent: an unscanned call and a clean call used to look the same
+                # in every log, which is how this class stayed invisible.
+                #
+                # Tested against _QUERY_UNSET, not None, so an extractor that legitimately
+                # RETURNS None is not misreported as a reflection failure. It falls through
+                # to the generic summary below exactly as it did before P-68, and does not
+                # inflate the counter.
                 query = f"Signature inspection fallback for {func_name} | Trace: {str(reflect_err)}"
+
+                # ONE RULE, not a case per input: a call is unreadable only when it carries
+                # NEITHER usable scan text NOR structured args. Round 2 fixed the
+                # extractor-returns-None case and left the template, so an extractor that
+                # RAISED while the argument loop had succeeded still counted a failopen and
+                # printed "no scannable text and no structured arguments" over a payload
+                # carrying both args and live structured detectors. Same harm — a healthy
+                # call reported as unprotected — reached through a different input.
+                if not structured_args:
+                    _record_reflection_failopen(func_name, reflect_err)
+
+            if not query or str(query).strip() in ("()", "", "None"):
+                query = f"Interception trace summary for tool function: {func_name}"
 
             # =========================================================
             # 🧭 EDGE ACTION INFERENCE (overridable by the explicit action= param)
@@ -3264,14 +3639,12 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             except Exception:
                 chain_of_thought = "Implicit tool call execution thread context trace."
                 
-            # POP (not get): receipt_id is a decorator CONTROL kwarg — the caller passes
-            # it on a retry to correlate the incident, per the README pattern
-            # `your_tool(revised, receipt_id=out.receipt_id)` — NOT a tool argument. Strip
-            # it here so it never leaks into func(*args, **kwargs) below, which otherwise
-            # TypeErrors on any typed tool that lacks **kwargs (a keyless activation snag:
-            # the documented retry pattern broke real tools). The query/args reflection
-            # already ran above, so this does not change what is sent to the gateway.
-            receipt_id = kwargs.pop("receipt_id", None)
+            # receipt_id was already popped ABOVE, before reflection. It must stay there:
+            # popping it here left it in kwargs while bind() ran, which is what turned the
+            # documented retry into a shield bypass. This line is kept as a no-op guard so a
+            # caller path that somehow reintroduces the key still cannot leak it into
+            # func(*args, **kwargs) below, where a typed tool without **kwargs would TypeError.
+            receipt_id = kwargs.pop("receipt_id", receipt_id)
 
             # The local strike count is no longer forwarded to the gateway — the gateway
             # OWNS the online count + the Path B decision now (issue #80). The only

@@ -32,17 +32,23 @@ import uuid
 
 # Reuse the project-root anchor + incident-store resolver + timestamp so the CLI
 # and the gateway agree on where the shared .agentx/ stores live, from any cwd.
-from .overrides import (_find_project_root, _incident_db_path, _now_iso,
+from .overrides import (_anchored_root, _incident_db_path, _now_iso,
                         cluster_near_duplicates)
 
-# The gateway's local policy store (backend/policy_store.py) lives next to
-# incidents.db under the shared .agentx/ mount. Same two real layouts as the
-# incident store; an explicit AGENTX_POLICY_DB always wins (what the tests use).
-_POLICY_DB_CANDIDATES = (
-    os.path.join(".agentx", "policies.db"),
-    os.path.join("agentx_sdk", ".agentx", "policies.db"),
-)
-DEFAULT_POLICY_DB = _POLICY_DB_CANDIDATES[0]
+# The gateway's local policy store (backend/policy_store.py) lives next to incidents.db
+# in the project's ONE .agentx/ home. BACKLOG P-76.
+#
+# 🔴 THIS WAS A CANDIDATE LIST SEARCHED FOR "the first that EXISTS", the same defect the
+# incident store had and for the same reason. It is worse here than there, because this
+# module WRITES: `agentx rules apply` creates the policy row the gateway is supposed to
+# arm. On the pre-P-76 layout the root store does not exist and the nested one does, so
+# the CLI wrote `agentx_sdk/.agentx/policies.db`, reported success, and the gateway --
+# now root-anchored (backend/policy_store.py) -- read a different file. The rule never
+# armed and nothing said so. A silent write to the wrong store is worse than a silent
+# read from one.
+#
+# An explicit AGENTX_POLICY_DB always wins (what the tests use).
+DEFAULT_POLICY_DB = os.path.join(".agentx", "policies.db")
 
 # Mirrors backend/policy_store.py init_db exactly so a rule the CLI writes is read
 # back verbatim by the gateway. Kept in sync by the parity test in test_rules.py.
@@ -67,21 +73,19 @@ _RULE_HARVEST_QUERY = (
 
 
 def _policy_db_path(path=None):
-    """Resolve the gateway's local policy store. Explicit arg / ``AGENTX_POLICY_DB``
-    win; else the first candidate that exists under the project root; else the
-    primary default under that root. Project-root-anchored so the CLI writes the
-    same DB the gateway reads, from any subdirectory."""
+    """Resolve the gateway's local policy store. Explicit arg / ``AGENTX_POLICY_DB`` win,
+    else the ONE canonical store under the project root.
+
+    Existence is deliberately NOT part of the rule -- see the comment on
+    DEFAULT_POLICY_DB. This resolves to the same file backend/policy_store.py writes, from
+    any subdirectory, which is the whole point: the CLI writes the policy the gateway
+    arms."""
     if path:
         return path
     env = os.environ.get("AGENTX_POLICY_DB")
     if env:
         return env
-    root = _find_project_root()
-    for candidate in _POLICY_DB_CANDIDATES:
-        full = os.path.join(root, candidate)
-        if os.path.exists(full):
-            return full
-    return os.path.join(root, DEFAULT_POLICY_DB)
+    return os.path.join(_anchored_root(), DEFAULT_POLICY_DB)
 
 
 def _parse_json_obj(raw):

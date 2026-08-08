@@ -33,24 +33,36 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # Stored under the same ``.agentx/`` mount the gateway shares for policies.json
 # and incidents.db, so the override store is git-trackable and survives restarts.
 DEFAULT_OVERRIDES_PATH = os.path.join(".agentx", "overrides.json")
 _SCHEMA_VERSION = 1
 
-# The gateway persists incidents.db into whatever host dir its compose file mounts
-# onto /app/.agentx. Two real layouts exist, both run from the repo root:
-#   * partner kit   — mounts ./.agentx            -> ./.agentx/incidents.db
-#   * this dev repo — mounts ./agentx_sdk/.agentx -> ./agentx_sdk/.agentx/incidents.db
-# Resolve against both so `agentx insights` finds the store either way; an explicit
-# AGENTX_INCIDENT_DB always wins (and is what the tests use).
-_INCIDENT_DB_CANDIDATES = (
-    os.path.join(".agentx", "incidents.db"),
-    os.path.join("agentx_sdk", ".agentx", "incidents.db"),
-)
-DEFAULT_INCIDENT_DB = _INCIDENT_DB_CANDIDATES[0]
+# ONE canonical store: <project root>/.agentx/incidents.db. BACKLOG P-76.
+#
+# 🔴 THIS USED TO BE A CANDIDATE LIST SEARCHED FOR "the first one that EXISTS", and
+# that is the defect, not a convenience. It made whichever store happened to appear
+# first authoritative, so the answer changed the moment a second one showed up -- and
+# one had, because the gateway resolved its own home against the process working
+# directory. Measured in this repo: the reader returned a 4-row `.agentx/incidents.db`
+# while the gateway had written 43,479 rows to `agentx_sdk/.agentx/incidents.db`, and
+# `agentx insights` reported "No blocks recorded yet" to a developer whose gateway was
+# recording perfectly. A resolution rule that silently re-points is worse than one that
+# is simply wrong, because nothing about the output says which file it read.
+#
+# The gateway now anchors to the same project root (backend/agentx_home.py), so there
+# is one answer on both sides. Any OTHER store found under the root is a STRAY -- it is
+# reported (see incident_db_strays), never silently substituted. An explicit
+# AGENTX_INCIDENT_DB still wins, and is what the tests use.
+DEFAULT_INCIDENT_DB = os.path.join(".agentx", "incidents.db")
+
+# Directories a stray scan must never descend into: they are large, and none of them
+# is anywhere a gateway writes its data home.
+_STRAY_SCAN_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                    ".next", "dist", "build", ".pytest_cache", ".mypy_cache"}
+_STRAY_SCAN_MAX_DEPTH = 3
 
 
 def _find_project_root(start=None):
@@ -80,31 +92,153 @@ def _find_project_root(start=None):
     return agentx_root or start_abs
 
 
+def _anchored_root(start=None):
+    """The directory to anchor `.agentx/` to. THE single guarded entry point.
+
+    🔴 EVERY STORE RESOLVER MUST USE THIS, NOT `_find_project_root` DIRECTLY, and the reason
+    is the defect that made this function necessary. BACKLOG P-76/P-78 anchored the stores to
+    the project root; the home-directory guard was then added to the gateway and to the policy
+    loader but NOT to `_incident_db_path` or `_policy_db_path`. That left **two** resolution
+    rules in a change whose entire thesis is that there is one, and it recreated the split it
+    closed: from a marker-free scratch directory the gateway wrote `<cwd>/.agentx/incidents.db`
+    while `agentx insights` read `~/.agentx/incidents.db` and reported "No blocks recorded
+    yet" -- the identical false statement P-76 exists to eliminate.
+
+    Fixing that by adding the guard at each call site would have left the template in place:
+    the next resolver would forget it too. So the guard lives HERE, once, and callers cannot
+    opt out by forgetting.
+
+    **Why the guard exists at all:** `_find_project_root` walks up until it finds `.git` or
+    `.agentx`, and `~/.agentx` exists for anyone who has run keyless `agentx adopt`. So for a
+    process outside a checkout the "project root" resolves to the user's HOME, which would put
+    a machine-wide store in `~/.agentx/` shared across every unrelated project. Anchoring only
+    means something inside an actual project; when the walk escapes to home or above there is
+    no project, and the honest answer is the working directory -- which is also the behaviour
+    that predates the anchoring, so nothing moves for that user.
+    """
+    start_abs = os.path.abspath(start or os.getcwd())
+    found = _find_project_root(start_abs)
+    return start_abs if _is_home_or_above(found) else found
+
+
 def _overrides_path(path=None):
     if path:
         return path
     env = os.environ.get("AGENTX_OVERRIDES")
     if env:
         return env
-    return os.path.join(_find_project_root(), DEFAULT_OVERRIDES_PATH)
+    return os.path.join(_anchored_root(), DEFAULT_OVERRIDES_PATH)
 
 
 def _incident_db_path(path=None):
-    """Resolve the incident store the gateway wrote. Explicit arg / env win; else
-    the first candidate that exists under the project root; else the primary
-    default under that root (so a caller can still report a not-found path).
-    Project-root-anchored so it resolves the same from any subdirectory."""
+    """Resolve the incident store the gateway wrote. Explicit arg / env win, else the
+    ONE canonical store under the project root.
+
+    Returns the canonical path whether or not it exists, so a caller can report a
+    not-found path rather than guessing at a different file. Project-root-anchored, so
+    it resolves the same from any subdirectory and matches what the gateway writes
+    (backend/agentx_home.py). Existence is deliberately NOT part of the rule -- see the
+    comment on DEFAULT_INCIDENT_DB for what "first one that exists" cost."""
     if path:
         return path
     env = os.environ.get("AGENTX_INCIDENT_DB")
     if env:
         return env
-    root = _find_project_root()
-    for candidate in _INCIDENT_DB_CANDIDATES:
-        full = os.path.join(root, candidate)
-        if os.path.exists(full):
-            return full
-    return os.path.join(root, DEFAULT_INCIDENT_DB)
+    return os.path.join(_anchored_root(), DEFAULT_INCIDENT_DB)
+
+
+def _is_home_or_above(path):
+    """True when ``path`` is the user's home directory or an ancestor of it.
+
+    Such a directory is not "a project": scanning it is unbounded and anything found in it
+    belongs to someone else's work, not the caller's. Never raises -- an unresolvable home
+    just means "cannot prove it is home", and the scan proceeds as before.
+    """
+    try:
+        home = os.path.realpath(os.path.expanduser("~"))
+        p = os.path.realpath(path)
+    except OSError:
+        return False
+    if home == p:
+        return True
+    # ⚠️ A FILESYSTEM ROOT ALREADY ENDS IN A SEPARATOR, so the naive `p + os.sep` produces
+    # "C:\\\\" or "//" and the prefix test never matches -- the one directory that is most
+    # obviously "above home" was the one case the guard let through, and it is the worst
+    # place to start a walk from. Normalise the separator before comparing.
+    prefix = p if p.endswith(os.sep) else p + os.sep
+    return home.startswith(prefix)
+
+
+def incident_db_strays(root=None, canonical=None):
+    """Other ``.agentx/incidents.db`` files under the project root, LARGEST first.
+
+    A stray is a store some gateway really did write, in a home that is no longer
+    canonical -- typically one started from a subdirectory before P-76, or a compose
+    mount pointing somewhere else. They are REPORTED, never read: substituting one is
+    how the reader silently disagreed with the writer in the first place.
+
+    Never raises and never opens a database. Only file sizes are used, because opening
+    SQLite to count rows is itself a write risk, and a diagnostic that can dirty what it
+    measures is not a diagnostic. Bounded to a shallow walk so ``agentx insights`` does
+    not pay for a full-repo scan.
+
+    Returns ``[{path, bytes}, ...]``, empty when the layout is clean.
+    """
+    explicit_root = root is not None
+    root = root or _anchored_root()
+
+    # 🔴 REFUSE TO SCAN WHEN "THE PROJECT" IS ACTUALLY THE HOME DIRECTORY.
+    # _find_project_root falls back to the nearest ancestor holding .agentx/, and
+    # `~/.agentx` exists for anyone who has run keyless `agentx adopt`. So a developer
+    # running from any directory outside a checkout resolves the root to $HOME, and this
+    # walk then (a) costs seconds of disk I/O on the MOST COMMON path -- a fresh user's
+    # first `agentx insights`, where the store does not exist -- and (b) reports unrelated
+    # projects' stores under the heading "other incident stores exist in this project",
+    # offering to read one. That is a false statement of exactly the kind this feature was
+    # written to correct, so it must not be the price of correcting the other one.
+    #
+    # The precise condition is "the root is the home directory or ABOVE it" -- that is
+    # what makes the walk huge and makes neighbouring directories other people's projects.
+    # Deliberately NOT "there is no .git": a partner kit is a real, bounded project with no
+    # checkout, and it should still get the hint.
+    if not explicit_root and _is_home_or_above(root):
+        return []
+
+    canonical = os.path.abspath(canonical or os.path.join(root, DEFAULT_INCIDENT_DB))
+    found = []
+    root_depth = os.path.abspath(root).rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        depth = os.path.abspath(dirpath).rstrip(os.sep).count(os.sep) - root_depth
+        if depth >= _STRAY_SCAN_MAX_DEPTH:
+            dirnames[:] = []
+        else:
+            # Prune in place so os.walk never descends; a filter after the fact would
+            # still pay the cost of walking node_modules.
+            dirnames[:] = [d for d in dirnames if d not in _STRAY_SCAN_SKIP]
+        if os.path.basename(dirpath) != ".agentx" or "incidents.db" not in filenames:
+            continue
+        full = os.path.abspath(os.path.join(dirpath, "incidents.db"))
+        # 🔴 normcase, LIKE EVERY OTHER PATH COMPARISON IN THIS CHANGE. A raw `==` makes any
+        # case difference between the walked path and the canonical one look like a
+        # mismatch, and on Windows that means the canonical store LISTS ITSELF AS A STRAY --
+        # the readout telling the developer their own store is not being read, which is the
+        # exact false statement P-76 exists to remove, reintroduced by the code that reports
+        # it. Cheap to get wrong because it is right on a case-sensitive filesystem and on
+        # any run where both strings happen to come from the same source.
+        if os.path.normcase(full) == os.path.normcase(canonical):
+            continue
+        try:
+            found.append({"path": full, "bytes": os.path.getsize(full)})
+        except OSError:
+            continue
+    # Largest first, and the docstring says exactly that. It used to claim
+    # "newest-largest", which the sort never implemented -- mtime is not read anywhere here.
+    # That matters because `_print_strays` offers `strays[0]` as the store to point
+    # AGENTX_INCIDENT_DB at, so an unearned claim of recency is load-bearing copy. Size is
+    # the honest proxy: the store with the most data in it is the one a developer is looking
+    # for, and it needs no extra stat call.
+    found.sort(key=lambda s: s["bytes"], reverse=True)
+    return found
 
 
 def _now_iso():
@@ -956,17 +1090,762 @@ def enumerate_candidates(harvest):
     return flat
 
 
+# --- recovery readout (BACKLOG P-59) -------------------------------------------------
+# This lives on the SDK side ON PURPOSE. It is a READ over the local incident store, and the
+# reader is `agentx insights`, which already opens that exact file (see incident_db_census).
+# Putting it here is not a new coupling and not a new thing published -- it is the same
+# coupling that already ships. The gateway WRITES this data; nothing in the gateway reads it.
+#
+# 🔴 SECOND COPY OF A CLOSED VOCABULARY. The gateway owns _DOMAIN_TAG_VOCAB and this is a
+# duplicate of it, which drifts by construction -- a KEEP IN SYNC comment is not a guard. The
+# guard is backend/test_recovery_summary_vocab_parity.py, which fails when the two diverge.
+# The vocabulary is what stops a drifting tag becoming a real-looking action class and
+# inflating whichever group it lands in.
+_DOMAIN_TAG_VOCAB = frozenset({
+    "database", "network", "agent-loop", "output", "general",
+    "cost", "cost / ops", "comms", "supply-chain", "filesystem",
+})
+
+
+# Below this many blocks a rate is NOT REPORTED. Three blocks and one recovery is not "33%",
+# it is noise wearing a percentage, and a percentage is what gets quoted.
+RECOVERY_MIN_SAMPLE = 10
+
+# 🔴 THE PER-COACHING FLOOR IS SEPARATE AND HIGHER, and criterion 11 asks for it by name for a
+# reason the per-class floor does not face: the rewrite queue is ranked ASCENDING, so the groups
+# with the fewest observations are exactly the ones that float to the top. "A coaching item with
+# three uses and no recoveries would top the rewrite queue on pure noise."
+#
+# Where 20 comes from, stated so the next person can argue with it rather than guess: with 20
+# settled blocks and zero continuations, the one-sided 95% bound on the true rate is about 14%,
+# which is low enough to act on. At 10 the same observation only bounds it at about 26% -- a
+# coaching item that works a quarter of the time is not a rewrite candidate, and at that floor we
+# could not tell the two apart. It is a JUDGEMENT about how much evidence justifies rewriting a
+# piece of text, not a derived constant, and it gates an ACTION rather than a display.
+COACHING_MIN_SAMPLE = 20
+
+# The outcome vocabulary, READ side. The gateway owns the write-side copy
+# (incident_store._OUTCOME_NEXT_VOCAB) and enforces it on write; this side must still classify
+# defensively, because a store can be written by a NEWER gateway than the SDK reading it. A
+# value we do not recognise is counted as exactly that -- never bucketed by prefix match, which
+# would quietly fold a future `recovered_but_slower` into `recovered` and move the headline
+# rate. Guarded by backend/test_recovery_summary_vocab_parity.py.
+_RECOVERED_OUTCOMES = frozenset({"recovered", "recovered_continued", "recovered_stopped"})
+# 🔴 A HUMAN APPROVAL IS NOT A RECOVERY and must never reach the recovery rate: our coaching did
+# not produce it, a person did. Deliberately OUTSIDE _RECOVERED_OUTCOMES, and the rows carrying
+# it are lifted out of the per-class table entirely and reported on their own line.
+_ESCALATION_OUTCOMES = frozenset({"approved_and_proceeded"})
+# Mirrors incident_store._HUMAN_APPROVAL_STATUSES; pinned by the parity test.
+_HUMAN_APPROVAL_STATUSES = frozenset({"ESCALATED"})
+_SETTLED_OUTCOMES = (frozenset({"reblocked", "no_further_activity"})
+                     | _RECOVERED_OUTCOMES | _ESCALATION_OUTCOMES)
+
+# 🔴 THE SCOREBOARD'S BUCKETS, NAMED RATHER THAN SPELLED INLINE. `coaching_scoreboard` is a near
+# copy of `recovery_summary`'s counting loop, and the first cut hardcoded these four strings while
+# the original classified through the constants above. That is the drift class
+# `test_recovery_summary_vocab_parity.py` exists for, and the parity test could not see it: it
+# pins _SETTLED_OUTCOMES against the gateway's vocabulary and never reaches this function. Add a
+# seventh outcome to BOTH vocabularies and the parity test stays green, the per-class table counts
+# it, and every block carrying it silently lands in `unrecognised` here -- dropping out of
+# `observed`, which is the denominator that ranks the rewrite queue.
+#
+# Splitting the recovered family is a JUDGEMENT per value, not something derivable from the
+# vocabulary, so completeness is asserted by a test instead:
+# test_coaching_scoreboard.py::test_every_known_outcome_lands_in_a_named_bucket.
+_CONTINUED_OUTCOME = "recovered_continued"      # took the advice AND carried on working
+_STOPPED_OUTCOME = "recovered_stopped"          # took the advice and the run ended
+_PROVISIONAL_OUTCOME = "recovered"              # not yet split by refine_recoveries
+_RESIDUAL_OUTCOME = "no_further_activity"       # we saw nothing more; evidence of neither
+_OBSERVED_FAILURE_OUTCOMES = frozenset({"reblocked"})
+
+# Statuses the settling sweep may touch: exactly the ones that join the block -> retry chain in
+# the gateway (park_incident's `_chainable`). 🔴 ESCALATED IS DELIBERATELY ABSENT and that
+# exclusion is the fix for a real defect: an escalation waits on a HUMAN, not on a timer, so a
+# 15-minute sweep settled "no further activity" onto a block whose approver was at lunch --
+# and because the settle writes an outcome, the genuine recovery that arrived when they got
+# back could no longer land (first-write-wins). A residual we invented outranked an observation
+# we made. Escalations stay open until something real happens to them.
+_SETTLEABLE_STATUSES = frozenset({"CHALLENGED", "DENIED"})
+
+# How long a run must be quiet before an unresolved block settles.
+# 🔴 A PARAMETER THAT CHANGES EVERY NUMBER IT HAS EVER PRODUCED. A shorter window settles more
+# blocks as "nothing more happened"; a longer one leaves them open. Stamp it wherever these
+# counts are shown and treat a change to it the way a rubric change is treated -- results
+# computed under different windows are not comparable.
+SETTLE_AFTER_SECONDS = 900  # 15 minutes
+
+
+# How long a read-time pass waits for a writer before giving up. The gateway uses 250ms on the
+# hot ALLOW path; this side is a human running `agentx insights`, so it can afford to wait.
+_STORE_BUSY_WAIT_SECONDS = 2.0
+
+
+def _connect_incident_store(path):
+    """A connection that WAITS for a writer instead of failing instantly.
+
+    🔴 THE SWEEPS RUN WHILE THE GATEWAY IS UP -- that is the normal case, not the edge one:
+    `agentx insights` reads the same file the running gateway writes on every block and every
+    allowed call. SQLite fails a write against a held lock in milliseconds. Every OTHER store
+    function in this module already returns a neutral value on ``sqlite3.Error`` ("Missing store
+    / locked DB -> []"); the three added for P-59 did not, so a locked store took `agentx
+    insights` down with a traceback -- the readout killed by the writer it reads. Reproduced by
+    holding a ``BEGIN IMMEDIATE`` on the store: ``OperationalError: database is locked`` out of
+    both sweeps. Waiting is how most of those stop happening; the caller swallows the rest.
+    """
+    return sqlite3.connect(path, timeout=_STORE_BUSY_WAIT_SECONDS)
+
+
+def _observation_window(conn):
+    """(since, allowed_calls) — when we started watching BOTH sides, and how many calls we let
+    through since. ``(None, 0)`` when we have never watched.
+
+    A run gets an activity row from its first ALLOWED call and also from its first BLOCK, so
+    this is the earliest moment this build could have seen either half. Everything downstream --
+    the rate, the per-class counts, the sweeps -- is scoped to it.
+    """
+    try:
+        row = conn.execute(
+            "SELECT MIN(first_seen), SUM(allowed_calls) FROM run_activity").fetchone()
+    except sqlite3.Error:
+        return None, 0            # a store predating the table: no data, not zero
+    since, allowed = (row or (None, None))
+    if not since:
+        return None, 0
+    return since, (allowed or 0)
+
+
+def settle_stale_blocks(older_than_seconds=SETTLE_AFTER_SECONDS, db_path=None, now=None):
+    """Settle blocks that never saw a qualifying allow to ``no_further_activity``.
+
+    Without this, every unresolved block sits at NULL forever and the buckets never add up:
+    "still open" and "nothing more happened" are indistinguishable, so no readout can be built
+    on them. Lazy and idempotent like ``reconcile_safe_paths``, and called from the same place
+    for the same reason -- at READ time, immediately before the readout that consumes it.
+
+    🔴 IT LIVES HERE, BESIDE ITS READER, BECAUSE IT SHIPPED WITH NO CALLER AT ALL. The first
+    cut of P-59 put both sweeps in ``backend/incident_store.py``, which the SDK cannot import
+    and the gateway never called -- so nothing settled in any real deployment, `open` never
+    drained, and "N blocks recorded, none settled yet" was the permanent state for every user
+    whose agents never recovered. The readout printed that sentence as though it were news.
+
+    🔴 THIS BUCKET IS A RESIDUAL, NOT A MEASUREMENT, and the readout must print it that way.
+    "We saw nothing more" covers an agent that gave up, a run that finished the job another
+    way, and a process that crashed. It is not a failure count, and calling it one would be
+    the flattering reading. A zero must earn its meaning.
+
+    🔴 SCOPED TO THE OBSERVATION WINDOW. A row older than the first activity we ever recorded
+    was written by a build that could not observe what came next, so settling it would stamp
+    "we saw nothing further" onto a period we were not watching -- 38,561 of them on the real
+    dev store, permanently, in a column the readout then counts. Outside the window a block
+    stays NULL, which already means the honest thing: we do not know.
+
+    ⚠️ A ROW WE CANNOT DATE IS LEFT ALONE. ``created_at`` is normally our own ISO-8601 UTC
+    stamp, but ``save_incident`` accepts a caller-supplied value, so an unparseable one is
+    possible. Settling it would be claiming an observation we did not make.
+
+    🔴 THE RUN MUST BE QUIET, NOT MERELY THE BLOCK OLD, and the two are different rows. The
+    first cut compared only ``incidents.created_at`` against the cutoff, so a run that was
+    blocked 20 minutes ago and is STILL MAKING ALLOWED CALLS RIGHT NOW had that block stamped
+    "no further activity" -- a claim the store's own ``run_activity.last_seen`` contradicts, on
+    the same read. And because settling writes an outcome, first-write-wins then stopped the
+    genuine recovery from ever landing when the slow retry arrived. That is exactly the defect
+    the ESCALATED exclusion above was written for, reproduced through a different door: a
+    residual we invented outranking an observation we were about to make. The parameter is
+    named for how long a run must be QUIET; now it is measured that way.
+
+    Only rows whose ``outcome_next`` IS NULL are touched, so a resolved recovery is never
+    overwritten by a later sweep. Returns the count settled this pass.
+
+    Never raises: a locked or unreadable store returns 0, the same neutral answer every other
+    store function in this module gives (see ``_connect_incident_store``).
+    """
+    p = _incident_db_path(db_path)
+    if not os.path.exists(p):
+        return 0
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=older_than_seconds)
+    try:
+        conn = _connect_incident_store(p)
+    except sqlite3.Error:
+        return 0
+    stale = []
+    try:
+        since, _ = _observation_window(conn)
+        if not since:
+            return 0            # never watched: nothing here is settleable
+        try:
+            rows = conn.execute(
+                "SELECT receipt_id, created_at, trace_id FROM incidents "
+                "WHERE outcome_next IS NULL AND created_at >= ? "
+                "AND COALESCE(parked_status, status) IN (%s)"
+                % ",".join("?" * len(_SETTLEABLE_STATUSES)),
+                (since,) + tuple(sorted(_SETTLEABLE_STATUSES)),
+            ).fetchall()
+        except sqlite3.Error:
+            return 0            # a store predating the column: nothing to settle, not an error
+        for receipt_id, created_at, trace_id in rows:
+            created = _parse_iso(created_at)
+            if created is None:
+                continue        # undateable -> leave open, see the docstring
+            if created >= cutoff:
+                continue        # the block itself is too fresh to have gone quiet
+            # The run's own record. NULL last_seen (a run we only ever blocked) is silence, not
+            # activity, so it settles. A last_seen INSIDE the window is the run demonstrably
+            # still going: leave it open, because "we saw nothing more" would be false and
+            # would permanently pre-empt the recovery that has not arrived YET.
+            seen = _parse_iso(_last_seen(conn, trace_id)) if trace_id else None
+            if seen is not None and seen >= cutoff:
+                continue
+            stale.append(receipt_id)
+        if not stale:
+            return 0
+        stamp = _now_iso()
+        # rowcount, NOT len(stale). The UPDATE carries `AND outcome_next IS NULL`, so a row that
+        # recovered between the SELECT above and this write is deliberately skipped -- and that
+        # race is real enough to have its own test. Reporting candidates SELECTED as though they
+        # were rows SETTLED made the returned count wrong in exactly the case the guard exists
+        # for: the one time the two numbers differ is the one time anyone would be looking.
+        settled = conn.executemany(
+            "UPDATE incidents SET outcome_next = 'no_further_activity', outcome_next_at = ? "
+            "WHERE receipt_id = ? AND outcome_next IS NULL",
+            [(stamp, r) for r in stale],
+        ).rowcount
+        conn.commit()
+    except sqlite3.Error:
+        # A locked store loses this pass, not the command. The sweep is idempotent and runs
+        # again on the next read, so nothing is lost permanently.
+        return 0
+    finally:
+        conn.close()
+    return settled
+
+
+def refine_recoveries(older_than_seconds=SETTLE_AFTER_SECONDS, db_path=None, now=None):
+    """Turn the provisional ``recovered`` into ``recovered_continued`` / ``recovered_stopped``.
+
+    The gateway records the FACT of a recovery the moment it happens; it cannot know yet whether
+    the run went on to do anything. This pass answers that from run activity, and it is the ONLY
+    defence against the improvement loop learning the wrong lesson: the easiest way to score well
+    on "the next call was allowed" is to suggest something trivially safe that does not
+    accomplish what the user wanted. A run that takes our suggestion and then stops is the tell.
+
+    🔴 A RECENT RECOVERY MUST NOT BE CLASSIFIED. The recovering call records activity BEFORE the
+    resolution is written, so immediately afterwards ``last_seen`` is always just BEHIND
+    ``outcome_next_at`` -- classifying then would mark every fresh recovery "stopped", a
+    systematic error pointing at the unflattering answer for a reason that is pure timing. Only
+    recoveries older than the quiet window are refined.
+
+    Lazy like ``settle_stale_blocks`` and called beside it. Idempotent: only rows still reading
+    exactly ``recovered`` are touched, so a refined row is final. Returns (continued, stopped).
+
+    Never raises: a locked or unreadable store returns (0, 0), the same neutral answer every
+    other store function in this module gives (see ``_connect_incident_store``).
+    """
+    p = _incident_db_path(db_path)
+    if not os.path.exists(p):
+        return 0, 0
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=older_than_seconds)
+    try:
+        conn = _connect_incident_store(p)
+    except sqlite3.Error:
+        return 0, 0
+    moved = {"recovered_continued": 0, "recovered_stopped": 0}
+    continued, stopped = [], []
+    try:
+        try:
+            rows = conn.execute(
+                "SELECT receipt_id, trace_id, outcome_next_at FROM incidents "
+                "WHERE outcome_next = 'recovered'").fetchall()
+        except sqlite3.Error:
+            return 0, 0         # a store predating the column
+        for receipt_id, trace_id, resolved_at in rows:
+            resolved = _parse_iso(resolved_at)
+            if resolved is None:
+                continue        # undateable -> leave provisional, same rule as the settle sweep
+            if resolved >= cutoff:
+                continue        # too recent to judge; see the docstring
+            seen = _parse_iso(_last_seen(conn, trace_id)) if trace_id else None
+            if seen is None:
+                # 🔴 NO ACTIVITY RECORD IS EVIDENCE LOSS, NOT EVIDENCE OF STOPPING, and this
+                # branch used to stamp `recovered_stopped` on it. The justification given was
+                # "a run that only ever got blocked has no activity row" -- and that state is
+                # UNREACHABLE for a row being refined here: every row in this loop reads
+                # `recovered`, which only the ALLOW path writes, and that path calls
+                # record_run_activity FIRST. save_incident writes a row for a block too.
+                #
+                # So the reachable causes are a FAILED or locked activity write (already
+                # counted as run_activity_write_failures) and a NULL trace_id. Both mean we
+                # lost the record, and turning that into `recovered_stopped` feeds our own
+                # recording failure into the improvement loop as "this advice was safe and
+                # useless" -- which is the signal the rewrite queue is RANKED on. It would
+                # demote working coaching on the strength of a dropped write.
+                #
+                # Left provisional. `recovered` still counts as a recovery in the readout; only
+                # the continued/stopped split stays unknown, which is the honest state.
+                continue
+            # STRICT. Activity at the SAME instant as the recovery is the recovering call
+            # itself, which is not the run carrying on -- counting it would inflate the one
+            # number the improvement loop ranks on, on nothing but timer granularity.
+            (continued if seen > resolved else stopped).append(receipt_id)
+        # rowcount, NOT len(ids) -- the SAME rule the settle sweep beside this was fixed for.
+        # 🔴 That fix landed on ONE member of the class and left its sibling: both sweeps
+        # SELECT then UPDATE behind a guard, so both can have a row move underneath them,
+        # and both reported candidates as though they were rows changed. Fixing the
+        # instance left the template standing.
+        for outcome, ids in (("recovered_continued", continued), ("recovered_stopped", stopped)):
+            if ids:
+                moved[outcome] = conn.executemany(
+                    "UPDATE incidents SET outcome_next = ? "
+                    "WHERE receipt_id = ? AND outcome_next = 'recovered'",
+                    [(outcome, r) for r in ids],
+                ).rowcount
+        conn.commit()
+    except sqlite3.Error:
+        # A locked store loses this pass, not the command. Idempotent, so the next read
+        # refines the same rows.
+        return 0, 0
+    finally:
+        conn.close()
+    return moved["recovered_continued"], moved["recovered_stopped"]
+
+
+def _last_seen(conn, trace_id):
+    try:
+        row = conn.execute(
+            "SELECT last_seen FROM run_activity WHERE trace_id = ?", (trace_id,)).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
+def _parse_iso(value):
+    """A tz-aware datetime, or None for anything we cannot date. Never raises: an unparseable
+    stamp must leave a row alone, not take down the command doing the reading."""
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def recovery_summary(path=None, min_sample=RECOVERY_MIN_SAMPLE):
+    """Aggregate what happened after our blocks. The readout half of P-59.
+
+    Grouped by ``domain_tag`` -- the row's validated, closed-vocab action dimension. 🔴 THE
+    BLENDED FIGURE MUST NEVER BE SHOWN ALONE: "our advice on destructive writes works and our
+    advice on network calls does not" is a work item; "62%" is a fact nobody can act on. Every
+    group carries ``readable``; a caller that prints a rate for an unreadable group is the bug
+    this flag exists to prevent.
+
+    Also returns a RUN-level rollup, because the per-block view answers a different question
+    than the one anyone asks. Blocked, blocked again, then through is two per-block rows and
+    one honest sentence: the run finished. Keep both; do not collapse them.
+
+    🔴 EVERY COUNT HERE IS SCOPED TO THE OBSERVATION WINDOW, and they all use the SAME one.
+    The first cut windowed only ``block_rate`` and left the per-class counts running over all
+    history. On the real dev store that is 38,561 blocks written by a build that could not
+    record an outcome, so the headline would have read "38561 settled, 3 recovered (0%)" -- the
+    exact asymmetry the rate's window exists to prevent, one function away from it. Blocks
+    outside the window are reported separately as ``blocks_before_window``, never mixed in.
+
+    🔴 ``block_rate`` IS THE FIGURE THAT MUST NEVER BE OMITTED. Criterion 14: a recovery rate is
+    never displayed without it, because the two fastest ways to raise recovery are to block more
+    loosely and to suggest something trivially safe, and only this shows the first. It is
+    computed from ``run_activity``, the allowed-call record this change added. ``None`` means we
+    cannot compute it, which is never zero.
+
+    ``state`` distinguishes the silences a single ``None`` used to collapse:
+      ``ok``            counts below are real
+      ``not_upgraded``  this store predates the outcome columns; the gateway adds them on its
+                        next write. ``blocks_all_time`` is still true and may be enormous, so
+                        "no blocks recorded yet" would be a false statement about it.
+      ``no_window``     upgraded, but nothing was recorded while we were watching both sides.
+
+    ``open`` counts blocks still awaiting an outcome; it is not a bucket of anything that
+    happened. Callers should run ``settle_stale_blocks`` / ``refine_recoveries`` first -- the
+    CLI does.
+    """
+    p = _incident_db_path(path)
+    if not os.path.exists(p):
+        return None
+    try:
+        conn = _connect_incident_store(p)
+    except sqlite3.Error:
+        return None             # unopenable store: no data, never a zero
+    try:
+        try:
+            # ASKED, not inferred from a failure. The first cut detected "this store predates
+            # the outcome columns" by catching the error from selecting them -- but a legacy
+            # store has no run_activity table either, so the window came back empty and the
+            # query was skipped before it could fail. The detector could never fire on the one
+            # store it was written for. A schema question deserves a schema query.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(incidents)")}
+            if not columns:
+                return None             # no incidents table: not one of our stores
+            all_time = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
+        except sqlite3.Error:
+            # sqlite3.Error, not OperationalError: a corrupt file raises DatabaseError (the
+            # PARENT), and the narrow catch crashed `agentx insights` outright.
+            return None
+        if not all_time:
+            return None
+        if "outcome_next" not in columns:
+            # 🔴 "PREDATES THE COLUMNS" AND "NO BLOCKS" ARE DIFFERENT SILENCES. Both used to
+            # return None, and the CLI printed "No blocks recorded yet" for both -- a sentence
+            # that is FALSE about a store holding tens of thousands of blocks. The GATEWAY owns
+            # the schema and adds missing columns when it writes; this side only reads.
+            return {"state": "not_upgraded", "blocks_all_time": all_time,
+                    "min_sample": min_sample}
+        since, allowed = _observation_window(conn)
+        try:
+            rows = conn.execute(
+                "SELECT domain_tag, outcome_next, trace_id, created_at, "
+                "COALESCE(parked_status, status) FROM incidents "
+                "WHERE created_at >= ?", (since,)).fetchall() if since else []
+            # 🔴 COUNTED, NOT INFERRED BY SUBTRACTION. `created_at >= ?` silently drops a row
+            # whose stamp is NULL (a NULL comparison is NULL, never true), and deriving the
+            # pre-window figure as all_time minus what survived then reported those rows as
+            # "recorded before we started tracking" -- which is not something we know about a
+            # row we cannot date at all. Same fabrication as the escalation subtraction, one
+            # column over. Asking directly keeps undateable rows out of BOTH buckets.
+            before_window = conn.execute(
+                "SELECT COUNT(*) FROM incidents WHERE created_at < ?", (since,)
+            ).fetchone()[0] if since else 0
+        except sqlite3.Error:
+            # Belt and braces, and NOT dead code: the schema check above answers "does this
+            # store have the outcome columns", which is a different question from "can this
+            # file be read". A corrupt page raises DatabaseError here and would otherwise take
+            # down `agentx insights` -- the crash finding 3 was filed for, reintroduced by
+            # replacing the catch with a check that does not cover the same case.
+            return None
+    finally:
+        conn.close()
+
+    def _blank():
+        return {"blocks": 0, "recovered": 0, "reblocked": 0,
+                "no_further_activity": 0, "open": 0, "unrecognised": 0}
+
+    def _count(bucket, outcome):
+        bucket["blocks"] += 1
+        if outcome is None:
+            bucket["open"] += 1
+        elif outcome in _RECOVERED_OUTCOMES:
+            bucket["recovered"] += 1
+        elif outcome in ("reblocked", "no_further_activity"):
+            bucket[outcome] += 1
+        else:
+            # 🔴 An outcome we do not recognise used to fall through every branch while still
+            # incrementing `blocks`, so it inflated `settled` -- the rate's DENOMINATOR -- and
+            # landed in no bucket anyone could see. Vocabulary is enforced on write, which is
+            # exactly why a value arriving here means something drifted, and a silent dilution
+            # of the headline rate is the worst possible way to learn that.
+            bucket["unrecognised"] += 1
+
+    by_class, overall, runs = {}, _blank(), {}
+    # 🔴 HUMAN APPROVALS ARE LIFTED OUT BEFORE ANYTHING IS COUNTED. An escalation is a block a
+    # PERSON released, so "the next call was allowed" says nothing about our coaching -- and the
+    # spec is explicit that approvals get their own counter and are never folded into the
+    # recovery rate. Measured before this: twelve blocks our coaching recovered NONE of, plus
+    # one human approval, printed 8%, and every point of it was the human.
+    #
+    # TWO signals, because each covers the other's blind spot. The OUTCOME is authoritative once
+    # written (first-write-wins, so it stays true), but it exists only after the approval is
+    # acted on. The PARKED status covers the ones still WAITING on a person -- `status` itself
+    # cannot, because the middleware overwrites it on recovery, which is the bug parked_status
+    # was added for. Falls back to `status` only for rows written before that column existed.
+    escalations = {"total": 0, "proceeded": 0, "open": 0, "closed_other": 0}
+    for domain_tag, outcome, trace_id, created_at, parked in rows:
+        if parked in _HUMAN_APPROVAL_STATUSES or outcome in _ESCALATION_OUTCOMES:
+            # 🔴 KEYED ON WHAT IT WAS, WHATEVER THE OUTCOME SAYS. The first cut only
+            # consulted `parked` when the outcome was still NULL, so an escalation that
+            # already carried an outcome fell straight through into the recovery table --
+            # and the shipped-but-inert version of the redirect wrote a plain `recovered`
+            # onto exactly those rows. Every one of them predating that fix was counted as
+            # our coaching working. Reproduced: twelve blocks recovered NONE of, plus one
+            # legacy row, printed 8% again.
+            escalations["total"] += 1
+            if outcome is None:
+                escalations["open"] += 1
+            elif outcome in _ESCALATION_OUTCOMES or outcome in _RECOVERED_OUTCOMES:
+                # `recovered` here is a LEGACY row: written before the redirect existed.
+                escalations["proceeded"] += 1
+            else:
+                # Settled some other way -- a timer reached it before the sweep excluded
+                # escalations. Neither proceeded nor waiting, and never a recovery.
+                escalations["closed_other"] += 1
+            continue
+        # An unknown or absent domain is its OWN named group, never folded into a real one:
+        # a silent merge would let a drifting tag inflate whichever class it landed in.
+        key = domain_tag if domain_tag in _DOMAIN_TAG_VOCAB else "(unclassified)"
+        _count(by_class.setdefault(key, _blank()), outcome)
+        _count(overall, outcome)
+        if trace_id:
+            runs.setdefault(trace_id, []).append((created_at or "", outcome))
+
+    for bucket in list(by_class.values()) + [overall]:
+        # SETTLED blocks are the only denominator a rate may use. An open block has not happened
+        # yet, and counting it as a non-recovery reports a pessimistic rate that improves on its
+        # own as the sweep runs. An unrecognised one is not a settled outcome either -- we have
+        # no idea what it is.
+        bucket["settled"] = bucket["blocks"] - bucket["open"] - bucket["unrecognised"]
+        bucket["readable"] = bucket["settled"] >= min_sample
+
+    # Run level: of the runs that hit at least one block, how many ended on a recovery.
+    # Sort on the TIMESTAMP ALONE. Sorting whole tuples falls through to comparing the second
+    # element when two incidents on a run share a created_at, and an unresolved outcome is None
+    # -- None < str raises TypeError and kills `agentx insights`. created_at is caller-supplied
+    # via save_incident, and /v1/incident is a caller that pins its own values.
+    # 🔴 THE DENOMINATOR IS SETTLED RUNS, NOT RUNS. This gate counted every run that hit a
+    # block, unlike every other denominator in this function, which uses `settled`. A run whose
+    # last block is still OPEN has not finished or failed to finish -- it has not happened yet.
+    # Counting it printed "15 runs hit a block - 0 finished after their last one", where the
+    # zero was partly pure absence, and it would improve on its own as the sweep ran. Same rule
+    # the per-class table follows: a zero must earn its meaning.
+    finished = settled_runs = 0
+    for events in runs.values():
+        last = max(events, key=lambda e: e[0])[1]
+        if last not in _SETTLED_OUTCOMES:
+            continue            # still open, or an outcome this version cannot read
+        settled_runs += 1
+        if last in _RECOVERED_OUTCOMES:
+            finished += 1
+    # 🔴 AN ESCALATION IS A CALL WE STOPPED, so it belongs in the BLOCK rate even though it
+    # is kept out of the RECOVERY table. Removing it from both sides of this ratio made the
+    # rate read LOW -- measured 0.333 where the true share of stopped calls was 0.500 --
+    # and "we interfere less than we do" is the flattering direction. The two questions are
+    # different: "how often do we stop a call" counts every stop; "does our coaching work"
+    # counts only the ones coaching could have acted on.
+    stopped = overall["blocks"] + escalations["total"]
+    observed = stopped + allowed
+    return {
+        "state": "ok" if since else "no_window",
+        "by_class": by_class,
+        "overall": overall,
+        # Its OWN counter, per the spec, never folded into the recovery rate above.
+        "escalations": escalations,
+        "runs": {"with_a_block": len(runs), "settled": settled_runs,
+                 "ended_on_a_recovery": finished,
+                 "readable": settled_runs >= min_sample},
+        # 🔴 NEVER SHOW THE RECOVERY RATE WITHOUT THIS BESIDE IT. The two fastest ways to raise
+        # recovery are to block more loosely and to suggest something trivially safe; the first
+        # is visible only here. None means we cannot compute it, which is NOT zero.
+        #
+        # ⚠️ KNOWN BIAS, and it points the safe way. An allowed call arriving without a trace id
+        # is not recorded, so the denominator can undercount allows, which makes the rate read
+        # HIGH. Erring toward "we block more than we do" does not flatter us.
+        "block_rate": (stopped / observed) if since and observed >= min_sample else None,
+        "block_rate_since": since,
+        "allowed_calls": allowed,
+        # Written before we were watching what came next. Reported, never mixed in: they cannot
+        # have recovered, and folding them into the counts would drive the headline to zero.
+        "blocks_all_time": all_time,
+        # 🔴 MINUS THE ESCALATIONS TOO. They are lifted out before anything is counted, so
+        # they never reach overall["blocks"] -- and subtracting only that reported every
+        # in-window human approval to the user as an EARLIER, pre-tracking block. A store
+        # holding escalations printed a fabricated "N earlier block(s)" line.
+        "blocks_before_window": before_window,
+        # Rows we cannot date at all. Neither in the window nor before it: claiming
+        # either would be an observation we did not make.
+        "blocks_undateable": all_time - overall["blocks"] - escalations["total"]
+                             - before_window,
+        "settle_window_seconds": SETTLE_AFTER_SECONDS,
+        "min_sample": min_sample,
+    }
+
+
+def coaching_scoreboard(path=None, min_sample=COACHING_MIN_SAMPLE):
+    """Score every piece of coaching we hand an agent. Criteria 11 and 12 of P-59.
+
+    ``recovery_summary`` answers "does our advice work HERE" (by action class). This answers
+    "does THIS PIECE OF TEXT work", which is the half that compounds: the low scorers become a
+    rewrite queue, the rewrite ships as a new version, and the new version is measured against
+    the old one. Detection is automatic; the rewrite is a person's job.
+
+    Grouped by ``(policy_id, coaching_version)``. Identity is ``policy_id`` -- there is
+    deliberately no second coaching id (incident_store.py) -- and the version is stamped at PARK
+    time, so a rewrite of OUR canonical coaching starts a fresh score with no flag for anyone to
+    remember to set. That is the spec's "a score goes provisional when its coaching text changes
+    version": the old text keeps its history, the new text has none yet and reads as such.
+
+    🔴 THAT HOLDS FOR CANONICAL COACHING ONLY, AND AN EARLIER VERSION OF THIS DOCSTRING CLAIMED IT
+    UNCONDITIONALLY. ``coaching_version`` is ``POLICY_BASELINE_VERSION``, a BUILD stamp bumped when
+    ``CANONICAL_COACHING_BY_FAILURE_MODE`` / ``_GATEWAY_BLOCK_SAFE_PATHS`` change (gateway.py, which
+    says so in its own comment). A developer-customised policy and a judge-authored
+    ``socratic_prompt`` carry the generation they were ISSUED under, not one we wrote -- so if a
+    developer edits their own coaching text, the version does NOT move and the new text is scored
+    in the SAME group as the text it replaced. Exactly the inheritance the rest of this paragraph
+    says cannot happen, in exactly the org-adaptive case the loop exists for. Nothing here detects
+    it; the honest statement is that the boundary is OUR release, not THEIR edit.
+
+    🔴 THE SCORE IS ``recovered_continued`` ALONE (criterion 12). The obvious metric -- "the next
+    call was allowed" -- rewards advice that is safe and useless, because the easiest way to earn
+    it is to suggest something trivially permitted that does not do what the user wanted.
+    ``recovered_stopped`` is the tell for exactly that, so it is reported BESIDE the score and
+    never added into it. A rising stopped share on a group whose score looks fine is the shape to
+    watch.
+
+    🔴 A PROVISIONAL ``recovered`` IS NOT SETTLED HERE, and this is the denominator trap in this
+    function. The gateway records the FACT of a recovery immediately; only ``refine_recoveries``
+    can later say whether the run went on to do anything. Counting an unrefined row as settled
+    puts it in the denominator and never in the numerator, so a run that is still going would
+    read as "this advice does not work". They are counted as ``refining`` and excluded from both
+    sides. Callers should run the sweeps first; the CLI does.
+
+    🔴 HUMAN APPROVALS ARE LIFTED OUT BEFORE ANYTHING IS COUNTED, on the same rule and for the
+    same reason as ``recovery_summary``: a person released that block, not our text, so scoring
+    our coaching on it credits the wrong author.
+
+    🔴 THE DENOMINATOR IS ``observed``, NOT ``settled``, and the difference is most of the store.
+    A block that settles to ``no_further_activity`` tells us nothing about the advice -- see the
+    comment on that line, which records what the first version of this printed against real
+    data.
+
+    Returns ``None`` for a store we cannot read, and a ``state`` of ``not_upgraded`` /
+    ``no_window`` for the two silences that are not "nothing recovered" -- the distinction
+    ``recovery_summary`` exists to keep, kept here too rather than collapsed back into a zero.
+    """
+    p = _incident_db_path(path)
+    if not os.path.exists(p):
+        return None
+    try:
+        conn = _connect_incident_store(p)
+    except sqlite3.Error:
+        return None
+    try:
+        try:
+            # ASKED, not inferred from a failed SELECT -- same reason as recovery_summary: a
+            # store predating the columns has no run_activity either, so the window comes back
+            # empty and the query that would have raised is never reached.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(incidents)")}
+            if not columns:
+                return None
+            all_time = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
+        except sqlite3.Error:
+            return None
+        if not all_time:
+            return None
+        if "outcome_next" not in columns or "coaching_version" not in columns:
+            return {"state": "not_upgraded", "blocks_all_time": all_time,
+                    "groups": [], "rewrite_queue": [], "min_sample": min_sample}
+        since, _allowed = _observation_window(conn)
+        try:
+            rows = conn.execute(
+                "SELECT policy_id, coaching_version, outcome_next, "
+                "COALESCE(parked_status, status) FROM incidents "
+                "WHERE created_at >= ?", (since,)).fetchall() if since else []
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+
+    def _blank(policy_id, version):
+        return {"policy_id": policy_id, "coaching_version": version, "blocks": 0,
+                "continued": 0, "stopped": 0, "reblocked": 0, "no_further_activity": 0,
+                "refining": 0, "open": 0, "unrecognised": 0}
+
+    groups = {}
+    for policy_id, version, outcome, parked in rows:
+        if parked in _HUMAN_APPROVAL_STATUSES or outcome in _ESCALATION_OUTCOMES:
+            continue
+        # A row with no coaching identity is its OWN named group, never folded into a real one.
+        # Folding it would let unattributed blocks drag down a real piece of text's score, and
+        # the size of this group is itself the finding -- it is what P-66 caught for domain_tag.
+        key = (policy_id or "(no policy id)", version or "(no version)")
+        g = groups.get(key) or groups.setdefault(key, _blank(*key))
+        g["blocks"] += 1
+        if outcome is None:
+            g["open"] += 1
+        elif outcome == _CONTINUED_OUTCOME:
+            g["continued"] += 1
+        elif outcome == _STOPPED_OUTCOME:
+            g["stopped"] += 1
+        elif outcome == _PROVISIONAL_OUTCOME:
+            g["refining"] += 1
+        elif outcome in _OBSERVED_FAILURE_OUTCOMES:
+            g["reblocked"] += 1
+        elif outcome == _RESIDUAL_OUTCOME:
+            g["no_further_activity"] += 1
+        else:
+            # Never bucketed by prefix match. A future `recovered_but_slower` folded into the
+            # numerator by a startswith() would move a score that drives a rewrite decision.
+            g["unrecognised"] += 1
+
+    out = []
+    for g in groups.values():
+        g["settled"] = (g["blocks"] - g["open"] - g["refining"] - g["unrecognised"])
+        # 🔴 THE RESIDUAL IS NOT IN THE DENOMINATOR, AND THIS WAS FOUND BY RUNNING THE READOUT,
+        # not by reviewing it. `no_further_activity` means "we saw nothing more" -- an agent that
+        # gave up, a run that finished the job another way, or a crashed process. It is the one
+        # bucket the spec insists is a residual rather than a measurement, and on the dev store
+        # it is 80% of every settled block. (The DEV store, not production: the suites write into
+        # `agentx_sdk/.agentx/incidents.db`, so it is part traffic and part test output. It shows
+        # the SHAPE honestly -- a run that never retries settles to the residual whatever wrote it
+        # -- but no count from it is a reading about customers.)
+        # With the residual in the denominator the entire board read
+        # `0 kept going (0%)` and the rewrite queue was really ranking "whose runs went quiet
+        # most". Three coaching items were ranked as 0% rewrite candidates on 32, 51 and 21
+        # blocks of which we observed the outcome of exactly NONE.
+        #
+        # So the score is over the outcomes we actually OBSERVED. `reblocked` stays in: being
+        # blocked again after our advice is a real observation, and a damning one. `went_quiet`
+        # is reported per group rather than folded away, because a coaching item whose runs
+        # mostly vanish is a finding too -- just not this one.
+        g["observed"] = g["continued"] + g["stopped"] + g["reblocked"]
+        g["went_quiet"] = g["no_further_activity"]
+        # The floor is on OBSERVED, not on blocks. A group with a thousand blocks and four
+        # observations is the same amount of evidence as a group with four blocks.
+        g["readable"] = g["observed"] >= min_sample
+        # 🔴 None, NOT 0.0, for a group below the floor. A zero here would be indistinguishable
+        # from a coaching item that genuinely never worked, and this number's whole job is to
+        # order a queue -- an unreadable group rendered as 0.0 would sort straight to the top of
+        # it, which is the precise failure criterion 11 exists to prevent.
+        g["score"] = (g["continued"] / g["observed"]) if g["readable"] else None
+        out.append(g)
+
+    out.sort(key=lambda g: (-g["blocks"], g["policy_id"]))
+    # Ascending by score: worst advice first, because that is the work item. Ties broken by MORE
+    # evidence first, so a group scraping past the floor never outranks a well-observed one at
+    # the same score.
+    queue = sorted((g for g in out if g["readable"]),
+                   key=lambda g: (g["score"], -g["observed"]))
+    return {
+        "state": "ok" if since else "no_window",
+        "groups": out,
+        "rewrite_queue": queue,
+        "min_sample": min_sample,
+        "window_since": since,
+        "settle_window_seconds": SETTLE_AFTER_SECONDS,
+        "blocks_all_time": all_time,
+    }
+
+
 def incident_db_census(db_path=None):
     """Diagnostic for ``agentx insights``: where the incident store is and how much
     of it is harvestable. Never raises — lets the CLI explain an empty result
     (wrong path? no recoveries? no judge?) instead of silently showing nothing.
 
-    Returns ``{path, exists, complied, with_resolution}``.
+    Returns ``{path, exists, complied, with_resolution, strays}``.
+
+    ``strays`` lists other incident stores under the project root (BACKLOG P-76). It is
+    populated ONLY when this store has no recovery data to show -- missing, empty, or
+    predating the outcome columns. Those are precisely the states that print a SILENCE,
+    and a silence is where a stray is the likely explanation ("No blocks recorded yet"
+    said to someone whose gateway was filling a different file).
+
+    ⚠️ Gated on ``with_resolution``, NOT on ``complied``. The store that caused this bug
+    holds 4 rows and predates the outcome columns, so it has complied rows and still
+    prints a silence; gating on complied would have skipped the scan in the one case
+    that motivated it. A store with resolutions is the only one that needs no hint.
+
+    An explicit ``db_path`` or ``AGENTX_INCIDENT_DB`` means the caller has already chosen
+    a store, so no scan runs and no hint is printed.
     """
     p = _incident_db_path(db_path)
     info = {"path": p, "exists": os.path.exists(p), "complied": 0,
-            "with_resolution": 0}
+            "with_resolution": 0, "strays": []}
+    chosen = bool(db_path) or bool(os.environ.get("AGENTX_INCIDENT_DB"))
     if not info["exists"]:
+        if not chosen:
+            info["strays"] = incident_db_strays(canonical=p)
         return info
     try:
         conn = sqlite3.connect(p)
@@ -982,6 +1861,8 @@ def incident_db_census(db_path=None):
             conn.close()
     except sqlite3.Error:
         pass
+    if not chosen and not info["with_resolution"]:
+        info["strays"] = incident_db_strays(canonical=p)
     return info
 
 
@@ -1135,7 +2016,7 @@ def _org_rules_path(path=None):
     env = os.environ.get("AGENTX_RULES")
     if env:
         return env
-    return os.path.join(_find_project_root(), DEFAULT_ORG_RULES_PATH)
+    return os.path.join(_anchored_root(), DEFAULT_ORG_RULES_PATH)
 
 
 def load_org_rules(rules_path=None):
