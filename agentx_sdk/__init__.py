@@ -1,9 +1,9 @@
-__version__ = "0.4.27"
+__version__ = "0.4.28"
 # ISO date this version was cut. Drives the OFFLINE staleness notice
 # (pulse.staleness_notice): an old install nags ITSELF to upgrade with no network
 # call, because pip cannot declare a minimum version of the leaf package and so
 # nothing else can reach a pinned install. MUST move with __version__ (BACKLOG C12).
-__released__ = "2026-08-07"
+__released__ = "2026-08-12"
 
 # The rule "never ship SDK source under a version that is ALREADY published" still
 # stands; what is gone is the hand-maintained `__published__` constant that used to
@@ -17,9 +17,21 @@ __released__ = "2026-08-07"
 # stale hand-maintained constant was the only in-tree option, and why the honest move is
 # to stop pretending it is a gate. The rule is now PROCEDURAL, checked at publish time:
 #
-# ▶ Before `twine upload`, confirm the live version is BELOW __version__:
-#     python -c "import json,urllib.request as u; print(json.load(
-#       u.urlopen('https://pypi.org/pypi/agentx-security-sdk/json'))['info']['version'])"
+# ▶ Before `twine upload`, confirm THIS version is not already live. Ask about the exact
+#   version, never the top-level index: `/pypi/<pkg>/json` is CDN-cached and has reported a
+#   stale `info.version` for long enough to wave through an upload of a version that already
+#   existed. The per-version endpoint is not cached the same way.
+#
+#   🔴 THREE OUTCOMES, NOT TWO, AND CONFLATING THEM IS THE WHOLE POINT: free, taken, and
+#   "could not ask". A first cut of this instruction said "a 404 means the number is free"
+#   over a bare urlopen -- but urlopen raises on a 404 AND on a DNS failure, a proxy block or
+#   a timeout, so any network hiccup read as permission to upload. Same fail-open direction as
+#   the cached index it replaced: every failure looks like good news.
+#
+#     py scripts/check_pypi_version_free.py       # 0 = free, 1 = taken, 2 = could not ask
+#
+#   It reads __version__ from this file rather than restating it, so it cannot go stale the
+#   way the retired __published__ marker did.
 
 from .decorators import (
     agentx_protect,

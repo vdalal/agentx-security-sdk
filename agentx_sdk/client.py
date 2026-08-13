@@ -19,7 +19,12 @@ class AgentXClient:
 
     def evaluate_intent(self, agent_id, query, chain_of_thought, receipt_id=None, trace_id=None,
                         action=None, args=None, session_tokens=0, session_cost_usd=0, budget_pool_id=None,
-                        enforcement=None, strike_count=None):
+                        enforcement=None, strike_count=None, tool=None):
+        # `tool` is APPENDED, after the deprecated `strike_count`, not slotted in beside
+        # the fields it belongs with. `strike_count` is retained precisely so existing
+        # direct callers do not break, and inserting ahead of it would hand a caller
+        # that still passes it positionally a `tool` instead. Every in-repo caller uses
+        # keywords; the ordering is for the external ones we cannot see.
         # `strike_count` is DEPRECATED and ignored (issue #80): the gateway owns the
         # strike count + the Path B decision per trace_id now, so a forwarded count
         # can no longer influence the verdict. The parameter is retained only so
@@ -49,7 +54,7 @@ class AgentXClient:
             return {"status": "REASONING_ENGINE_UNREACHABLE", "reason": "no_api_key"}
 
         # =========================================================
-        # 🧭 ACTION / ARGS CONTRACT (declared routing, text fallback)
+        # 🧭 ACTION / ARGS / TOOL CONTRACT (declared routing, text fallback)
         # =========================================================
         # `action` names the tool surface (execute_database_query, fetch_url, …)
         # and `args` carries its structured named fields. Both are best-effort:
@@ -58,6 +63,24 @@ class AgentXClient:
         # gateway's deterministic floor scans it, so even if `action` is wrong or
         # absent the detectors are never starved. Structured when confident,
         # text-fallback always present.
+        #
+        # `tool` is the DECORATED FUNCTION'S OWN NAME, and it is a THIRD channel on
+        # purpose (BACKLOG P-69). The flattening keeps argument VALUES only, so
+        # `delete_all_customer_records(table="customers")` reaches the gateway as the
+        # word "customers" and the verb is simply gone. The name is where that verb
+        # lives, and it is the granularity an operator actually configures against —
+        # a per-context limit is written `support_agent:issue_refund`, which is a TOOL,
+        # not one of the coarse action surfaces above.
+        #
+        # 🔴 IT IS NOT FOLDED INTO `action`, and that separation is the point. `action`
+        # ROUTES: the gateway skips a surface-scoped policy whose target does not match
+        # it. Putting a tool name there routes a database tool off the database
+        # surface, which is what the SDK's old name-derived `filesystem_delete` guess
+        # actually did. Carried separately, a wrong `tool` costs a limit lookup that
+        # misses, never a policy that is skipped.
+        #
+        # No new data category: `query` and `args` already carry the caller's real
+        # argument VALUES, and a function name is the developer's own code identity.
         # =========================================================
         # `strike_count` is intentionally NOT sent: the gateway owns the strike
         # count + the Path B circuit-breaker decision per trace_id (issue #80). The
@@ -76,6 +99,11 @@ class AgentXClient:
             payload["action"] = action
         if args:
             payload["args"] = args
+        # Attached only when non-empty, for the same reason: a direct caller that
+        # passes no tool sends the payload it sends today, and the gateway's
+        # tool-keyed lookups simply do not fire.
+        if tool:
+            payload["tool"] = str(tool)
         # Cumulative session spend for the budget-ceiling floor.
         # Sent like strike_count — the gateway owns the ceiling + verdict. Omitted
         # when zero so an un-metered caller's payload is unchanged.
@@ -96,6 +124,23 @@ class AgentXClient:
         # the gateway's persistence path — is byte-identical to today.
         if str(enforcement or "").strip().lower() == "audit":
             payload["enforcement"] = "audit"
+            # 🔴 CAPABILITY marker, and it exists because the gateway and the SDK deploy
+            # INDEPENDENTLY. This SDK releases EVERY verdict in audit — escalations and
+            # breaker halts included.
+            # Older SDKs do not: they still suspend on an ESCALATED and poll
+            # /v1/status/{receipt_id} for up to 120 seconds.
+            #
+            # So a gateway that stopped parking escalations in audit, talking to an SDK
+            # that still polls, would leave that poll unresolvable — 120s of hang followed
+            # by "Timeout waiting for SOC approval", in the one mode whose entire promise
+            # is that we do not change how their code behaves. Strictly worse than before,
+            # because the parked row at least let a human approve it.
+            #
+            # The gateway therefore keys the full skip on THIS FLAG, not on the posture
+            # alone. Behaviour is then correct in both directions regardless of which
+            # side deploys first, which is the only property worth having here — deploy
+            # ORDERING is not something a released SDK can be made to respect.
+            payload["audit_releases_all"] = True
 
         headers = {
             "Authorization": f"Bearer {api_key}",

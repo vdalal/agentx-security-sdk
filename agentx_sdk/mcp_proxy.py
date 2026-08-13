@@ -96,7 +96,8 @@ try:
     # `agentx status` reads), so a real MCP catch shows up in `agentx status` — not just
     # the streak. Best-effort at the call sites; gated on session_stats["_ledger"] so the
     # routing-core unit tests (which build a bare session_stats) never touch the ledger.
-    from agentx_sdk.db import init_db, log_intercept, log_self_correction, WOULD_BLOCK_STATUS
+    from agentx_sdk.db import (init_db, log_intercept, log_self_correction, record_call,
+                               WOULD_BLOCK_STATUS)
 finally:
     sys.stdout = _real_stdout
 
@@ -121,6 +122,10 @@ _USAGE = (
     "  uvx agentx-mcp --review     see what was stopped. Approve a fix your agent found,\n"
     "                              or mark a block right or wrong.\n"
     "  uvx agentx-mcp --insights   see what your agents have learned to do instead.\n"
+    # Listed for the same reason the Python door lists `agentx audit`: mcp_demo now sends the
+    # reader here, and a command the on-ramp names and --help hides is unfindable the moment
+    # that footer scrolls away.
+    "  uvx agentx-mcp --audit      see what your agents actually DID, call by call.\n"
 )
 
 
@@ -1093,7 +1098,16 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     # whole agent down. `_block_response` is a CallToolResult with isError: true.
     load_err = current_policy_load_error()
     strict = _policy_load_posture() == "strict"
-    if load_err is not None and strict:
+    # 🔴 ...and not in AUDIT. A strict fail-closed is a refusal, and audit refuses nothing:
+    # the decorator releases this exact fault (AgentXPolicyLoadError) and this surface has to
+    # match, or "watch-only" is true of the SDK and false of agentx-mcp. An operator running
+    # the proxy in audit with a malformed .agentx/policies.json would otherwise have EVERY
+    # tools/call answered with isError -- their whole agent broken by the mode we tell them
+    # is safe to try.
+    #
+    # The fault is still recorded and still announced below; only the block is dropped. As
+    # everywhere else here, released is not the same as unnoticed.
+    if load_err is not None and strict and session_stats.get("_enforcement") != "audit":
         req_id = msg.get("id")
         if req_id is not None:
             writer.send(_block_response(req_id, _policy_load_error_message(load_err, mcp=True)))
@@ -1104,6 +1118,38 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # (that metric means "ran unscreened"). Just a once-per-process notice.
         _note_mcp_fail_closed(log)
         return "block"
+
+    if load_err is not None and session_stats.get("_enforcement") == "audit":
+        # The audit twin of the block above. The call is RELEASED, but an unscreened call is
+        # not a clean one, so this is counted and said out loud once — the decorator's
+        # policy_config_faults counter has the same job on that surface. Silence here would
+        # mean an audit run over a broken config reported nothing and looked healthy.
+        #
+        # 🔴 COUNTED IN BOTH POSTURES, deliberately NOT gated on `strict`. The decorator
+        # counts on the fault + audit alone (decorators.py, `if enforcement_level ==
+        # "audit"`), and both surfaces print the SAME end-of-session sentence ("your own
+        # rules were NOT applied"), which is equally true under permissive. Gating this on
+        # strict made one number mean two different things depending on which door the
+        # operator came through, and left permissive+audit with only the mid-session stderr
+        # banner — which is exactly the "it scrolls past, the report is what they read"
+        # argument this counter was added for.
+        session_stats["policy_config_faults"] = session_stats.get("policy_config_faults", 0) + 1
+        # The NOTICE stays strict-only: permissive gets `_note_mcp_policy_degraded` below,
+        # which correctly names the setting that operator actually made.
+        if strict and not session_stats.get("_config_fault_noticed"):
+            session_stats["_config_fault_noticed"] = True
+            try:
+                # Wording corrected with the decorator twin: control does NOT return here,
+                # it continues to evaluate_call_keyless and the WOULD_BLOCK record, so these
+                # calls ARE screened by the built-ins and DO appear in the insights. What is
+                # lost is the operator's own rules. Saying "unscreened" sent them looking
+                # for findings that were already there.
+                print("[agentx-mcp] AUDIT: your policy config could not be READ, so calls "
+                      "are screened by the BUILT-IN floor only and your own rules are NOT "
+                      "applied. Findings under-report what your policies would catch: %s"
+                      % load_err, file=log)
+            except Exception:
+                pass
 
     # `name` is read below but bound INSIDE the try. JSON-RPC permits `params` to be an
     # ARRAY, and this proxy screens an UNTRUSTED client stream -- so `params.get` raises
@@ -1131,12 +1177,18 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         print("[agentx-mcp] shield bypassed (malformed params): %s" % shape_err, file=log)
         return "forward"
 
-    if load_err is not None:
-        # Reached only in PERMISSIVE posture (strict returned above). The built-in floor is
-        # armed and STILL screens this call, so it is NOT a fail-open -- do NOT count it (an
-        # earlier cut did, so a DROP TABLE the built-ins then BLOCKED was mislabeled "ran
-        # unscreened" and polluted the metric). Warn once; a genuine fail-open is only the
-        # built-in scan itself throwing, counted in the except below.
+    if load_err is not None and not strict:
+        # PERMISSIVE posture only. The built-in floor is armed and STILL screens this call, so
+        # it is NOT a fail-open -- do NOT count it (an earlier cut did, so a DROP TABLE the
+        # built-ins then BLOCKED was mislabeled "ran unscreened" and polluted the metric).
+        # Warn once; a genuine fail-open is only the built-in scan itself throwing, counted in
+        # the except below.
+        #
+        # 🔴 `and not strict` is load-bearing, and its comment used to say "strict returned
+        # above" -- true until audit stopped returning. Strict + audit now falls through to
+        # here, and this banner names AGENTX_POLICY_LOAD=permissive, a setting that operator
+        # did NOT make. They would have gone looking for a config they never wrote, on top of
+        # a second notice about the fault they were already told about six lines up.
         _note_mcp_policy_degraded(log)
 
     try:
@@ -1198,6 +1250,28 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 # (B): form the abstract recovery-pair, capturing the SAFE call's structural
                 # signature (value-free) so the pair is a useful reframe, not just a counter.
                 harvest.note_recovery(tool_key, params.get("arguments"))
+        # P-92 INVENTORY, the MCP twin of the decorator's _record_inventory. This surface gets
+        # it for the same reason it already shares the ledger, the category vocab and the
+        # recovery definition: the two keyless paths are kept from drifting deliberately, and
+        # an inventory covering only the decorator would make `agentx audit` quietly mean
+        # something different depending on how the user wired us in.
+        #
+        # Audit posture only, matching the decorator. A clean call carries no verdict, so
+        # unlike the would-block twin below there is nothing to release and nothing to
+        # narrate -- this path stays SILENT, because it now runs on every passing call and a
+        # per-call line would bury the developer's own tool output.
+        if session_stats.get("_enforcement") == "audit" and session_stats.get("_ledger"):
+            try:
+                seq = session_stats.get("_ledger_seq", 0)
+                session_stats["_ledger_seq"] = seq + 1
+                inv_trace = "%s-%d" % (session_stats.get("_trace_id") or "mcp-session", seq)
+                # `stats=` is what puts this surface on the funnel. Without it the proxy
+                # wrote a full inventory and pulsed audit_calls=0, so every MCP install
+                # reported "never ran audit" and the rung read 0 for that whole population.
+                record_call(inv_trace, "mcp_proxy", tool_key, params.get("arguments"),
+                            stats=session_stats)
+            except Exception:
+                pass
         return "forward"
 
     # AUDIT posture: this call matched a policy, but AGENTX_ENFORCEMENT=audit — record the
@@ -1222,7 +1296,12 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         try:
             # `agentx-mcp --insights`, never `agentx insights`: under uvx the SDK's `agentx`
             # script is not on PATH, so the bare form sent this reader to a command not found.
-            print("[agentx-mcp] AUDIT: would have stopped '%s' (%s), but AGENTX_ENFORCEMENT=audit, "
+            # "audit is on", not "AGENTX_ENFORCEMENT=audit". On THIS door the env var is
+            # genuinely the only source, so the old wording was true here -- and it is changed
+            # anyway, so the rule that stops the other four sites regressing can be flat.
+            # A tripwire with a carve-out is a tripwire with a hole in exactly the shape of
+            # the next bug; test_audit_copy_never_asserts_the_env_var.py is that rule.
+            print("[agentx-mcp] AUDIT: would have stopped '%s' (%s), but audit is on, "
                   "so it ran. Recorded. See it: uvx agentx-mcp --insights"
                   % (tool_key, decision.get("policy_name")), file=log)
         except Exception:
@@ -1497,6 +1576,18 @@ def _protection_report(session_stats, log):
             print("[agentx-mcp]   -> %d call(s) could NOT be checked and were allowed through (a BUG on "
                   "our side, not a policy decision). Please report: https://bit.ly/agentfirewall"
                   % failopens_n, file=log)
+        # Broken policy config in AUDIT. _screen_message increments this counter; without a
+        # line here it was WRITE-ONLY, which is the same defect §0⑦ of the spec records on the
+        # decorator: a test asserted the counter and passed while the operator saw nothing. The
+        # once-per-process stderr notice is not a substitute -- it scrolls past mid-session,
+        # and this is the end-of-session report they actually read. Distinct from the
+        # fail-open line above on purpose: that one says "our bug", this one says "your file",
+        # and sending an operator into the wrong system costs them an afternoon.
+        config_faults_n = int(session_stats.get("policy_config_faults", 0) or 0)
+        if config_faults_n:
+            print("[agentx-mcp]   -> %d call(s) ran with your policy file UNREADABLE: screened by the "
+                  "BUILT-IN floor only, your own rules were NOT applied (findings under-report)."
+                  % config_faults_n, file=log)
         protection = pulse.record_protection(session_stats)
         if protection:
             print("[agentx-mcp] protection streak: %s." % pulse.format_protection_line(protection), file=log)
@@ -1644,6 +1735,15 @@ def main(argv=None):
         # script, so this only ever failed on the uvx door -- which is the door /docs
         # documents.) Same reader, same code, reachable from the entry point they have.
         _reader_globals("execute_insights", argv[1:])
+        return 0
+    if argv and argv[0] == "--audit":
+        # 🔴 THE READER FOR THE ROWS THIS PROXY NOW WRITES (P-92). The clean-forward path
+        # records an inventory row per passing call, and without this flag that data goes in
+        # on the MCP door and never comes out: `agentx audit` is not on PATH under uvx, and
+        # it reads a cwd-relative ledger rather than the per-user MCP one. Recording data a
+        # user cannot read is worse than not recording it, so the writer and this arrived
+        # together. Same reachability rule as --review / --insights above.
+        _reader_globals("execute_audit", argv[1:])
         return 0
     if argv and argv[0] == "--":          # explicit end-of-options separator
         argv = argv[1:]

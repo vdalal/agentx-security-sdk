@@ -101,6 +101,27 @@ No Python in your stack? Run it on demand with [`uvx`](https://docs.astral.sh/uv
 
 (`pipx run agentx-mcp <real server command>` works the same way.) A blocked call comes back to the agent as a coaching tool error it can self-correct on, so the run keeps going and the dangerous call never reaches the server.
 
+## Runnable examples
+
+`examples/` holds one script per behaviour, each small enough to read in a sitting. They live in the published sdist but not in the wheel, so `pip install` alone does not put them on your disk. This repository is where you read or clone them.
+
+```bash
+git clone https://github.com/vdalal/agentx-security-sdk
+cd agentx-security-sdk
+pip install agentx-security-sdk
+python examples/00_quickstart_pip.py
+```
+
+`00_quickstart_pip.py` needs nothing beyond the SDK itself. A prompt-injected `DROP TABLE` reaches a protected tool and is stopped in-process, with no key and no network call.
+
+The other scripts load a local `.env` for convenience, so install their extras first:
+
+```bash
+pip install -r examples/requirements.txt
+```
+
+[`examples/README.md`](examples/README.md) lists what each script demonstrates and what it needs to run. Several of the later ones drive the hosted gateway and require a key, which that table marks.
+
 ## What is open, and what is hosted
 
 This repo is the keyless **Shield**: deterministic, in-process blocking with in-band coaching, MIT-licensed, no account required. It is the whole story for stopping the catastrophic call before it executes.
@@ -111,8 +132,9 @@ The **Recover** tier turns a block into a completed task. When you connect the h
 
 ```bash
 pip install -e .
-pytest agentx_sdk/
 ```
+
+This repository is a snapshot of exactly what `pip install agentx-security-sdk` publishes, so it carries shipping code and examples only. The test suite is not part of the published package and is not mirrored here.
 
 ## License
 

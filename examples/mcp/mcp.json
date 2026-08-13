@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "agentx-mcp",
+      "args": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/data"]
+    }
+  }
+}

@@ -861,8 +861,13 @@ def list_recent_incidents(limit=50, db_path=None):
     try:
         conn = sqlite3.connect(p)
         try:
+            # `, rowid DESC` is the same rule as the run rollup below and as the store's own
+            # readers: created_at is caller-supplied and NOT unique, so ordering on it alone
+            # leaves ties to SQLite -- and under a LIMIT that means the newest of two blocks
+            # written in the same instant can be the one dropped from `agentx review`.
             cur = conn.execute(
-                "SELECT * FROM incidents ORDER BY created_at DESC LIMIT ?", (int(limit),))
+                "SELECT * FROM incidents ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (int(limit),))
             cols = [c[0] for c in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
         finally:
@@ -891,7 +896,7 @@ def find_incidents_by_receipt_prefix(prefix, db_path=None):
         try:
             cur = conn.execute(
                 "SELECT * FROM incidents WHERE receipt_id LIKE ? ESCAPE '\\' "
-                "ORDER BY created_at DESC", (escaped + "%",))
+                "ORDER BY created_at DESC, rowid DESC", (escaped + "%",))
             cols = [c[0] for c in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
         finally:
@@ -1109,7 +1114,21 @@ _DOMAIN_TAG_VOCAB = frozenset({
 
 # Below this many blocks a rate is NOT REPORTED. Three blocks and one recovery is not "33%",
 # it is noise wearing a percentage, and a percentage is what gets quoted.
-RECOVERY_MIN_SAMPLE = 10
+#
+# 🔴 ONE CONSTANT, NOT TWO THAT HAPPEN TO AGREE. P-97 added db._RATE_MIN_SAMPLE for the
+# status screen and the session summary, encoding this identical rule at the identical value
+# in a second file. Two copies of a threshold do not disagree on the day they are written;
+# they disagree the day someone tunes one of them, and then two screens report different
+# floors for the same ratio and neither is wrong on its own. Aliased rather than re-declared,
+# so editing the source constant is the only way to change either. (db imports only
+# sqlite3/time/os, so this cannot cycle.)
+#
+# ⚠️ THE ALIAS BINDS ONCE, AT IMPORT. An earlier version of this comment said "there is
+# nothing to keep in sync", which overstates it: monkeypatching db._RATE_MIN_SAMPLE at
+# RUNTIME does not move this name, and `recovery_summary`'s default argument below binds it
+# a second time at def-time. That only matters to a test that patches one and asserts on the
+# other; for shipped code the value has exactly one source.
+from .db import _RATE_MIN_SAMPLE as RECOVERY_MIN_SAMPLE  # noqa: E402
 
 # 🔴 THE PER-COACHING FLOOR IS SEPARATE AND HIGHER, and criterion 11 asks for it by name for a
 # reason the per-class floor does not face: the rewrite queue is ranked ASCENDING, so the groups
@@ -1497,10 +1516,17 @@ def recovery_summary(path=None, min_sample=RECOVERY_MIN_SAMPLE):
                     "min_sample": min_sample}
         since, allowed = _observation_window(conn)
         try:
+            # `rowid` is SELECTED because it is the tie-break that decides which block ENDED a
+            # run when two share a created_at -- see the `max()` key below, which is the line
+            # that actually decides it. The ORDER BY does NOT: `max()` returns the FIRST
+            # maximal element, so an ordered scan without that key would pick the EARLIEST of
+            # a tie, which is deterministic and wrong. It is here only so the scan this
+            # function reads is reproducible (P-85).
             rows = conn.execute(
                 "SELECT domain_tag, outcome_next, trace_id, created_at, "
-                "COALESCE(parked_status, status) FROM incidents "
-                "WHERE created_at >= ?", (since,)).fetchall() if since else []
+                "COALESCE(parked_status, status), rowid FROM incidents "
+                "WHERE created_at >= ? ORDER BY created_at, rowid",
+                (since,)).fetchall() if since else []
             # 🔴 COUNTED, NOT INFERRED BY SUBTRACTION. `created_at >= ?` silently drops a row
             # whose stamp is NULL (a NULL comparison is NULL, never true), and deriving the
             # pre-window figure as all_time minus what survived then reported those rows as
@@ -1553,7 +1579,7 @@ def recovery_summary(path=None, min_sample=RECOVERY_MIN_SAMPLE):
     # cannot, because the middleware overwrites it on recovery, which is the bug parked_status
     # was added for. Falls back to `status` only for rows written before that column existed.
     escalations = {"total": 0, "proceeded": 0, "open": 0, "closed_other": 0}
-    for domain_tag, outcome, trace_id, created_at, parked in rows:
+    for domain_tag, outcome, trace_id, created_at, parked, rowid in rows:
         if parked in _HUMAN_APPROVAL_STATUSES or outcome in _ESCALATION_OUTCOMES:
             # 🔴 KEYED ON WHAT IT WAS, WHATEVER THE OUTCOME SAYS. The first cut only
             # consulted `parked` when the outcome was still NULL, so an escalation that
@@ -1579,7 +1605,7 @@ def recovery_summary(path=None, min_sample=RECOVERY_MIN_SAMPLE):
         _count(by_class.setdefault(key, _blank()), outcome)
         _count(overall, outcome)
         if trace_id:
-            runs.setdefault(trace_id, []).append((created_at or "", outcome))
+            runs.setdefault(trace_id, []).append((created_at or "", rowid, outcome))
 
     for bucket in list(by_class.values()) + [overall]:
         # SETTLED blocks are the only denominator a rate may use. An open block has not happened
@@ -1590,10 +1616,22 @@ def recovery_summary(path=None, min_sample=RECOVERY_MIN_SAMPLE):
         bucket["readable"] = bucket["settled"] >= min_sample
 
     # Run level: of the runs that hit at least one block, how many ended on a recovery.
-    # Sort on the TIMESTAMP ALONE. Sorting whole tuples falls through to comparing the second
-    # element when two incidents on a run share a created_at, and an unresolved outcome is None
-    # -- None < str raises TypeError and kills `agentx insights`. created_at is caller-supplied
-    # via save_incident, and /v1/incident is a caller that pins its own values.
+    #
+    # 🔴 SORT ON (created_at, rowid) — NEVER on the timestamp alone, and NEVER on the whole
+    # tuple (P-85). The two failure modes it is threading between:
+    #
+    #   whole tuple    falls through to comparing the OUTCOME when two incidents on a run
+    #                  share a created_at, and an unresolved outcome is None. `None < str`
+    #                  raises TypeError and kills `agentx insights`.
+    #   timestamp only was the fix for that, and it made ties ARBITRARY: `max()` returns
+    #                  whichever equal element it met first, so which block "ended" the run
+    #                  depended on row order. Measured: the same two-block run reported
+    #                  ended_on_a_recovery as 0 or 1 across identical runs, 4 failures in 5.
+    #
+    # `rowid` is monotonic, always present, never NULL, and needs no coercion, so it gives a
+    # TOTAL order that cannot raise. created_at is caller-supplied via save_incident and
+    # /v1/incident pins its own values, so same-second blocks on one trace are ordinary
+    # traffic, not a test artifact.
     # 🔴 THE DENOMINATOR IS SETTLED RUNS, NOT RUNS. This gate counted every run that hit a
     # block, unlike every other denominator in this function, which uses `settled`. A run whose
     # last block is still OPEN has not finished or failed to finish -- it has not happened yet.
@@ -1602,7 +1640,7 @@ def recovery_summary(path=None, min_sample=RECOVERY_MIN_SAMPLE):
     # the per-class table follows: a zero must earn its meaning.
     finished = settled_runs = 0
     for events in runs.values():
-        last = max(events, key=lambda e: e[0])[1]
+        last = max(events, key=lambda e: (e[0], e[1]))[2]
         if last not in _SETTLED_OUTCOMES:
             continue            # still open, or an outcome this version cannot read
         settled_runs += 1
@@ -1866,6 +1904,17 @@ def incident_db_census(db_path=None):
     return info
 
 
+def reviewable_items_with_truncation(db_path=None, cluster=True):
+    """``(items, page_of_more)`` — the public form. ``page_of_more`` comes from the READ
+    that was actually truncated, never from comparing two totals.
+
+    Anything that prints a "showing N of M" must take the flag from here. Deriving it as
+    ``total > REVIEW_READ_CAP`` looks equivalent and is not: adopt items are not subject to
+    the cap, so five adopt items plus 198 pending blocks crosses the threshold while
+    nothing was truncated at all."""
+    return _reviewable_with_truncation(db_path, cluster)
+
+
 def reviewable_items(db_path=None, cluster=True):
     """Items awaiting a human decision, for ``agentx review`` — the batched label-channel
     capture. Two kinds, teach-wins first:
@@ -1881,6 +1930,188 @@ def reviewable_items(db_path=None, cluster=True):
     yes/no decisions just means each adopted one silently overwrites the last (wasted
     decisions on an LLM-paraphrased corpus, which rarely produces byte-identical text).
     The rest stay browsable by number via ``agentx insights`` / ``agentx adopt <#>``."""
+    items, _ = _reviewable_with_truncation(db_path, cluster)
+    return items
+
+
+# The recency window for the two review reads. It is DELIBERATE: reviewable_items feeds
+# count_reviewable, which runs at atexit for every protected session and must stay cheap.
+# What was NOT deliberate is printing a saturated count as if it were a total -- see P-80.
+REVIEW_READ_CAP = 200
+
+
+def _incidents_by_verdict_state(limit, labelled, db_path=None):
+    """``(rows, more_exist)`` -- blocks WITH a verdict (``labelled=True``) or WITHOUT one
+    (``labelled=False``), newest first, the LIMIT applied to the rows that QUALIFY rather
+    than to recent incidents in general.
+
+    ONE function, not two near-copies, because both review reads have the same bug and a
+    rule with two entry points gets fixed at one of them. ``agentx review`` and
+    ``agentx review --labeled`` are the two members.
+
+    🔴 THIS IS THE FIX FOR P-80's SECOND FACE. ``list_recent_incidents(200)`` then filtering
+    in Python spends the window on rows that need no review, so 250 recently-labelled
+    incidents in front of 50 unlabelled ones yields ZERO and the nudge disappears for a user
+    with a real backlog. Filtering in SQL spends the window on the rows we want.
+
+    Degrades on an older store rather than raising: the ``label_verdict`` column may not
+    exist (this read predates it), in which case nothing is labelled -- so every blocking
+    row is pending and NOTHING is labelled. Missing store / locked DB / no ``status``
+    column -> ``([], False)``, the honest empty state every caller already renders."""
+    p = _incident_db_path(db_path)
+    if not os.path.exists(p):
+        return [], False
+    statuses = sorted(_BLOCKING_STATUSES)
+    try:
+        conn = sqlite3.connect(p)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(incidents)")}
+            if "label_verdict" not in cols:
+                # A store predating the label channel. Nothing can carry a verdict, so the
+                # labelled read is empty and the pending read still needs `status`.
+                if labelled:
+                    return [], False
+                if "status" not in cols:
+                    return [], False
+            if labelled:
+                # 🔴 NO STATUS CLAUSE, deliberately. The Python version this replaces
+                # filtered on `label_verdict` ALONE, so adding `status IN (...)` here would
+                # silently drop any labelled row whose status is not blocking. This change
+                # is about WHICH ROWS THE WINDOW IS SPENT ON, not about which rows qualify;
+                # changing both at once is how a fix ships a second behaviour nobody asked
+                # for.
+                where, params = "label_verdict IS NOT NULL AND label_verdict != ''", []
+            else:
+                if "status" not in cols:
+                    return [], False
+                where = "status IN (%s)" % ",".join("?" for _ in statuses)
+                if "label_verdict" in cols:
+                    where += " AND (label_verdict IS NULL OR label_verdict = '')"
+                params = list(statuses)
+            # Same tie-break as list_recent_incidents: created_at is caller-supplied and
+            # NOT unique, so ordering on it alone lets SQLite drop the newer of two rows
+            # written in the same instant.
+            order = ("ORDER BY created_at DESC, rowid DESC" if "created_at" in cols
+                     else "ORDER BY rowid DESC")
+            cur = conn.execute(
+                "SELECT * FROM incidents WHERE %s %s LIMIT ?" % (where, order),
+                params + [int(limit) + 1])            # +1: see _reviewable_with_truncation
+            names = [c[0] for c in cur.description]
+            rows = [dict(zip(names, r)) for r in cur.fetchall()]
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return [], False
+    more_exist = len(rows) > limit
+    rows = rows[:limit]
+    for r in rows:
+        r["resolution_path"] = _parse_resolution_path(r.get("resolution_path"))
+    return rows, more_exist
+
+
+def count_incidents(db_path=None):
+    """Total rows in the store. A ``COUNT(*)``.
+
+    ⚠️ NO PRODUCTION CALLER RIGHT NOW, and the history is the reason it is worth keeping.
+    It was added to gate ``agentx review``'s "this can take a minute" banner on the size of
+    the walk, after the first gate (pending count alone) promised a wait that never came.
+    That was wrong too: reading rows is cheap (~0.4s for 43,000) and the cost is the
+    per-row WRITES, so gating on stored rows fired the banner on every run forever for
+    anyone with a large store. The banner gates on the writes now. Kept because "how big is
+    this store" is a real question the retention work (P-97) will need to ask, and because
+    the docstring is the record of why it must not be used for timing."""
+    p = _incident_db_path(db_path)
+    if not os.path.exists(p):
+        return 0
+    try:
+        conn = sqlite3.connect(p)
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] or 0)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
+def count_awaiting_verdict(db_path=None):
+    """The EXACT number of blocks with no verdict yet. A ``COUNT(*)``, so it is cheap
+    enough for the atexit nudge and does not materialise a single row.
+
+    🔴 WHY EXACT AND NOT "200+". Three surfaces print this number and they disagreed on a
+    real store (founder's, 2026-08-10): ``agentx review --stats`` counted the whole store
+    and said **17,711 blocks still awaiting a verdict**, while the session-end nudge and
+    the walkthrough header both read a 200-row window and could not say anything but 200.
+    A reader with all three in front of them cannot tell which is the size of their job.
+    The cap on the WALKTHROUGH is real work-limiting and stays; the cap on the COUNT was
+    never anything but an artifact of reusing the list-read to do arithmetic."""
+    p = _incident_db_path(db_path)
+    if not os.path.exists(p):
+        return 0
+    statuses = sorted(_BLOCKING_STATUSES)
+    try:
+        conn = sqlite3.connect(p)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(incidents)")}
+            if "status" not in cols:
+                return 0
+            where = "status IN (%s)" % ",".join("?" for _ in statuses)
+            if "label_verdict" in cols:
+                where += " AND (label_verdict IS NULL OR label_verdict = '')"
+            row = conn.execute(
+                "SELECT COUNT(*) FROM incidents WHERE %s" % where, statuses).fetchone()
+            return int(row[0] or 0)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+
+
+def _reviewable_with_truncation(db_path=None, cluster=True):
+    """``(items, hit_the_cap)`` -- the review backlog plus whether the read window was
+    exhausted.
+
+    🔴 THE +1 IS THE WHOLE POINT (P-80, reproduced 2026-08-10). Reading exactly
+    ``REVIEW_READ_CAP`` rows cannot distinguish "there are exactly 200" from "there are
+    thousands and you saw 200", and the session-end nudge printed the second as the first:
+    seed 250 reviewable blocks and it prints "200 item(s)"; seed 500 and it prints "200"
+    again. An operator reads that as the size of the job. Asking for one row MORE than we
+    keep costs a single row per session and makes the number honest -- either it is the
+    count, or it visibly is not.
+
+    🔴 AND THE WINDOW IS SPENT ON ROWS THAT QUALIFY, which is the second half of the same
+    defect and the more damaging one. This used to take the 200 most recent INCIDENTS and
+    filter them here, so rows that need no review still consumed the window: a store with
+    250 recently-labelled incidents in front of 50 unlabelled ones returned ZERO, the
+    nudge vanished for a user with a real backlog, and `agentx review` showed an empty
+    list over the same window. Measured 2026-08-10: 50 items awaiting review, nothing on
+    screen. Filtering in SQL means the count and the walkthrough see the same items, and
+    ``hit_the_cap`` now means "more than 200 things ACTUALLY await review" rather than
+    "more than 200 incidents exist", which is what a reader takes "200+" to mean anyway.
+    """
+    items = _adopt_items(db_path, cluster)
+    raw, hit_the_cap = _incidents_by_verdict_state(REVIEW_READ_CAP, labelled=False,
+                                                   db_path=db_path)
+    for r in raw:
+        items.append({
+            "kind": "verdict",
+            "receipt_id": r.get("receipt_id"),
+            "policy_id": r.get("policy_id"),
+            "policy_violated": r.get("policy_violated"),
+            "status": r.get("status"),
+            "label_safe_path": r.get("label_safe_path"),
+            "created_at": r.get("created_at"),
+            "challenge_issued": r.get("challenge_issued"),
+            "agent_cot": r.get("agent_cot"),
+            "raw_payload": r.get("raw_payload"),
+        })
+    return items, hit_the_cap
+
+
+def _adopt_items(db_path=None, cluster=True):
+    """The recoveries worth offering, one per policy. Split out so ``review_backlog_size``
+    can count them WITHOUT also running the pending-blocks query and materialising 200
+    verdict dicts it drops on the next line -- that ran at ``atexit`` for every protected
+    session and opened the store twice to answer one question."""
     items = []
     _store = load_overrides()          # once for the whole loop, not twice per policy
     for pid, bucket in harvest_candidates(db_path, cluster=cluster).items():
@@ -1900,21 +2131,33 @@ def reviewable_items(db_path=None, cluster=True):
             "resolution_type": top.get("resolution_type"),
             "count": top.get("count"),
         })
-    for r in list_recent_incidents(limit=200, db_path=db_path):
-        if r.get("status") in _BLOCKING_STATUSES and not r.get("label_verdict"):
-            items.append({
-                "kind": "verdict",
-                "receipt_id": r.get("receipt_id"),
-                "policy_id": r.get("policy_id"),
-                "policy_violated": r.get("policy_violated"),
-                "status": r.get("status"),
-                "label_safe_path": r.get("label_safe_path"),
-                "created_at": r.get("created_at"),
-                "challenge_issued": r.get("challenge_issued"),
-                "agent_cot": r.get("agent_cot"),
-                "raw_payload": r.get("raw_payload"),
-            })
     return items
+
+
+def review_backlog_size(db_path=None):
+    """``(count, more_than_we_will_show)`` for every surface that PRINTS the backlog size.
+
+    The count is EXACT: a ``COUNT(*)`` for the pending blocks plus the adopt items. The
+    flag says the walkthrough will show fewer than the count, so a caller can render
+    "showing the first 200" rather than pretending the two numbers are one.
+
+    🔴 THE COUNT USED TO BE THE LENGTH OF A CAPPED LIST, which is how three surfaces ended
+    up disagreeing about one number on a real store: ``--stats`` said 17,711 awaiting, the
+    nudge said 200, the walkthrough header said 200. Only one of those was the size of the
+    job. Counting and listing are different questions and the cap belongs to the second.
+
+    🔴 ``more_than_we_will_show`` IS NOT A TRUNCATION FLAG and callers must not use it as
+    one. The cap applies to the pending BLOCKS only, so five adopt items behind 198 pending
+    blocks pushes the total past 200 while nothing was truncated. Anything rendering
+    "showing N of M" takes its flag from ``reviewable_items_with_truncation``, which gets it
+    from the read that was actually cut short."""
+    try:
+        adopt = len(_adopt_items(db_path, cluster=False))
+        pending = count_awaiting_verdict(db_path)
+        total = adopt + pending
+        return total, pending > REVIEW_READ_CAP
+    except Exception:
+        return 0, False
 
 
 def labeled_items(db_path=None):
@@ -1923,8 +2166,20 @@ def labeled_items(db_path=None):
     labeled, an item vanishes from the normal walkthrough with no way back to see or
     change that decision. Same "verdict" item shape as ``reviewable_items``, plus the
     current ``label_verdict`` so it can be shown before it's (maybe) overwritten."""
+    return labeled_items_with_truncation(db_path)[0]
+
+
+def labeled_items_with_truncation(db_path=None):
+    """``(items, more_exist)`` — the other member of P-80's class, and it had the same bug.
+
+    The Python-side filter spent the 200-row window on rows that had NO verdict, so an
+    operator whose recent blocks are all pending saw an empty ``--labeled`` list over a
+    store holding 25,601 labelled ones. Filtered in SQL now, from the same one entry point
+    as the pending read."""
     items = []
-    for r in list_recent_incidents(limit=200, db_path=db_path):
+    rows, more_exist = _incidents_by_verdict_state(REVIEW_READ_CAP, labelled=True,
+                                                   db_path=db_path)
+    for r in rows:
         if r.get("label_verdict"):
             items.append({
                 "kind": "verdict",
@@ -1939,7 +2194,7 @@ def labeled_items(db_path=None):
                 "agent_cot": r.get("agent_cot"),
                 "raw_payload": r.get("raw_payload"),
             })
-    return items
+    return items, more_exist
 
 
 def count_reviewable(db_path=None):
@@ -1948,11 +2203,12 @@ def count_reviewable(db_path=None):
     near-duplicate merge: the count is invariant under clustering (adopt items are
     one-per-policy; verdict items don't cluster at all), so this returns the SAME
     number ``reviewable_items()`` would, without the O(k^2) difflib pass. Defensive:
-    0 on any error / absent store, so the nudge stays quiet on a plain or keyless run."""
-    try:
-        return len(reviewable_items(db_path, cluster=False))
-    except Exception:
-        return 0
+    0 on any error / absent store, so the nudge stays quiet on a plain or keyless run.
+
+    Returns the bare int. Anything that PRINTS this number must use review_backlog_size()
+    instead, which also says whether the number saturated -- printing a capped count as a
+    total is P-80."""
+    return review_backlog_size(db_path)[0]
 
 
 def label_stats(db_path=None):

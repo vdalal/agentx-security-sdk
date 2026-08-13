@@ -7,4 +7,37 @@
 # sdist. The public PyPI + MIT-mirror surface stays shipping-code-only.
 prune sdk_tests
 recursive-exclude sdk_tests *
+
+# THE EXAMPLES, ON PURPOSE, AND ONLY THE SOURCE FILES.
+#
+# The sdist is what the public MIT mirror is generated from (its SOURCES.txt surface), so
+# until now the mirror carried the SDK with no example of using it, and every CLI screen that
+# wanted to point a reader at one had nothing reachable to point at: a `pip install` user has
+# no repo, and the monorepo is private. `agentx demo --audit` covers the reader who wants to
+# RUN one; this covers the reader who wants to READ one.
+#
+# Scoped to *.py so the ledger and caches an example leaves behind when somebody runs it
+# (.agentx.db, __pycache__/, .agentx/) can never be swept into a release. The mirror is a
+# published surface and a stray ledger on it is a leak, not a mess.
+#
+# 🔴 THE INCLUDE LIST IS REVIEWED AS PUBLISHED COPY, NOT AS A FILE LIST. The first version of
+# it was a glob, and the glob was wrong three ways at once: `ts-guard/` documents the gateway
+# wire contract and cites `backend/gateway.py:5703` in its comments, which republishes the
+# layout and line offsets of the CLOSED half of this product; it carried a Vitest suite onto
+# a surface this file's own first paragraph says is shipping-code-only; and every example
+# imports `python-dotenv`, which `install_requires` does not bring, so the scripts were
+# runnable-looking and not runnable. `sdk_tests/test_published_example_surface.py` now
+# asserts all three against the real files, and it found a fourth (an example printing a path
+# inside our private `eval/`) that review did not.
+#
+# ts-guard is deliberately NOT here. It is a demonstration of the gateway's contract, and the
+# gateway is the part nobody outside can read.
+include examples/*.py
+include examples/requirements.txt
+include examples/README.md
+include examples/mcp/*.py
+include examples/mcp/*.json
+include examples/mcp/README.md
+
 global-exclude *.pyc
+global-exclude .agentx.db

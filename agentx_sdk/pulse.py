@@ -63,11 +63,17 @@ _TIMEOUT = 1.0                     # seconds — best-effort; bounds the atexit 
 # splits had_block/first_block_ever (booleans) out from the count keys.
 _ALLOWED_KEYS = {"install_id", "sdk_version", "python", "os", "first_seen", "ts",
                  "mode", "gateway_present", "reasoning_enabled", "contributed",
-                 "block_category", "integration", "session"}
+                 "block_category", "integration", "session", "ran_audit_report"}
 _ALLOWED_SESSION_KEYS = {
     "tools_monitored", "intercepts", "critical_blocks",
     "human_escalations", "self_corrections", "would_blocks",
     "had_block", "first_block_ever", "shield_failopens",
+    # P-92. COUNTS ONLY -- the tool NAMES that produced them stay on the user's disk, in the
+    # same class as the raw payload we refuse. `audit_calls` is the first signal that can
+    # distinguish "wired us in and ran a real agent" from "installed and never ran", because
+    # every existing counter needs something to have been CAUGHT before it moves, and the
+    # population this rung is aimed at is precisely the one nothing catches.
+    "audit_calls", "audit_tools",
 }
 
 
@@ -248,6 +254,37 @@ def mark_contributed(state=None, cursor=None):
         state["last_contributed"] = date.today().isoformat()
         if cursor:
             state["last_contributed_cursor"] = cursor
+        _save_state(state)
+    except Exception:
+        pass
+
+
+def mark_audit_report_run(state=None):
+    """Record that a human ran `agentx audit` — the P-92 rung being climbed. STICKY.
+
+    The conversion the funnel is missing is not "did audit record something", which the
+    session counts now answer, but "did anyone LOOK". Those are two processes: the agent run
+    writes the inventory, the report reads it, and only the second one is a person choosing
+    to take the next step. Same shape and stickiness as mark_contributed.
+
+    Never raises: this is called from a reader command whose job is to print a screen, and
+    telemetry must never be the reason that screen fails.
+
+    🔴 EXCLUDED FROM AUTOMATION, like every other genuine-usage signal. This flag is the
+    CONVERSION EVENT the P-92 funnel is built around and it is STICKY, so one CI job or one
+    contributor's `pytest` marks that install as having climbed the rung permanently -- and
+    the rung can never be un-climbed to correct it. `record_protection` and `maybe_emit_nudge`
+    already refuse in automation on exactly this reasoning; this writer shipped without the
+    gate rather than with a decision to skip it.
+    """
+    try:
+        if is_automation_context():
+            return
+        if state is None:
+            state = _load_state()
+        _ensure_identity(state)
+        state["ran_audit_report"] = True
+        state["last_audit_report"] = date.today().isoformat()
         _save_state(state)
     except Exception:
         pass
@@ -733,7 +770,24 @@ def build_payload(session_stats, state, first_block_ever=None):
             # a traceback can carry a file path, an argument, or a fragment of the user's
             # data, and this allowlist exists precisely to keep that off the wire.
             "shield_failopens": int(session_stats.get("shield_failopens", 0)),
+            # P-92 THE AUDIT RUNG. `pip install` -> `agentx demo` -> audit is the ladder, and
+            # until now the funnel went blind at the third step: every other counter here
+            # requires something to have been CAUGHT, so an install that wired us in and ran
+            # a well-behaved agent was indistinguishable from a download that never ran. That
+            # is the exact population the rung exists for. audit_calls > 0 with would_blocks
+            # 0 is the state we could not previously see: EVALUATING and nothing to catch.
+            #
+            # audit_tools is the shape of the run, not just its size -- one tool called 500
+            # times and 12 tools called once are different installs and the same audit_calls.
+            # Both are counts; the NAMES stay on the user's disk.
+            "audit_calls": int(session_stats.get("audit_calls", 0)),
+            "audit_tools": int(session_stats.get("audit_tools", 0)),
         },
+        # CROSS-PROCESS, so it rides top-level off the persisted state rather than the
+        # session: the agent run that records the inventory and the `agentx audit` that reads
+        # it are two different processes, and the conversion we care about is whether the
+        # human ever looked. Same shape as `contributed`.
+        "ran_audit_report": bool(state.get("ran_audit_report")),
     }
 
 

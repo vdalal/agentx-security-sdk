@@ -1,0 +1,14 @@
+# What the examples need on top of the SDK itself.
+#
+# `pip install agentx-security-sdk` brings `requests` and nothing else, deliberately: the
+# shield has one dependency. The examples load a local .env for convenience, which is a
+# habit of the examples and not of the product, so the package that does it lives here
+# rather than in install_requires.
+#
+# 00_quickstart_pip.py needs NONE of this and imports only the SDK, on purpose: it is the
+# file to hand someone who has just run pip install.
+python-dotenv>=1.0.0
+
+# Only the reasoning/recovery demos (01, 02, 03, 07, 10) drive a real LLM, and only those
+# need this. They also need a GEMINI_API_KEY and the gateway running.
+google-genai>=0.3.0

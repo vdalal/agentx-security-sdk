@@ -155,8 +155,13 @@ def _drive(run_proxy, stub_path, out):
     print(" Nothing was installed and no key was used. This is the free local check:", file=out)
     print(" it stops the blatant destructive calls, not everything.", file=out)
     print("", file=out)
-    print(" Try it on your own server, risk-free. AUDIT mode records what it WOULD", file=out)
-    print(" stop, and stops nothing. In mcp.json:", file=out)
+    # Same promise change as the Python door's footer (cli.py), for the same reason: audit
+    # now records EVERY call, so offering "what it WOULD stop" undersells it and lands a
+    # well-behaved server's reader on an empty screen. The two doors move together on
+    # purpose; a rung that means different things depending on how you wired us in is the
+    # recurring defect here (copy true of one path, generalised to all).
+    print(" Now do it on your own server. Audit watches every call and stops nothing.", file=out)
+    print(" In mcp.json:", file=out)
     # `"command": "uvx"`, matching ui/utils/mcp.ts -- the config this project actually ships.
     # The bare `"command": "agentx-mcp"` form only starts if agentx-mcp is on PATH, which a
     # reader who just ran `uvx agentx-mcp --demo` does NOT have: uvx is ephemeral. Handing
@@ -164,7 +169,10 @@ def _drive(run_proxy, stub_path, out):
     # pass set out to remove. (Caught in review of #287.)
     print("       \"command\": \"uvx\",  \"args\": [\"agentx-mcp\", \"npx\", \"-y\", \"your-mcp-server\", \"...\"]", file=out)
     print("       AGENTX_ENFORCEMENT=audit", file=out)
-    print("   Use your client as usual, then see what it caught:  uvx agentx-mcp --insights", file=out)
+    # `uvx agentx-mcp --audit`, never `agentx audit`: under uvx the SDK's `agentx` script is
+    # not on PATH, and it reads the cwd-relative ledger rather than the per-user MCP one.
+    # Same reachability rule the --insights CTA already follows on this door.
+    print("   Use your client as usual, then see what it did:  uvx agentx-mcp --audit", file=out)
     print("", file=out)
     # Same closing line as `agentx demo` (cli.py), from the same single-sourced invite, so the
     # two demos hand off to the same two places instead of each inventing an ending.
