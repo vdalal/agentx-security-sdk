@@ -9,6 +9,31 @@
 # file to hand someone who has just run pip install.
 python-dotenv>=1.0.0
 
-# Only the reasoning/recovery demos (01, 02, 03, 07, 10) drive a real LLM, and only those
-# need this. They also need a GEMINI_API_KEY and the gateway running.
-google-genai>=0.3.0
+# NOTHING ELSE, DELIBERATELY, AND `google-genai` IS THE DELIBERATE OMISSION. Three of the four
+# published examples run on the SDK plus python-dotenv: no API key, no gateway, no LLM
+# credentials. The fourth, 01, is the recovery demo, and recovery makes a real LLM call to
+# re-plan, so it needs an LLM client and your own key.
+#
+# Pinning that client here would make every reader install it, including the majority who have
+# no key and cannot run 01 either way. So 01 asks for it at the point of use instead: run it
+# without the client or without the key and it names what is missing and points at 08. A
+# dependency for one optional script belongs in that script's own message, not in the file a
+# reader installs from before they know which script they want.
+#
+# 🔴 IF YOU ARE IN A CLONE OF THE REPO, THIS FILE IS NOT ENOUGH FOR EVERY SCRIPT YOU CAN SEE.
+# Read off the imports rather than from memory, because an earlier version of this list was
+# wrong in both directions at once:
+#
+#   * `google-genai` (an `import` at the top, so it fails before anything runs): 01, 03, 07, 10
+#   * a GEMINI_API_KEY on top of that:                                           01, 07, 10
+#   * the gateway running on :8000:                                          02, 09, 10, 11
+#   * an AGENTX_API_KEY for that gateway (02 falls back to a placeholder):        02, 09, 11
+#   * a GEMINI_API_KEY *and* the gateway, together:                                       10
+#
+#     pip install google-genai
+#
+# That line is here rather than pinned above because a published reader does not have those
+# scripts and should not be asked to install for them. It is spelled out rather than left to
+# "each script states its own extras", which was written here and was not true: three of them
+# open straight into `from google import genai` with no header at all, so following this file
+# and running one produced a ModuleNotFoundError and nothing to explain it.

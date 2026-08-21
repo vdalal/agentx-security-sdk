@@ -2,7 +2,6 @@ import os
 import json
 import sys
 from dotenv import load_dotenv
-from google import genai
 
 # --- Make the SDK importable when running this file straight from the repo ---
 root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -20,13 +19,37 @@ from agentx_sdk import decorators as agentx_runtime
 # -------------------------------------------------------------------
 GATEWAY_URL = "http://localhost:8000"
 AGENT_ID = "demo_db_agent"
-# This recovery demo makes a REAL LLM call to re-plan, so it needs a Gemini key.
-# Fail with a friendly pointer instead of an opaque genai traceback if it's missing.
+# This recovery demo makes a REAL LLM call to re-plan, so it needs a Gemini key AND the
+# `google-genai` client. Both are checked HERE, and the client is imported here rather than
+# at the top of the file, on purpose:
+#
+# this example ships in the published package, where `google-genai` is not a dependency. An
+# import on line 5 raised ModuleNotFoundError before any of the friendly text below could
+# print, and a published example that dies on its fifth line is worse than no example. It is
+# also why this one was briefly dropped from the published set: the crash, not the key.
+#
+# The rule this file now satisfies is not "runs with no key" -- it is "never crashes for a
+# reader with no key". Declining clearly, with somewhere to go, is a fine thing for a
+# published example to do.
+#
+# BOTH ARE CHECKED BEFORE EITHER IS REPORTED. Chaining them (key first, client only if the key
+# is set) named one thing at a time to the reader who has NEITHER -- which is the default for
+# somebody who just ran `pip install`. They go and get a key, run it again, and are declined a
+# second time for a package nobody mentioned. One decline should name everything it needs.
+_MISSING = []
 if not os.environ.get("GEMINI_API_KEY"):
-    print("⚠️  Demo 01 needs a GEMINI_API_KEY — it calls an LLM to re-plan after a block.")
+    _MISSING.append("a GEMINI_API_KEY")
+try:
+    from google import genai
+except ImportError:
+    _MISSING.append("the google-genai package (pip install google-genai)")
+
+if _MISSING:
+    print(f"⚠️  Demo 01 needs {' and '.join(_MISSING)} — it calls an LLM to re-plan after a block.")
     print("    For the keyless path (deterministic Shield block, no key/gateway needed), run:")
     print("    python examples/08_frictionless_agent_protection.py")
     sys.exit(0)
+
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 # Dynamic evaluation model hook configuration variable
 AGENTX_EVALUATION_MODEL = os.getenv("AGENTX_EVALUATION_MODEL", "gemini-2.5-flash")
@@ -48,8 +71,7 @@ init_db()
 # tool never has to declare it — the decorator strips it before your function is called.
 # This example used to declare it, and that mattered more than it looked: with the
 # parameter present the decorator's signature binding succeeded, which quietly hid a bug
-# for every tool that did NOT declare it (BACKLOG P-68). Leaving it here would teach the
-# workaround.
+# for every tool that did NOT declare it. Leaving it here would teach the workaround.
 def execute_database_query(query: str, cot: str):
     """A mock database tool representing a connection to production."""
     print(f"\n[DATABASE] 💥 Executing against Prod DB: {query}")
@@ -110,17 +132,32 @@ def run_sql_injection_demo():
             Return ONLY valid JSON: {{"revised_cot": "I understand the error...", "revised_query": "..."}}
             """
 
+            # THE CALL AND THE PARSE ARE SEPARATE FAILURES WITH SEPARATE FIXES. One `except`
+            # around both reported a depleted Gemini quota as "Failed to parse LLM response",
+            # which sends a reader to inspect JSON when the answer was on their billing page.
+            # The API's own message carries the remedy, so it is printed rather than replaced
+            # by a label of ours.
             try:
                 response = gemini_client.models.generate_content(
                     model=AGENTX_EVALUATION_MODEL,
                     contents=rethink_prompt,
                     config={"response_mime_type": "application/json"}
                 )
+            except Exception as e:
+                print(f"❌ [AGENT ERROR] The re-plan call to Gemini failed: {e}")
+                print("    Recovery needs a working key — quota and billing problems arrive")
+                print("    here as 429 RESOURCE_EXHAUSTED. The block itself still held.")
+                print("    For the keyless path, run:")
+                print("    python examples/08_frictionless_agent_protection.py")
+                return
+
+            try:
                 correction = json.loads(response.text)
                 current_cot = correction["revised_cot"]
                 current_query = correction["revised_query"]
-            except Exception as e:
-                print(f"❌ [AGENT ERROR] Failed to parse LLM response: {e}")
+            except (ValueError, KeyError, TypeError) as e:
+                print(f"❌ [AGENT ERROR] The model replied, but not in the JSON this demo "
+                      f"asked for: {e}")
                 return
 
         else:

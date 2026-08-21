@@ -2,11 +2,21 @@
 
 Runnable scripts, each one a single behaviour you can watch happen.
 
+Four numbered examples ship with the package. Three of them run with no API key, no gateway
+and no LLM credentials. The fourth, `01_self_healing_agent.py`, shows recovery: it needs your
+own Gemini key, and if you run it without one it says so and points you at `08`.
+
+If you are reading this in a **clone of the repository** you will see more scripts than these
+four. Those extra ones are not part of the published package, and several of them do need a
+Gemini key and a running gateway. Do not trust their headers to tell you which: some open
+straight into `from google import genai` with nothing above it. `requirements.txt` lists which
+script needs what, script by script.
+
 ## Setup
 
 ```bash
 pip install agentx-security-sdk
-pip install -r requirements.txt     # python-dotenv, and google-genai for the LLM demos
+pip install -r requirements.txt     # python-dotenv, for the three that load a local .env
 ```
 
 `00_quickstart_pip.py` needs neither of those beyond the SDK itself. It is the file to run
@@ -19,18 +29,27 @@ first if you have just installed and want to see a block in ten seconds.
 | `00_quickstart_pip.py` | A prompt-injected `DROP TABLE` is stopped in-process | nothing, not even `requirements.txt` |
 | `08_frictionless_agent_protection.py` | The same, on a tool with no configuration at all | `requirements.txt` (it loads a `.env`) |
 | `12_audit_what_your_agent_did.py` | **Nothing is blocked.** A support agent works a refund ticket and AgentX records what each call touched, then `agentx audit` reads it back | `requirements.txt` (it loads a `.env`) |
+| `01_self_healing_agent.py` | **Recovery.** A blocked agent reads the challenge, re-plans, and completes the task instead of dying | `requirements.txt`, `pip install google-genai`, and your own `GEMINI_API_KEY` |
 
-`12` is the odd one out and worth running second. Every other example here ends in an
-intervention (a block, a scrub, an escalation), so they show you what AgentX does. `12` shows
-you what your *agent* does, which is the half you cannot get from a detector.
+`12` is the odd one out and worth running second. The other two end in an intervention, so
+they show you what AgentX does. `12` shows you what your *agent* does, which is the half you
+cannot get from a detector.
 
-## The rest
+## Protecting an MCP server instead
 
-`01`, `02`, `03`, `07` and `10` drive a real LLM and need a `GEMINI_API_KEY` plus the gateway
-running. `04`, `05`, `06`, `09` and `11` are deterministic; `09` and `11` are gateway-side
-verdicts and need the gateway with an `AGENTX_API_KEY`.
+`mcp/` wraps any MCP server so every `tools/call` is screened before it runs, with no changes
+to the server and no Python in your own stack. Start with `mcp/README.md`.
 
-Each script says at the top what it needs and what it is showing.
+## What the published package does not include
+
+`01` shows recovery, but it shows the half that runs in this MIT package: the block lands, the
+agent reads the challenge, re-plans with your key and finishes the task. The judge that *writes*
+a task-fitting challenge, and the coach-and-retry it drives, run in the hosted gateway. Run `01`
+without the gateway and it says so itself, in the line it prints: recovered, but *degraded*.
+
+The scripts that drive that gateway end-to-end are not published, because shipping them would
+mean shipping code you can read and cannot run. They exist in the repository if you have it.
+Request gateway access at [agentx-core.com](https://agentx-core.com).
 
 ## A note on the ledger
 

@@ -68,6 +68,12 @@ _ALLOWED_SESSION_KEYS = {
     "tools_monitored", "intercepts", "critical_blocks",
     "human_escalations", "self_corrections", "would_blocks",
     "had_block", "first_block_ever", "shield_failopens",
+    # P-107. `had_block` and `first_block_ever` cannot tell OUR canned demo from the
+    # developer's own agent -- `agentx demo` wraps a tool, gets blocked and self-corrects,
+    # so it moves every counter a real install moves. This is the one signal that answers
+    # "has anyone ever seen us catch something in code THEY wrote". A boolean, never an
+    # agent name: the id that decides it stays on their disk. See decorators._note_own_agent_block.
+    "own_agent_block",
     # P-92. COUNTS ONLY -- the tool NAMES that produced them stay on the user's disk, in the
     # same class as the raw payload we refuse. `audit_calls` is the first signal that can
     # distinguish "wired us in and ran a real agent" from "installed and never ran", because
@@ -341,19 +347,95 @@ def _is_dev_env():
     return str(_env("AGENTX_ENV") or "").strip().lower() in ("development", "dev", "test")
 
 
-def is_automation_context():
-    """True when this run is a test/CI invocation OR an explicitly-flagged dev
-    environment (AGENTX_ENV=development|dev|test) — i.e. NOT genuine developer/usage
-    signal. Such runs are excluded from telemetry (and the protection streak / nudge)
-    even when opted in, so an operator's or contributor's own machine can't inflate the
-    activation funnel. Never raises."""
+# The machine-level twin of AGENTX_ENV. BACKLOG P-104.
+#
+# 🔴 THE SWITCH ONLY WORKED IN ONE FOLDER. `_is_dev_env` reads AGENTX_ENV from the process
+# env and from the `.env` beside the CURRENT DIRECTORY, and ours lives in the repo. So the
+# exclusion worked from C:\Projects\agentX and silently did nothing anywhere else --
+# including a brand new empty folder, which is exactly where the founder tests the product
+# because that is what a first-time user sees. Every one of those runs was recorded as a
+# real person reaching us, and one of the flags it sets (ran_audit_report) never resets.
+#
+# The cost is not one wrong number: we have written in several places that we have never
+# seen a real outside user reach the product, so the first time that number is not zero we
+# would not be able to tell which it was.
+#
+# Beside pulse.json, so the fact travels with the MACHINE rather than the directory.
+_INTERNAL_MARKER = Path.home() / ".agentx" / "internal"
+
+
+def _is_test_run():
+    """True when this process is a pytest run.
+
+    Its own function so a TEST CAN SWITCH IT OFF. Every other exclusion branch is
+    unreachable from inside the suite otherwise: this one is always true here, so
+    `is_automation_context()` returns True no matter what the others answer, and a test
+    written against them passes without exercising them. That is not hypothetical -- the
+    first version of the machine-marker test asserted True in a folder with no flag set and
+    stayed green with the marker lookup deleted entirely."""
+    return "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _machine_marked_internal():
+    """True when this machine has been marked as ours. Never raises."""
     try:
-        return (
-            "pytest" in sys.modules
-            or bool(os.environ.get("PYTEST_CURRENT_TEST"))
-            or _is_ci()
-            or _is_dev_env()
-        )
+        return _INTERNAL_MARKER.exists()
+    except Exception:
+        return False
+
+
+def _mark_machine_internal():
+    """Remember that this machine is ours, so the next run in any directory knows.
+
+    🔴 ONLY EVER CALLED FOR AN EXPLICIT AGENTX_ENV, never for pytest or CI. A developer
+    running their OWN test suite with our SDK imported trips the pytest branch, and marking
+    their machine on that basis would delete a real user from the funnel permanently and
+    silently -- the same false positive that is the worse direction on the web side. An
+    explicit AGENTX_ENV=development is a statement a person made about their machine; a
+    pytest import is not."""
+    try:
+        _INTERNAL_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        if not _INTERNAL_MARKER.exists():
+            _INTERNAL_MARKER.write_text(
+                "This machine is flagged as ours, so its runs stay out of the activation\n"
+                "funnel from any directory (AGENTX_ENV only reaches the folder it sits in).\n"
+                "Delete this file to be counted as an ordinary install again.\n",
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+
+def is_automation_context():
+    """True when this run is a test/CI invocation, an explicitly-flagged dev environment
+    (AGENTX_ENV=development|dev|test), or a machine we have marked as ours — i.e. NOT
+    genuine developer/usage signal. Such runs are excluded from telemetry (and the
+    protection streak / nudge) even when opted in, so an operator's or contributor's own
+    machine can't inflate the activation funnel. Never raises."""
+    try:
+        # Checked first, and it PERSISTS: an explicit AGENTX_ENV is the one signal that
+        # says something about the machine rather than about this invocation, so it is
+        # promoted to a machine fact and every later run in every other folder inherits it.
+        #
+        # 🔴 BUT NOT FROM A TEST OR CI RUN, AND AGENTX_ENV ALONE DOES NOT SETTLE THAT.
+        # `_is_dev_env` reads AGENTX_ENV from the `.env` beside the CURRENT DIRECTORY, and
+        # THIS REPO'S `.env` sets AGENTX_ENV=development -- so a plain `pytest sdk_tests/`
+        # from a clone satisfied the branch above and wrote the marker into the developer's
+        # REAL home directory, on the first run, before any test declared anything. That is
+        # precisely the false positive _mark_machine_internal's own docstring forbids ("a
+        # developer running their OWN test suite ... would delete a real user from the funnel
+        # permanently and silently"), arriving through the .env rather than through the
+        # pytest branch. A marked machine never un-marks itself, so the cost is permanent and
+        # the file is one nobody knows to look for.
+        #
+        # The exclusion itself still applies (True below either way); only the PERSISTING of
+        # it is withheld, because a test process is not a person making a statement about
+        # their machine. `.env.example` documents the sticky behaviour for the real case.
+        if _is_dev_env():
+            if not (_is_test_run() or _is_ci()):
+                _mark_machine_internal()
+            return True
+        return _is_test_run() or _is_ci() or _machine_marked_internal()
     except Exception:
         return False
 
@@ -391,7 +473,7 @@ def _show_notice(state=None, integration="decorator"):
         # surfaces while naming `agentx demo` -- a command an MCP user does not have, because
         # uvx and pipx install the `agentx-mcp` script only. So the very first sentence AgentX
         # said to an MCP user was an instruction that fails. `integration` is the same coarse
-        # value the pulse already carries, so this needs no new signal. (2026-07-31.)
+        # value the pulse already carries, so this needs no new signal.
         _try_it = ("uvx agentx-mcp --demo" if integration == "mcp" else "agentx demo")
         print(f" New here? Try:  {_try_it}   ·   Questions/feedback: {DISCORD_URL}")
         print("─" * 60)
@@ -582,7 +664,7 @@ UPGRADE_COMMAND = "pip install --upgrade agentx-security-sdk"
 # doors /docs actually documents it does NOTHING -- uvx builds a fresh ephemeral env per run
 # and pipx keeps its own venv, so neither one reads the user's global pip environment. The
 # command succeeds, the version does not move, and nothing on screen says so. `@latest` is
-# what makes uvx re-resolve instead of serving its cache. (2026-07-31.)
+# what makes uvx re-resolve instead of serving its cache.
 #
 # BOTH doors named, because the first cut of this line said `uvx agentx-mcp@latest --version`
 # and repeated the original sin one door over: that PRINTS a version, it does not upgrade
@@ -760,6 +842,12 @@ def build_payload(session_stats, state, first_block_ever=None):
             "would_blocks": int(session_stats.get("would_blocks", 0)),
             "had_block": had_block,
             "first_block_ever": first_block_ever,
+            # P-107. bool() rather than pass-through: this is a genuine two-state fact (a
+            # non-demo block either happened this session or it did not), unlike the
+            # tri-state capability flags where None means "never advertised". A missing key
+            # means False, which UNDERSTATES adoption -- the safe direction for the number
+            # we would quote as evidence somebody real reached us.
+            "own_agent_block": bool(session_stats.get("own_agent_block", False)),
             # SHIELD FAIL-OPENS: tool calls the Local Shield could not screen because it
             # THREW and fell through, so the call ran unscreened. A shield BUG, not a
             # policy decision, and on the keyless tier an enforcement BYPASS (nothing sits

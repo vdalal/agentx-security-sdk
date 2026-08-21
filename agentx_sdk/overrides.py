@@ -2038,7 +2038,7 @@ def count_awaiting_verdict(db_path=None):
     enough for the atexit nudge and does not materialise a single row.
 
     🔴 WHY EXACT AND NOT "200+". Three surfaces print this number and they disagreed on a
-    real store (founder's, 2026-08-10): ``agentx review --stats`` counted the whole store
+    real store: ``agentx review --stats`` counted the whole store
     and said **17,711 blocks still awaiting a verdict**, while the session-end nudge and
     the walkthrough header both read a 200-row window and could not say anything but 200.
     A reader with all three in front of them cannot tell which is the size of their job.
@@ -2070,7 +2070,7 @@ def _reviewable_with_truncation(db_path=None, cluster=True):
     """``(items, hit_the_cap)`` -- the review backlog plus whether the read window was
     exhausted.
 
-    🔴 THE +1 IS THE WHOLE POINT (P-80, reproduced 2026-08-10). Reading exactly
+    🔴 THE +1 IS THE WHOLE POINT. Reading exactly
     ``REVIEW_READ_CAP`` rows cannot distinguish "there are exactly 200" from "there are
     thousands and you saw 200", and the session-end nudge printed the second as the first:
     seed 250 reviewable blocks and it prints "200 item(s)"; seed 500 and it prints "200"
@@ -2083,7 +2083,7 @@ def _reviewable_with_truncation(db_path=None, cluster=True):
     filter them here, so rows that need no review still consumed the window: a store with
     250 recently-labelled incidents in front of 50 unlabelled ones returned ZERO, the
     nudge vanished for a user with a real backlog, and `agentx review` showed an empty
-    list over the same window. Measured 2026-08-10: 50 items awaiting review, nothing on
+    list over the same window. Measured on a real store: 50 items awaiting review, nothing on
     screen. Filtering in SQL means the count and the walkthrough see the same items, and
     ``hit_the_cap`` now means "more than 200 things ACTUALLY await review" rather than
     "more than 200 incidents exist", which is what a reader takes "200+" to mean anyway.

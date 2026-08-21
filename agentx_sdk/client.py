@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import uuid
 import warnings
@@ -196,8 +197,8 @@ class AgentXClient:
             # malformed field — or an ordinary cold-start 502 — silently disabled a
             # protected tool AND skipped the AGENTX_FAIL_MODE decision entirely, so the
             # default (open: run the tool, count a degraded execution) never got to apply
-            # and nothing recorded that we were running unprotected. Found 2026-08-02;
-            # see BACKLOG P-21. NOTE: this is NOT an audit-posture issue — audit
+            # and nothing recorded that we were running unprotected. NOTE: this is NOT an
+            # audit-posture issue — audit
             # deliberately covers POLICY blocks, not availability (see
             # decorators._audit_and_proceed) — it is fail-mode routing.
             # `gateway_reached` and `detail` matter and were lost in the first cut of this
@@ -299,7 +300,7 @@ class AgentXClient:
             # and about to block. Riskier than a clean connection failure. Signal fail-open.
             return {"status": "REASONING_ENGINE_UNREACHABLE", "reason": "timeout"}
         except requests.exceptions.RequestException as e:
-            # CLASS CLOSE, not another instance (2026-08-02). The two handlers above name
+            # CLASS CLOSE, not another instance. The two handlers above name
             # two transport failures; `requests` has many more that mean the SAME thing —
             # SSLError (a proxy doing cert interception), ProxyError, TooManyRedirects,
             # ChunkedEncodingError, ContentDecodingError, RetryError. Every one of them is
@@ -398,14 +399,28 @@ class AgentXClient:
                 headers=headers,
                 timeout=(1.0, 10.0)
             )
+            # 🔴 STDERR, BECAUSE STDOUT BELONGS TO THE COMMAND. These fire from a background park
+            # thread at an arbitrary moment, so on stdout they land in the MIDDLE of whatever the
+            # command is printing -- and `agentx audit --json` then emits a document no parser can
+            # read. Exactly the rule the brand banner had to learn: a caller who asked for machine
+            # output gets only the document, and a notice is never deleted for them, it is moved.
+            #
+            # It is also not command output by any reading. It is a diagnostic about telemetry
+            # that failed while the block itself stood, which is what the sentence says.
+            #
+            # ⚠️ HOW IT SURFACED, because the shape is worth keeping: a suite test went red only
+            # when the developer's local gateway was STOPPED and only in full-suite order. A park
+            # to a gateway that is not there times out on a machine that drops rather than refuses,
+            # the warning printed mid-JSON, and the completeness contract broke. The suite had been
+            # green partly because a gateway happened to be running.
             if resp.status_code != 200:
                 print(f"⚠️ [LOCAL KEYWORD SHIELD] Async incident park rejected "
                       f"({resp.status_code}) for receipt {receipt} — the block stood, "
-                      f"but recovery for this trace won't be recorded.")
+                      f"but recovery for this trace won't be recorded.", file=sys.stderr)
         except Exception as e:
             print(f"⚠️ [LOCAL KEYWORD SHIELD] Async incident park failed "
                   f"({type(e).__name__}) for receipt {receipt} — the block stood, "
-                  f"but recovery for this trace won't be recorded.")
+                  f"but recovery for this trace won't be recorded.", file=sys.stderr)
 
     def drain_pending_parks(self, timeout=3.0):
         """Join outstanding fire-and-forget park threads at session end so a short

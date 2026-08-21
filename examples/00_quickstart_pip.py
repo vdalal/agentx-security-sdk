@@ -9,9 +9,9 @@
 #
 # It runs with ZERO API key and ZERO gateway: the deterministic SHIELD
 # floor blocks the dangerous call in-process, offline, via the built-in
-# fallback policy seeds. Adding a Gemini key later upgrades you from
-# "block" to "block + coach the agent back to a safe path" (the Recover
-# tier) — see 10_self_correction_coaching.py in the repo.
+# fallback policy seeds. Connecting the hosted gateway later upgrades you
+# from "block" to "block + coach the agent back to a safe path" (the
+# Recover tier). Request access at https://agentx-core.com.
 # =====================================================================
 
 from agentx_sdk import agentx_protect, start_secure_session, is_block

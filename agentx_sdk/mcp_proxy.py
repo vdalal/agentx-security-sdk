@@ -75,6 +75,7 @@ try:
         _scope,
         _target_action,
         _note_block_category,
+        _note_own_agent_block,
         _resolve_enforcement,
         evaluate_call_keyless,
         AgentXPolicyLoadError,
@@ -96,8 +97,16 @@ try:
     # `agentx status` reads), so a real MCP catch shows up in `agentx status` — not just
     # the streak. Best-effort at the call sites; gated on session_stats["_ledger"] so the
     # routing-core unit tests (which build a bare session_stats) never touch the ledger.
+    # P-112's novelty reader is bound HERE for the same reason `pulse` is, one comment up:
+    # _protection_report runs at shutdown and a `from agentx_sdk import db` down there would
+    # be a shutdown-time import. The functions resolve db.DB_PATH from their own module
+    # globals when CALLED, so binding the names early does not freeze the path that
+    # _point_stores_at_mcp_home repoints at the per-user MCP ledger.
     from agentx_sdk.db import (init_db, log_intercept, log_self_correction, record_call,
-                               WOULD_BLOCK_STATUS)
+                               WOULD_BLOCK_STATUS,
+                               read_novelty, advance_watermark, format_novelty_item, top_novelty,
+                               current_call_shape, _call_shape,
+                               WATERMARK_SESSION)
 finally:
     sys.stdout = _real_stdout
 
@@ -125,7 +134,15 @@ _USAGE = (
     # Listed for the same reason the Python door lists `agentx audit`: mcp_demo now sends the
     # reader here, and a command the on-ramp names and --help hides is unfindable the moment
     # that footer scrolls away.
-    "  uvx agentx-mcp --audit      see what your agents actually DID, call by call.\n"
+    # "grouped by tool", not "call by call": this line promised the per-call list for as
+    # long as the screen has grouped. `--audit --calls` is the one that keeps the promise,
+    # and everything after --audit is forwarded to the same reader, so it needs no dispatch
+    # of its own here.
+    "  uvx agentx-mcp --audit      see what your agents actually DID, grouped by tool.\n"
+    # Both flags, because this is the ONLY help an uvx reader has and every flag after
+    # --audit is forwarded to the same reader. Advertising one and not the other made the
+    # other undiscoverable on this door while the Python door named both.
+    "                              --calls lists them one at a time; --json for a program.\n"
 )
 
 
@@ -236,7 +253,7 @@ def _note_mcp_fail_closed(log):
     # exist (uvx and pipx install `agentx-mcp` only), and it fires at the worst possible
     # moment: every tools/call is being blocked, and the one instruction on screen for
     # unjamming the server was a command the reader cannot run. The file path is the
-    # actionable thing and _policy_load_error_message already names it. (2026-07-31.)
+    # actionable thing and _policy_load_error_message already names it.
     _mcp_once_banner("failclosed", [
         "AgentX Local Shield FAILING CLOSED: your policy file is malformed,",
         "so every tools/call is BLOCKED until you fix it. Nothing ran.",
@@ -306,7 +323,7 @@ class _Harvest:
     implemented locally here. STILL founder-gated: how to sanitize the server-defined tool name
     (raw / hashed / dropped) before any NETWORK sink (it stays raw in this local file -- the org's
     own data), and (2) there is NO network sink and no Discovery/adopt-queue integration
-    (moat-collection-day0, founder-gated)."""
+    (not built today, and deliberately left as a future decision)."""
 
     def __init__(self):
         self._pending = {}     # tool -> {policy_category, policy_name, policy_id} (abstract only)
@@ -408,7 +425,7 @@ def _mcp_overrides_path():
     OVERRIDES store was left on `overrides._overrides_path()`, which falls back to a project
     root walked up from cwd -- so it inherited the exact defect its two siblings were fixed for.
 
-    What that cost, measured 2026-07-31 rather than argued: `uvx agentx-mcp --insights` run from
+    What that cost, measured on a real run rather than argued: `uvx agentx-mcp --insights` run from
     a repo printed `1 policy / Active: ...`; run from C:\\ it printed `No reusable safe-paths to
     show yet`. Same machine, same user, same store-in-principle. The second is the one answer
     this surface must never give, and the audit banner sends people straight to it.
@@ -417,7 +434,7 @@ def _mcp_overrides_path():
     adopt_override() from the MCP host's launch directory while the human runs --review from
     their terminal, so a promoted safe-path could be written where the reader never looks.
 
-    Per-user, matching the ledger (founder call 2026-07-31). The Python door keeps its
+    Per-user, matching the ledger. The Python door keeps its
     project-root anchoring: there, "the directory you are in" IS your project, and the
     commit-overrides.json-to-your-repo model depends on it. On the MCP door there is no project
     -- an editor spawns the proxy from somewhere arbitrary -- so per-user is the only default
@@ -631,7 +648,8 @@ def mcp_recovery_candidates(path=None, log=None):
 
 
 def _auto_coach_enabled():
-    """Auto-coach is default ON (the moat should compound silently). One explicit off wins:
+    """Auto-coach is default ON, so recovered safe-paths accumulate without a manual step.
+    One explicit off wins:
     AGENTX_MCP_AUTO_COACH in {0,false,no,off}."""
     return os.environ.get("AGENTX_MCP_AUTO_COACH", "on").strip().lower() not in ("0", "false", "no", "off")
 
@@ -664,7 +682,7 @@ def auto_coach(path=None, log=None):
     try:
         from agentx_sdk.overrides import (load_overrides, adopt as adopt_override,
                                           _norm_for_dedup)
-        # THE PROJECT-ROOT GATE IS GONE (2026-07-31), and removing it is the other half of the
+        # THE PROJECT-ROOT GATE IS GONE, and removing it is the other half of the
         # per-user store fix. It used to return early unless a `.git`/`.agentx` resolved by
         # walking up from CWD, on the stated grounds that "an MCP host launched from an odd cwd
         # ($HOME, /) never scatters an overrides.json". That rationale died the moment the write
@@ -726,7 +744,7 @@ def auto_coach(path=None, log=None):
         if promoted:
             # `uvx agentx-mcp --review`, not `agentx mcp-insights`: same reachability rule as
             # the rest of this door, and --review is what ACTS on these (adopt / reject) rather
-            # than just listing them. (2026-07-31.)
+            # than just listing them.
             print("[agentx-mcp] auto-coach promoted %d recovery path(s) into the org-brain "
                   "(source=mcp_auto; review them:  uvx agentx-mcp --review  ·  "
                   "AGENTX_MCP_AUTO_COACH=off to stop)." % promoted, file=log)
@@ -1020,6 +1038,33 @@ def _forward(line, child_in):
     child_in.flush()
 
 
+# The agent id this surface owns. There is no per-agent identity on the MCP wire (the
+# client is whatever editor/agent spawned us), and `log_intercept` below already writes
+# its rows under this same name -- so the ONE name is stated here rather than repeated.
+#
+# 🔴 IT IS DELIBERATELY NOT IN db.OUR_AGENT_IDS, and that is the whole point of routing the
+# P-107 flag through the shared predicate instead of hardcoding True: `uvx agentx-mcp --demo`
+# is our canned sequence, but it dispatches BEFORE the proxy session exists (main(), the
+# `--demo` branch) and never emits a pulse, so every block that reaches _count_block came
+# from a real server the developer wired up themselves.
+_MCP_AGENT_ID = "mcp_proxy"
+
+
+def _count_block(session_stats):
+    """Record that a tools/call was BLOCKED on this surface. ONE entry point.
+
+    🔴 THERE ARE THREE BLOCK RETURNS IN _screen_message (runaway ceiling, drift gate, and
+    the shield verdict) and every counter added since has had to be added to each of them by
+    hand. `own_agent_block` (P-107) is the one where a missed site is invisible: it does not
+    change what the door prints, it silently reports "our own demo" for a developer's real
+    MCP catch -- on the surface most likely to produce one, since an MCP proxy only ever sits
+    in front of a server somebody wired up. The counters move together or the surfaces drift.
+    """
+    session_stats["intercepts"] = session_stats.get("intercepts", 0) + 1
+    session_stats["critical_blocks"] = session_stats.get("critical_blocks", 0) + 1
+    _note_own_agent_block(_MCP_AGENT_ID, session_stats)
+
+
 def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest=None):
     """Screen ONE parsed JSON-RPC message. Returns ``"forward"`` (the caller relays it
     to the server) or ``"block"`` (a blocked tools/call, already handled — do NOT
@@ -1048,8 +1093,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
             writer.send(_block_response(req_id, text))
         else:
             print("[agentx-mcp] dropped id-less tools/call past the runaway ceiling", file=log)
-        session_stats["intercepts"] = session_stats.get("intercepts", 0) + 1
-        session_stats["critical_blocks"] = session_stats.get("critical_blocks", 0) + 1
+        _count_block(session_stats)
         session_stats["runaway_halts"] = session_stats.get("runaway_halts", 0) + 1
         print("[agentx-mcp] blocked tools/call (runaway ceiling %d exceeded at %d calls)."
               % (ceiling, session_stats["total_calls"]), file=log)
@@ -1071,8 +1115,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                     writer.send(_block_response(req_id, _drift_coaching(gate_name)))
                 else:
                     print("[agentx-mcp] dropped id-less call to drifted tool '%s'" % gate_name, file=log)
-                session_stats["intercepts"] = session_stats.get("intercepts", 0) + 1
-                session_stats["critical_blocks"] = session_stats.get("critical_blocks", 0) + 1
+                _count_block(session_stats)
                 print("[agentx-mcp] blocked tools/call '%s' (MCP Tool Description Drift; re-verify required)."
                       % gate_name, file=log)
                 return "block"
@@ -1289,8 +1332,15 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 seq = session_stats.get("_ledger_seq", 0)
                 session_stats["_ledger_seq"] = seq + 1
                 wb_trace = "%s-%d" % (session_stats.get("_trace_id") or "mcp-session", seq)
+                # Same P-92-B fix as the decorator's twin (agentx_sdk/decorators.py's
+                # _record_would_block): this write path is independent of that one -- its
+                # own ledger, its own call site -- and was missed the first time. A rule
+                # applied at only one of two independent call sites still leaves the other
+                # one carrying the original defect.
+                names, amount, target_class = _call_shape(tool_key, params.get("arguments"))
                 log_intercept(wb_trace, "mcp_proxy", tool_key,
-                              decision.get("policy_id"), decision.get("policy_name"), WOULD_BLOCK_STATUS)
+                              decision.get("policy_id"), decision.get("policy_name"), WOULD_BLOCK_STATUS,
+                              arg_names=names, amount=amount, target_class=target_class)
             except Exception:
                 pass
         try:
@@ -1315,8 +1365,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     tripped = streaks.get(tool_key, 0) >= max_turns
     streaks[tool_key] = streaks.get(tool_key, 0) + 1
 
-    session_stats["intercepts"] = session_stats.get("intercepts", 0) + 1
-    session_stats["critical_blocks"] = session_stats.get("critical_blocks", 0) + 1
+    _count_block(session_stats)
     # Closed-vocab privacy guard (only a known category enum may ride the pulse, never
     # the free text a pulled policy could carry), shared with the decorator via the
     # parameterized recorder so the two can't drift.
@@ -1591,6 +1640,48 @@ def _protection_report(session_stats, log):
         protection = pulse.record_protection(session_stats)
         if protection:
             print("[agentx-mcp] protection streak: %s." % pulse.format_protection_line(protection), file=log)
+        # P-112: what is NEW about this agent, and the reason to open the audit screen. The
+        # MCP half of the decorator's session-end line -- main() suppresses the atexit
+        # summary on this door, so a line wired only there reaches ZERO of these users. Same
+        # reach problem, and the same answer, as the staleness notice directly below.
+        #
+        # 🔴 THE FACTS COME FROM THE SHARED FORMATTER, THE COMMAND DOES NOT. `db` decides
+        # what counts as new and words it once, so the two doors cannot drift on the claim.
+        # The CTA is per-door on purpose: `agentx audit` is not on PATH under uvx, and
+        # handing this reader the decorator's spelling is the exact defect this file has
+        # already been fixed for on --review and on the upgrade command.
+        #
+        # ⚠️ NO LOCAL IMPORT. The names are bound at module load under the stdout guard, for
+        # the reason stated there: this function runs at shutdown, where the import machinery
+        # may already be torn down. db.DB_PATH is pointed at the per-user MCP ledger by
+        # _point_stores_at_mcp_home(), which main() calls before the session starts, and these
+        # functions resolve it when called -- so this reads THIS door's ledger.
+        #
+        # 🔴 EXCLUDED FROM AUTOMATION, AND HERE THAT IS CORRECTNESS. This advances a
+        # watermark, so a CI run would CONSUME the novelty and the operator's next real
+        # session would print nothing, scooped by a machine.
+        if not pulse.is_automation_context():
+            # `current` computed ONCE and handed to both, as the other two doors do. Left
+            # off, each call recomputed the whole shape -- three full ledger scans at
+            # shutdown instead of one, and it made current_call_shape's own docstring claim
+            # ("both real call sites hand it `current`") false about this door.
+            _current = current_call_shape()
+            _novelty = read_novelty(WATERMARK_SESSION, current=_current)
+            _items = top_novelty(_novelty["items"], 2)
+            if _items:
+                print("[agentx-mcp] new for your agent:", file=log)
+                for _item in _items:
+                    _line = format_novelty_item(_item)
+                    if _line:
+                        # Session-level facts (when the agent ran) carry no tool name, so the
+                        # prefix goes with them rather than printing a bare colon.
+                        _pre = ("%s: " % _item["tool"]) if _item["tool"] else ""
+                        print("[agentx-mcp]   -> %s%s" % (_pre, _line), file=log)
+                _hidden = len(_novelty["items"]) - len(_items)
+                if _hidden > 0:
+                    print("[agentx-mcp]   -> ...and %d more." % _hidden, file=log)
+                print("[agentx-mcp]   -> see them:  uvx agentx-mcp --audit", file=log)
+                advance_watermark(WATERMARK_SESSION, current=_current)
         # Offline staleness notice — the MCP half of the same reach problem. An MCP user
         # never sees the decorator's atexit summary (main() suppresses it), so a notice
         # wired only there would reach ZERO of them. Same shared phrase + command as the
@@ -1602,7 +1693,7 @@ def _protection_report(session_stats, log):
             # package (they installed agentx-mcp) AND is a no-op on two of the three install
             # paths: uvx resolves a fresh ephemeral env per run and pipx has its own venv, so
             # neither reads the user's global pip. It succeeded and changed nothing, which is
-            # worse than a command-not-found because nothing looks wrong. (2026-07-31.)
+            # worse than a command-not-found because nothing looks wrong.
             print("[agentx-mcp] update: %s. -> %s" % (stale, pulse.MCP_UPGRADE_COMMAND), file=log)
     except Exception:
         pass
@@ -1622,7 +1713,7 @@ def _reader_globals(fn, argv):
     from agentx_sdk import cli, db as _db
     saved_entry = cli.MCP_ENTRY
     saved_db = os.environ.get("AGENTX_INCIDENT_DB")
-    # AGENTX_OVERRIDES joined the list 2026-07-31 with the store fix. Everything this wrapper
+    # AGENTX_OVERRIDES joined this list with the per-user store fix. Everything this wrapper
     # sets must be restorable, or the next in-process caller inherits the MCP door's view.
     saved_overrides = os.environ.get("AGENTX_OVERRIDES")
     # db.DB_PATH too. _point_stores_at_mcp_home mutates FOUR things and the first version of
@@ -1632,6 +1723,15 @@ def _reader_globals(fn, argv):
     try:
         cli.MCP_ENTRY = True          # render CTAs this reader can actually run
         _point_stores_at_mcp_home()
+        # 🔴 MIGRATE AFTER THE REPOINT, NEVER BEFORE. These reader subcommands are
+        # dispatched straight at cli.execute_*, so they never reach cli.main() and main's migration
+        # hook does not cover them. Doing it here, once _point_stores_at_mcp_home has moved
+        # db.DB_PATH onto the per-user MCP ledger, is also what makes it upgrade the RIGHT file:
+        # the old import-time init_db() migrated whatever .agentx.db happened to be sitting in the
+        # directory the MCP host launched from, which is nobody's ledger. ensure_ledger_current
+        # never creates a file, so a reader run against a home that has no ledger yet still leaves
+        # nothing behind.
+        _db.ensure_ledger_current()
         getattr(cli, fn)(argv)
     finally:
         cli.MCP_ENTRY = saved_entry
@@ -1745,6 +1845,23 @@ def main(argv=None):
         # together. Same reachability rule as --review / --insights above.
         _reader_globals("execute_audit", argv[1:])
         return 0
+    # 🔴 THE BARE WORD IS THE NATURAL TYPO. Every one of the four commands above has an
+    # `agentx <word>` twin on the SDK door (no dashes), so a reader switching doors -- or
+    # copy-pasting a snippet meant for the other one -- types `agentx-mcp audit` out of
+    # habit. Without this, that falls all the way through to `run_proxy`, which tries to
+    # spawn a subprocess literally named "audit" and fails with a raw
+    # "command not found: audit" / exit 127 -- indistinguishable from a real misconfigured
+    # server command, and it never tells the reader they just needed two dashes.
+    # Scoped to EXACTLY one bare arg: a real wrapped-server invocation always carries the
+    # server's own args (`agentx-mcp npx -y @modelcontextprotocol/server-x ...`), so a
+    # single bare word matching one of our own subcommand names is not a call shape any
+    # real wrap uses.
+    if len(argv) == 1 and argv[0] in ("demo", "review", "insights", "audit"):
+        sys.stderr.write(
+            "[agentx-mcp] unknown command '%s' -- did you mean '--%s'?\n"
+            "  uvx agentx-mcp --%s\n" % (argv[0], argv[0], argv[0])
+        )
+        return 2
     if argv and argv[0] == "--":          # explicit end-of-options separator
         argv = argv[1:]
     if not argv:
@@ -1797,7 +1914,7 @@ def main(argv=None):
     # the two sides came to disagree about where adopted safe-paths live: the proxy's
     # auto-coach wrote them through the cwd-derived default while `--review` read the per-user
     # one. Two call sites computing "the same" answer separately is the bug, so there is now
-    # one function and both callers use it. (2026-07-31.)
+    # one function and both callers use it.
     _point_stores_at_mcp_home()
     try:
         init_db()

@@ -1,8 +1,6 @@
 # MCP examples
 
-Guarding an MCP-based agent with AgentX, keyless, with no code change. This is the
-runnable companion to **Door 2** of the partner onboarding runbook
-(`outreach/partner-onboarding-runbook.md`), which is the source of truth for the wrap.
+Guarding an MCP-based agent with AgentX, keyless, with no code change.
 
 The Python examples in the parent directory show the `@agentx_protect` decorator. These
 show the other keyless door: `agentx-mcp`, a proxy that wraps a real MCP server and screens
@@ -70,5 +68,5 @@ the older path still works from a clone.
 - **stdio transport only.** This wraps a local MCP server your client launches by command.
   A remote MCP server reached over HTTP/SSE is not covered today.
 - **Not every agent uses MCP.** If your tools live in your own code (a Vercel AI SDK or
-  LangChain `tool()`), there is no MCP boundary to wrap. That is the in-process guard
-  (Door 3 in the runbook).
+  LangChain `tool()`), there is no MCP boundary to wrap. Use the in-process guard instead:
+  the `@agentx_protect` decorator, shown in the examples one directory up.

@@ -1,7 +1,9 @@
+import json
 import re
 import sqlite3
 import time
 import os
+import sys
 from contextlib import contextmanager
 
 # Hidden file in the directory where the developer runs their agent.
@@ -51,7 +53,38 @@ INVENTORY_STATUS = "ALLOWED"
 # session, when that footer is long gone and only the ledger remains.
 DEMO_AGENT_ID = "demo_cli"                      # `agentx demo` and `agentx demo --audit`
 EXAMPLE_AGENT_ID = "agentx_example_agent"       # the shipped examples/ scripts
-OUR_AGENT_IDS = (DEMO_AGENT_ID, EXAMPLE_AGENT_ID)
+#
+# 🔴 AND THE OTHER NAMES THE SHIPPED EXAMPLES ACTUALLY WRITE UNDER (no count here on
+# purpose: a maintained number beside the list it counts goes stale before the list does).
+# The comment above
+# said this tuple covered "the shipped examples/ scripts" and it covered exactly ONE of them
+# (12_audit_what_your_agent_did.py, the file it was added for). Every other example predates
+# the constant and names its own agent, so `examples/00_quickstart_pip.py` -- the one file we
+# tell a brand-new developer to run -- was disowned by nothing.
+#
+# Harmless while this tuple only fed `agentx audit` labelling; not harmless from 0.4.29, when
+# `own_agent_block` started asking "was somebody caught in code THEY wrote". A quickstart run
+# answered yes, which manufactures the exact evidence that field exists to look for, on the
+# first command a stranger runs. Both halves of the rule now have to hold, so the polarity is
+# pinned in sdk_tests/test_our_agent_ids.py: every id an example runs under is here, and no
+# id here is one an example does not use.
+#
+# ⚠️ STILL A CLOSED SET OF EXACT NAMES, never a `demo_` prefix -- see is_our_agent below. A
+# developer who calls their own agent `demo_billing` must keep their rows.
+_EXAMPLE_AGENT_IDS = (
+    "demo_quickstart_agent",      # 00_quickstart_pip.py
+    "demo_db_agent",              # 01_self_healing_agent.py
+    "demo_support_agent",         # 03_outbound_dlp_scrubbing.py
+    "demo_stubborn_agent",        # 04_circuit_breaker_demo.py
+    "demo_dlp_agent",             # 05_zero_knowledge_dlp.py
+    "demo_soc_agent",             # 06_hitl_escalation.py
+    "demo_react_sim_agent",       # 07_pure_react_agent_simulation.py
+    "demo_frictionless_agent",    # 08_frictionless_agent_protection.py
+)
+# NOT here on purpose: 02 / 09 / 10 / 11 drive the gateway client directly and never wrap a
+# tool, so their agent ids cannot reach the local ledger or the session counters this set
+# gates. Claiming a name we do not need is not free -- it disowns any developer who picks it.
+OUR_AGENT_IDS = (DEMO_AGENT_ID, EXAMPLE_AGENT_ID) + _EXAMPLE_AGENT_IDS
 
 
 def _our_agents_clause(negate=False):
@@ -159,19 +192,21 @@ _CREATE_EVENT_LOG_SQL = "CREATE TABLE IF NOT EXISTS event_log (\n    %s\n)" % ",
     "%s %s" % (name, ddl) for name, ddl in _EVENT_LOG_COLUMNS)
 
 
-# --- RETENTION (P-97) -------------------------------------------------------------------
+# --- RETENTION -------------------------------------------------------------------------
 #
-# Until 2026-08-11 NOTHING pruned this file. No retention, no row cap, no vacuum. That was
-# survivable only because the ledger records the RARE event: every writer is a hit, and
-# `reached_first_block` is 0 across six installs, so in practice we wrote almost nothing.
+# Before this retention policy shipped, NOTHING pruned this file. No retention, no row cap,
+# no vacuum. That was survivable only because the ledger records the RARE event: every
+# writer is a hit, and `reached_first_block` is 0 across six installs, so in practice we
+# wrote almost nothing.
 #
-# 🔴 P-92 changes the write rate from "the rare block" to "every call", which is the entire
-# point of that proposal and therefore the entire problem. The ceiling has to exist BEFORE
-# the writer that needs it, or we ship unbounded growth onto the user's own disk.
+# 🔴 Recording every passing call, not only blocks, changes the write rate from "the rare
+# event" to "every call", which is the entire reason this ceiling has to exist BEFORE the
+# writer that needs it, rather than after -- otherwise we ship unbounded growth onto the
+# user's own disk.
 #
-# The policy, ratified by the founder 2026-08-11: 30 days OR 10,000 rows, whichever binds
-# first, and the drop is REPORTED rather than silent. The loud part is not manners: P-57
-# deleted an entire ledger quietly and the lesson taken from it was that deletion must
+# The policy: 30 days OR 10,000 rows, whichever binds first, and the drop is REPORTED
+# rather than silent. The loud part is not manners: an earlier version of this ledger was
+# deleted quietly on a schema upgrade, and the lesson taken from it was that deletion must
 # always be visible to the person whose data it was.
 _RETENTION_DAYS = 30
 _RETENTION_MAX_ROWS = 10000
@@ -368,10 +403,10 @@ def _report_quarantine(why):
     """
     backup = _quarantine_ledger()
     if backup:
-        print("⚠️ [AgentX SDK] The local ledger %s, so it was saved as %s and a new one "
+        _notice("⚠️ [AgentX SDK] The local ledger %s, so it was saved as %s and a new one "
               "started. Nothing was deleted." % (why, backup))
         return True
-    print("⚠️ [AgentX SDK] The local ledger %s, and it could not be moved aside (it may be "
+    _notice("⚠️ [AgentX SDK] The local ledger %s, and it could not be moved aside (it may be "
           "open in another program). It is UNCHANGED, and this session will not be "
           "recorded." % why)
     return False
@@ -403,7 +438,7 @@ def _upgrade_existing_ledger():
     if unaddable:
         # Loud, but NOT a reason to touch their data. See _plan_migration: this is a bad
         # DDL string on our side, and the ledger keeps working without the column.
-        print("🔴 [AgentX SDK] Cannot add %s to an existing ledger, so this install will "
+        _notice("🔴 [AgentX SDK] Cannot add %s to an existing ledger, so this install will "
               "run without it. Your history is untouched. Please report this: "
               "https://bit.ly/agentfirewall" % ", ".join(unaddable))
     if not addable:
@@ -423,12 +458,48 @@ def _upgrade_existing_ledger():
             conn.commit()
     except sqlite3.Error as exc:
         # A WRITE failure is NOT evidence the ledger is bad. Leave it exactly as it is.
-        print("⚠️ [AgentX SDK] Could not upgrade the local ledger (%s). It is UNCHANGED and "
+        _notice("⚠️ [AgentX SDK] Could not upgrade the local ledger (%s). It is UNCHANGED and "
               "your history is safe; this session may not be recorded. Try again once "
               "nothing else is using it." % exc)
         return False
-    print("🔄 [AgentX SDK] Ledger upgraded to the current schema. Your history is intact.")
+    _notice("🔄 [AgentX SDK] Ledger upgraded to the current schema. Your history is intact.")
     return True
+
+
+def ensure_ledger_current():
+    """Bring an EXISTING ledger up to the current schema. NEVER creates one. Never raises.
+
+    Returns True when the caller may go on to CREATE (either there was nothing to upgrade, or the
+    upgrade succeeded), False when an existing ledger could not be migrated.
+
+    🔴 THIS EXISTS SO MIGRATION AND CREATION STOP BEING THE SAME EVENT. They were welded
+    together in init_db(), which decorators.py called at import, so the only way to keep an old
+    ledger migrating itself was to create a file for everybody who imported the SDK. Splitting
+    them lets the reader entry points -- cli.main(), mcp_proxy._reader_globals, and the first
+    protected call in decorators._decide -- keep db.py's promise that "a column added here migrates
+    itself onto every ledger that already exists" without any of them writing to disk first.
+
+    ⚠️ The three callers above are what keep that promise. If you remove one, narrow the promise
+    with it rather than leaving a sentence nobody enforces.
+    """
+    if not os.path.exists(DB_PATH):
+        return True
+    return _upgrade_existing_ledger()
+
+
+
+def _notice(message):
+    """An SDK diagnostic. STDERR, always.
+
+    🔴 STDOUT BELONGS TO THE COMMAND. These fire from ledger setup and migration, which now runs
+    from `cli.main()` before a command renders, so on stdout they print AHEAD of the document and
+    `agentx audit --json` emits something no parser can read. Exactly the defect the brand banner
+    had to learn, and the same one the incident-park warning was moved off stdout for.
+
+    Never deleted for a machine caller, only moved: someone piping JSON still needs to be told
+    their ledger could not be upgraded.
+    """
+    print(message, file=sys.stderr)
 
 
 def init_db():
@@ -447,23 +518,36 @@ def init_db():
     "Clean slate!" (P-57). The trigger was entirely ours: it fired the first time a user ran
     a build that had added a column.
 
-    ⚠️ This must NEVER raise. decorators.py imports this module and calls init_db() at
-    import time (decorators.py:765), so an exception here breaks `import agentx_sdk`
-    outright. That is the opposite of the sibling in backend/incident_store.py, which is
-    documented as write-path-only and allowed to raise.
+    ⚠️ This must NEVER raise, and the REASON changed rather than the rule. decorators.py
+    no longer calls this at import time, but mcp_proxy.main() calls it at proxy startup where a
+    raise kills the JSON-RPC session before it speaks, and examples/01 and examples/03 call it at
+    MODULE scope, where a raise still breaks a shipped example on import. That is the opposite of
+    the sibling in backend/incident_store.py, which is documented as write-path-only and allowed
+    to raise.
+
+    ⚠️ THIS CREATES A FILE, so it is the wrong call for anything a reader triggers. To bring an
+    existing ledger up to date without conjuring one, call ensure_ledger_current() -- which is what
+    the CLI and the MCP reader path do, so typing `agentx status` in a directory no longer leaves a
+    database behind in it.
     """
-    if os.path.exists(DB_PATH) and not _upgrade_existing_ledger():
+    if not ensure_ledger_current():
         return
 
     try:
         with _connection() as conn:
             conn.execute(_CREATE_EVENT_LOG_SQL)
             conn.execute(_CREATE_RETENTION_SQL)
+            # Like ledger_retention, this is OURS rather than the user's history, so it is
+            # created here and stays outside _plan_migration -- the quarantine path that
+            # table walks is about event_log being someone else's table, and a bookkeeping
+            # table that fails to appear costs a screen a line, never a record.
+            conn.execute(_CREATE_NOVELTY_SQL)
+            conn.execute(_CREATE_NOVELTY_SEEN_SQL)
             conn.commit()
     except sqlite3.Error as exc:
         # Never raise (see the docstring). The ledger writers are already best-effort, so
         # the session runs unrecorded rather than the SDK failing to import.
-        print("⚠️ [AgentX SDK] Could not open the local ledger (%s). Protection is unaffected; "
+        _notice("⚠️ [AgentX SDK] Could not open the local ledger (%s). Protection is unaffected; "
               "this session will not be recorded." % exc)
         return
 
@@ -610,10 +694,9 @@ _CLASS_HINTS = (
 # ⚠️ KNOWN LIMIT, DELIBERATE, NOT A BUG TO REDISCOVER. This reads TOP-LEVEL arguments only.
 # The gateway walks nested objects to depth 4 because `{"payment": {"amount": 250, "currency":
 # "usd"}}` is the shape payment integrations pass, so a nested payload records nothing here.
-# Founder call 2026-08-12: not porting the walk yet. Flat `amount=..., currency=...` kwargs are
-# the normal shape for a decorated Python function, which is this path; nesting mostly arrives
-# on the MCP path. Filed against [[#p-83]]; when the walk is adopted it extends THIS rule
-# rather than replacing a different one.
+# Not porting the walk yet. Flat `amount=..., currency=...` kwargs are the normal shape for
+# a decorated Python function, which is this path; nesting mostly arrives on the MCP path.
+# When the walk is adopted it should extend THIS rule rather than replace a different one.
 _AMOUNT_KEY = "amount"
 _CURRENCY_KEY = "currency"
 
@@ -837,6 +920,43 @@ def _call_shape(tool_name, arguments):
         amount = 0.0
 
     return joined, amount, _classify_target(tool_name, names)
+
+
+def _union_arg_names_and_classes(rows):
+    """Union argument NAMES (each row's own comma-joined string, re-split) and TARGET
+    CLASSES across a set of DISTINCT (arg_names, target_class) rows.
+
+    The aggregation both get_call_inventory (per tool, ALLOWED rows) and
+    get_would_block_summary (per policy, WOULD_BLOCK rows) need — extracted so a future fix
+    to the split/union rule (e.g. an edge case in the comma split, or a name containing
+    whitespace) applies to both readers at once rather than one silently drifting from the
+    other, which is exactly the "fixed at one call site, missed the sibling" shape this
+    file's own writers have hit twice.
+
+    Pure; never raises (`split(",")` on a falsy value degrades to "", which the generator
+    below already handles). Returns (sorted_names, sorted_classes)."""
+    names, classes = set(), set()
+    for arg_names, target_class in rows:
+        names.update(n for n in (arg_names or "").split(",") if n)
+        if target_class:
+            classes.add(target_class)
+    return sorted(names), sorted(classes)
+
+
+def _exclude_agents_fragment(excluded):
+    """The `agent_id NOT IN (...)` WHERE fragment `_grouped_policy_rows` and
+    `get_would_block_summary`'s per-policy shape query both need, extracted so the two
+    places that filter the SAME agent_id list cannot drift on HOW they filter it (the exact
+    risk `_grouped_policy_rows`'s own docstring names for its callers, now also true of the
+    caller that hand-rolled this instead of reusing it).
+
+    `excluded` is the already-filtered (truthy-only) list, matching every existing call
+    site's own filtering step. Returns ("", []) when there is nothing to exclude, else
+    (" AND agent_id NOT IN (?,?,...)", [the ids]) — the fragment is a leading-space suffix,
+    append directly to an existing WHERE clause."""
+    if not excluded:
+        return "", []
+    return " AND agent_id NOT IN (%s)" % ",".join("?" for _ in excluded), list(excluded)
 
 
 def _older(a, b):
@@ -1147,6 +1267,12 @@ def ledger_needs_trimming(path=None, margin=None):
     and that is not a fault. Past the ceiling by more than one whole interval means nothing is
     trimming it.
     """
+    # 🔴 A LEDGER THAT DOES NOT EXIST IS NOT OVER ITS CEILING. _connection() opens via
+    # sqlite3.connect, which CREATES the file, so without this guard `agentx status` on a machine
+    # that has never recorded anything leaves a 0-byte .agentx.db behind -- the same defect as the
+    # 32 KB one, in a size that is HARDER to notice rather than easier.
+    if not os.path.exists(path or DB_PATH):
+        return False
     slack = _PRUNE_EVERY_WRITES if margin is None else margin
     try:
         with _connection(path) as conn:
@@ -1340,7 +1466,8 @@ def get_call_inventory(path=None, limit=25):
     empty = {"tools": [], "total_calls": 0, "window_start": None, "covers_all": True,
              "distinct_tools": 0, "readable": True, "flagged_total": 0,
              "would_block_total": 0, "unclassified_total": 0, "flagged_from_demo": 0,
-             "inventory_from_demo": 0, "viewable_total": 0}
+             "inventory_from_demo": 0, "viewable_total": 0, "would_block_from_demo": 0,
+             "totals": dict(dict.fromkeys(_LEDGER_TOTAL_KEYS, 0), window_start=None)}
     if not os.path.exists(path or DB_PATH):
         return empty
     try:
@@ -1373,11 +1500,7 @@ def get_call_inventory(path=None, limit=25):
                 cursor.execute(
                     "SELECT DISTINCT arg_names, target_class FROM event_log "
                     "WHERE status IS ? AND tool_name IS ?", (INVENTORY_STATUS, name))
-                names, classes = set(), set()
-                for arg_names, target_class in cursor.fetchall():
-                    names.update(n for n in (arg_names or "").split(",") if n)
-                    if target_class:
-                        classes.add(target_class)
+                names, classes = _union_arg_names_and_classes(cursor.fetchall())
                 # `IS NOT`, not `!=`. In SQLite `NULL != 'ALLOWED'` evaluates to NULL, which
                 # is not true, so a legacy row with no status (the P-57 migration path
                 # explicitly contemplates them) counted as NEITHER inventory nor flagged and
@@ -1399,7 +1522,7 @@ def get_call_inventory(path=None, limit=25):
                 flagged = cursor.fetchone()[0] or 0
                 tools.append({
                     "tool": name, "calls": calls, "max_amount": amount or 0.0,
-                    "arg_names": sorted(names), "classes": sorted(classes),
+                    "arg_names": names, "classes": classes,
                     "first_ts": first_ts, "last_ts": last_ts, "flagged": flagged,
                 })
 
@@ -1448,9 +1571,20 @@ def get_call_inventory(path=None, limit=25):
             #
             # The rule, stated once: a sentence about the ledger is computed FROM the ledger,
             # never from the subset the screen happens to be showing.
-            cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS NOT ?",
-                           (INVENTORY_STATUS,))
-            flagged_total = cursor.fetchone()[0] or 0
+            # 🔴 THROUGH `_ledger_totals`, NOT ITS OWN QUERY. This reader shipped a parallel
+            # set of ledger-wide counts that only the human grouped screen read, so the two
+            # surfaces of one command each had their own definition of the same fact -- the
+            # last place not routed through the single source, and where the next instance of
+            # this class was going to come from.
+            #
+            # The VALUE is unchanged and deliberately so: this screen counts every
+            # non-inventory row, INCLUDING the status-less legacy ones, because before P-92
+            # the ledger held nothing but calls we had an opinion about (see
+            # INVENTORY_STATUS). `_ledger_totals` splits that pair apart for the machine
+            # document; here they are added back together. Same numbers, one definition,
+            # and `test_the_two_surfaces_agree_about_one_ledger` holds the relationship.
+            _shared = _ledger_totals(cursor)
+            flagged_total = _shared["flagged"] + _shared["unclassified"]
 
             # 🔴 OUR OWN DEMO IS NOT "WHAT YOUR AGENT DID". `agentx demo` writes a catch under
             # agent_id 'demo_cli', and the demo footer sends the reader straight here -- so on
@@ -1489,13 +1623,28 @@ def get_call_inventory(path=None, limit=25):
                            (WOULD_BLOCK_STATUS,))
             would_block_total = cursor.fetchone()[0] or 0
 
+            # 🔴 AND WHICH OF THOSE WERE OURS, because a caller is about to use this count as
+            # EVIDENCE. `agentx demo --audit` writes its scripted DROP TABLE as a WOULD_BLOCK,
+            # so on the first run of the ladder this number is 1 and that 1 is ours. A screen
+            # that says "audit caught these and let them run -- turn on enforce" off the back
+            # of it is selling protection using our own demo as the proof, and telling a
+            # developer their agent did something it did not. Third status to need this split
+            # (see flagged_from_demo and inventory_from_demo directly below); the rule is that
+            # any count a SENTENCE about "your agent" rests on needs it.
+            cursor.execute(
+                "SELECT COUNT(*) FROM event_log WHERE status IS ? AND " + _ours_sql,
+                (WOULD_BLOCK_STATUS, *_ours_params))
+            would_block_from_demo = cursor.fetchone()[0] or 0
+
             # Rows with NO status at all (legacy, pre-P-57 migration). They are counted in
             # flagged_total because a row we cannot classify is still a row -- but every
             # `agentx insights` reader filters on CHALLENGED / RECOVERED / WOULD_BLOCK, so
             # sending someone there to "see them" shows nothing. The caller needs to know how
             # many of the flagged are actually VIEWABLE before it offers that command.
-            cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS NULL")
-            unclassified_total = cursor.fetchone()[0] or 0
+            # Same source as `flagged_total` above, for the same reason: this number and the
+            # machine document's `unclassified` are the same fact and must not be able to
+            # drift apart.
+            unclassified_total = _shared["unclassified"]
 
             # What `agentx insights` can actually SHOW. Deriving this as "flagged minus NULL"
             # assumed every non-NULL status is renderable there, and that reader filters on
@@ -1515,10 +1664,16 @@ def get_call_inventory(path=None, limit=25):
                 "readable": True,
                 "flagged_total": flagged_total,
                 "would_block_total": would_block_total,
+                "would_block_from_demo": would_block_from_demo,
                 "unclassified_total": unclassified_total,
                 "viewable_total": viewable_total,
                 "flagged_from_demo": flagged_from_demo,
                 "inventory_from_demo": inventory_from_demo,
+                # Handed over rather than discarded. It was computed here and thrown away,
+                # so the JSON caller opened a SECOND connection and recomputed all of it --
+                # extra queries, and a separate transaction, so a row written between the two
+                # reads produced a payload whose totals disagreed with the list they label.
+                "totals": _shared,
             }
     except Exception:
         # 🔴 A READ FAILURE IS NOT AN EMPTY LEDGER, and conflating them is the exact defect
@@ -1527,6 +1682,1209 @@ def get_call_inventory(path=None, limit=25):
         out = dict(empty)
         out["readable"] = False
         return out
+
+
+#: Every count a sentence about this ledger can rest on, and the ONLY place they are
+#: computed. Both audit views and both output shapes read these, so they cannot disagree.
+_LEDGER_TOTAL_KEYS = ("rows", "inventory", "flagged", "unclassified", "ours",
+                      "distinct_tools", "window_start")
+
+
+def _ledger_totals(cursor):
+    """The ledger-wide counts, from one place. Assumes an open cursor; never raises alone.
+
+    🔴 ONE ENTRY POINT, BECAUSE TWO HAND-BUILT COPIES DISAGREED. The grouped reader and the
+    per-call reader each assembled their own set, and the JSON built from them reported
+    `flagged: 3, ours: 0` for a ledger whose 3rd flagged row WAS ours -- two numbers over
+    two different populations, printed side by side under one label, so a consumer
+    subtracting one from the other counted our own demo's block as the developer's.
+
+    🔴 FOUR POPULATIONS, NOT TWO, AND THE FOURTH IS WHY. A row's status is ALLOWED (we
+    looked and had nothing to say), a real verdict (we had an opinion), or NULL -- a legacy
+    row predating the status column. `flagged` counts VERDICTS ONLY; the legacy rows are
+    counted apart as `unclassified`, because the per-call screen renders one as "unrecorded"
+    and a total that called it flagged would contradict the row beside it.
+
+    ⚠️ AND THAT IS A NARROWER NUMBER THAN THE GROUPED SCREEN'S, DELIBERATELY. Before P-92
+    this ledger held ONLY calls we had an opinion about (see INVENTORY_STATUS above), so a
+    status-less row genuinely IS one -- which is why `agentx audit` counts it under "tripped
+    a policy" and then says separately that it comes from an older ledger. Neither number is
+    wrong; they are different sets. The screen's is `flagged + unclassified`, and
+    `test_the_two_surfaces_agree_about_one_ledger` is what stops that relationship drifting.
+
+    `IS` / `IS NOT`, never `=` / `!=`: SQLite yields NULL for those against NULL, which is
+    not true, so a status-less row silently vanishes from every count at once. This module
+    has been fixed for that trap more than once.
+    """
+    # 🔴 NOT `COUNT(DISTINCT tool_name)`, FOR THE SAME NULL RULE THIS DOCSTRING STATES.
+    # SQLite's COUNT(DISTINCT col) SKIPS NULLs, so a row whose tool_name was never written
+    # counted in `rows` and in no tool at all: a one-row legacy ledger rendered as
+    # "1 call across 0 tools" on the per-call screen -- which then printed that very row as
+    # "(unnamed)" underneath. Measured. `SELECT DISTINCT` keeps the NULL group, which is
+    # also what `get_call_inventory`'s `GROUP BY tool_name` does, so the two readers agree
+    # on how many tools a ledger holds instead of differing by one on exactly the rows this
+    # function exists to stop mis-counting.
+    cursor.execute(
+        "SELECT COUNT(*), "
+        "(SELECT COUNT(*) FROM (SELECT DISTINCT tool_name FROM event_log)), "
+        "MIN(timestamp) FROM event_log")
+    rows, distinct_tools, window_start = cursor.fetchone()
+
+    cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS ?", (INVENTORY_STATUS,))
+    inventory = cursor.fetchone()[0] or 0
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM event_log WHERE status IS NOT ? AND status IS NOT NULL",
+        (INVENTORY_STATUS,))
+    flagged = cursor.fetchone()[0] or 0
+
+    cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS NULL")
+    unclassified = cursor.fetchone()[0] or 0
+
+    ours_sql, ours_params = _our_agents_clause()
+    cursor.execute("SELECT COUNT(*) FROM event_log WHERE " + ours_sql, tuple(ours_params))
+    ours = cursor.fetchone()[0] or 0
+
+    return {"rows": rows or 0, "inventory": inventory, "flagged": flagged,
+            "unclassified": unclassified, "ours": ours,
+            "distinct_tools": distinct_tools or 0, "window_start": window_start}
+
+
+def get_ledger_totals(path=None):
+    """`_ledger_totals` for a caller that has no cursor. Never raises.
+
+    Returns the counts plus `readable`. A caller rendering these must branch on `readable`:
+    zeroes from an unreadable ledger describe a file nobody managed to open, which is not
+    the same statement as an idle agent.
+    """
+    empty = dict.fromkeys(_LEDGER_TOTAL_KEYS, 0)
+    empty["window_start"] = None
+    empty["readable"] = True
+    if not os.path.exists(path or DB_PATH):
+        return empty
+    try:
+        with _connection(path) as conn:
+            out = _ledger_totals(conn.cursor())
+            out["readable"] = True
+            return out
+    except Exception:
+        out = dict(empty)
+        out["readable"] = False
+        return out
+
+
+def get_call_log(path=None, limit=50, offset=0):
+    """P-92: what the agent did, ONE ROW PER CALL, newest first. Never raises.
+
+    The per-call sibling of `get_call_inventory`, which groups by tool. Both read the same
+    ledger; this one does not collapse it, because the ORDER is information a grouped view
+    cannot carry. A table read one row at a time, five hundred times, is "read_row: 500
+    calls" in the aggregate and is recognisable for what it is here. Nothing in this product
+    DETECTS that shape (P-117 -- only a stateful system could), so an ordered list is
+    currently the only place it can be seen at all.
+
+    🔴 IT READS EVERY STATUS, NOT JUST THE INVENTORY, and that is the whole difference from
+    its sibling. `get_call_inventory` reads INVENTORY_STATUS alone because it answers "what
+    did we have no opinion about". This answers "what did the agent DO", and a timeline with
+    the calls we objected to filtered out shows a tool called five times when it was called
+    six. The per-row `status` is what keeps the two questions apart: dropping the rows loses
+    the count, a column does not.
+
+    `limit=None` returns every row in the window -- what `--all` and `--json` pass. "Every
+    row" is bounded by construction: _RETENTION_MAX_ROWS is the ceiling on this table.
+
+    Returns {readable, rows, shown, window_start, covers_all, totals}, where `totals`
+    is the shared `_ledger_totals` block -- handed over whole rather than picked apart, so a
+    caller cannot pair two counts drawn over different populations. `readable` False means
+    the ledger is on disk and could NOT be read -- never that the agent did nothing. The two
+    render differently; see the same contract on `get_call_inventory`.
+    """
+    # Every key the success path returns, so a caller never has to branch on which of the
+    # three exits it got. The missing-file and unreadable exits differ ONLY in `readable`.
+    empty = {"readable": True, "rows": [], "shown": 0, "covers_all": True,
+             "totals": dict(dict.fromkeys(_LEDGER_TOTAL_KEYS, 0), window_start=None),
+             "window_start": None}
+    if not os.path.exists(path or DB_PATH):
+        return empty
+    try:
+        with _connection(path) as conn:
+            cursor = conn.cursor()
+            # Counted over the WHOLE ledger, never from the page below. Same rule this
+            # module already states for the grouped reader: a sentence about the ledger is
+            # computed FROM the ledger, never from the subset the screen happens to show.
+            totals = _ledger_totals(cursor)
+            window_start = totals["window_start"]
+
+            # 🔴 `rows_dropped`, NOT `rows_dropped - blocks_dropped`. The grouped reader
+            # subtracts because its sentence is about INVENTORY rows only. This view holds
+            # EVERY status, so any eviction at all shortens the window it describes --
+            # borrowing the sibling's expression would report a fully-trimmed ledger of
+            # blocks as complete. The counter that decides a sentence has to be the counter
+            # that sentence is about.
+            #
+            # Guarded separately from the read above for the sibling's reason:
+            # `ledger_retention` is created by init_db, so pointing this at ANOTHER
+            # process's ledger can raise "no such table" on a file that reads perfectly, and
+            # a missing counter table is not an unreadable ledger.
+            try:
+                cursor.execute("SELECT rows_dropped FROM ledger_retention WHERE id = 1")
+                dropped_row = cursor.fetchone()
+            except Exception:
+                dropped_row = None
+
+            # `id` is the tie-break, and it is load-bearing rather than tidy: `timestamp` is
+            # a REAL, so two calls inside one clock tick come back in whatever order SQLite
+            # likes. That makes "newest first" wrong exactly when calls are FASTEST, which
+            # is the burst this view exists to make visible.
+            sql = ("SELECT timestamp, tool_name, status, arg_names, amount, target_class, "
+                   "policy_name, trace_id, agent_id FROM event_log "
+                   "ORDER BY timestamp DESC, id DESC")
+            # 🔴 OFFSET SURVIVES `limit=None`. The clause used to be appended only when a
+            # limit was set, so `get_call_log(limit=None, offset=50)` silently returned the
+            # whole list from row 1 -- the next paging caller gets 50 duplicated rows with
+            # nothing red. SQLite has no OFFSET without LIMIT, and `LIMIT -1` is its
+            # documented "no limit", so the two stay independent as the signature promises.
+            sql += " LIMIT ? OFFSET ?"
+            params = [-1 if limit is None else int(limit), int(offset)]
+            cursor.execute(sql, params)
+
+            rows = []
+            for (ts, tool, status, arg_names, amount, target_class,
+                 policy_name, trace_id, agent_id) in cursor.fetchall():
+                rows.append({
+                    "ts": ts,
+                    "tool": tool,
+                    "status": status,
+                    "arg_names": arg_names,
+                    "amount": amount or 0.0,
+                    "target_class": target_class,
+                    "policy_name": policy_name,
+                    "trace_id": trace_id,
+                    "agent_id": agent_id,
+                    # MARKED, never dropped -- the same call the grouped screen makes for
+                    # the same rows. `agentx demo --audit` writes real rows under our own
+                    # agent id, and a reader who ran it precisely to get a populated screen
+                    # would otherwise be handed an empty one.
+                    # 🔴 THROUGH `is_our_agent`, WHOSE OWN DOCSTRING SAYS "ONE PREDICATE,
+                    # BECAUSE THE LAST TWO TIMES THIS WAS ANSWERED IT WAS ANSWERED PER SITE
+                    # AND ONE SITE WAS MISSED". This was a third hand-written site, in the
+                    # branch whose whole stated class is going around an entry point that
+                    # already exists. Equivalent today; that is not the point.
+                    "ours": is_our_agent(agent_id),
+                })
+
+            return {
+                "readable": True,
+                "rows": rows,
+                # NO `total` here. It was `totals["rows"]` under a second name, and one fact
+                # with two names is what this change spent its review budget removing.
+                "shown": len(rows),
+                # The ledger-wide counts, whole and unedited, from the one place that
+                # computes them. Handing over the block rather than a hand-picked pair is
+                # what stops a caller inventing a subtraction between two populations.
+                "totals": totals,
+                "window_start": window_start,
+                "covers_all": not (dropped_row and dropped_row[0]),
+            }
+    except Exception:
+        # 🔴 A READ FAILURE IS NOT AN EMPTY LEDGER, and the stakes are higher here than on
+        # the sibling: this reader feeds `--json`, whose consumer is a program with no prose
+        # to tell the two apart. The JSON renderer OMITS the list entirely rather than
+        # emitting [], because [] means "your agent did nothing".
+        out = dict(empty)
+        out["readable"] = False
+        return out
+
+
+# --- P-112 NOVELTY: what is NEW about this ledger since the reader last saw it ---------
+#
+# 🔴 THE WATERMARK IS A STORED COPY OF THE AGGREGATE, NEVER A TIMESTAMP AND NEVER A ROW ID,
+# AND THAT IS THE WHOLE DESIGN. P-112 was decided as "audit first, enforce later": today only
+# audit posture writes inventory rows, and when enforce eventually records them it will do so
+# as PER-TOOL AGGREGATES upserted on an interval rather than one row per call -- the write
+# volume becomes O(distinct tools), which is what removes the per-call cost objection. A reader
+# that diffed timestamps, or walked per-call rows, would have to be rewritten on the day that
+# lands. A reader that diffs this aggregate against a stored copy of the SAME aggregate does
+# not, because the shape it reads is the shape that will still be there. Only the posture gate
+# moves. That constraint is the reason this is not the obvious "rows newer than X" query.
+#
+# It is also the only version that survives retention. `MAX(amount)` read from the ledger goes
+# DOWN when the row holding the largest bucket is trimmed, so a later call at the old size
+# would be announced as a new record. A stored watermark only ever moves up.
+_CREATE_NOVELTY_SQL = """CREATE TABLE IF NOT EXISTS ledger_novelty (
+    watermark     TEXT NOT NULL,
+    tool_name     TEXT NOT NULL,
+    arg_names     TEXT,
+    classes       TEXT,
+    max_amount    REAL NOT NULL DEFAULT 0,
+    calls         INTEGER NOT NULL DEFAULT 0,
+    arg_combos    TEXT,
+    max_day_calls INTEGER NOT NULL DEFAULT 0,
+    max_day       TEXT,
+    max_burst     INTEGER NOT NULL DEFAULT 0,
+    max_burst_at  TEXT,
+    hours         TEXT,
+    weekend       INTEGER NOT NULL DEFAULT 0,
+    last_ts       REAL,
+    PRIMARY KEY (watermark, tool_name)
+)"""
+
+# Columns added after the table first shipped on this branch. Same three-line treatment as
+# ledger_retention, and outside _plan_migration for the same reason: this is OUR bookkeeping,
+# not the user's history, so a column we cannot add costs a novelty line and never a record.
+_NOVELTY_COLUMNS = [
+    ("arg_combos",    "TEXT"),
+    ("max_day_calls", "INTEGER NOT NULL DEFAULT 0"),
+    ("max_day",       "TEXT"),
+    ("max_burst",     "INTEGER NOT NULL DEFAULT 0"),
+    ("max_burst_at",  "TEXT"),
+    ("hours",         "TEXT"),
+    ("weekend",       "INTEGER NOT NULL DEFAULT 0"),
+    ("last_ts",       "REAL"),
+]
+
+
+def _dumps_set(values):
+    """Serialise a set of strings so EVERY member survives, including the empty one.
+
+    The sets on a novelty row are otherwise separator-joined, which is fine while an empty
+    member is meaningless (there is no empty argument name). It is not fine for argument
+    COMBINATIONS, where "the call took no arguments" is a real and interesting member. See
+    the read side for the defect that produced.
+    """
+    try:
+        return json.dumps(sorted(values))
+    except Exception:
+        return "[]"
+
+
+def _loads_set(blob):
+    """Inverse of `_dumps_set`. Never raises; an unreadable value reads as empty."""
+    try:
+        loaded = json.loads(blob or "[]")
+        return [v for v in loaded if isinstance(v, str)]
+    except Exception:
+        return []
+
+
+def _ensure_novelty_columns(conn):
+    """Add any ledger_novelty column an older ledger is missing. Idempotent; never raises."""
+    try:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(ledger_novelty)")}
+        if not have:
+            return
+        for name, ddl in _NOVELTY_COLUMNS:
+            if name not in have:
+                conn.execute("ALTER TABLE ledger_novelty ADD COLUMN %s %s" % (name, ddl))
+    except Exception:
+        # A ledger we cannot ALTER still reads: the missing columns come back as absent keys
+        # and the signals that depend on them stay quiet. Degrading to fewer novelty lines is
+        # the correct failure for a feature whose whole job is to be pleasant.
+        pass
+
+# WHETHER THE READER HAS EVER SEEN THIS SURFACE, which is NOT the same question as whether we
+# have any rows stored for it, and conflating the two produced a false sentence on the first
+# run of the ladder. A ledger holding only our own demo rows gives the table above nothing to
+# write, so "have we stored anything" answered NO for someone who had already run the command.
+# One row per watermark; it is a flag, not a log.
+_CREATE_NOVELTY_SEEN_SQL = """CREATE TABLE IF NOT EXISTS ledger_novelty_seen (
+    watermark TEXT PRIMARY KEY,
+    ts        REAL,
+    busiest   TEXT
+)"""
+
+_NOVELTY_SEEN_COLUMNS = [("busiest", "TEXT")]
+
+
+def _record_changed(now_id, was_id):
+    """🔴 THE ONE RULE EVERY RECURRING SIGNAL GOES THROUGH: a record is news when its HOLDER
+    changes, never when its VALUE moves.
+
+    Three signals here are records rather than firsts -- busiest day, biggest burst, busiest
+    tool -- and each one learned this separately and incompletely. `busiest_day` and `burst`
+    were fixed to store the identity of the record (the day, the minute) and compare THAT,
+    because a still-open day keeps growing and re-announced itself every session. `busiest`
+    was left comparing a derived quantity, and had a worse version of the same bug: the
+    stored call count is a running MAX, so once retention trims the previous leader's rows
+    the live ledger and the watermark disagree PERMANENTLY and nothing reconciles them.
+    Reproduced: 100 calls to one tool, 10 to another, trim the first, and "now your busiest
+    tool" printed on every session forever -- crowding out every real fact on a two-line
+    teaser.
+
+    A rule invented at one site and not carried to its siblings is the template this branch
+    keeps repeating. This is the entry point so a fourth record cannot get it wrong.
+    """
+    return bool(now_id) and now_id != was_id
+
+
+def _ensure_novelty_seen_columns(conn):
+    """Add any ledger_novelty_seen column an older ledger is missing. Never raises."""
+    try:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(ledger_novelty_seen)")}
+        if not have:
+            return
+        for name, ddl in _NOVELTY_SEEN_COLUMNS:
+            if name not in have:
+                conn.execute("ALTER TABLE ledger_novelty_seen ADD COLUMN %s %s" % (name, ddl))
+    except Exception:
+        pass
+
+# TWO watermarks, because the two surfaces ask DIFFERENT QUESTIONS and one watermark would
+# have them eat each other's answer. The session-end line asks "what did I not know before
+# this run"; `agentx audit` asks "what has changed since I last looked at this screen". With a
+# single watermark the atexit line would consume the novelty and the report -- the screen we
+# are trying to send them to -- would render empty for the reader who just followed it.
+WATERMARK_SESSION = "session"
+WATERMARK_REPORT = "report"
+
+# Prose names for the surface classes. `_SURFACE_LABELS` is the TABLE column ("DB", "FS") and
+# is too terse to drop into a sentence; these go in "first call to your database". Kept as a
+# separate map rather than title-casing the stored value, because `http` reads as "network" to
+# a developer and as nothing at all spelled out. `_CLASS_OTHER` is deliberately ABSENT: it
+# means we could not tell, and "first call to your other" is a claim about their code we have
+# no basis for. The same under-inclusive rule `_TARGET_CLASSES` is written under.
+_SURFACE_WORDS = {
+    "db": "database",
+    "filesystem": "filesystem",
+    "http": "network",
+    "shell": "shell",
+    "cloud": "cloud",
+}
+
+# How dominant one tool has to be before "your busiest tool" is worth a line. A share, not a
+# rank: on a ledger of twenty tools the top one is always SOME tool, and printing it would be
+# a fact with no information in it.
+_CONCENTRATION_SHARE = 0.4
+
+# ...and a floor under the sample, because a share of three calls is not a shape. On the
+# first run of the ladder a wrapped agent has made a handful of calls and "mostly one tool:
+# run_sql ran 2 of your 3" is arithmetic dressed as an observation. Found by walking the
+# ladder in one directory rather than by a test, which is where this screen's last four
+# defects came from too.
+_CONCENTRATION_MIN_CALLS = 10
+
+# How many argument names one novelty line will name before it counts the rest. An agent with
+# optional arguments can add a dozen in one session, and a line that lists them all stops
+# being a signal and becomes the table again.
+_MAX_NEW_ARGS_SHOWN = 3
+
+# How many argument COMBINATIONS one tool's watermark will remember. Unlike every other field
+# stored there, this one is not drawn from a closed set -- a tool with many optional keywords
+# has combinatorially many. Past the cap the tool stops contributing the missing-argument
+# signal, which is the honest end state: a tool that varied enough to hit this has no stable
+# "always passes X" for anything to violate.
+_MAX_ARG_COMBOS = 24
+
+# How far a new hour has to be from every hour already seen before it counts as the agent
+# running OUTSIDE its usual window. 1 means "next door is the same window": 10am then 11am is
+# a working day, 10am then 3am is not.
+_HOUR_SAME_WINDOW = 1
+
+
+def _hour_distance(a, b):
+    """Hours between two clock hours, the short way round. Never raises; 24 on bad input.
+
+    Circular on purpose: 23:00 and 00:00 are one hour apart, and treating them as
+    twenty-three would call every late-night run a departure from a midnight one.
+    """
+    try:
+        gap = abs(int(a) - int(b))
+    except Exception:
+        return 24
+    return min(gap, 24 - gap)
+
+
+# A "burst record" below this is not a record, it is two calls that happened to share a
+# minute. Any agent in a loop clears it immediately; an agent doing one thing at a time never
+# will, which is the distinction the line exists to draw.
+_BURST_WORTH_SHOWING = 5
+
+# A tool needs more than a single call before "now your busiest tool" means
+# anything. One call each is a tie, and a tie is decided by spelling.
+_BUSIEST_MIN_CALLS = 2
+
+# How long an absence has to be before coming back is worth remarking on. A weekend is not an
+# absence, and a line that fired every Monday would be a nag rather than news.
+_GAP_WORTH_SHOWING = 7 * 86400
+
+
+def current_call_shape(path=None):
+    """The per-tool aggregate the novelty reader diffs. THE DEVELOPER'S ROWS ONLY.
+
+    Returns ``{tool_name: {"calls", "max_amount", "arg_names", "classes"}}``, empty on any
+    failure. Never raises.
+
+    MEASURED, because P-112 is a row where an unmeasured cost nearly became a veto. Cost is
+    LINEAR IN ROWS and paid ONCE PER SESSION, at exit -- the whole session-end pass (this
+    read plus the write that reuses it) across 12 tools:
+
+        50 rows 5.6 ms | 200 5.3 | 1,000 7.7 | 5,000 20 | 10,000 (P-97's cap) 44
+
+    On a ledger holding only blocks -- no inventory rows, which is every install that has not
+    turned audit on -- the read is 0.64 ms. Nothing here runs per tool call.
+
+    ⚠️ TWO EARLIER SETS OF NUMBERS IN THIS DOCSTRING WERE WRONG, AND BOTH WERE WRONG THE SAME
+    WAY: measured on a ledger built in a tight loop, where every row shared a handful of
+    timestamps and the GROUP BY collapsed to a few groups. Spread realistically the read is
+    ~31 ms at the cap, not the 13.9 first recorded here. A companion figure for the write was
+    inflated for the opposite reason -- it was timed WITHOUT passing `current`, so it silently
+    re-did the read. **A benchmark's fixture is part of its claim.** Re-run these when the
+    function grows a query, and build the fixture like the thing it stands for.
+
+    ⚠️ ALL THREE CALL SITES PASS `current` THROUGH, and that is a requirement rather than an
+    observation. Omitting it makes the pair cost three scans instead of one. The MCP door did
+    omit it, which also made an earlier version of the sentence above ("the read that both
+    real call sites hand it") untrue of one of them -- a claim about call sites that was
+    checked against two of the three.
+
+    ⚠️ AND THIS DOES NOT HAVE TO BE A FULL SCAN. Every signal here is a union, a running
+    maximum or a count, so new rows could be folded into the stored bookmark without
+    re-reading the old ones -- bounded by activity rather than by ledger size. Deliberately
+    NOT done yet: it needs a read-up-to marker whose failure mode is news silently lost
+    forever, and it buys nothing at 5 ms. It becomes the right trade when enforce starts
+    recording and every ledger sits at the cap permanently, which is P-112's second half.
+
+    ⚠️ SAY HOW OFTEN IT RUNS, NOT WHICH PATH IT IS ON. Every number above is ONCE PER
+    SESSION, at exit. Nothing in this file runs PER TOOL CALL -- the per-call code costs
+    0.062 ms and this reader adds nothing to it, in either posture. The two costs differ by
+    how often they happen, so that is what the words have to carry: "hot path" and
+    "protected call path" name neither, and the second one also reads as a claim about
+    enforce posture, which it is not.
+
+    🔴 DELIBERATELY NOT `get_call_inventory`, and the two differences are both load-bearing.
+    That reader caps at `limit` tools, so a tool would be announced as seen-for-the-first-time
+    on the day it climbs into the top 25 -- years after its first call. And it deliberately
+    INCLUDES our own demo rows so the screen can footnote them, which is right for a table the
+    reader can see the footnote under and wrong for a one-line claim: "your agent touched your
+    filesystem for the first time" about `agentx demo --audit`'s four scripted calls is us
+    telling a developer something false about their own code, on the first run of the ladder,
+    with no table underneath to qualify it. That is the exact misattribution the per-tool
+    `flagged` count was already fixed for once.
+
+    ⚠️ ROWS WITH NO TOOL NAME ARE SKIPPED ENTIRELY rather than grouped under a placeholder.
+    Every sentence this feeds names the tool, so an unnamed one has nothing to say, and the
+    table below keys on the name -- SQLite permits NULL in a PRIMARY KEY column and treats
+    two NULLs as distinct, so admitting them would quietly grow a duplicate row per session.
+    """
+    if not os.path.exists(path or DB_PATH):
+        return {}
+    shape = {}
+    try:
+        with _connection(path) as conn:
+            cursor = conn.cursor()
+            not_ours_sql, not_ours_params = _our_agents_clause(negate=True)
+            cursor.execute(
+                "SELECT tool_name, COUNT(*), MAX(amount), MAX(timestamp) FROM event_log "
+                "WHERE status IS ? AND tool_name IS NOT NULL AND " + not_ours_sql +
+                " GROUP BY tool_name",
+                (INVENTORY_STATUS, *not_ours_params))
+            for name, calls, amount, last_ts in cursor.fetchall():
+                shape[name] = {"calls": calls or 0, "max_amount": amount or 0.0,
+                               "arg_names": set(), "classes": set(), "combos": set(),
+                               "max_burst": 0, "max_burst_at": None, "hours": set(), "weekend": False,
+                               "max_day_calls": 0, "max_day": None, "last_ts": last_ts or 0.0}
+            # ONE pass for every tool's argument names and classes, rather than the
+            # per-tool query `get_call_inventory` runs. This one is called from atexit in
+            # the developer's own process, so the N+1 is a cost their session pays.
+            cursor.execute(
+                "SELECT DISTINCT tool_name, arg_names, target_class FROM event_log "
+                "WHERE status IS ? AND tool_name IS NOT NULL AND " + not_ours_sql,
+                (INVENTORY_STATUS, *not_ours_params))
+            for name, arg_names, target_class in cursor.fetchall():
+                entry = shape.get(name)
+                if entry is None:
+                    continue
+                entry["arg_names"].update(n for n in (arg_names or "").split(",") if n)
+                if target_class:
+                    entry["classes"].add(target_class)
+                # 🔴 THE COMBINATION, NOT JUST THE UNION, and the difference is a whole class
+                # of signal. Unioning the names answers "what can this tool take"; the SET OF
+                # COMBINATIONS answers "what did this call actually pass", which is the only
+                # way an argument going MISSING is visible. A query that always carried a
+                # `limit` and one day does not is the shape of an unbounded read, and under a
+                # union it is indistinguishable from any other call.
+                #
+                # Stored as a sorted csv so two calls passing the same keywords in a different
+                # order are one combination rather than two.
+                entry["combos"].add(",".join(sorted(
+                    n for n in (arg_names or "").split(",") if n)))
+
+            # --- THE TIME-SHAPED HALF, IN ONE PASS -------------------------------------
+            #
+            # Everything above is SHAPE, and shape is finite: one tool has one surface, a
+            # handful of argument names and one magnitude range, so a developer who wrapped a
+            # single function runs out of news almost immediately. Measured on ten sessions of
+            # one realistic tool: EIGHT were silent, including the one that dropped an
+            # argument it had always passed and the one that ran 45 calls against a previous
+            # best of 20. Time-shaped facts are what renew, because a RECORD can always be
+            # broken where a FIRST cannot happen twice.
+            #
+            # Grouped to the MINUTE and folded up in Python rather than run as four queries:
+            # per-minute counts give the burst record directly, summing them by day gives the
+            # daily record, and the hour and weekday come along on the same rows.
+            #
+            # ⚠️ LOCALTIME, DELIBERATELY. These end up in sentences a human reads about their
+            # own working day -- "busiest day yet", "first call between 03:00 and 04:00" --
+            # and a UTC day boundary would put a developer's evening work on tomorrow's date.
+            # The stored timestamps stay epoch; only this reader localises.
+            # ⚠️ ONE strftime, NOT FIVE, AND IT IS WORTH 17 MILLISECONDS. The first version
+            # asked for the day, hour, weekday and minute as four separate conversions plus a
+            # fifth for the grouping key, and every one of them runs per ROW: on a ledger at
+            # the P-97 ceiling that took this function from 5.4 ms to 23.5 ms. One combined
+            # key sliced in Python gives the same four facts, because they are all prefixes or
+            # suffixes of the same string. Measured before and after, not assumed.
+            cursor.execute(
+                "SELECT tool_name,"
+                "       strftime('%Y-%m-%d %H:%M %w', timestamp, 'unixepoch', 'localtime'),"
+                "       COUNT(*)"
+                "  FROM event_log"
+                " WHERE status IS ? AND tool_name IS NOT NULL AND timestamp IS NOT NULL"
+                "   AND " + not_ours_sql +
+                " GROUP BY tool_name, 2",
+                (INVENTORY_STATUS, *not_ours_params))
+            per_day = {}
+            for name, stamp, count in cursor.fetchall():
+                # "2026-06-01 09:00 1" -> day, hour, minute-key, weekday.
+                if not stamp or len(stamp) < 18:
+                    continue
+                day, hour, minute, weekday = stamp[:10], stamp[11:13], stamp[:16], stamp[-1]
+                entry = shape.get(name)
+                if entry is None:
+                    continue
+                count = count or 0
+                if count > entry["max_burst"]:
+                    entry["max_burst"] = count
+                    entry["max_burst_at"] = minute
+                if hour:
+                    entry["hours"].add(hour)
+                if weekday in ("0", "6"):
+                    entry["weekend"] = True
+                if day:
+                    key = (name, day)
+                    per_day[key] = per_day.get(key, 0) + count
+            for (name, day), count in per_day.items():
+                entry = shape[name]
+                if count > entry["max_day_calls"]:
+                    entry["max_day_calls"] = count
+                    entry["max_day"] = day
+    except Exception:
+        # A ledger we cannot read has nothing NEW to say about it, and the callers of this
+        # print a line only when there is one. Silence is the correct failure here: the
+        # screens that must tell "unreadable" apart from "empty" read get_call_inventory,
+        # which carries `readable` for exactly that.
+        return {}
+    return shape
+
+
+# 🔴 "NEVER WATERMARKED" AND "COULD NOT READ IT" ARE DIFFERENT ANSWERS, and one value for
+# both is the template this branch has now fixed five times (the seen-flag split, the
+# column-tolerant select, the empty combination, and three ours-vs-theirs counts). The
+# last instance lived in `advance_watermark`: it took `_read_watermark(...) or {}`, so a
+# transient read failure merged the new state against NOTHING and every running maximum,
+# set and timestamp was rewritten DOWNWARD -- breaking the "a watermark only ever moves
+# up" invariant its own docstring promises, and re-announcing a record the tool had
+# already set. Cheap to split now that the missing-table case is answered by the PRAGMA
+# below rather than by the exception handler.
+_WATERMARK_UNREADABLE = object()
+
+
+def _read_watermark(watermark, path=None):
+    """The stored aggregate for `watermark`.
+
+    THREE answers, and callers depend on telling them apart:
+      dict                    -- what we had seen
+      None                    -- never watermarked, so everything is new
+      _WATERMARK_UNREADABLE   -- we could not read it, so we know NOTHING
+
+    None and {} are different answers and the caller depends on it: None means this ledger
+    has never been watermarked, so everything in it is new and the surfaces say "first look"
+    rather than announcing a year of history as though it happened this afternoon.
+    """
+    if not os.path.exists(path or DB_PATH):
+        return None
+    try:
+        with _connection(path) as conn:
+            cursor = conn.cursor()
+            _ensure_novelty_columns(conn)
+            # 🔴 SELECT WHAT THE TABLE ACTUALLY HAS, NOT WHAT THIS VERSION EXPECTS. The
+            # ALTER above is best-effort and its comment claimed a graceful degradation --
+            # "the missing columns come back as absent keys and the signals that depend on
+            # them stay quiet". That was false: naming all thirteen columns made the SELECT
+            # RAISE on a ledger we could not ALTER, the handler returned None, and None is
+            # the sentinel for NEVER WATERMARKED -- so the entire watermark was discarded and
+            # every tool re-announced as a first call, every session, silently. The failure
+            # was total where the comment promised partial. Now the promise is the code.
+            have = {r[1] for r in conn.execute("PRAGMA table_info(ledger_novelty)")}
+            wanted = ["tool_name", "arg_names", "classes", "max_amount", "calls",
+                      "arg_combos", "max_day_calls", "max_day", "max_burst", "max_burst_at",
+                      "hours", "weekend", "last_ts"]
+            present = [c for c in wanted if c in have]
+            if "tool_name" not in present:
+                return None
+            cursor.execute(
+                "SELECT %s FROM ledger_novelty WHERE watermark IS ?" % ", ".join(present),
+                (watermark,))
+            rows = [dict(zip(present, r)) for r in cursor.fetchall()]
+    except Exception:
+        # NOT "no such table" any more -- the PRAGMA above answers that by returning None
+        # cleanly, which is what lets this handler mean one thing: a lock, a corrupt file,
+        # a permission error. We know nothing about what was stored, and saying "nothing
+        # was" would let the caller overwrite it.
+        return _WATERMARK_UNREADABLE
+    if not rows:
+        return None
+    stored = {}
+    for row in rows:
+        name = row.get("tool_name")
+        arg_names, classes = row.get("arg_names"), row.get("classes")
+        max_amount, calls = row.get("max_amount"), row.get("calls")
+        combos, max_day_calls = row.get("arg_combos"), row.get("max_day_calls")
+        max_day, max_burst = row.get("max_day"), row.get("max_burst")
+        max_burst_at, hours = row.get("max_burst_at"), row.get("hours")
+        weekend, last_ts = row.get("weekend"), row.get("last_ts")
+        stored[name] = {
+            "calls": calls or 0,
+            "max_amount": max_amount or 0.0,
+            "arg_names": {n for n in (arg_names or "").split(",") if n},
+            "classes": {c for c in (classes or "").split(",") if c},
+            # 🔴 JSON, NOT A SEPARATOR, AND THE EMPTY MEMBER IS WHY. A call that takes NO
+            # arguments is a real combination, and its member is the empty string. Every
+            # other set on this row is separator-joined and filtered with `if c` on the way
+            # back, which is correct for them -- there is no such thing as an empty argument
+            # NAME or an empty surface -- and silently wrong here: the no-argument
+            # combination was written, dropped on read, and therefore counted as brand new on
+            # every single session. `dropped` then compared the intersection of everything
+            # else against an empty set and announced "called without <every argument> for
+            # the first time", forever, top-ranked, about a call the developer had made weeks
+            # earlier. Reproduced end to end before fixing.
+            #
+            # A set whose members can legitimately be empty needs a serialisation that
+            # round-trips exactly, not one that filters. `test_every_stored_set_round_trips`
+            # pins this for all four sets so the next one added cannot repeat it.
+            "combos": set(_loads_set(combos)),
+            "max_day_calls": max_day_calls or 0,
+            "max_day": max_day,
+            "max_burst": max_burst or 0,
+            "max_burst_at": max_burst_at,
+            "hours": {h for h in (hours or "").split(",") if h},
+            "weekend": bool(weekend),
+            "last_ts": last_ts or 0.0,
+        }
+    return stored
+
+
+def _watermark_busiest(watermark, path=None):
+    """Which tool was busiest when this watermark was last advanced, or None.
+
+    Stored, not derived. See `_record_changed` for why deriving it from the call counts is a
+    permanent nag rather than a one-off wrong answer.
+    """
+    if not os.path.exists(path or DB_PATH):
+        return None
+    try:
+        with _connection(path) as conn:
+            _ensure_novelty_seen_columns(conn)
+            row = conn.execute(
+                "SELECT busiest FROM ledger_novelty_seen WHERE watermark IS ?",
+                (watermark,)).fetchone()
+    except Exception:
+        return None
+    return row[0] if row else None
+
+
+def _watermark_seen(watermark, path=None):
+    """Has this surface ever run for this ledger? Never raises; False on anything unreadable.
+
+    Deliberately separate from `_read_watermark`. "We have no rows for you" and "you have
+    never looked" are different facts, and answering the second with the first is what put
+    FIRST LOOK on a screen the reader had already opened.
+    """
+    if not os.path.exists(path or DB_PATH):
+        return False
+    try:
+        with _connection(path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM ledger_novelty_seen WHERE watermark IS ?",
+                (watermark,)).fetchone()
+    except Exception:
+        # "no such table" is the ordinary state of every ledger written before this shipped.
+        return False
+    return bool(row)
+
+
+def advance_watermark(watermark, path=None, current=None):
+    """Store `current` as what this watermark has now seen. Best-effort; never raises.
+
+    ⚠️ A WATERMARK ONLY EVER MOVES UP, and there are TWO separate reasons, which is worth
+    stating because they are easy to conflate and only one of them is this merge.
+
+      1. A tool whose rows are ALL trimmed is protected by the loop, not by the merge: this
+         iterates `current`, so a tool that has vanished from the ledger is simply not
+         written, and its stored row stays exactly as it was.
+      2. A tool whose rows are PARTIALLY trimmed is what the merge is for, and nothing else
+         covers it. Retention drops the OLDEST rows first, so a tool that once passed
+         ≥10,000 and now has only a ≥1,000 row left reports a SMALLER max than we have
+         already seen. Overwriting would lower the watermark, and the tool's next large call
+         would be announced as a record it had already set -- a false claim manufactured by
+         our own housekeeping, which is the class P-97 was decided under. Argument names
+         behave the same way: the row carrying `cc` ages out, and `cc` becomes new again.
+
+    ⚠️ An earlier version of this docstring gave reason 1 as the justification for the merge.
+    It is a true statement about the behaviour and the wrong explanation of this code, and a
+    fault injection is what caught it: removing the merge left the test green.
+
+    🔴 THE SURFACE IS MARKED AS HAVING RUN EVEN WHEN THERE IS NOTHING TO STORE, and that is
+    a correctness fix, not tidiness. `first_look` is a claim about whether the READER has
+    ever seen this screen, and an early return on an empty aggregate computed it from
+    whether WE had rows -- two different questions. On the first run of the ladder every row
+    in the ledger is ours, so `agentx audit` stored nothing, and the NEXT run still believed
+    nobody had ever looked and headed the block "FIRST LOOK AT THIS LEDGER" for a founder
+    who had run the command two steps earlier. Found by walking the ladder in one directory.
+
+    This screen already had the rule, four lines above where this hooks in:
+    `mark_audit_report_run` is written BEFORE the screen renders and is "never gated on what
+    the screen FOUND", because the question is whether a human took the step. Same question
+    here, and the same answer.
+    """
+    if current is None:
+        current = current_call_shape(path)
+    stored = _read_watermark(watermark, path)
+    # 🔴 A READ WE COULD NOT DO IS NOT AN EMPTY READ. `or {}` treated them the same, so a
+    # transient failure merged the new state against nothing and rewrote every running
+    # maximum, set and timestamp DOWNWARD -- the exact invariant the docstring above
+    # promises, broken by the handler meant to be defensive. The mark still goes in (a human
+    # did take the step, and that is a different fact), but the per-tool detail is left
+    # exactly as it was rather than replaced by a lower version of itself.
+    unreadable = stored is _WATERMARK_UNREADABLE
+    stored = {} if unreadable or stored is None else stored
+    # 🔴 A MISSING LEDGER IS NOT MARKED. _connection() opens via sqlite3.connect, which CREATES the
+    # file, so without this guard a caller asking only to record that somebody LOOKED would conjure
+    # a database to write that mark into.
+    #
+    # ⚠️ READ THIS BEFORE DELETING THE GUARD, because it looks like the defect the docstring above
+    # warns against and it is not. That defect was a ledger WITH rows whose aggregate came back
+    # empty (on the first ladder run every row is ours), which made the NEXT run head the block
+    # "FIRST LOOK AT THIS LEDGER" for someone who had run the command two steps earlier. That path
+    # is untouched: the file exists, so we fall through and mark it exactly as before.
+    #
+    # What is genuinely given up is narrower -- the no-file case -- and three things make it
+    # acceptable rather than hidden:
+    #   1. The funnel record survives. `pulse.mark_audit_report_run` writes the "a human ran
+    #      agentx audit" flag to the pulse file, not to this ledger, so the conversion event the
+    #      P-92 funnel is built on is still captured.
+    #   2. Nothing is announced on the empty run either way. `read_novelty` returns its `empty`
+    #      literal with first_look=False whenever `current_call_shape` is falsy, which a missing
+    #      ledger always is.
+    #   3. The header the flag drives says "first look at THIS LEDGER". If no ledger existed when
+    #      they last looked, the next run is the first look at one, so the claim stays true.
+    # ⚠️ DEFENSIVE, AND SAID PLAINLY BECAUSE A FAULT INJECTION PROVED IT. Removing this guard does
+    # NOT redden the read-only-command test: no shipped path reaches here without a ledger today.
+    # The two novelty-line callers are gated behind `if items:`, and items require rows; the one
+    # caller that deliberately marks an EMPTY screen is not reached, because execute_audit returns
+    # on its own empty branch first. Kept anyway, and pinned by its own direct test, because
+    # `advance_watermark` creating a database purely to record that somebody looked is a landmine
+    # for the next caller -- and the record-while-blocking work rewrites exactly these paths.
+    if not os.path.exists(path or DB_PATH):
+        return False
+    try:
+        with _connection(path) as conn:
+            conn.execute(_CREATE_NOVELTY_SQL)
+            conn.execute(_CREATE_NOVELTY_SEEN_SQL)
+            # The mark goes in FIRST and unconditionally. Everything below is the per-tool
+            # detail, which an empty ledger simply does not have.
+            _ensure_novelty_seen_columns(conn)
+            # The busiest tool's NAME rides with the mark, because it is a ledger-level fact
+            # rather than a per-tool one, and because storing the identity is what stops the
+            # record re-firing (see _record_changed). Falls back to what was already stored
+            # when the current ledger has nothing to say, so a trim cannot erase it.
+            conn.execute(
+                "INSERT OR REPLACE INTO ledger_novelty_seen (watermark, ts, busiest) "
+                "VALUES (?, ?, ?)",
+                (watermark, time.time(),
+                 _busiest(current) or _watermark_busiest(watermark, path)))
+            _ensure_novelty_columns(conn)
+            for name, entry in ({} if unreadable else (current or {})).items():
+                was = stored.get(name) or {}
+                names = sorted(set(entry["arg_names"]) | set(was.get("arg_names") or ()))
+                classes = sorted(set(entry["classes"]) | set(was.get("classes") or ()))
+                hours = sorted(set(entry["hours"]) | set(was.get("hours") or ()))
+                # 🔴 CAPPED, BECAUSE THIS ONE CAN GROW WITHOUT BOUND. Every other field here
+                # is drawn from a small closed set -- 24 hours, six surfaces, one number --
+                # but a tool called with many optional keywords has combinatorially many
+                # argument combinations, and each is a distinct member. Past the cap we STOP
+                # ADDING rather than evicting: an eviction policy would make a combination
+                # "new" again later and re-announce a missing argument that has been normal
+                # for weeks. A tool this varied has no stable "always passes X" to violate,
+                # so the signal is meaningless for it anyway, and going quiet is the honest
+                # end state.
+                #
+                # 🔴 CAPPED PER ADDITION, NOT PER CALL. The first version tested the size and
+                # then unioned the whole batch in, so one advance carrying 34 combinations
+                # sailed past a cap of 24 and stored all of them -- a size check that only
+                # decided WHETHER to grow, never BY HOW MUCH. Caught by the test that asserts
+                # the bound rather than by reading the branch, which looks correct. Sorted so
+                # which ones survive is deterministic rather than set-iteration order.
+                combos = set(was.get("combos") or ())
+                for combo in sorted(entry["combos"]):
+                    if len(combos) >= _MAX_ARG_COMBOS:
+                        break
+                    combos.add(combo)
+                # A record only ever moves up. `max_day` travels WITH its count so the
+                # sentence can name the day the record was set; taking the larger of the two
+                # counts and the date beside it keeps them from drifting apart.
+                if (was.get("max_day_calls") or 0) >= entry["max_day_calls"]:
+                    day_calls, day = was.get("max_day_calls") or 0, was.get("max_day")
+                else:
+                    day_calls, day = entry["max_day_calls"], entry["max_day"]
+                # Same pairing for the burst record: the minute it was set travels with the
+                # count, so the reader is told about one record-setting minute once rather
+                # than watching a still-open minute climb.
+                if (was.get("max_burst") or 0) >= entry["max_burst"]:
+                    burst, burst_at = was.get("max_burst") or 0, was.get("max_burst_at")
+                else:
+                    burst, burst_at = entry["max_burst"], entry["max_burst_at"]
+                # INSERT OR REPLACE rather than an UPSERT clause: the merge above is already
+                # done in Python, so the two are equivalent here, and `ON CONFLICT ... DO
+                # UPDATE` needs SQLite 3.24+. The SDK ships to whatever sqlite3 the user's
+                # Python was built against, and a version floor nobody declared is a failure
+                # that appears only on someone else's machine.
+                conn.execute(
+                    "INSERT OR REPLACE INTO ledger_novelty "
+                    "(watermark, tool_name, arg_names, classes, max_amount, calls, "
+                    " arg_combos, max_day_calls, max_day, max_burst, max_burst_at, hours,"
+                    " weekend, last_ts)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (watermark, name, ",".join(names), ",".join(classes),
+                     max(entry["max_amount"], was.get("max_amount") or 0.0),
+                     max(entry["calls"], was.get("calls") or 0),
+                     _dumps_set(combos), day_calls, day,
+                     burst, burst_at,
+                     ",".join(hours),
+                     1 if (entry["weekend"] or was.get("weekend")) else 0,
+                     max(entry["last_ts"], was.get("last_ts") or 0.0)))
+            conn.commit()
+    except Exception:
+        # A watermark we could not store means the same novelty is offered again next time.
+        # Repeating a true line is a far cheaper failure than suppressing one, so this is
+        # silent rather than surfaced.
+        return False
+    return True
+
+
+def _busiest(shape):
+    """The NAME of the most-called tool, ties broken by name so it is stable.
+
+    Returns a string, not a pair. The docstring said "(tool, calls)" while the body returned
+    `[0][0]`; every caller happened to be right, so the next one written from the docstring
+    would have been the first to unpack a string into two names.
+    """
+    if not shape:
+        return None
+    return sorted(shape.items(), key=lambda kv: (-kv[1]["calls"], kv[0]))[0][0]
+
+
+def read_novelty(watermark, path=None, current=None):
+    """What is new about this ledger since `watermark` was last advanced. Never raises.
+
+    Returns ``{"items", "first_look", "busiest", "busiest_calls", "total_calls",
+    "distinct_tools"}``. `items` are dicts of ``{"tool", "kind", "detail"}``; render them
+    through `format_novelty_item` so both surfaces print the same words.
+
+    🔴 THERE IS NO POSTURE CHECK IN HERE, AND ITS ABSENCE IS DELIBERATE. Under enforce the
+    ledger holds no inventory rows, so this returns nothing and both surfaces stay quiet
+    without being told why. On the day P-112's second half lands and enforce records too,
+    this function lights up with no edit -- which is the "only the posture gate moves"
+    requirement, expressed as code rather than as a note asking someone to remember.
+    """
+    empty = {"items": [], "first_look": False, "busiest": None, "busiest_calls": 0,
+             "total_calls": 0, "distinct_tools": 0}
+    if current is None:
+        current = current_call_shape(path)
+    if not current:
+        # ⚠️ AND `first_look` STAYS FALSE HERE, WHICH IS DELIBERATE. An earlier version read
+        # it above this line under a comment insisting it had to be computed BEFORE the empty
+        # return -- and then returned the `empty` literal, discarding it. The comment
+        # described an intention the code did not carry out, and the round-trip to the ledger
+        # was paid on every empty read, including every `agentx status`.
+        #
+        # There is nothing to claim on this path: no items means no header, and no header
+        # means nothing for the flag to qualify. The defect that comment was aimed at lives
+        # in `advance_watermark`, which marks the surface as having run whether or not it
+        # found anything -- that is what makes the NEXT read say "new since you last looked"
+        # instead of "first look" for someone who has already been here.
+        return empty
+    first_look = not _watermark_seen(watermark, path)
+    stored = _read_watermark(watermark, path)
+    if stored is _WATERMARK_UNREADABLE:
+        # We cannot say what is NEW without knowing what was OLD. Treating an unreadable
+        # watermark as an empty one would announce the developer's whole history as though
+        # it had just happened -- the loudest possible wrong answer, produced by a lock.
+        return empty
+    stored = stored or {}
+
+    items = []
+    for name in sorted(current):
+        entry = current[name]
+        was = stored.get(name)
+        # Ordered by what a reader would want first if the list is trimmed: a surface we had
+        # never seen this tool touch, then a bigger magnitude than it has ever carried, then
+        # the tool itself, and argument names last -- they are the noisiest of the four,
+        # since one optional keyword adds one.
+        new_classes = sorted(
+            c for c in entry["classes"]
+            if c in _SURFACE_WORDS and c not in ((was or {}).get("classes") or ()))
+        for target_class in new_classes:
+            items.append({"tool": name, "kind": "surface", "detail": target_class})
+        # The stored `amount` IS a bucket floor, never a measurement (see _call_shape), so
+        # comparing the numbers compares the buckets. A raw comparison would announce a new
+        # record for 1,001 against 1,000 -- two calls the screen renders identically.
+        #
+        # ⚠️ AND ONLY FOR A TOOL WE ALREADY KNEW (`was`), which is a deliberate silence.
+        # "Largest amount yet" is a claim about a history, and a tool on its first appearance
+        # does not have one -- the honest headline there is the tool itself. The magnitude is
+        # not lost: the table under this block prints it per tool either way.
+        #
+        # ⚠️ THIS COLUMN IS EMPTY UNLESS THE CALL ALSO NAMED A CURRENCY (P-103's rule, in
+        # _call_shape), so `{"amount": 1500}` alone never fires this. Verified rather than
+        # assumed -- the first smoke run of this function showed no amount item at all and
+        # the branch looked exercised.
+        if was and entry["max_amount"] > (was.get("max_amount") or 0.0):
+            items.append({"tool": name, "kind": "amount", "detail": entry["max_amount"]})
+        # 🔴 ONLY WHEN THE SURFACE LINE DID NOT ALREADY SAY IT. A tool we have never seen
+        # necessarily reaches every surface it reaches for the first time, so both branches
+        # fire and the block printed the same tool twice: "run_sql — first call to your
+        # database" directly above "run_sql — first time we have seen this tool". One fact,
+        # two sentences, and the second is the weaker of them. The surface line wins because
+        # it is the half a reader can act on -- "a new tool" is a fact about our records,
+        # "it reached your database" is a fact about their agent.
+        if was is None and not new_classes:
+            items.append({"tool": name, "kind": "tool", "detail": None})
+        new_args = sorted(set(entry["arg_names"]) - set((was or {}).get("arg_names") or ()))
+        # Only for a tool we already knew. On a brand-new tool every argument is new, and
+        # "first time we have seen this tool" followed by a list of the arguments it takes
+        # is one fact printed twice.
+        if was is not None and new_args:
+            items.append({"tool": name, "kind": "argument", "detail": new_args})
+
+        # --- THE TIME-SHAPED AND COMBINATION SIGNALS -------------------------------------
+        # Added because the shape signals above are FINITE and a developer who wrapped one
+        # function exhausts them in a session or two. Every one of these can fire again.
+        if was is not None:
+            # 🔴 AN ARGUMENT THAT WENT MISSING, which is the security-shaped one. Reported
+            # only for something EVERY previous call carried, computed as the intersection of
+            # the stored combinations -- so a keyword that has always been optional is not
+            # news, and a `limit` that has never once been absent is.
+            old_combos = set(was.get("combos") or ())
+            fresh = set(entry["combos"]) - old_combos
+            if old_combos and fresh and len(old_combos) < _MAX_ARG_COMBOS:
+                always_had = set.intersection(
+                    *[{n for n in c.split(",") if n} for c in old_combos])
+                for combo in sorted(fresh):
+                    dropped = sorted(always_had - {n for n in combo.split(",") if n})
+                    if dropped:
+                        items.append({"tool": name, "kind": "dropped", "detail": dropped})
+                        break
+            # A RECORD, not a first, which is why it can fire forever. The day travels with
+            # the count so the sentence can say what it beat.
+            #
+            # 🔴 ONCE PER RECORD-SETTING DAY, NOT ONCE PER SESSION. A record for a day still in
+            # progress keeps growing, so without the day comparison a developer who runs their
+            # agent six times on a busy Tuesday is told "busiest day yet" six times, with a
+            # bigger number each time -- and one of those sessions made two calls. Every one
+            # of those sentences is true and the sequence is a nag. Found by simulating ten
+            # sessions of one tool, where it read "session 5 (2 calls): busiest day yet: 38".
+            # Comparing the DAY rather than the COUNT collapses them to one.
+            if (entry["max_day_calls"] > (was.get("max_day_calls") or 0)
+                    and _record_changed(entry["max_day"], was.get("max_day"))):
+                items.append({"tool": name, "kind": "busiest_day",
+                              "detail": (entry["max_day_calls"], was.get("max_day_calls") or 0)})
+            # Same rule at minute resolution, keyed on the minute the record was set. A
+            # runaway loop looks exactly like this, which is why it earns a line even on a
+            # well-behaved agent -- it is the one that will not be well-behaved. Floored so an
+            # ordinary two-calls-in-a-minute is not a "record".
+            if (entry["max_burst"] > (was.get("max_burst") or 0)
+                    and entry["max_burst"] >= _BURST_WORTH_SHOWING
+                    and _record_changed(entry["max_burst_at"],
+                                       was.get("max_burst_at"))):
+                items.append({"tool": name, "kind": "burst", "detail": entry["max_burst"]})
+
+    # --- FACTS ABOUT THE AGENT, NOT ABOUT A TOOL --------------------------------------
+    #
+    # 🔴 WHEN the agent ran is a property of the SESSION, and emitting it per tool was pure
+    # repetition. Measured on five tools in one late-night weekend session: "first call
+    # between 03:00 and 04:00" appeared THREE times and "first weekend call" THREE times --
+    # six of the fifteen items, all saying two things. That alone overflowed a six-line
+    # screen and pushed out a magnitude record and a new tool.
+    #
+    # The union across tools is the right question: the agent has run at this hour before, or
+    # it has not. These carry no tool name because naming one would be arbitrary -- the
+    # renderers print them unprefixed.
+    if stored:
+        hours_now = set().union(*[e["hours"] for e in current.values()]) if current else set()
+        hours_before = set().union(*[set(e.get("hours") or ()) for e in stored.values()])
+        # 🔴 AN HOUR NEXT TO ONE WE HAVE ALREADY SEEN IS THE SAME WORKING WINDOW, NOT A NEW
+        # ONE. Founder run: day one at 10:53, day two at 11:00 -- seven minutes later in real
+        # time -- and this printed "first call between 11:00 and 12:00", then outranked BOTH
+        # "first call in 9 days" and "busiest day yet" off a two-line teaser. A developer who
+        # works ordinary hours would collect eight or ten of these in their first week, each
+        # trivially true and none of them news.
+        #
+        # The signal was built for the opposite case: an agent running at 3am when it has
+        # only ever run at 10am. Distance is what separates those, so distance is the rule --
+        # circular, because 23:00 and 00:00 are an hour apart, not twenty-three.
+        far_hours = sorted(
+            h for h in (hours_now - hours_before)
+            if all(_hour_distance(h, seen) > _HOUR_SAME_WINDOW for seen in hours_before))
+        if far_hours and hours_before:
+            items.append({"tool": "", "kind": "hour", "detail": far_hours[0]})
+        if (any(e["weekend"] for e in current.values())
+                and not any(e.get("weekend") for e in stored.values())):
+            items.append({"tool": "", "kind": "weekend", "detail": None})
+
+        # 🔴 THE RETURN IS A SESSION FACT TOO, and it was in the per-tool loop. Five tools
+        # idle for a month produced FIVE "first call in 29 days" lines -- the entire audit
+        # block and both teaser slots, all saying one thing. Exactly what `hour` and
+        # `weekend` were lifted out of that loop for, re-introduced two commits later by
+        # adding a new signal inside it. Computed over the newest call in the whole ledger.
+        gap = (max((e["last_ts"] for e in current.values()), default=0.0)
+               - max((e.get("last_ts") or 0.0 for e in stored.values()), default=0.0))
+        if any(e.get("last_ts") for e in stored.values()) and gap >= _GAP_WORTH_SHOWING:
+            items.append({"tool": "", "kind": "gap", "detail": gap})
+
+    # 🔴 IDENTITY, NOT THE COUNT. `stored` holds a running MAX per tool, so once retention
+    # trims the previous leader's rows the derived answer disagrees with the live ledger
+    # FOREVER and re-announces every session. Same rule as the day and burst records.
+    busiest_now = _busiest(current)
+    busiest_before = _watermark_busiest(watermark, path)
+    if busiest_before and _record_changed(busiest_now, busiest_before):
+        # ⚠️ AND IT HAS TO BE A REAL LEAD, NOT A TIE-BREAK. `_busiest` breaks ties by name so
+        # its answer is stable, which means two tools on one call each swap the title purely
+        # on alphabetical order -- and "now your busiest tool" fires over nothing. Found by
+        # an existing trimmed-tool test going red on this change, not by review. Compared
+        # against the previous holder's count IN THE CURRENT LEDGER, so a leader that was
+        # trimmed away does not hand over the title on a technicality either.
+        now_calls = current[busiest_now]["calls"]
+        before_calls = (current.get(busiest_before) or {}).get("calls", 0)
+        if now_calls > before_calls and now_calls >= _BUSIEST_MIN_CALLS:
+            items.append({"tool": busiest_now, "kind": "busiest", "detail": None})
+
+    # Ordered by what a reader would want first when the list is trimmed, and the two at the
+    # top are the two that could mean something is wrong: an argument that went missing and a
+    # surface this tool had never touched. Records next, because they are the ones that recur.
+    # Argument names last -- one optional keyword adds one, so it is the noisiest.
+    order = {"dropped": 0, "surface": 1, "amount": 2, "burst": 3, "busiest_day": 4,
+             "hour": 5, "weekend": 6, "tool": 7, "busiest": 8, "gap": 9, "argument": 10}
+    # Default 99, NOT 9: 9 is `gap`'s own rank, so a kind added later would have silently
+    # interleaved with it rather than sorting last as the comment above promises.
+    items.sort(key=lambda i: (order.get(i["kind"], 99), i["tool"]))
+    total = sum(e["calls"] for e in current.values())
+    return {"items": items, "first_look": first_look, "busiest": busiest_now,
+            "busiest_calls": current[busiest_now]["calls"] if busiest_now else 0,
+            "total_calls": total, "distinct_tools": len(current)}
+
+
+def top_novelty(items, limit):
+    """The `limit` most worth showing, AT MOST ONE PER TOOL. Shared, so surfaces can't drift.
+
+    🔴 BREADTH BEFORE DEPTH, AND MEASURED RATHER THAN GUESSED. `read_novelty` ranks purely by
+    KIND, so every item of the loudest kind sorts ahead of every item of the next -- and on
+    five tools in one eventful session that put two "busiest day yet" lines above BOTH
+    session-level facts, pushing "first call between 03:00 and 04:00" and "first weekend
+    call" off a six-line screen. Two lines about the same kind of thing, at the cost of the
+    two that were about something else.
+
+    One per tool first, in rank order, then the remainder if there is room. A developer
+    scanning two lines learns about two tools rather than twice about one.
+
+    ⚠️ ITEMS BEYOND THE LIMIT ARE NOT KEPT FOR NEXT TIME. The watermark advances over
+    everything that was COMPUTED, not everything that was SHOWN, so the overflow expires --
+    which is why the callers print a count of it rather than dropping it silently. Queuing it
+    would need a second store and would re-announce week-old news; the ranking exists so that
+    what expires is the least of it. The two surfaces keep SEPARATE watermarks, so anything
+    the session line has no room for is still waiting when `agentx audit` runs.
+    """
+    picked, seen = [], set()
+    for item in items:
+        tool = item.get("tool") or ""
+        if tool and tool in seen:
+            continue
+        seen.add(tool)
+        picked.append(item)
+        if len(picked) >= limit:
+            return picked
+    for item in items:
+        if item not in picked:
+            picked.append(item)
+            if len(picked) >= limit:
+                break
+    return picked
+
+
+def format_novelty_item(item):
+    """The words for one novelty item, in ONE place because TWO surfaces print them.
+
+    The session-end line and `agentx audit` show the same facts, and the last time this
+    project let two surfaces word the same thing separately they drifted -- which is why
+    `format_protection_line` and `format_staleness_line` exist next door. Returns "" for
+    anything unrecognised, so an item kind added later cannot print a bare dict.
+    """
+    kind = item.get("kind")
+    if kind == "surface":
+        word = _SURFACE_WORDS.get(item.get("detail"))
+        return "first call to your %s" % word if word else ""
+    if kind == "amount":
+        # "amount", not "number": the column holds the magnitude of an argument the tool
+        # itself NAMED as an amount. And "yet", because a bucket floor is a lower bound.
+        amount = item.get("detail") or 0
+        try:
+            return "largest amount yet: ≥%s" % f"{int(amount):,}"
+        except Exception:
+            return ""
+    if kind == "tool":
+        return "first time we have seen this tool"
+    if kind == "busiest":
+        return "now your busiest tool"
+    if kind == "dropped":
+        names = list(item.get("detail") or ())
+        if not names:
+            return ""
+        return "called without %s for the first time" % ", ".join(names[:_MAX_NEW_ARGS_SHOWN])
+    if kind == "busiest_day":
+        try:
+            now, before = item.get("detail")
+        except Exception:
+            return ""
+        # The previous record is stated beside the new one, because "45 calls" alone is a
+        # number the reader has to have been keeping track of to find interesting.
+        if before:
+            return "busiest day yet: %d calls (previous best %d)" % (now, before)
+        return "busiest day yet: %d calls" % now
+    if kind == "burst":
+        return "%d calls in one minute, the most yet" % (item.get("detail") or 0)
+    if kind == "hour":
+        hour = item.get("detail")
+        try:
+            # % 24 so the last hour of the day does not render "between 23:00 and 24:00",
+            # which is not a time anybody writes.
+            return "first call between %02d:00 and %02d:00" % (int(hour), (int(hour) + 1) % 24)
+        except Exception:
+            return ""
+    if kind == "weekend":
+        return "first weekend call"
+    if kind == "gap":
+        days = int((item.get("detail") or 0) // 86400)
+        if days < 1:
+            return ""
+        return "first call in %d days" % days
+    if kind == "argument":
+        names = list(item.get("detail") or ())
+        if not names:
+            return ""
+        shown = ", ".join(names[:_MAX_NEW_ARGS_SHOWN])
+        extra = len(names) - _MAX_NEW_ARGS_SHOWN
+        return "new argument%s: %s%s" % ("" if len(names) == 1 else "s", shown,
+                                         " +%d more" % extra if extra > 0 else "")
+    return ""
 
 
 def get_retention_status(path=None):
@@ -1679,6 +3037,15 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
 
 def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status, tokens=None, time_saved=None,
                   arg_names=None, amount=0.0, target_class=None):
+    # 🔴 CONTRACT: `arg_names`/`amount`/`target_class` MUST ALREADY BE REDUCED, via
+    # `_call_shape`, before they reach here — never pass a raw `arguments` dict, a raw
+    # query string, or an unreduced value to these three parameters. This function does
+    # not call `_call_shape` itself and does not validate its inputs; it trusts every
+    # caller to have already stripped values down to names/a bucket/a class. Every current
+    # caller does (record_call and every WOULD_BLOCK writer route through `_call_shape`
+    # first) — a future call site that skips that step would write a raw value straight to
+    # the ledger with nothing here to stop it.
+    #
     # 🔴 THE DEFAULTS USED TO BE 1500 TOKENS AND 5 MINUTES, AND NO CALL SITE HAS EVER
     # PASSED A VALUE. Every row therefore carried the same invented pair, and the readers
     # summed them into "Tokens Saved: ~3000" on the session summary and "saved ~1500
@@ -1712,6 +3079,22 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
                tokens, time_saved)
     try:
         with _connection() as conn:
+            # 🔴 THE WRITER CREATES THE TABLE IT WRITES. init_db() no longer runs at
+            # import time, so this may be the first thing in the process to touch the ledger.
+            # Without this line the INSERT below fails into the best-effort `except` and takes
+            # EVERY row with it, silently -- no error, no complaint, an empty ledger that reads
+            # exactly like a quiet agent. Same shape as prune_ledger's self-heal for
+            # ledger_retention and advance_watermark's for the two novelty tables; this
+            # generalises the rule those two already follow rather than adding a third
+            # convention for the same job.
+            #
+            # ⚠️ IT DOES NOT MIGRATE, AND THAT IS THE POINT. `IF NOT EXISTS` is a no-op against
+            # an existing pre-P-92 event_log, which is correct: the retry below stays the WHOLE
+            # guarantee that a catch still gets recorded on a ledger the migration has not
+            # reached. Running the migration from here would leave the legacy-retry tests green
+            # while quietly disabling the path they exist to cover. Upgrading an existing ledger
+            # is ensure_ledger_current's job and it runs at the entry points, never on this path.
+            conn.execute(_CREATE_EVENT_LOG_SQL)
             cursor = conn.cursor()
             try:
                 cursor.execute(
@@ -1909,11 +3292,9 @@ def _grouped_policy_rows(path, status_clause, exclude_agents, extra_select=""):
     if not os.path.exists(p):
         return None
     excluded = [a for a in (exclude_agents or []) if a]
-    clause = status_clause
-    params = []
-    if excluded:
-        clause += " AND agent_id NOT IN (%s)" % ",".join("?" for _ in excluded)
-        params.extend(excluded)
+    frag, frag_params = _exclude_agents_fragment(excluded)
+    clause = status_clause + frag
+    params = list(frag_params)
     sel_extra = (", " + extra_select) if extra_select else ""
     try:
         with _connection(p) as conn:
@@ -2046,7 +3427,7 @@ def get_block_frequency(path=None, exclude_agents=None):
     """Rank the local flight-recorder ledger BY POLICY: how often each policy fired
     and how often the agent recovered from it. Aggregates BOTH the decorator and the
     MCP-proxy paths (they write the same event_log with distinct agent_ids). This is
-    the local, privacy-safe harvest that grows the moat/insights view
+    the local, privacy-safe harvest that grows the insights view
     (scripts/ledger_insights.py) and the frequency-ranked playground order.
 
     A "block" is a challenge episode (still-open CHALLENGED or self-corrected
@@ -2103,21 +3484,74 @@ def get_would_block_summary(path=None, exclude_agents=None):
     'agents protected' metric — an audit install is evaluating, not yet protected.
 
     Privacy-safe by construction (same as the block ledger): only the policy class, the
-    dev's own tool name, and the verdict are stored, never a raw query or payload.
+    dev's own tool name, the verdict, and (as of the shape fix below) the SAME shape data
+    an ALLOWED row already carries — argument NAMES, a magnitude BUCKET, a target CLASS,
+    never a raw query or payload — are stored.
 
     path: read a specific ledger file (default: the module DB_PATH in the CWD).
     exclude_agents: iterable of agent_id values to drop.
 
-    Returns {"total": int, "policies": [{policy_id, policy_name, would_blocks}, ...]};
-    total is 0 (policies []) when there is no DB, an error, or no audited catch yet.
+    Returns {"total": int, "policies": [{policy_id, policy_name, would_blocks, tools,
+    arg_names, classes, max_amount}, ...]}; total is 0 (policies []) when there is no DB,
+    an error, or no audited catch yet.
     """
-    rows = _grouped_policy_rows(path, f"status = '{WOULD_BLOCK_STATUS}'", exclude_agents,
+    p = path or DB_PATH
+    rows = _grouped_policy_rows(p, f"status = '{WOULD_BLOCK_STATUS}'", exclude_agents,
                                 extra_select="GROUP_CONCAT(DISTINCT tool_name)")
     if rows is None:
         return {"total": 0, "policies": []}
-    policies = [
-        {"policy_id": pid, "policy_name": pname, "would_blocks": wb or 0,
-         "tools": _tool_list(tools)}
-        for pname, pid, wb, tools in rows
-    ]
+    excluded = [a for a in (exclude_agents or []) if a]
+    exclude_frag, exclude_params = _exclude_agents_fragment(excluded)
+    policies = []
+    # 🔴 A SEPARATE PER-POLICY QUERY, THE SAME SHAPE get_call_inventory ALREADY USES FOR
+    # ARG_NAMES/TARGET_CLASS -- not a GROUP_CONCAT bolted onto the query above. arg_names is
+    # itself a comma-joined string per ROW ("limit,query"); GROUP_CONCAT-ing that across rows
+    # would nest one comma-separated list inside another with no way to tell "one call's two
+    # arguments" from "two calls' one argument each" apart on the way back out. Reading
+    # DISTINCT rows and union-splitting them in Python (like get_call_inventory does per
+    # tool) sidesteps that ambiguity entirely, at the cost of one query per policy rather
+    # than folding it into the single GROUP BY above -- the same N+1 the tool-level reader
+    # already accepts, and for the same reason: a handful of distinct policies, not a
+    # per-call cost.
+    try:
+        with _connection(p) as conn:
+            cursor = conn.cursor()
+            for pname, pid, wb, tools in rows:
+                arg_names, classes, max_amount = [], [], 0.0
+                # 🔴 CAUGHT PER POLICY, NOT AROUND THE WHOLE LOOP. A ledger written before
+                # the P-92-B shape columns existed fails this SELECT identically on every
+                # policy, and the fallback below covers that. But scoping the catch here
+                # (rather than around the whole `with` block, as an earlier version did)
+                # means a transient failure on ONE policy's shape query — a lock, say —
+                # degrades only that policy instead of discarding shape data already read
+                # for every policy before it. It also means there is exactly one place that
+                # builds a policy's dict, not two: the try body and the except path used to
+                # each build their own nearly-identical dict literal, and a field added to
+                # one had no test forcing it into the other.
+                try:
+                    cursor.execute(
+                        "SELECT DISTINCT arg_names, target_class, amount FROM event_log "
+                        "WHERE status = ? AND policy_name IS ?" + exclude_frag,
+                        [WOULD_BLOCK_STATUS, pname] + exclude_params)
+                    shape_rows = cursor.fetchall()
+                    arg_names, classes = _union_arg_names_and_classes(
+                        (r[0], r[1]) for r in shape_rows)
+                    max_amount = max((r[2] or 0.0 for r in shape_rows), default=0.0)
+                except Exception:
+                    pass
+                policies.append({
+                    "policy_id": pid, "policy_name": pname, "would_blocks": wb or 0,
+                    "tools": _tool_list(tools),
+                    "arg_names": arg_names, "classes": classes, "max_amount": max_amount,
+                })
+    except Exception:
+        # The COUNT query (via _grouped_policy_rows) already opened this same file once
+        # successfully, so reaching here means opening a SECOND connection to it failed --
+        # rarer than the per-policy column-missing case above, which is now caught inline.
+        # Degrade the whole report to shape-less rather than lose it outright.
+        policies = [
+            {"policy_id": pid, "policy_name": pname, "would_blocks": wb or 0,
+             "tools": _tool_list(tools), "arg_names": [], "classes": [], "max_amount": 0.0}
+            for pname, pid, wb, tools in rows
+        ]
     return {"total": sum(row["would_blocks"] for row in policies), "policies": policies}

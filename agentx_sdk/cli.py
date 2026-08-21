@@ -30,6 +30,38 @@ from .rules import harvest_rule_candidates, adopt_rule
 # backward compatibility — callers and tests still do `from .cli import load_env_file`).
 from .envfile import load_env_file
 
+
+def _ledger_path_line(path, indent="   "):
+    """The ledger path, marked when there is no file there yet.
+
+    🔴 ONE ENTRY POINT FOR THREE CALL SITES, deliberately. The recurring defect in this file is a
+    rule invented where it was motivated and never applied to its siblings, and this rule has
+    three siblings: `agentx status`, the empty audit screen, and the empty call log.
+
+    Every one of them names the ledger because the likeliest reason a screen is empty is the
+    reader standing in a different folder, so the path is what makes "nothing here" checkable
+    rather than a claim. That worked while the ledger was created on import: the file always
+    existed by the time anything printed its name. Now it is created only when there is something
+    to record, so an empty screen can name a file that is not there -- and a path the reader looks
+    for and does NOT find turns a verifiable statement back into a puzzle.
+
+    Three words restore it, and they say the true thing rather than papering over it: we do not
+    write a file until there is something to put in it.
+
+    🔴 WHERE THIS GOES, AND WHERE IT MUST NOT. There are more path-printing sites than the empty
+    screens, and they are not all the same question:
+      • EMPTY states -- `agentx status`, `agentx audit`, the empty call log, `agentx share` --
+        take this, because the file genuinely may not be there.
+      • UNREADABLE states take it NOT AT ALL. Those screens open with "the ledger is on disk but
+        could not be read", so the file provably exists; "(not created yet)" beside that sentence
+        would contradict it. The suffix is conditional and so would never fire, but a reader
+        should not have to work that out to trust the screen.
+      • The `--json` payload keeps a bare path. A machine consumer gets a path, not prose.
+    """
+    suffix = "" if os.path.exists(path) else "  (not created yet)"
+    return "%s%s%s" % (indent, path, suffix)
+
+
 def _render_offline_dashboard(gateway_url, mode="local"):
     """No gateway reachable. For a keyless/local user that is the normal free state, so
     lead with THIS machine's LOCAL flight-recorder (the value they have accrued) and
@@ -38,16 +70,24 @@ def _render_offline_dashboard(gateway_url, mode="local"):
     source as the end-of-run session summary, so the two can never drift."""
     local = (mode == "local")
     if local:
-        print("\n🛡️  AGENTX LOCAL STATUS        (keyless in-process shield, no gateway needed)")
+        # The header carried the same vocabulary the body below it just lost -- "keyless
+        # in-process shield" -- which is how a rename lands on some of a screen and not the
+        # rest. Cut here too, in the same pass, so the screen has one voice.
+        print("\n🛡️  AGENTX LOCAL STATUS                    (no gateway or key needed)")
         print("=" * 75)
-        print("  Your agents are protected right now. The in-process Layer-0 shield")
-        print("  (@agentx_protect, or one line in mcp.json) blocks DROP TABLE, SSRF, and")
-        print("  secret-exfil offline, with no gateway and no key.")
+        # PLAIN, on the first screen a stranger runs.
+        # "in-process Layer-0 shield" is our name for the mechanism; what a reader needs is
+        # what it stops and what it costs them. The term survives everywhere else in the
+        # product -- this was scoped to `status` and `audit` deliberately, because it is
+        # pinned by ten test files and appears on surfaces this pass did not look at.
+        print("  Your agents are protected right now. One decorator, or one line in")
+        print("  mcp.json, blocks destructive SQL, internal network calls and secret")
+        print("  leaks. Offline, no gateway, no key.")
     else:
         print(f"❌ Gateway not reachable at {gateway_url} — the live dashboard is offline.")
-        print("   -> Your agents are STILL protected: the in-process Layer-0 shield")
-        print("      (@agentx_protect) keeps blocking deterministic threats — DROP TABLE,")
-        print("      SSRF, secret-exfil — offline, with no gateway and no key.")
+        print("   -> Your agents are STILL protected: @agentx_protect keeps blocking")
+        print("      destructive SQL, internal network calls and secret leaks, offline,")
+        print("      with no gateway and no key.")
 
     # LOCAL flight-recorder: what THIS machine has blocked, from the SDK's own ledger.
     # Lazy import + broad guard so a missing/locked DB degrades to the reassurance
@@ -112,9 +152,9 @@ def _render_offline_dashboard(gateway_url, mode="local"):
         intercepts = census["block_episodes"]
         recoveries = census["recoveries"]
         top_offender = (stats or {}).get("top_offender") or "None"
-        print("\n📊 LOCAL FLIGHT RECORDER (no gateway needed):")
+        print("\n📊 WHAT WAS RECORDED (no gateway needed):")
         if ledger_path:
-            print(f"   {ledger_path}")
+            print(_ledger_path_line(ledger_path))
         # Three lines removed here, all unbacked: "Catastrophic actions blocked" (a
         # severity we hold no data for, counted from a stale two-name list) and the
         # token/time savings (a constant times a row count). Every number left is one
@@ -182,7 +222,7 @@ def _render_offline_dashboard(gateway_url, mode="local"):
         if reason == "unreadable":
             # No count, no retention line and no "wrap a tool" CTA: every one of them is a
             # sentence about a ledger we did not read.
-            print("\n📊 LOCAL FLIGHT RECORDER: the ledger is on disk but could not be read,")
+            print("\n📊 WHAT WAS RECORDED: the ledger is on disk but could not be read,")
             print("   so this screen cannot tell you what your floor stopped. It is NOT a")
             print("   statement that nothing was blocked.")
             if ledger_path:
@@ -195,10 +235,16 @@ def _render_offline_dashboard(gateway_url, mode="local"):
             # writes these rows -- so naming a variable the reader never set is a false
             # statement about their environment. Fixed on the insights screen and the audit
             # banner in this same change; this was the third site.
-            print("\n📊 LOCAL FLIGHT RECORDER: nothing was STOPPED in this ledger, but it")
-            print(f"   holds {census['would_blocks']:,} call(s) recorded while audit was on")
-            print("   and allowed to run. Audit records what the floor would stop; it does")
-            print("   not stop it, so a zero here is the posture, not a verdict.")
+            # "WHAT WAS RECORDED", not "LOCAL FLIGHT RECORDER" (founder copy pass): the old
+            # header is OUR name for the thing, on the first screen a stranger runs. And
+            # three lines instead of four -- "a zero here is the posture, not a verdict"
+            # already says what the sentence setting it up was saying.
+            # No dangling "...but it holds": the sentence that used to complete it is shared
+            # with `agentx insights`, which has no lead-in, so it had to become a complete
+            # sentence and this one had to stop leaning on it.
+            print("\n📊 WHAT WAS RECORDED: nothing was STOPPED in this ledger.")
+            for _ln in _audit_posture_lines(census["would_blocks"]):
+                print("   " + _ln)
             # ...and whose calls they were. Same footnote `agentx audit` and `agentx insights`
             # carry: `agentx demo --audit` writes a would-block into this ledger and three of
             # our own screens send the reader here to read it.
@@ -209,9 +255,9 @@ def _render_offline_dashboard(gateway_url, mode="local"):
                     # Re-indented to this screen's 3-space body, not the audit screen's 2.
                     print("   " + _ln.strip())
         elif reason == "trimmed":
-            print("\n📊 LOCAL FLIGHT RECORDER: no blocks remain in this ledger.")
+            print("\n📊 WHAT WAS RECORDED: no blocks remain in this ledger.")
         else:
-            print("\n📊 LOCAL FLIGHT RECORDER: no blocks recorded in this ledger yet.")
+            print("\n📊 WHAT WAS RECORDED: no blocks recorded in this ledger yet.")
         if reason != "unreadable":
             # 🔴 STATE THE RULE ONCE: "go wrap a tool and run your agent" is only true of a
             # ledger holding no evidence that they already did. Every sentence above is about
@@ -249,16 +295,68 @@ def _render_offline_dashboard(gateway_url, mode="local"):
                 print(f"   the last {retention['current_max_age_days']} days or "
                       f"{retention['current_max_rows']:,} records.")
             if ledger_path:
-                print(f"   {ledger_path}")
-                print("   Blocks are recorded per ledger, so running agentx from another folder")
-                print("   reads a different one.")
+                print(_ledger_path_line(ledger_path))
+                print("   Ledgers are per folder; agentx run elsewhere reads a different one.")
             if _inventory_calls:
                 # What the ledger DOES hold, and the screen that shows it. Named as calls we
                 # had no objection to, so the zero above keeps its meaning instead of reading
                 # as a contradiction two lines later.
-                print(f"   This ledger holds {_inventory_calls:,} recorded call(s) that passed. "
-                      "See what your")
-                print(f"   agent did:   {_audit_cmd()}")
+                # P-112: a REASON to open that screen, not just a count of what is on it.
+                # A running total is the same number every time they look; "2 are new since
+                # you last looked" is the only part of this line that can differ between two
+                # runs, which is what makes it worth reading twice.
+                #
+                # 🔴 COUNTS, NEVER CONSUMES, AND NEVER LISTS. `read_novelty` is a pure read --
+                # only `advance_watermark` clears -- and this surface deliberately does not
+                # call it. `agentx status` is run often, so a status that advanced the
+                # watermark would leave the audit screen it just pointed at empty by the time
+                # the reader got there: two surfaces eating each other, which is the exact
+                # defect a founder ladder run caught on this feature two commits ago, arriving
+                # from a third direction. Status counts and points; audit enumerates and
+                # clears. Best-effort: a failure here costs the clause, never the screen.
+                #
+                # ⚠️ THIS SCREEN ALREADY REMOVED A LEDGER AGGREGATION ONCE, fifteen lines
+                # above, because `get_call_inventory()` cost about fifty-five scans of an
+                # unindexed table to decide one line. So this one has to justify itself
+                # rather than inherit the slot. It is the same SHAPE and a different SIZE:
+                # three grouped scans plus two single-row lookups, measured at 0.9 ms on a
+                # 200-row ledger and 31 ms at P-97's 10,000-row cap, on an interactive
+                # command a human just typed. That is a different decision from fifty-five.
+                #
+                # If it ever needs to be cheaper, the answer is not a narrower window here --
+                # it is folding new rows into the stored bookmark instead of rescanning, which
+                # `current_call_shape`'s docstring records along with the trigger for doing it.
+                _new, _first_look = 0, False
+                try:
+                    from .db import read_novelty, WATERMARK_REPORT
+                    _n = read_novelty(WATERMARK_REPORT)
+                    _new, _first_look = len(_n["items"]), _n["first_look"]
+                except Exception:
+                    _new, _first_look = 0, False
+                # 🔴 COUNT, THEN ITS FOOTNOTE, THEN THE POINTER -- AND NOTHING BETWEEN THE
+                # FIRST TWO. The demo note below says "4 of THOSE came from AgentX's own demo
+                # code", and `those` can only mean the number on the line above it. The first
+                # version of this change printed the novelty line in between, so on a founder
+                # run it read:
+                #
+                #     This ledger holds 13 recorded call(s) that passed.
+                #     1 thing(s) changed since you last looked. ...
+                #     4 of those came from AgentX's own demo code
+                #
+                # -- four of the one thing. This is the SECOND time in this branch a line was
+                # inserted between a number and the sentence qualifying it; the audit screen's
+                # concentration line did the same thing and was moved for the same reason. The
+                # rule is worth stating once: a footnote binds to the number ABOVE it, so new
+                # lines go after the footnote, never between.
+                # A rule between the two subjects. Everything above is about what was
+                # STOPPED; everything below is about what PASSED. They were ten unbroken
+                # lines and a reader had no cue that the subject had changed.
+                print("   " + "─" * 70)
+                # Through `_plural`, per its own docstring: the parenthetical is "the tell
+                # of a screen nobody read aloud". Flagged rather than silently widened in
+                # an earlier commit; founder called it in.
+                print(f"   This ledger holds {_plural(_inventory_calls, 'recorded call')} "
+                      "that passed.")
                 # 🔴 "YOUR agent" IS THE CLAIM, SO OURS HAS TO BE NAMED. `agentx demo --audit`
                 # writes four ALLOWED rows into this ledger by design (the audit screen exists
                 # to show them), and this screen reported them under a sentence about the
@@ -268,6 +366,22 @@ def _render_offline_dashboard(gateway_url, mode="local"):
                 if _ours:
                     for _ln in _demo_row_note(_ours, of_total=_inventory_calls):
                         print("   " + _ln.strip())
+                _phrase = _novelty_phrase(_new, _first_look)
+                if _phrase:
+                    # 🔴 "THINGS", NOT A BARE NUMBER AFTER A SENTENCE ABOUT CALLS. `_new`
+                    # counts FACTS -- a new surface, a busiest day, a burst, a gap -- and one
+                    # single call to a known tool can produce four of them. Worded as
+                    # "...calls that passed, and 4 are new" the number reads as four CALLS,
+                    # which is false, and it invites the reader to reconcile it against the
+                    # count beside it. They are not the same population either: the call count
+                    # is ledger-wide and includes our demo's rows, the fact count is the
+                    # developer's own. Naming the unit is what stops the subtraction.
+                    #
+                    # ⚠️ THROUGH `_plural`, WHOSE OWN DOCSTRING CALLS THE PARENTHETICAL "the
+                    # tell of a screen nobody read aloud" -- and the first version of this line
+                    # printed "1 thing(s) changed". The helper existed the whole time.
+                    print("   " + _phrase)
+                print(f"   See what your agent did:   {_audit_cmd()}")
             elif census.get("would_blocks", 0) > 0:
                 # They ran, and every call ON RECORD tripped a policy -- so there is no
                 # inventory to point at, and telling them to wrap a tool is the same wrong
@@ -298,12 +412,14 @@ def _render_offline_dashboard(gateway_url, mode="local"):
 
     print("\n  " + "─" * 71)
     if local:
-        print("\n  Want the full deterministic floor (AST + the whole failure catalog),")
-        print("  coached recovery, and the live team dashboard? It runs locally, free:")
+        # "deterministic floor (AST + the whole failure catalog)" is three pieces of our own
+        # vocabulary in one clause, on the pitch line, to someone who has run one command.
+        print("\n  Want deeper checks, automatic recovery, and a team dashboard?")
+        print("  It runs locally, free:")
         print("     ▶ Get gateway access:  https://bit.ly/agentfirewall")
     else:
-        print("\n  The gateway adds the full deterministic floor (AST + the whole failure")
-        print("  catalog), coached recovery, and the live team dashboard:")
+        print("\n  The gateway adds deeper checks, automatic recovery, and a team")
+        print("  dashboard:")
         print("     ▶ Already a design partner?   docker compose up -d")
         print("     ▶ Want it (free, runs locally)?   https://bit.ly/agentfirewall")
     print("=" * 75)
@@ -338,6 +454,27 @@ def _self_corrections_line(pivots, nudges):
 def execute_status_inspection(gateway_url, api_key, mode="local"):
     """Probes local container metrics endpoints for running RAM stats and armed rules."""
     headers = {"Authorization": f"Bearer {api_key}"}
+    # `localhost` resolves to both `::1` and `127.0.0.1`, and a down gateway pays the
+    # connect timeout on EACH address in turn -- 2x the configured 2.0s below, on the
+    # very first command a new keyless install runs. `_gateway_reachable` already exists
+    # as a fast (0.4s) /health probe for exactly this question (used by the rule-authoring
+    # path); reuse it here rather than adding a third timeout budget to reconcile. A down
+    # gateway now fails in ~2x0.4s instead of ~2x2.0s. A live gateway still gets found:
+    # ANY response on /health (even non-200) counts as reachable and falls through to the
+    # real calls below, unchanged.
+    #
+    # 🔴 THE BUDGET IS NOT MODE-SYMMETRIC. `local`'s common case is "nothing is there" (a
+    # keyless install with no gateway), so 0.4s is the right default: fast-fail dominates.
+    # `cloud` is the opposite: a linked user's gateway is expected to exist, and a remote/
+    # cold-starting one (Cloud Run, first request after idle) can legitimately take longer
+    # than 0.4s to answer /health without being down. A precheck that's too eager to say
+    # "unreachable" would flip a slow-but-live gateway into the hard error path (exit 1)
+    # that used to require an actual ConnectionError -- give cloud the same 2.0s budget the
+    # real calls below already use, so this precheck can only fail faster, never stricter.
+    precheck_timeout = 0.4 if mode == "local" else 2.0
+    if not _gateway_reachable(gateway_url=gateway_url, timeout=precheck_timeout):
+        _render_offline_dashboard(gateway_url, mode)
+        sys.exit(0 if mode == "local" else 1)
     try:
         telemetry_res = requests.get(f"{gateway_url}/v1/telemetry", headers=headers, timeout=2.0)
         policy_res = requests.get(f"{gateway_url}/v1/debug/policies", headers=headers, timeout=2.0)
@@ -350,6 +487,15 @@ def execute_status_inspection(gateway_url, api_key, mode="local"):
         sys.exit(0 if mode == "local" else 1)
 
     if telemetry_res.status_code != 200 or policy_res.status_code != 200:
+        # Same contract as the ConnectionError branch above, extended to cover it: a
+        # local/keyless user has no gateway BY DESIGN, so anything else that happens to be
+        # listening on the default port and answers with a non-200 (401 from an unrelated
+        # gateway instance, a stray dev server, ...) is still "no gateway configured for
+        # THIS shell", not a fault. Only a linked/cloud user, who explicitly configured a
+        # gateway, should see this as a real error.
+        if mode == "local":
+            _render_offline_dashboard(gateway_url, mode)
+            sys.exit(0)
         print("❌ Error: Reasoning Engine contract validation failed.")
         print(f"   -> /v1/telemetry status: {telemetry_res.status_code}")
         print(f"   -> /v1/debug/policies status: {policy_res.status_code}")
@@ -858,8 +1004,8 @@ def _wrap(text, prefix, width=84):
 # WHICH COMMANDS THE CURRENT READER CAN ACTUALLY RUN
 #
 # `agentx-mcp` sets this to True before dispatching --review / --insights. It matters because
-# the MCP door and the Python door hand the reader DIFFERENT commands, and until 2026-07-31
-# this output assumed everyone had the `agentx` script:
+# the MCP door and the Python door hand the reader DIFFERENT commands. This output used to
+# assume everyone had the `agentx` script:
 #
 #   pip install agentx-mcp     -> `agentx` AND `agentx-mcp` on PATH (the SDK is a dependency)
 #   pipx install agentx-mcp    -> `agentx-mcp` only
@@ -871,7 +1017,7 @@ def _wrap(text, prefix, width=84):
 # WHY A FLAG AND NOT A PATH PROBE: `shutil.which()` cannot answer this from inside the
 # process. Under uvx the ephemeral env's Scripts dir is on the CHILD's PATH by construction,
 # so `which("agentx-mcp")` resolves into uv's cache for a user whose shell has no such
-# command -- verified 2026-07-31, it reports success in exactly the direction that hurts.
+# command -- it reports success in exactly the direction that hurts.
 #
 # WHY `uvx agentx-mcp --x` AND NOT `agentx-mcp --x`: the uvx form works on ALL THREE install
 # paths above, and it is already the form /docs teaches. Mildly redundant for someone who
@@ -892,6 +1038,17 @@ def _audit_cmd():
     # SDK's `agentx` script is not on PATH, so a bare `agentx audit` handed to an MCP reader
     # is a command-not-found aimed at exactly the person we just told to go look.
     return "uvx agentx-mcp --audit" if MCP_ENTRY else "agentx audit"
+
+
+def _audit_calls_cmd():
+    """The per-call screen, on whichever door the reader came through.
+
+    Built from `_audit_cmd` rather than spelled out, so the door resolution above cannot be
+    right in one helper and wrong in the other. The MCP entry point forwards everything
+    after `--audit` to this same reader (mcp_proxy dispatch), so the flag needs no work
+    there -- but the COMMAND still differs, which is the whole reason `_audit_cmd` exists.
+    """
+    return "%s --calls" % _audit_cmd()
 
 
 # (There was a `_demo_cmd()` here, added when the empty state offered the demo on both
@@ -959,10 +1116,10 @@ from .db import OUR_AGENT_IDS as _OUR_AGENT_IDS
 
 
 def _print_local_blocks_section():
-    """What the floor stopped ON THIS MACHINE, read from the SDK's own ledger. P-93(b).
+    """What the floor stopped ON THIS MACHINE, read from the SDK's own ledger.
 
     🔴 THIS SCREEN USED TO SAY NOTHING AT THE ONE MOMENT THE PRODUCT HAD JUST PROVED
-    ITSELF. Reproduced 2026-08-10: two real keyless blocks land in `.agentx.db`, then
+    ITSELF. Two real keyless blocks land in `.agentx.db`, then
     `agentx insights` prints two sections, both describing the PAID path, both empty by
     construction for a keyless user, and the only concrete instruction on the screen is
     "go run the gateway". The data was already there and already had a reader --
@@ -983,7 +1140,10 @@ def _print_local_blocks_section():
     # developer has folders. Verified by reading the store this function actually opens --
     # the three other "local to this machine" headers in this file read the INCIDENT store
     # and the overrides store, whose scoping is a separate question and is NOT touched here.
-    print("\n🛑 WHAT YOUR FLOOR STOPPED HERE          (local to this ledger)")
+    # "WHAT WAS BLOCKED HERE", not "WHAT YOUR FLOOR STOPPED" (founder copy pass): "floor" is
+    # our word for the mechanism, and a section title is not where to teach it. Matches
+    # `agentx status`'s "WHAT WAS RECORDED" so the two screens sound like one product.
+    print("\n🛑 WHAT WAS BLOCKED HERE                 (local to this ledger)")
     print("=" * 75)
 
     # Defensive: a missing or locked ledger degrades to the empty state, never a traceback.
@@ -1079,7 +1239,7 @@ def _print_local_blocks_section():
         # ways of reaching that statement -- so the TRIMMED empty state, the one where our own
         # housekeeping caused the emptiness, was the case that lost the evidence. A fact that
         # qualifies a claim has to travel with every route to the claim.
-        print("  %s" % os.path.abspath(db_module.DB_PATH))
+        print(_ledger_path_line(os.path.abspath(db_module.DB_PATH), "  "))
         print("")
         # 🔴 A ZERO MUST EARN ITS MEANING. This SCREEN reads only blocks, so an empty one is
         # a statement about what it selects, not about how the agents behaved. Saying so is
@@ -1106,10 +1266,11 @@ def _print_local_blocks_section():
             # "while audit was on", not "under AGENTX_ENFORCEMENT=audit": the per-tool
             # `enforcement=` argument sets audit too, and that is the path `agentx demo
             # --audit` takes, so this sentence named a variable the reader had not set.
-            print("  %d call(s) WERE recorded while audit was on and allowed"
-                  % audited)
-            print("  to run. Audit records what the floor would stop; it does not stop it,")
-            print("  so a zero here is the posture, not a verdict on your agents.")
+            # Three lines to two, and the same sentence `agentx status` uses -- one fact
+            # should not have two wordings on two screens. CAPS on "WERE" removed: the
+            # copy rules count emphasis as editorialising.
+            for _ln in _audit_posture_lines(audited):
+                print("  " + _ln)
             # ...and whose calls they were, same as every other count on these screens.
             # 🔴 COUNTED DIRECTLY, NOT BY SUBTRACTION, AND THE SWALLOWED EXCEPTION IS WHY.
             # This read `audited - get_would_block_summary(exclude_agents=[demo])["total"]`.
@@ -1192,7 +1353,7 @@ def _print_local_blocks_section():
         print("=" * 75)
         return
 
-    print("  %d block(s) recorded, by policy:" % total)
+    print("  %s recorded, by policy:" % _plural(total, "block"))
     for r in rows:
         line = "     %4dx   %s" % (r["blocks"], r["policy_name"] or "unattributed")
         if r["recoveries"]:
@@ -1223,7 +1384,11 @@ def _print_local_blocks_section():
     # call into that store. Founder-caught by running `agentx insights`, not by review --
     # the sentence is a print statement, so nothing red could ever appear.
     print("  This screen lists catches only, so it is never a measure of activity.")
-    print("  What your agent actually did, call by call:   %s" % _audit_cmd())
+    # 🔴 THIS LINE PROMISED "call by call" AND POINTED AT A SCREEN THAT GROUPS BY TOOL. The
+    # promise was right about what a reader wants and wrong about what they got, for as long
+    # as it has shipped. `--calls` is the screen it was describing, so the command now
+    # matches the sentence rather than the sentence being softened to match the command.
+    print("  What your agent actually did, call by call:   %s" % _audit_calls_cmd())
     print("=" * 75)
 
 
@@ -1237,7 +1402,7 @@ def _print_recovery_section(census):
     for all three would tell a keyless user their agents never recover, which is not a finding
     about their agents, it is a finding about what we are not recording.
 
-    ⚠️ THIS PARAGRAPH ITSELF CARRIED THE P-102 DEFECT until 2026-08-12. It read "the keyless
+    ⚠️ THIS PARAGRAPH ITSELF CARRIED THE SAME DEFECT IT NOW WARNS ABOUT. It read "the keyless
     shield does not write here", which is true of THIS STORE and reads as a claim about
     recoveries in general -- and recoveries ARE recorded, in the local ledger, by
     log_self_correction on both keyless paths. The user-facing copy (the print block below)
@@ -1277,11 +1442,12 @@ def _print_recovery_section(census):
         # cut two dropped the word "above" but kept pointing at a policy row that an empty
         # ledger never prints. Removing the deictic WORD is not the fix -- removing the
         # REFERENT is. This says what the product does and names nothing on the screen.
-        print("  Recoveries ARE recorded: when your agent revises a blocked call and it")
-        print("  runs, AgentX counts that as a recovery.")
-        print("  What is missing here is what came NEXT: whether the run went on to")
-        print("  finish the job, or stopped right after our suggestion. Only a gateway")
-        print("  records that -- run your agents against the local gateway to collect it.")
+        # Five lines to three. The first sentence said the same thing twice ("recoveries
+        # are recorded" / "AgentX counts that as a recovery"); the honest content is what
+        # is MISSING and what would collect it.
+        print("  A recovery is your agent revising a blocked call so it runs. Those are")
+        print("  recorded. What is not is whether the run then finished the job -- only a")
+        print("  gateway sees that. Run your agents against the local one to collect it.")
         _print_strays(census)
         print("=" * 75)
         return
@@ -1313,8 +1479,8 @@ def _print_recovery_section(census):
     # older gateway has no outcome columns at all, and saying "no blocks recorded yet" to
     # someone holding tens of thousands of them is simply false.
     if summary.get("state") == "not_upgraded":
-        print("  %d block(s) recorded, but this store predates the outcome columns, so there"
-              % summary["blocks_all_time"])
+        print("  %s recorded, but this store predates the outcome columns, so there"
+              % _plural(summary["blocks_all_time"], "block"))
         print("  is nothing recorded about what happened after them. The gateway adds the")
         print("  columns on its next write -- blocks from then on will be tracked.")
         _print_strays(census)
@@ -1349,8 +1515,8 @@ def _print_recovery_section(census):
         print("=" * 75)
         return
     if o["settled"] == 0:
-        print("  %d block(s) recorded, none settled yet. Outcomes settle once a run goes"
-              % o["blocks"])
+        print("  %s recorded, none settled yet. Outcomes settle once a run goes"
+              % _plural(o["blocks"], "block"))
         print("  quiet; there is nothing to read until then.")
         print("=" * 75)
         return
@@ -1617,6 +1783,86 @@ def _print_coaching_scoreboard():
               % sum(1 for g in queue[:3] if id(g) in marked))
 
 
+def _joined_phrase(parts, sep="; "):
+    """"a; b; and c" from a list. Empty list gives "", one item gives itself.
+
+    🔴 SEMICOLONS, NOT COMMAS, AND IT IS NOT A STYLE CHOICE. The members joined here are
+    whole phrases that contain their own commas -- "leaking secrets, keys and credentials" is
+    ONE item -- so a comma join produced "...leaking secrets, keys and credentials, leaking
+    customer personal data, hidden characters..." where a reader cannot see where one item
+    ends. Only visible by reading the rendered sentence; the list looked fine as a list.
+    """
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return "%s%sand %s" % (sep.join(parts[:-1]), sep, parts[-1])
+
+
+def _print_wrapped(text, indent="  ", width=75):
+    """Print `text` wrapped to the screen fence, without breaking words. Never raises.
+
+    🔴 THE FENCE IS 75 AND THIS SCREEN KEEPS TO IT. Prose assembled at runtime -- a joined
+    list whose members come from a policy table -- has no fixed length, so it cannot be laid
+    out by counting characters in the source the way the fixed lines above it are. Wrapping
+    here is what lets a variable-length sentence live on a fence-aligned screen at all.
+    """
+    words, line = (text or "").split(), ""
+    for word in words:
+        candidate = ("%s %s" % (line, word)).strip()
+        if len(candidate) + len(indent) > width and line:
+            print("%s%s" % (indent, line))
+            line = word
+        else:
+            line = candidate
+    if line:
+        print("%s%s" % (indent, line))
+
+
+def _audit_posture_lines(count):
+    """The "audit recorded these and let them run" sentence, in ONE place.
+
+    🔴 TWO SCREENS SAY THIS AND THEY HAD TWO WORDINGS. `agentx status` said "N calls that
+    audit recorded and let run"; `agentx insights` said "N call(s) WERE recorded while audit
+    was on and allowed to run" -- one fact, two voices, and a reader moving between them has
+    to work out whether they are the same thing. Same failure family as the enforce command
+    that was correct on one branch and wrong on its sibling. Returns lines WITHOUT indent so
+    each screen keeps its own margin.
+
+    ⚠️ IT HAS TO STAND ALONE, BECAUSE ONE OF THE TWO SCREENS HAS NO LEAD-IN. The first
+    version read "4 calls that audit recorded and let run." -- which completes `agentx
+    status`'s "...but it holds", and on `agentx insights` is a bare noun phrase with no verb,
+    following an unrelated sentence. De-duplicating copy across two screens means the shared
+    line has to survive BOTH contexts, so it carries its own verb now and the lead-in that
+    was leaning on it was rewritten. Sharing a sentence is not the same as sharing a clause.
+    """
+    return [
+        "Audit recorded %s and let %s run." % (_plural(count, "call"),
+                                               "it" if count == 1 else "them"),
+        "Audit stops nothing, so a zero here is the posture, not a verdict.",
+    ]
+
+
+def _novelty_phrase(count, first_look):
+    """"3 things changed since you last looked." / the first-look wording. ONE place.
+
+    🔴 THE THIRD SURFACE GOT THIS WRONG, WHICH IS WHY IT IS A FUNCTION. `read_novelty` grows
+    a `first_look` flag precisely so a year of history is not dated to this afternoon, and
+    `agentx audit` branches on it -- FIRST LOOK AT THIS LEDGER versus NEW SINCE YOU LAST
+    LOOKED. `agentx status` consumed the same reader, threw the flag away, and told a
+    stranger on a fresh install that N things had "changed since you last looked" against a
+    baseline that has never existed. A rule threaded into one of its two consumers.
+
+    Returns "" when there is nothing to say, so the caller prints nothing.
+    """
+    if not count:
+        return ""
+    if first_look:
+        return "%s here, and this is the first look at this ledger." % _plural(count, "thing")
+    return "%s changed since you last looked." % _plural(count, "thing")
+
+
 def _plural(n, singular, plural=None):
     """"1 call" / "2 calls". `n` is formatted with thousands separators.
 
@@ -1788,7 +2034,7 @@ def _print_wrap_snippet():
     branches said "Wrap a tool, then run your agent with it on:" followed only by the
     AGENTX_ENFORCEMENT lines. Step two, shown; step one, named and left as an exercise. On a
     fresh directory that is the entire first-run experience: an instruction with no
-    instructions. Founder-flagged 2026-08-12 after running it in a new shell.
+    instructions. Observed after running it in a new shell.
 
     ⚠️ PYTHON DOOR ONLY. An MCP reader does not decorate anything -- they add AgentX to
     mcp.json and their client spawns it -- so this snippet is not a step they can take, and
@@ -1820,7 +2066,7 @@ def _print_audit_sample():
     find, and most agents will not find it. Show the shape; let their own data be the
     interesting part.
 
-    🔴 MCP DOOR ONLY SINCE 2026-08-12. The Python door gets `_print_audit_offer` instead: a
+    🔴 MCP DOOR ONLY. The Python door gets `_print_audit_offer` instead: a
     fabricated table was the best this screen could do while the only way to fill it was for
     the reader to go instrument their own codebase, and `agentx demo --audit` now fills it
     for real in one command. Where that command is available, invented rows are strictly
@@ -1874,6 +2120,43 @@ def _tools_line(tools):
         if len(prefix) + len(text) <= 75 or len(shown) <= 1:
             return [_fit(prefix + text, 75)]
         shown.pop()
+
+
+def _shape_lines(db_module, arg_names, classes, max_amount):
+    """The "surface: db, arguments: query, limit" + "largest amount seen: >=1,000" lines
+    under a WOULD_BLOCK policy group in `agentx insights` -- the audit-mode twin of
+    `agentx audit`'s SURFACE/ARGUMENTS table columns (execute_audit, above), reusing the
+    exact same fitting/bucket rules (_fit_names, _format_bucket, db_module._SURFACE_LABELS)
+    so the two screens describe a call's shape identically instead of growing two dialects
+    for the same underlying columns.
+
+    `db_module` is a PARAMETER, not a module-level name -- same convention as
+    `_print_novelty(db_module)` above: `from . import db as db_module` is done lazily,
+    function-scoped, at each call site (see the comment on the FIRST such import, ~line 60)
+    so a missing/locked DB degrades a screen instead of crashing the CLI, and there is no
+    module-level `db_module` for a helper defined at this scope to close over.
+
+    Returns a list of lines (empty when there is nothing to say -- a legacy row recorded
+    before the shape columns existed, same convention as _tools_line above).
+    """
+    surface = "/".join(
+        db_module._SURFACE_LABELS.get(c, c)
+        for c in (classes or []) if c != db_module._CLASS_OTHER)
+    lines = []
+    prefix = ("             surface: %s, arguments: " % surface) if surface \
+        else "             arguments: "
+    names = _fit_names(arg_names or [], max(75 - len(prefix), 10))
+    if names != "(none)":
+        lines.append(_fit(prefix + names, 75))
+    elif surface:
+        # No argument names recorded (a legacy row, or a call that genuinely took none), but
+        # the surface classification still landed and is worth a line on its own -- dropping
+        # it here would make an old-ledger install look shapeless even where it isn't.
+        lines.append(_fit("             surface: %s" % surface, 75))
+    bucket = _format_bucket(max_amount)
+    if bucket and (max_amount or 0.0) >= _MAGNITUDE_WORTH_SHOWING:
+        lines.append("             largest amount seen: %s" % bucket)
+    return lines
 
 
 def _demo_row_note(count, of_total=None, pronoun="those"):
@@ -1932,6 +2215,618 @@ def _print_audit_offer():
     print("")
 
 
+# How many novelty lines this screen prints before it counts the rest. The block is the
+# reason to re-run the command, not a second copy of the table underneath it.
+_MAX_NOVELTY_SHOWN = 6
+
+
+def _posture_command_lines(posture, indent="      "):
+    """The two shell forms as a LIST, for call sites that build a list of lines rather than
+    printing. Lazy import, like every other decorators use in this file."""
+    from .decorators import posture_command_lines
+    return posture_command_lines(posture, indent)
+
+
+def _audit_posture_clause():
+    """What audit IS, in the words decorators.AUDIT_POSTURE_CLAUSE holds. Lazy import like
+    every other decorators use in this file, so importing the CLI stays cheap."""
+    from .decorators import AUDIT_POSTURE_CLAUSE
+    return AUDIT_POSTURE_CLAUSE
+
+
+# (There was an `_audit_route_may_print` here, added with the route change so the blind-spot
+# block could print the audit command without colliding with the enforce CTA. DELETED: the
+# command was ALREADY on this screen, ~20 lines up, from the demo-note branch at the
+# `posture != "audit"` else. Its condition (`all_ours`, not MCP, shell not audit) is a strict
+# subset of that one's, so the two never disagreed -- they just both printed, giving the
+# ladder's first screen the same two-shell block twice. Caught by review, reproduced by
+# running `agentx audit` against a ledger holding one demo row.
+#
+# The lesson worth keeping: the guard was correct and still wrong. It reasoned about which
+# command may print HERE, having never asked what the screen already printed. A rule about a
+# whole screen cannot be enforced from one block inside it. The blind-spot STATEMENT stays
+# where it was, because a statement is not a second instruction.)
+
+
+def _print_posture_command(posture, indent="      "):
+    """How to run at a given posture, for THIS door. The ONE place that answers it.
+
+    Took a `posture` argument when the audit screen needed the mirror of it: the audit CTA
+    used to hand over `@agentx_protect(..., enforcement="audit")`, a per-tool pin that beats
+    this variable and never expires. Two postures, one printer -- a second function would be
+    the drift this one was extracted to stop.
+
+    🔴 EXTRACTED BECAUSE THE RULE WAS OBEYED AT ONE CALL SITE AND BROKEN AT ITS SIBLING, IN
+    THE SAME CHANGE. The rule is old and written down: print BOTH shells, because
+    `VAR=value cmd` is not valid in PowerShell and `$env:VAR="x"; cmd` is not valid in bash,
+    so either alone hands half our readers a command they cannot run. The loud enforce block
+    honoured it. The quiet block added a hundred lines later printed the PowerShell form
+    only -- inverting the exact defect the loud block's own comment warns about, onto the
+    other platform, on the branch the MAJORITY of readers hit. It also dropped
+    `python your_agent.py`, so even the right-platform reader got a variable assignment with
+    nothing to run.
+    #
+    A rule restated in prose beside each instance gets obeyed at some of them. This is the
+    entry point instead, so a third caller cannot get it wrong and a change to the wording
+    reaches every screen at once.
+    """
+    if MCP_ENTRY:
+        # This reader's posture lives in mcp.json, not in a shell they can prefix.
+        print("%sset AGENTX_ENFORCEMENT=%s in your mcp.json" % (indent, posture))
+        return
+    # The shell forms live in decorators.posture_command_lines: the session summary prints
+    # this same instruction, and two copies of a two-shell rule is how one of them drifts.
+    # Imported inside the function like every other decorators use in this file.
+    from .decorators import posture_command_lines
+    for line in posture_command_lines(posture, indent):
+        print(line)
+
+
+def _print_enforce_command(indent="      "):
+    """Kept as the name every enforce call site already uses. Thin on purpose."""
+    _print_posture_command("enforce", indent)
+
+
+def _print_novelty(db_module):
+    """The "what changed since last time" block. Returns the novelty dict for the caller.
+
+    Never raises and prints nothing it cannot stand behind: on an unreadable ledger, on a
+    ledger with no inventory rows, and on any internal failure, `read_novelty` returns an
+    empty result and this is silent. A screen that says "nothing new" when it simply could
+    not tell is the false-empty class this whole surface has been fixed for three times.
+
+    🔴 THE WATERMARK IS ADVANCED AFTER PRINTING, NOT BEFORE. Advancing first would mean a
+    reader whose terminal died mid-screen loses the novelty permanently, and it would make
+    the block empty for the second of two runs a second apart -- which is what a developer
+    does when they are not sure the first one worked.
+    """
+    try:
+        current = db_module.current_call_shape()
+        novelty = db_module.read_novelty(db_module.WATERMARK_REPORT, current=current)
+    except Exception:
+        return None
+    items = novelty["items"]
+    if not items:
+        # 🔴 STILL MARK THE SCREEN AS RUN. This is the same rule `mark_audit_report_run`
+        # states at the top of execute_audit -- the mark records that a human took the step,
+        # never what we had to show them. Returning here without it meant the first run of
+        # the ladder (every row ours, so nothing to say) left no trace, and the NEXT run
+        # headed its block "FIRST LOOK AT THIS LEDGER" for a reader who had already opened
+        # the screen. Founder-found, walking the ladder in one directory.
+        try:
+            db_module.advance_watermark(db_module.WATERMARK_REPORT, current=current)
+        except Exception:
+            pass
+        return novelty
+    # TWO HEADERS, because they are two different claims. On a ledger we have never
+    # watermarked, every tool in it is "new" -- but it is new to US, not new to the agent,
+    # and "first call to your database" under a SINCE YOU LAST LOOKED header would date a
+    # year of history to this afternoon. The first-look header says which one this is.
+    if novelty["first_look"]:
+        print("  FIRST LOOK AT THIS LEDGER")
+    else:
+        print("  NEW SINCE YOU LAST LOOKED")
+    for item in db_module.top_novelty(items, _MAX_NOVELTY_SHOWN):
+        line = db_module.format_novelty_item(item)
+        if line:
+            # An empty tool name is deliberate, not missing data: WHEN the agent ran is a
+            # fact about the session, so naming one of the tools it happened to use would be
+            # arbitrary.
+            #
+            # ⚠️ AND IT DOES NOT GET THE EMPTY COLUMN. Padding a blank name to 24 characters
+            # printed "                             first call in 9 days" -- a sentence
+            # marooned a third of the way across the screen with nothing to its left. The
+            # column exists to line tool names up with each other; a line with no tool name
+            # is not in that column at all.
+            if item["tool"]:
+                print("    %-24s %s" % (_fit(item["tool"], 24), line))
+            else:
+                print("    %s" % line)
+    hidden = len(items) - min(len(items), _MAX_NOVELTY_SHOWN)
+    if hidden > 0:
+        print("    (%d more not listed)" % hidden)
+    print("")
+    try:
+        db_module.advance_watermark(db_module.WATERMARK_REPORT, current=current)
+    except Exception:
+        pass
+    return novelty
+
+
+def _print_concentration(novelty):
+    """"`run_sql` was 412 of 500 calls" — the shape of the traffic, not a change in it.
+
+    ⚠️ THIS IS NOT A NOVELTY LINE AND IT IS DELIBERATELY NOT UNDER THAT HEADER. It is true
+    on every run, so a reader who came back for what changed would find it there unchanged
+    and learn that the section lies. It earns its place for the opposite reason: it is the
+    one claim on this screen that survives everything -- a ratio is stable under sampling and
+    under retention, where "largest amount yet" fails toward understatement.
+
+    Silent below `_CONCENTRATION_SHARE`, because on a ledger of twenty even tools the busiest
+    one is just whichever it happens to be, and printing it would be a sentence with no
+    information in it.
+    """
+    if not novelty or novelty["distinct_tools"] < 2:
+        return
+    from .db import _CONCENTRATION_SHARE, _CONCENTRATION_MIN_CALLS
+    if novelty["total_calls"] < _CONCENTRATION_MIN_CALLS:
+        return
+    share = novelty["busiest_calls"] / float(novelty["total_calls"])
+    if share < _CONCENTRATION_SHARE:
+        return
+    # Counted over the developer's OWN rows, both halves. `inventory["total_calls"]` on the
+    # line above includes our demo's, so dividing one by the other would produce a share of
+    # a different population -- and on the first run of the ladder a share of mostly us.
+    print("  Mostly one tool: %s ran %s of your %s."
+          % (novelty["busiest"], f"{novelty['busiest_calls']:,}",
+             _plural(novelty["total_calls"], "call")))
+
+
+# --- `agentx audit` FLAGS ---------------------------------------------------------------
+#
+# 🔴 TWO AXES, NOT FOUR MODES. `--calls` decides WHAT you see (one row per call instead of
+# grouped by tool); `--json` decides HOW it prints (data for a program instead of a screen
+# for a person). Keeping them independent is what makes all four combinations mean
+# something, and it is the split `npx @agentx-core/scan` already ships as `--all` (content)
+# versus `--json` (format). Folding them into one flag would leave no way to ask for the
+# grouped view machine-readably.
+_AUDIT_SCHEMA = "agentx.audit/1"
+
+# The human page sizes. JSON is never capped (see _effective_limit). Two numbers because
+# the two views count different things: calls, and tools. 25 is the grouped reader's own
+# long-standing default, restated here so both views ask the same function for their bound.
+_DEFAULT_CALL_ROWS = 50
+_DEFAULT_TOOL_ROWS = 25
+
+def _audit_usage():
+    """The usage line, with the command resolved for the door the reader came through.
+
+    🔴 A FUNCTION, NOT A CONSTANT, AND BOTH HALVES OF THAT MATTER. It was a module-level
+    string reading "agentx audit", printed on the MCP door too -- where `agentx` is not on
+    PATH, so an unknown-flag error told the reader to run a command that does not exist.
+    That is the exact failure `_audit_cmd` was written to prevent, reintroduced beside it.
+
+    And it must be built at PRINT time: `MCP_ENTRY` is set by the proxy AFTER this module
+    imports, so a constant computed at import would resolve the wrong door however it was
+    written.
+    """
+    return "   Usage:  %s [--calls] [--json] [--limit N | --all]" % _audit_cmd()
+
+# What a status MEANS, in the words a developer would use. The raw strings are ledger
+# vocabulary and two of them are actively misleading read cold: WOULD_BLOCK is a call we
+# let RUN, and CHALLENGED is one we stopped.
+#
+# ⚠️ AN UNKNOWN STATUS FALLS THROUGH TO ITS RAW VALUE rather than to a friendly default.
+# A legacy row carrying a status this table has never heard of is exactly the row a reader
+# needs to see verbatim, and rendering it as "allowed" would be inventing a verdict.
+_CALL_STATUS_LABELS = {
+    "ALLOWED": "allowed",
+    "WOULD_BLOCK": "would block",
+    "CHALLENGED": "blocked",
+    "RECOVERED": "recovered",
+}
+
+
+def _call_status_label(status):
+    """Plain-word label for one ledger status. `None` is its own answer, not 'allowed'."""
+    if status is None:
+        # Pre-P-57 rows exist with no status at all. "unrecorded" says we do not know,
+        # which is the truth; folding them into any verdict would be a claim we cannot make.
+        return "unrecorded"
+    return _CALL_STATUS_LABELS.get(status, status.lower())
+
+
+def _parse_audit_args(args):
+    """Flags for `agentx audit`. Exits 1 on a bad one, the way `agentx share` does.
+
+    🔴 ERRORS GO TO STDERR HERE, unlike its siblings, and the reason is `--json`:
+    `agentx audit --json --bogus > out.json` must not put an error message inside the file
+    the caller is about to parse. The siblings have no machine-readable mode, so they
+    correctly print to stdout; this one cannot.
+    """
+    opts = {"calls": False, "json": False, "limit": None, "all": False}
+
+    def _die(message):
+        print("\n❌ %s" % message, file=sys.stderr)
+        print(_audit_usage(), file=sys.stderr)
+        sys.exit(1)
+
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in ("-h", "--help"):
+            # Every other door in the product answers --help. The reader most likely to type
+            # it here is the one who just heard the flags exist, and rejecting it as an
+            # unknown option -- with a usage line, on stderr, exiting 1 -- is a strange way
+            # to greet them. Exit 0: this is a successful request, not a mistake.
+            #
+            # 🔴 BUT NOT ONTO A CALLER'S DOCUMENT. Every error above goes to stderr precisely
+            # so `--json` keeps stdout parseable, and this exit was the one that did not
+            # honour it: `agentx audit --json --help > out.json` wrote a human usage line
+            # into the file. Same rule, same reason, one more exit -- which is the shape this
+            # branch keeps having to re-fix.
+            print(_audit_usage(), file=sys.stderr if "--json" in args else sys.stdout)
+            sys.exit(0)
+        if tok == "--calls":
+            opts["calls"] = True; i += 1
+        elif tok == "--json":
+            opts["json"] = True; i += 1
+        elif tok == "--all":
+            opts["all"] = True; i += 1
+        elif tok == "--limit":
+            if i + 1 >= len(args):
+                _die("--limit needs a number.")
+            try:
+                value = int(args[i + 1])
+            except (TypeError, ValueError):
+                _die("--limit needs a number, not '%s'." % args[i + 1])
+            if value < 1:
+                _die("--limit must be at least 1.")
+            opts["limit"] = value; i += 2
+        else:
+            _die("Unknown option '%s' for `%s`." % (tok, _audit_cmd()))
+    # The usage line offers these as alternatives (`--limit N | --all`) and they were not:
+    # `--all --limit 3` silently resolved to 3, so the screen did the opposite of the flag
+    # the reader typed last. Say so rather than pick one.
+    if opts["all"] and opts["limit"] is not None:
+        _die("--all and --limit ask for different things; pass one.")
+    return opts
+
+
+def _effective_limit(opts, default):
+    """How many entries to read. `None` means every one in the window.
+
+    🔴 JSON IS ALWAYS COMPLETE, and that is a contract borrowed from `scan`, whose own
+    `--json` is documented as such. The human screen trims because a terminal has a size;
+    a program reading a silently truncated list has no way to know it was trimmed and will
+    report a smaller agent than the one that ran. An explicit `--limit` still wins, because
+    a caller asking for N entries asked for N entries.
+
+    🔴 `default` IS A PARAMETER BECAUSE THE TWO VIEWS COUNT DIFFERENT THINGS -- 50 CALLS or
+    25 TOOLS. The first version of this took no argument, so it was called on the per-call
+    path only and the grouped path hardcoded its own answer: `--limit 1` was accepted,
+    reported nothing, and returned two tools. A flag parsed and then ignored is worse than
+    one that does not exist, because the reader believes the screen answered them. Both
+    views route through here now, which is what makes the docstring above true on all four
+    flag combinations rather than one.
+    """
+    if opts["limit"] is not None:
+        return opts["limit"]
+    if opts["all"] or opts["json"]:
+        return None
+    return default
+
+
+def _iso(ts):
+    """Epoch seconds -> ISO 8601 UTC, or None. Never raises on a junk timestamp."""
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _local_day_and_clock(ts):
+    """(YYYY-MM-DD, HH:MM:SS) in LOCAL time, or ("", "--:--:--"). Never raises.
+
+    🔴 LOCAL, NOT UTC, AND IT HAS TO MATCH `_since_phrase`. That helper dates this screen's
+    window with a naive `datetime.fromtimestamp`, so rendering the rows in UTC put a header
+    dated one day above rows dated the next -- the same instants, described by one screen in
+    two clocks, which reads as data from a different day. Found by running it, not by review.
+
+    The JSON keeps UTC (`_iso`), where an unambiguous absolute instant is what a program
+    needs and there is no second clock on the page to disagree with.
+    """
+    try:
+        moment = datetime.fromtimestamp(float(ts))
+        return moment.strftime("%Y-%m-%d"), moment.strftime("%H:%M:%S")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "", "--:--:--"
+
+
+def _split_arg_names(joined):
+    """Argument names as a list, from EITHER shape the two readers return.
+
+    The writer budgets and joins whole names (db._call_shape); this is the inverse, and it
+    exists so the JSON carries a list rather than making every consumer re-split a string
+    and rediscover the comma rule.
+
+    🔴 IT ACCEPTS A LIST AS WELL AS A STRING, AND THAT IS NOT DEFENSIVENESS -- IT IS THE
+    BUG. `get_call_log` hands over the raw column (a joined string); `get_call_inventory`
+    hands over a list, because it unions the names across every row for a tool first. Two
+    readers, same field name, different types. Assuming the string form printed `query` as
+    "q, u, e, r, y" on the per-call screen; assuming the list form crashed the grouped JSON.
+    Both directions were hit, one after the other, which is why the conversion lives in ONE
+    place that knows about both rather than at each call site.
+    """
+    if not joined:
+        return []
+    if isinstance(joined, (list, tuple, set)):
+        return [str(n) for n in joined if str(n)]
+    return [part for part in (p.strip() for p in str(joined).split(",")) if part]
+
+
+def _surface_label(db_module, target_class):
+    """The human name for a target class, or None when it carries no information."""
+    if not target_class or target_class == db_module._CLASS_OTHER:
+        return None
+    return db_module._SURFACE_LABELS.get(target_class, target_class)
+
+
+def _audit_json_payload(db_module, opts, inventory=None, log=None):
+    """The `--json` document. One shape, two possible list keys.
+
+    🔴 WHEN THE LEDGER CANNOT BE READ, THE LIST KEY IS ABSENT -- NOT AN EMPTY LIST. This is
+    the same false-empty defect the human screens have been fixed for twice (P-76, and again
+    in #326), arriving on a surface with no prose to soften it: `{"calls": []}` states that
+    the agent did nothing, and a program has no way to tell that from a locked file. Absent
+    forces the consumer to look at `ledger.readable`, which is the fact it needs.
+    """
+    source = log if log is not None else inventory
+    readable = bool(source.get("readable"))
+    payload = {
+        "schema": _AUDIT_SCHEMA,
+        # 🔴 THE VIEW IS NAMED, BECAUSE THE TWO SHAPES ANSWER DIFFERENT QUESTIONS UNDER ONE
+        # SCHEMA. Without it a consumer handed a file cannot tell which flag produced it,
+        # and the two lists are not interchangeable: `tools` is grouped and reads inventory
+        # rows only, `calls` is a timeline over every row. Same version, same field names,
+        # different denominators -- so the file has to say which one it is.
+        "view": "calls" if log is not None else "tools",
+        "ledger": {
+            "readable": readable,
+            "path": os.path.abspath(db_module.DB_PATH),
+            "window_start": source.get("window_start"),
+            "window_start_iso": _iso(source.get("window_start")),
+            # 🔴 `None`, NOT `True`, WHEN THE LEDGER COULD NOT BE READ. The branch below
+            # omits `totals` because "zeroes would be as false as an empty list -- they
+            # describe a ledger nobody managed to read", and `covers_all: true` is a
+            # positive claim of exactly that kind: it asserts the window is untrimmed for a
+            # file that would not open. Same rule, one more field.
+            "covers_all": source.get("covers_all", True) if readable else None,
+            "retention_days": db_module._RETENTION_DAYS,
+            "max_rows": db_module._RETENTION_MAX_ROWS,
+        },
+    }
+    if not readable:
+        # No `totals` either. Zeroes here would be as false as an empty list, for the same
+        # reason: they describe a ledger nobody managed to read.
+        return payload
+
+    # 🔴 ONE TOTALS BLOCK, FROM THE LEDGER, IDENTICAL IN BOTH VIEWS. It used to be built by
+    # hand per view, and the two disagreed: the grouped one paired `flagged` (every non-
+    # inventory row, ours included) with `ours` (our ALLOWED rows only), so a consumer
+    # subtracting them counted our own demo's block as the developer's -- the exact split
+    # the human grouped screen footnotes with care. Four populations, named separately, from
+    # `db._ledger_totals`: it is not this function's business to recombine them.
+    if readable:
+        # 🔴 BOTH READERS NOW HAND THIS BLOCK OVER, so neither view goes back to the
+        # database for numbers it was already given. The grouped one computed it internally
+        # and discarded it, so this line opened a SECOND connection and recomputed all of
+        # it -- extra queries, and a separate transaction, so a row written between the two
+        # reads yielded a payload whose totals disagreed with the list they label.
+        #
+        # ⚠️ THE COMMENT THAT WAS HERE SAID "only the grouped reader goes back for one", and
+        # that premise stopped being true in the same commit that made it half-false. A
+        # justification outliving its code by one commit is the shape this branch keeps
+        # meeting; it is worth saying out loud that it happened here too.
+        totals = dict((log if log is not None else inventory)["totals"])
+        # A second read can disagree with the first: the file can be locked or moved between
+        # them. Dropping that flag would publish zeroes as though they were counts, which is
+        # the empty-versus-unreadable confusion this payload exists to refuse.
+        if totals.pop("readable", True) is False:
+            payload["ledger"]["readable"] = False
+            return payload
+        # 🔴 `ledger.window_start` IS A FACT ABOUT THE FILE, SO IT COMES FROM THE LEDGER-WIDE
+        # READ IN BOTH VIEWS. Built from `source` alone it was the grouped reader's own
+        # MIN(timestamp) over INVENTORY rows only, so a ledger whose oldest row is a BLOCK
+        # reported two different `ledger.window_start` values for the same file depending on
+        # which flag you passed -- under one schema, under a key namespaced to the ledger
+        # rather than to the view. Measured: the two views dated the same file nearly two
+        # years apart. `covers_all` stays per-view on purpose (each reader counts the
+        # evictions its own list is about); the WINDOW is not per-view.
+        payload["ledger"]["window_start"] = totals.get("window_start")
+        payload["ledger"]["window_start_iso"] = _iso(totals.get("window_start"))
+        totals.pop("window_start", None)
+        # `shown` is "entries in the list below" -- calls in one view, tools in the other.
+        # It is the one total whose UNIT depends on the view, which is why `view` above is
+        # not decoration.
+        totals["shown"] = len(log["rows"]) if log is not None else len(inventory["tools"])
+        if log is None:
+            # 🔴 `shown` NEEDS A DENOMINATOR IN ITS OWN UNITS. `distinct_tools` counts every
+            # tool in the ledger; the `tools` list holds only those with inventory rows. So a
+            # complete, uncapped document read as truncated -- `distinct_tools: 4, shown: 1`
+            # over a list that was missing nothing -- against a flag whose whole contract is
+            # that it never truncates. This is the number the list is actually out of.
+            totals["listed_total"] = inventory["distinct_tools"]
+        payload["totals"] = totals
+
+    if log is not None:
+        payload["calls"] = [{
+            "ts": row["ts"],
+            "time": _iso(row["ts"]),
+            "tool": row["tool"],
+            "status": row["status"],
+            "status_label": _call_status_label(row["status"]),
+            "arg_names": _split_arg_names(row["arg_names"]),
+            "amount_bucket": row["amount"],
+            "surface": _surface_label(db_module, row["target_class"]),
+            "policy": row["policy_name"],
+            "trace_id": row["trace_id"],
+            "agent_id": row["agent_id"],
+            "ours": row["ours"],
+        } for row in log["rows"]]
+        return payload
+
+    payload["tools"] = [{
+        "tool": row["tool"],
+        "calls": row["calls"],
+        "arg_names": _split_arg_names(row["arg_names"]),
+        "surfaces": [s for s in (_surface_label(db_module, c) for c in row["classes"]) if s],
+        "max_amount_bucket": row["max_amount"],
+        "first_ts": row["first_ts"],
+        "first_time": _iso(row["first_ts"]),
+        "last_ts": row["last_ts"],
+        "last_time": _iso(row["last_ts"]),
+        # 🔴 NOT `flagged`. The same key name over two different populations in one nested
+        # document: this per-tool number EXCLUDES our own demo and example rows, while
+        # `totals.flagged` includes them -- so a consumer summing the column against the
+        # total finds a gap with nothing in the payload explaining it. The human screen
+        # footnotes that split in prose; a document has no prose, so the name carries it.
+        "flagged_excluding_ours": row["flagged"],
+    } for row in inventory["tools"]]
+    return payload
+
+
+def _print_unreadable_ledger(db_module):
+    """ONE wording for "on disk, could not be read", shared by both audit screens.
+
+    🔴 UNREADABLE IS NOT EMPTY -- the rule this whole surface keeps being fixed for (P-76,
+    and again on the neighbouring screen in #326). Telling a developer with a locked ledger
+    that their agent did nothing is a false statement about their own data.
+
+    It lives in one function because there are now two screens that can hit it, and two
+    surfaces describing the same limit in two ways is how a reader concludes they mean
+    different things.
+    """
+    print("  The ledger is on disk but could not be read, so this screen cannot tell you")
+    print("  what your agent did. It is NOT a statement that it did nothing.")
+    print("")
+    print("     %s" % os.path.abspath(db_module.DB_PATH))
+    print("")
+    print("  Another process may hold it open. If it is corrupt, moving it aside starts")
+    print("  a fresh one; the records it holds are not recoverable.")
+    print("=" * 75)
+
+
+def _print_empty_ledger_guidance(db_module):
+    """The `--calls` empty state.
+
+    🔴 NAME THE LEDGER, because the likeliest cause of an empty screen is the reader
+    standing in a different folder. `DB_PATH` is cwd-relative, so an agent run in ~/proj
+    and this command run from ~ read two different files, and every other sentence is then
+    a confident guess about the wrong one. The grouped screen has said this for exactly
+    that reason; this screen said "No calls on record" and stopped.
+
+    It POINTS at the grouped screen rather than restating its guidance. That block runs to
+    forty lines, branches on the door and the posture, and is pinned by several tests --
+    copying it here is how two surfaces begin describing the same limit in two ways, which
+    is the drift this file keeps having to undo.
+    """
+    print("  No calls on record in this ledger.")
+    print("")
+    print(_ledger_path_line(os.path.abspath(db_module.DB_PATH), "     "))
+    print("     Calls are recorded per ledger, so running agentx from another folder")
+    print("     reads a different one.")
+    print("")
+    print("  What to do about it:   %s" % _audit_cmd())
+    print("=" * 75)
+
+
+def _print_call_log(db_module, log, opts):
+    """The `--calls` screen: one line per call, newest first.
+
+    The ORDER is the whole point. Grouped by tool, a table read one row at a time five
+    hundred times is a single line reading "500 calls"; here it is five hundred lines in a
+    row at three-per-second, which a person recognises immediately. Nothing in the product
+    DETECTS that shape, so this screen is currently the only place it can be seen.
+    """
+    if not log["totals"]["rows"]:
+        # 🔴 A DEAD END WAS THE ONE THING THIS SCREEN COULD NOT AFFORD. It printed "No calls
+        # on record" and stopped -- while the grouped screen, for the identical condition,
+        # names the ledger file, warns that running from another folder reads a different
+        # one, and says how to fill it. `DB_PATH` is cwd-relative, so wrong-directory is the
+        # MOST likely reason this screen is empty, and this was the only screen that did not
+        # say so. Same guidance, one implementation, because two surfaces describing the
+        # same limit in two ways is how a reader concludes they mean different things.
+        _print_empty_ledger_guidance(db_module)
+        return
+
+    if not log["covers_all"]:
+        # Directly above the counts it qualifies, for the reason the grouped screen states:
+        # a footnote at the bottom does not undo a number read at the top.
+        print("  This ledger has been trimmed, so the rows below are what was KEPT, not")
+        print("  everything your agent has ever done.")
+    print("  %s across %s%s"
+          % (_plural(log["totals"]["rows"], "call"),
+             _plural(log["totals"]["distinct_tools"], "tool"),
+             _since_phrase(log["window_start"])))
+    if log["shown"] < log["totals"]["rows"]:
+        print("  (showing the most recent %d; %s more not listed -- use --all)"
+              % (log["shown"], f"{log['totals']['rows'] - log['shown']:,}"))
+    print("")
+    print("  %-8s  %-24s  %-12s %s" % ("TIME", "TOOL", "STATUS", "ARGUMENTS"))
+    print("  " + "-" * 71)
+
+    # 🔴 THE BUDGET IS DERIVED FROM THE FORMAT, NOT PICKED, and it is the same arithmetic
+    # the grouped screen documents: the columns above occupy 2 + 8 + 2 + 24 + 2 + 12 + 1 =
+    # 51, so 75 - 51 = 24 keeps an ordinary row inside the fence this screen holds to.
+    # `_fit_names` drops WHOLE names and says "+N more" rather than slicing the join, which
+    # is the defect both the writer and the grouped reader have already been fixed for.
+    names_budget = 75 - 51
+    shown_day = None
+    for row in log["rows"]:
+        day, clock = _local_day_and_clock(row["ts"])
+        # A date line only when the day CHANGES. The alternative is a date on every row,
+        # which costs 11 columns of argument names on every line to repeat a fact that is
+        # the same for most of them.
+        if day != shown_day:
+            print("  %s" % (day or "(no date)"))
+            shown_day = day
+        # An asterisk, explained once below. Our own rows are MARKED rather than dropped
+        # (the grouped screen makes the same call): someone who ran `agentx demo --audit`
+        # to get a populated screen would otherwise be shown an empty one.
+        tool = (row["tool"] or "(unnamed)") + ("*" if row["ours"] else "")
+        # 🔴 `_fit_names` TAKES A LIST, AND THE LEDGER STORES A JOINED STRING. Handing it
+        # the raw column iterated the string CHARACTER BY CHARACTER and rendered `query` as
+        # "q, u, e, r, y". The grouped screen never met this because its reader unions the
+        # names into a list first; this one reads the column directly. Caught by running it.
+        print("  %-8s  %-24s  %-12s %s"
+              % (clock, _fit(tool, 24), _fit(_call_status_label(row["status"]), 12),
+                 _fit_names(_split_arg_names(row["arg_names"]), names_budget)))
+
+    print("")
+    # 🔴 THE LEGEND COUNTS WHAT IS ON THE PAGE, NOT WHAT IS IN THE LEDGER. `ours_total` is
+    # ledger-wide, so on a trimmed page it printed "* 1 row written by our demo" under a
+    # table carrying no asterisk at all -- a footnote explaining a marker the reader cannot
+    # see. Same class as the footnote-separated-from-its-number defect this product has
+    # already been fixed for twice, and found the same way: by running it with --limit.
+    #
+    # The ledger-wide fact is still worth stating, so it gets its own sentence instead of
+    # borrowing the legend's.
+    # 🔴 NOT `elif`. The two sentences are about different things -- what is marked ON THE
+    # PAGE, and what exists elsewhere in the ledger -- and an `elif` made them mutually
+    # exclusive, so a page carrying SOME of our rows silently dropped the fact that more sat
+    # off it. Both can be true at once, and on a trimmed page they usually are.
+    shown_ours = sum(1 for row in log["rows"] if row["ours"])
+    off_page_ours = log["totals"]["ours"] - shown_ours
+    if shown_ours:
+        print("  * %s above written by AgentX's own demo or examples, not by your agent."
+              % _plural(shown_ours, "row"))
+    if off_page_ours > 0:
+        print("  %s elsewhere in this ledger came from AgentX's own demo or examples."
+              % _plural(off_page_ours, "row"))
+    print("=" * 75)
+
+
 def execute_audit(args=None):
     """`agentx audit` — what your agent actually DID. P-92.
 
@@ -1947,8 +2842,20 @@ def execute_audit(args=None):
     """
     from . import db as db_module
     from . import pulse as pulse_module
-    from .db import get_call_inventory, get_retention_status, ledger_empty_reason
+    from .db import (get_call_inventory, get_call_log, get_retention_status,
+                     ledger_empty_reason)
 
+    opts = _parse_audit_args(args or [])
+
+    # 🔴 `--json` DOES NOT CLIMB THE RUNG, AND THIS IS THE ONE PLACE THAT CAN STOP IT.
+    # `ran_audit_report` is the conversion event the P-92 funnel is built around, it is
+    # STICKY, and it can never be un-climbed. Its only guard is is_automation_context(),
+    # which catches CI and test runs -- and a tool polling `--json` on a developer's laptop
+    # is neither. `--json` exists FOR other programs, so counting it as "a person looked"
+    # would let a cron job mark an install permanently converted and quietly empty that
+    # number of its meaning. A human who wants the rung counted runs the human screen,
+    # which is what the rung is about.
+    #
     # Marked BEFORE the screen renders, and never gated on what the screen FOUND. The funnel
     # question is "did a human take this step", which is answered by them running the command
     # -- not by whether we had anything good to show them. Gating it on a populated screen
@@ -1961,27 +2868,69 @@ def execute_audit(args=None):
     # written "unconditionally", which was true the day it was written and stopped being true
     # when that gate was added one commit later -- a justification outliving the code it
     # describes, which is the shape this file keeps having to re-fix.
-    pulse_module.mark_audit_report_run()
+    if not opts["json"]:
+        pulse_module.mark_audit_report_run()
+
+    # --- MACHINE OUTPUT: returns before ANY human line reaches stdout ------------------
+    # 🔴 THE EARLY RETURN IS THE POINT, not a shortcut. `scan` shipped a real bug where a
+    # human block printed after the JSON and `--json --share > out.json` produced a file
+    # that was not JSON. The only way that cannot happen here is for the JSON path never to
+    # reach the printing code at all; the flag-parse errors above go to stderr for the same
+    # reason.
+    if opts["json"]:
+        if opts["calls"]:
+            payload = _audit_json_payload(
+                db_module, opts,
+                log=get_call_log(limit=_effective_limit(opts, _DEFAULT_CALL_ROWS)))
+        else:
+            # Through the SAME bound as the per-call view. With no `--limit` this is None
+            # (`rows[:None]` is the whole list), so the grouped document stays complete --
+            # the 25-tool cap is a screen affordance with no business in a file a program
+            # parses. With `--limit N` the caller gets N, which is what they asked for and
+            # what this branch used to ignore.
+            payload = _audit_json_payload(
+                db_module, opts,
+                inventory=get_call_inventory(limit=_effective_limit(opts, _DEFAULT_TOOL_ROWS)))
+        print(json.dumps(payload, indent=2))
+        if not payload["ledger"]["readable"]:
+            sys.exit(2)
+        return
+
+    # --- HUMAN, ONE ROW PER CALL ------------------------------------------------------
+    if opts["calls"]:
+        log = get_call_log(limit=_effective_limit(opts, _DEFAULT_CALL_ROWS))
+        print("\n\U0001f50e WHAT YOUR AGENT DID, CALL BY CALL     (local to this ledger)")
+        print("=" * 75)
+        if not log["readable"]:
+            _print_unreadable_ledger(db_module)
+            sys.exit(2)
+        _print_call_log(db_module, log, opts)
+        return
 
     print("\n\U0001f50e WHAT YOUR AGENT DID                    (local to this ledger)")
     print("=" * 75)
 
-    inventory = get_call_inventory()
+    # Through the same bound as every other view, so `--limit` / `--all` mean something here
+    # too. They were parsed and then ignored on this path.
+    inventory = get_call_inventory(limit=_effective_limit(opts, _DEFAULT_TOOL_ROWS))
 
     # 🔴 UNREADABLE IS NOT EMPTY. Same rule as the block screen next door, and the same
     # reason: telling a developer with a locked ledger that their agent did nothing is a
     # false statement about their own data, and it is the one wrong answer this surface
     # must never give (P-76, and the defect #326 had to fix on the neighbouring screen).
     if not inventory["readable"]:
-        print("  The ledger is on disk but could not be read, so this screen cannot tell you")
-        print("  what your agent did. It is NOT a statement that it did nothing.")
-        print("")
-        print("     %s" % os.path.abspath(db_module.DB_PATH))
-        print("")
-        print("  Another process may hold it open. If it is corrupt, moving it aside starts")
-        print("  a fresh one; the records it holds are not recoverable.")
-        print("=" * 75)
-        return
+        _print_unreadable_ledger(db_module)
+        sys.exit(2)
+
+    # Read once, for BOTH branches. The empty branch has always used it; the populated one
+    # needs it too, because the single instruction it prints to a reader whose table is
+    # entirely ours is only true when audit is on (see the CTA below).
+    #
+    # ⚠️ IT IS THIS SHELL'S POSTURE, WHICH IS NOT THE SAME QUESTION ON THE MCP DOOR: that
+    # reader sets AGENTX_ENFORCEMENT in mcp.json for a server process this terminal has never
+    # seen, so an unset value there means "we do not know", not "off". Both call sites below
+    # branch on MCP_ENTRY before saying anything about it.
+    posture = (os.environ.get("AGENTX_ENFORCEMENT") or "").strip().lower()
 
     if not inventory["total_calls"]:
         # Three different empties, and they need three different sentences. Guessing here is
@@ -1990,7 +2939,6 @@ def execute_audit(args=None):
             reason = ledger_empty_reason()
         except Exception:
             reason = "empty"
-        posture = (os.environ.get("AGENTX_ENFORCEMENT") or "").strip().lower()
 
         # 🔴 AN EMPTY INVENTORY IS NOT AN IDLE AGENT, and saying so was a real defect on this
         # screen. Reproduced against examples/01_self_healing_agent.py, which makes exactly
@@ -2040,7 +2988,7 @@ def execute_audit(args=None):
             # ~/proj and `agentx audit` run from ~ read two different files, and every
             # sentence below is then a confident guess about the wrong one. `agentx status`
             # already prints the path for exactly this reason.
-            print("     %s" % os.path.abspath(db_module.DB_PATH))
+            print(_ledger_path_line(os.path.abspath(db_module.DB_PATH), "     "))
             print("     Calls are recorded per ledger, so running agentx from another folder")
             print("     reads a different one.")
         print("")
@@ -2096,8 +3044,7 @@ def execute_audit(args=None):
             print("")
             print("  ...then run your agent with audit on:")
             print("")
-            print("      AGENTX_ENFORCEMENT=audit python your_agent.py          # mac/linux")
-            print('      $env:AGENTX_ENFORCEMENT="audit"; python your_agent.py  # PowerShell')
+            _print_posture_command("audit")
         elif reason == "unreadable":
             print("  The ledger could not be read, so this is not a statement that your agent")
             print("  did nothing.")
@@ -2144,6 +3091,17 @@ def execute_audit(args=None):
                   % (retention['current_max_age_days'], f"{retention['current_max_rows']:,}"))
             print("")
 
+    # --- P-112: WHAT IS NEW SINCE THEY LAST LOOKED --------------------------------------
+    # The reason to come BACK. Everything below this block is a standing description of the
+    # ledger: run it twice in a row and it says the same thing, which is a screen you read
+    # once. This section is the only part that can differ between two runs, so it goes first
+    # and the rest becomes the detail behind it.
+    #
+    # Printed from the REPORT watermark, which only this command advances -- the session-end
+    # line has its own. One shared watermark would mean the atexit line ate the novelty and
+    # this screen, the one it just told them to open, rendered empty.
+    novelty = _print_novelty(db_module)
+
     print("  %s across %s%s"
           % (_plural(inventory['total_calls'], "call"),
              _plural(inventory['distinct_tools'], "tool"),
@@ -2163,14 +3121,82 @@ def execute_audit(args=None):
     # against the line above: on the first run of the ladder that is the whole table, and
     # "4 of those" beside "4 calls" is a subtraction we should do for them.
     from_demo = inventory.get("inventory_from_demo") or 0
+    # 🔴 READ HERE BECAUSE THE INSTRUCTION BELOW HAS TO KNOW WHETHER THE ENFORCE ASK WILL
+    # PRINT, AND ONE VARIABLE MAY NOT CARRY TWO VALUES ON ONE SCREEN. Computed again at its
+    # own call site further down would be the drift; computed once, read twice.
+    #
+    # The count is THEIRS, not the raw total, for the same reason the ask below is: `agentx
+    # demo --audit` writes its scripted DROP TABLE as a WOULD_BLOCK, and a demo row is not
+    # evidence that this reader has run anything under audit.
+    _their_would_blocks = max(
+        0, inventory["would_block_total"] - (inventory.get("would_block_from_demo") or 0))
     if from_demo:
         for _ln in _demo_row_note(from_demo, of_total=inventory["total_calls"]):
             print(_ln)
         if from_demo >= inventory["total_calls"]:
-            print("  Wrap one of your tools and its calls land here beside these.")
+            # 🔴 THIS SENTENCE USED TO BE UNCONDITIONAL, AND IT WAS FALSE FOR ALMOST
+            # EVERYONE WHO READ IT (P-112). It printed "Wrap one of your tools and its calls
+            # land here beside these" -- and a wrapped tool writes an inventory row ONLY in
+            # audit posture. The default is enforce, which records nothing that passed. So
+            # the reader followed the single instruction on the screen whose entire job is to
+            # move them from watching our demo to watching their own agent, nothing changed,
+            # and the honest conclusion available to them was that it does not work.
+            #
+            # It fired on exactly the run where it does the most damage: the branch is
+            # reached when every row in the table is OURS, which is the first run of the
+            # ladder -- `agentx demo --audit`, whose footer sends them straight here.
+            #
+            # The fix is the missing second step, not softer wording. Both steps or neither.
+            if MCP_ENTRY:
+                # We cannot see this reader's posture: it lives in the mcp.json their client
+                # reads, for a server process this terminal never spawned. So the audit
+                # condition is stated rather than diagnosed. Same rule as the empty branch.
+                print("  Put agentx-mcp in front of your own server, with")
+                print('  "env": { "AGENTX_ENFORCEMENT": "audit" }, and its calls land here')
+                print("  beside these.")
+            elif posture == "audit":
+                # True as written: audit is on in this shell, so the wrap is the only step
+                # left. This is the one case the old sentence was right about.
+                print("  Wrap one of your tools and its calls land here beside these.")
+            elif _their_would_blocks:
+                # 🔴 THE STATEMENT WITHOUT THE COMMAND, BECAUSE THE ENFORCE ASK IS ABOUT TO
+                # PRINT AND IT SETS THE SAME VARIABLE TO THE OPPOSITE VALUE. Reproduced: a
+                # ledger holding `agentx demo --audit`'s four rows (so the table is all ours)
+                # plus ONE would-block of the reader's own printed
+                # `AGENTX_ENFORCEMENT=audit python your_agent.py` here and
+                # `AGENTX_ENFORCEMENT=enforce python your_agent.py` eight lines below it --
+                # one variable, two opposite values, on one screen. That is the exact defect
+                # the `all_ours` suppression on the enforce CTA was added to prevent; it just
+                # never covered this arm, because a would-block writes NO inventory row
+                # (decorators._audit_and_proceed: one call, one row), so "the table is
+                # entirely ours" and "they have a catch of their own" are not exclusive.
+                #
+                # The audit command is the one that yields. A would-block of their own is
+                # proof they have ALREADY run under audit, so the instruction is telling them
+                # to do the thing they just did; the enforce ask beside their catch is the
+                # step they have not taken. The wrap sentence stays -- it is a statement, and
+                # it is why their audited tool is missing from the table above.
+                print("  Wrap one of your tools and run it with audit on, and its calls")
+                print("  land here beside these.")
+            else:
+                print("  Wrap one of your tools AND run it with audit on, and its calls land")
+                print("  here beside these. Audit is off in this shell:")
+                print("")
+                _print_posture_command("audit")
+    # 🔴 AFTER THE DEMO NOTE, NOT UNDER THE COUNT, AND THE ORDER IS A CORRECTNESS FIX. This
+    # line counts the DEVELOPER's rows and the count above is ledger-wide, so on a ledger
+    # holding one demo row the screen read "12 calls across 3 tools" and then "9 of 11 calls"
+    # -- two totals of the same thing, one line apart, with nothing between them to explain
+    # the difference. That is the P-96 defect exactly. Printed after the sentence that says
+    # which rows are ours, and naming the population in its own words as well, so the two
+    # numbers are reconcilable by reading rather than by subtraction.
+    _print_concentration(novelty)
     hidden = inventory["distinct_tools"] - len(inventory["tools"])
     if hidden > 0:
-        print("  (showing the busiest %d; %d more not listed)"
+        # Names the flag, like the per-call screen does. `--all` only started working on
+        # THIS path in the change that added it, and a screen that trims without saying how
+        # to stop trimming leaves the reader assuming the rest is unreachable.
+        print("  (showing the busiest %d; %d more not listed -- use --all)"
               % (len(inventory["tools"]), hidden))
     print("")
     print("  %-24s %7s  %-11s %s" % ("TOOL", "CALLS", "SURFACE", "ARGUMENTS"))
@@ -2244,6 +3270,10 @@ def execute_audit(args=None):
     # and the screen then announced "nothing tripped a policy" over a ledger of catches. The
     # list is also truncated to the display limit. get_call_inventory computes both counts
     # over the whole ledger for exactly this reason.
+    # A rule between the table and the sentences about it. The founder's ask, and the same
+    # device `agentx status` already uses: on a screen this tall the eye needs somewhere to
+    # stop, and the paragraphs below are about the table rather than more of it.
+    print("  " + "─" * 71)
     flagged = inventory["flagged_total"]
     would_block = inventory["would_block_total"]
     if flagged:
@@ -2299,7 +3329,14 @@ def execute_audit(args=None):
                 print("  %s %s from a ledger older than this version, so there is"
                       % (lead, "are" if older != 1 else "is"))
                 print("  nothing left to show about them.")
-            print("  See them:  %s" % reader)
+            # 🔴 ONLY WHEN THERE IS SOMETHING TO SEE. This printed unconditionally, so on a
+            # ledger of nothing but legacy rows it said "nothing left to show about them"
+            # and then, on the very next line, sent the reader to a command that shows
+            # nothing. The EMPTY branch of this same screen has guarded on `viewable_total`
+            # since it was written; the populated branch never got the guard -- one rule,
+            # one of its two sites, which is the shape this whole PR keeps meeting.
+            if inventory["viewable_total"]:
+                print("  See them:  %s" % reader)
         # The same attribution the EMPTY branch was fixed for, which this branch did not
         # get: `flagged` counts `agentx demo`'s own catch, so without this the populated
         # screen credits our scripted call to their agent too.
@@ -2309,6 +3346,55 @@ def execute_audit(args=None):
                 print(_ln)
     else:
         print("  Nothing above was blocked, and nothing tripped a policy.")
+
+    # --- THE ENFORCE ASK, BESIDE THE EVIDENCE THAT EARNS IT --------------------------------
+    #
+    # 🔴 ITS POSITION IS THE POINT, AND THE BOTTOM OF THE SCREEN IS WHAT WAS WRONG WITH IT.
+    # The first version of this change put it in the footer, where the founder's brief for it
+    # -- "trigger the action after we have shown value" -- was satisfied on paper and not on
+    # the screen: it opened with "Audit recorded THOSE", and `those` referred to a sentence
+    # FOURTEEN LINES earlier, with the whole built-in-floor list and the wrap-another-tool
+    # CTA in between. Both sentences also said "would have been stopped", in different words,
+    # far enough apart to read as two different facts. Caught by running it, not by the tests
+    # that were green over it.
+    #
+    # So it lives here, directly under the count it is about. A pronoun with its antecedent
+    # in the line above needs no number of its own, which also keeps the P-96 rule this
+    # screen keeps re-earning: one event, one count, stated once.
+    #
+    # 🔴 THEIRS, NOT OURS. `agentx demo --audit` writes its scripted DROP TABLE as a
+    # WOULD_BLOCK, so on the first run of the ladder this count is 1 and that 1 is ours.
+    # Going loud off the raw number sells enforce using our own demo as the proof and tells a
+    # developer their agent did something it did not -- the fourth count on this screen to
+    # need the split, after the per-tool flag, the inventory total and the empty branch.
+    # Read off the value computed beside the demo note above, not recomputed: the audit
+    # instruction up there is suppressed on exactly this condition, and two expressions for
+    # one rule is how one of them stops matching.
+    their_would_blocks = _their_would_blocks
+    if their_would_blocks:
+        print("")
+        # Agrees with the sentence directly above, which is the antecedent. Pluralised on
+        # `would_block` rather than on `their_would_blocks`, because the line this points at
+        # is the one the reader just read -- and in the mixed branch that line's last clause
+        # is "N ran anyway", which is exactly what "RAN" is true of here. A count of ours
+        # would make the pronoun disagree with its own referent on the one-catch screen.
+        print("  ⚠️  %s RAN. Audit records what it would stop; it does not stop it."
+              % ("That call" if would_block == 1 else "Those calls"))
+        print("")
+        _print_enforce_command()
+        print("")
+        # 🔴 THE STEP WE ARE RECOMMENDING TURNS THIS SCREEN OFF (P-112), so it is said in the
+        # same breath as the ask. Enforce records what it STOPPED and nothing that passed, so
+        # a reader who takes this CTA comes back to a screen that has stopped growing, and
+        # the conclusion available to them is that they broke it. Same harm as the CTA higher
+        # up this file, one step later in the same ladder.
+        #
+        # ⚠️ IT NAMES WHERE THE RECORD GOES INSTEAD, rather than warning them off. The trade
+        # stated without the destination reads as a reason not to turn protection on, which
+        # is the opposite of what we want and not what is true.
+        print("      Enforce stops them. It records only what it stopped, so this screen")
+        print("      goes quiet and the catches keep landing in %s."
+              % ("uvx agentx-mcp --insights" if MCP_ENTRY else "agentx insights"))
 
     # 🔴 WHAT WE WATCH FOR, STATED SO THE READER CAN DO THE JOIN THEMSELVES.
     #
@@ -2335,13 +3421,24 @@ def execute_audit(args=None):
         # they bought. Both sentences now name the floor rather than the product.
         keyed = bool((os.environ.get("AGENTX_API_KEY") or "").strip())
         print("")
-        print("  The built-in floor watches for:")
-        # POLICY + WHY, the same two columns `npx @agentx-core/scan` prints for the static
-        # half. A reader who ran scan on their repo sees the identical names here against
-        # what actually ran.
-        for name, why in coverage:
-            print("      %-34s %s" % (name, why))
-        print("")
+        print("  " + "─" * 71)
+        # 🔴 THE WHY, NOT THE POLICY NAMES. This was two
+        # columns -- `Mass Destructive Intent   destroying data or infrastructure` -- one row
+        # per policy, nine lines of a forty-four-line screen, identical on every run. The
+        # left column is OUR vocabulary: "Mass Destructive Intent" is a name we chose and it
+        # tells a stranger nothing they cannot get from the right column. Cutting the half
+        # that is mechanism and keeping the half that is consequence is the whole of copy
+        # rule one, and it takes the block from nine lines to four.
+        #
+        # ⚠️ WHAT THIS COSTS, SAID PLAINLY: `npx @agentx-core/scan` prints those same policy
+        # NAMES for the static half of the product, and a reader who ran both used to see one
+        # vocabulary across two surfaces. That link is gone. Weighed and accepted -- the names
+        # were doing the linking, and the reader this screen is written for has not run scan.
+        #
+        # The join it exists for is unchanged: they hold what we watch for against the table
+        # of what their agent actually ran, and notice `refund_customer` is not on our side.
+        _print_wrapped("The built-in floor watches for: %s."
+                       % _joined_phrase([why for _name, why in coverage]))
         if keyed:
             # Do NOT tell a paying user their agent is unwatched outside this list: their
             # gateway is the thing this screen cannot see. Read it aloud before changing it --
@@ -2351,7 +3448,7 @@ def execute_audit(args=None):
             print("  Your gateway checks more than this list. Anything neither of them")
             print("  covers runs unchecked.")
         else:
-            print("  Anything outside that list is not checked by the built-in floor.")
+            print("  Anything outside that is not checked by the built-in floor.")
 
     # 🔴 THE HONEST LIMIT OF THIS SCREEN, and the only CTA that can name what to do about it.
     # Every row above is a tool the developer ALREADY wrapped -- that is how we saw it. So a
@@ -2359,26 +3456,98 @@ def execute_audit(args=None):
     # genuinely still need wrapping are precisely the ones this screen is blind to. Saying so
     # is both the true caveat and the next step: on the shipped examples this table has one
     # or two rows, which reads as "not much happens" when it means "not much is wrapped".
+    #
+    # Two lines, not four (founder copy pass): the old wording spent a full sentence on the
+    # restatement ("A tool you have not wrapped does not appear here at all") that the first
+    # clause already carries.
+    #
+    # 🔴 "WRAPPED" WAS THE WRONG WORD, AND THE SNIPPET UNDER IT WAS MISSING THE ARGUMENT THAT
+    # MATTERS. Wrapping is NOT what puts a tool on this screen -- the inventory records the
+    # AUDIT route only, so a plainly-wrapped tool running under enforce is called, checked,
+    # and never appears here. Measured: two wrapped tools, one audited and one not, one call
+    # and two calls; this screen reported "1 call across 1 tool" and the enforcing tool was
+    # absent, under a heading that reads WHAT YOUR AGENT DID. So the instruction sent someone
+    # to add a tool, run again, and watch nothing change -- an instruction that ends in
+    # silence, the same failure the quiet-session screen was fixed for, one screen over.
+    #
+    # 🔴 AND THE FIX FOR IT SHIPPED THE WRONG ROUTE. It named the
+    # per-tool pin `enforcement="audit"`, which BEATS AGENTX_ENFORCEMENT and never expires:
+    # a reader who took that advice made the tool non-blocking for good, and the "to block
+    # instead of watching" CTA at the bottom of THIS SAME SCREEN cannot undo it. Verified by
+    # running it -- variable set to enforce, pinned tool still ran `rm -rf /`. The env route
+    # lasts one run, and the line above it says blocking is off rather than leaving the
+    # reader to find out. Its cost is scope: every tool, not one, which is the honest trade
+    # for an instruction whose whole purpose is to LOOK at something.
+    #
+    # ⚠️ AND IT MAY NOT PRINT AT A READER WHO IS ALREADY THERE. This instruction sets the
+    # same variable the enforce CTA at the bottom of this screen sets, to the opposite value
+    # -- the collision the block below already warns about, which the old decorator-pin
+    # wording sidestepped only by naming a different mechanism. A reader whose shell is
+    # ALREADY audit has nothing to change here, so the line is a no-op that argues with its
+    # neighbour; measured, both printed four lines apart on exactly that run. Their own
+    # posture decides.
     if not MCP_ENTRY:
         print("")
-        print("  This is what your WRAPPED tools did. A tool you have not wrapped does not")
-        print("  appear here at all. Wrap another and run again:")
-        print("")
-        print('      @agentx_protect(agent_id="my_agent")   # around any tool function')
+        print("  " + "─" * 71)
+        # The blind-spot admission is a STATEMENT and always prints. Only the command below
+        # it is conditional, because only a command can collide with another command.
+        print("  Only tools running in audit mode appear here. A tool that ran with")
+        print("  blocking on doesn't show up here.")
 
-    print("")
-    print("  To start blocking instead of watching:")
-    if MCP_ENTRY:
-        # This reader's posture lives in mcp.json, not in a shell they can prefix.
-        print("      set AGENTX_ENFORCEMENT=enforce in your mcp.json")
-    else:
-        # BOTH SHELLS, matching `agentx demo`. The bare `VAR=value cmd` form is not valid in
-        # PowerShell, so a Windows reader given only that line has a CTA they cannot run --
-        # the same reachability failure as handing an `agentx` command to a uvx door. The
-        # demo footer already ships both forms; a rung that works there and not here is worse
-        # than either, because the reader has already succeeded once with the other spelling.
-        print("      AGENTX_ENFORCEMENT=enforce python your_agent.py          # mac/linux")
-        print('      $env:AGENTX_ENFORCEMENT="enforce"; python your_agent.py  # PowerShell')
+    # --- THE ENFORCE CTA, EARNED RATHER THAN ALWAYS-ON -----------------------------------
+    #
+    # It used to print the same four lines on every run, disconnected from anything the
+    # screen had just shown. Now it has two forms, and which one appears is decided by
+    # whether audit actually CAUGHT something for this developer.
+    #
+    # 🔴 THEIRS, NOT OURS, AND THIS IS THE WHOLE CARE IN THIS BLOCK. `agentx demo --audit`
+    # writes its scripted DROP TABLE as a WOULD_BLOCK, so on the first run of the ladder
+    # `would_block_total` is 1 and that 1 is ours. Going loud off that number would sell
+    # enforce using our own demo as the evidence, and tell a developer their agent did
+    # something it did not -- the same misattribution the per-tool `flagged` count, the
+    # inventory count and the empty screen have each been fixed for already. Hence the
+    # `would_block_from_demo` split, which this reader had to grow to answer it.
+    #
+    # ⚠️ AND THE QUIET FORM IS NOT OPTIONAL, WHICH IS THE HALF THAT WAS NEARLY DROPPED.
+    # "Only offer enforce after a catch" reads better and shortens the screen further, and it
+    # would leave the developer whose agent behaves well -- the MAJORITY, and the population
+    # a session that ends with nothing blocked is about -- never told how to turn protection on,
+    # on the one screen they
+    # opened precisely because nothing was blocked. So: loud beside the evidence when there
+    # is some, quiet down here when there is not, never nothing.
+    #
+    # The trade is folded in rather than dropped. A reader who switches from HERE hits the
+    # identical quiet screen, and the "did I break it" conclusion does not care which branch
+    # sent them.
+    #
+    # 🔴 AND NOT AT ALL WHEN THE TABLE IS ENTIRELY OURS, WHICH IS A CONTRADICTION THIS CHANGE
+    # CREATED. The CTA at the top of this screen now names AGENTX_ENFORCEMENT=audit -- it had
+    # to, that was P-112's false-instruction fix -- and this one names
+    # AGENTX_ENFORCEMENT=enforce. On the first run of the ladder both print, twenty-five lines
+    # apart, telling the same reader to set one variable to two opposite values. Before the
+    # fix above there was only ever one env instruction on this screen; adding the missing one
+    # collided with the standing one, and neither line is wrong on its own.
+    #
+    # The tie breaks on what the reader can actually DO. A table that is all ours means they
+    # have never seen a call of their own recorded, so enforce is not their next step -- it is
+    # the step that guarantees they never see one. Get their agent into the ledger first. The
+    # LOUD branch is deliberately still allowed here: it fires only on a would-block of their
+    # own, which means they DO have something of theirs at stake even if the inventory is ours.
+    #
+    # 🔴 THIS IS ONLY HALF THE "one variable, one value" RULE, AND THE OTHER HALF LIVES AT
+    # THE DEMO NOTE. Suppressing the enforce ask here covers the quiet all-ours screen; it
+    # does NOT cover the LOUD branch above, which prints enforce off a would-block of their
+    # own and is deliberately still allowed on an all-ours table. That case is handled where
+    # the audit instruction is printed, by suppressing THAT one instead -- see the
+    # `_their_would_blocks` arm beside the demo note. Neither site can enforce a
+    # whole-screen rule alone, which is the lesson the deleted `_audit_route_may_print`
+    # guard was written down for.
+    all_ours = from_demo and from_demo >= inventory["total_calls"]
+    if not their_would_blocks and not all_ours:
+        print("")
+        print("  To block instead of watching:")
+        _print_enforce_command()
+        print("  (enforce records what it stopped, not what passed, so this screen goes quiet)")
     print("=" * 75)
 
 
@@ -2431,6 +3600,7 @@ def execute_insights(args=None):
     # NameError -- swallowed by the except below, which turned the attribution line
     # off silently. `DEMO_AGENT_ID` went with the subtraction it was imported for.
     from .db import get_would_block_summary, get_ledger_census
+    from . import db as db_module
     audit = get_would_block_summary()
     # Gate on the CURRENT posture, not just the presence of rows: would-block rows are an
     # AUDIT-mode artifact, and once the dev has flipped to enforce, both the "what WOULD have
@@ -2469,11 +3639,19 @@ def execute_insights(args=None):
         # per-tool `enforcement=` argument, which is how `agentx demo --audit` writes these,
         # and naming a variable the reader never set is a statement about their environment
         # that is false. The banner next door had the same defect, found the same way.
-        print(f"  {audit['total']} action(s) recorded while audit was on, by policy:")
+        print(f"  {_plural(audit['total'], 'action')} recorded while audit was on, "
+              "by policy:")
         for row in audit["policies"]:
             print(f"     {row['would_blocks']:>4}x   {row['policy_name']}")
             # Same question, same answer, on the audited half: these are the calls that RAN.
             for _ln in _tools_line(row.get("tools")):
+                print(_ln)
+            # P-92-B / P-120: the shape data a WOULD_BLOCK row now carries (same columns an
+            # ALLOWED row on `agentx audit` already shows) -- what kind of surface, what
+            # arguments, how big a labelled amount, if any. Silent per-policy when a row
+            # predates the write-side fix (empty list), same as _tools_line above.
+            for _ln in _shape_lines(db_module, row.get("arg_names"), row.get("classes"),
+                                    row.get("max_amount")):
                 print(_ln)
         # The same attribution every other count on these screens carries.
         #
@@ -2502,16 +3680,19 @@ def execute_insights(args=None):
 
     print("\n🧠 SAFE-PATHS YOUR AGENTS LEARNED        (local to this machine)")
     print("=" * 75)
-    print("  When an agent recovered from a block, AgentX saved the fix. Adopt one and")
-    print("  AgentX coaches your agents straight to it on the next block.")
 
+    # The intro promise below only prints once we know a fix was saved (see the populated
+    # branch further down) -- this empty-state block says only what it can back up: the
+    # posture (what's missing and why), never a path/env-var diagnosis aimed at someone
+    # who isn't misconfigured. They're keyless, which is the normal case.
     if not harvest and not active and not rule_list:
         print("\n  No reusable safe-paths to show yet — here's why:")
         if not census["exists"]:
-            print("   • No incident store on disk at that path. Run your protected")
-            print("     agents against the local gateway first (it writes incidents.db")
-            print("     into its mounted .agentx/). Set AGENTX_INCIDENT_DB to point")
-            print("     elsewhere if your gateway mounts a different folder.")
+            print("   • These harvested-reframe safe-paths come from the gateway's incident")
+            print("     store (needs a Gemini key live at recovery time), and no store")
+            print("     exists yet. Run your agents against the local gateway to start")
+            print("     collecting them. (Keyless MCP recovery paths are a separate")
+            print("     corpus — see below if you have any.)")
         elif census["complied"] == 0:
             print("   • No self-corrections recorded — no agent has recovered from a")
             print("     block yet. Safe-paths are harvested only from recoveries.")
@@ -2524,6 +3705,12 @@ def execute_insights(args=None):
         else:
             print("   • Self-corrections carry a resolution_path, but none were marked")
             print("     reusable by the judge yet. Keep running — reusable ones accrue.")
+        # census["strays"] can be populated whenever with_resolution is 0 -- which is
+        # every branch above except the last -- not only the not-exists case. Called
+        # once here, after the whole if/elif, instead of once per branch: _print_strays
+        # is a no-op on an empty list, so this is always safe and never needs to track
+        # which branches above can produce a stray.
+        _print_strays(census)
         if mcp_flat:
             # `agentx mcp-insights` has no MCP-door equivalent, and telling a reader who is
             # ALREADY inside --insights to go run another view is noise anyway. State the fact,
@@ -2543,6 +3730,11 @@ def execute_insights(args=None):
         _note_that_the_two_doors_keep_separate_brains()
         print("=" * 75)
         return
+
+    # The intro promise lives here, once we know a fix was actually saved -- the
+    # empty-state branch above never claims one exists before checking.
+    print("  When an agent recovers from a block, AgentX saves the fix. Adopt one and")
+    print("  it coaches your agents straight to it next time.")
 
     # Show the FULL safe-path text, wrapped with a hanging indent — NEVER
     # truncated. A reframe's discriminating clause is usually in its tail (e.g.
@@ -2644,7 +3836,7 @@ def execute_insights(args=None):
     # anchors the store to your project root precisely so you can commit it; the MCP door has
     # no project (an editor spawns the proxy from an arbitrary directory), so it keeps one
     # per-user store and there is nothing to commit. Printing the repo advice there sent people
-    # looking for a file that is not in their repo. (2026-07-31, with the store fix.)
+    # looking for a file that is not in their repo.
     if MCP_ENTRY:
         print("  Adopted coaching lands in your per-user store (~/.agentx/overrides.json) and")
         print("  applies to every server you front. A rule lands in your local policy store")
@@ -2822,15 +4014,20 @@ def _confirm_adopt(label, challenge):
         return False
 
 
-def _gateway_reachable(timeout=0.4):
+def _gateway_reachable(timeout=0.4, gateway_url=None):
     """Best-effort probe: is a gateway listening at the configured URL? ANY HTTP
     response (even a 401/404) means something is bound there, so it counts as
     reachable; only a connection error or timeout counts as unreachable. Short
     timeout so authoring never stalls; a probe is never on a hot path (one CLI
-    action). Reuses the resolved AGENTX_GATEWAY_URL so it agrees with `agentx status`."""
-    env = load_env_file()
-    gateway_url = (os.environ.get("AGENTX_GATEWAY_URL")
-                   or env.get("AGENTX_GATEWAY_URL", "http://localhost:8000"))
+    action). Reuses the resolved AGENTX_GATEWAY_URL so it agrees with `agentx status`.
+
+    `gateway_url`, when passed, is used as-is instead of re-resolving from the
+    environment — a caller that already resolved its own URL (`execute_status_
+    inspection`) must probe THAT one, not risk silently disagreeing with it."""
+    if gateway_url is None:
+        env = load_env_file()
+        gateway_url = (os.environ.get("AGENTX_GATEWAY_URL")
+                       or env.get("AGENTX_GATEWAY_URL", "http://localhost:8000"))
     try:
         requests.get(f"{gateway_url}/health", timeout=timeout)
         return True
@@ -3702,7 +4899,7 @@ def _note_that_the_two_doors_keep_separate_brains():
     learned over MCP never appears in the Python door's insights and never coaches a
     Python-door block.
 
-    That split is DELIBERATE (founder call 2026-07-31) and is not a bug: the MCP door has no
+    That split is DELIBERATE and is not a bug: the MCP door has no
     project -- an editor spawns the proxy from an arbitrary directory -- so per-user is the
     only default both of its processes compute the same answer for. What was missing is
     anyone SAYING so, which leaves the product looking like it lost your work.
@@ -3804,8 +5001,8 @@ def execute_review(args=None):
     #
     # Two whole-store passes run before a single character is printed, and BOTH read up to
     # 100,000 rows and then write per changed row: reconcile_safe_paths and
-    # apply_declared_verdicts. Measured ~43 SECONDS for ~17,700 blocks on the founder's
-    # machine, 2026-08-10, in total silence. It reads as a hang, and it was why
+    # apply_declared_verdicts. Measured ~43 SECONDS for ~17,700 blocks on a real store,
+    # in total silence. It reads as a hang, and it was why
     # `agentx review` looked unrunnable.
     #
     # 🔴 GATE ON THE WORK, AND THE WORK IS *WRITES*. Measured: reading 43,000 rows takes
@@ -4641,7 +5838,7 @@ def execute_share(args=None):
         else:
             print("  No block on record in this ledger, so there's nothing to share.")
         try:
-            print("  %s" % os.path.abspath(db_module.DB_PATH))
+            print(_ledger_path_line(os.path.abspath(db_module.DB_PATH), "  "))
         except Exception:
             pass
         if reason != "unreadable":
@@ -4712,7 +5909,7 @@ def _demo_next_steps():
     ONE next step, on the reader's OWN door: try it in AUDIT mode, which blocks nothing and
     records what it WOULD catch. Then Docs and Discord. Nothing else.
 
-    THE MCP BRANCH WAS REMOVED (founder call 2026-07-31), for two reasons.
+    THE MCP BRANCH WAS REMOVED, for two reasons.
 
     Wrong door. This is `agentx demo`, the PYTHON SDK's command. Detecting a Cursor config
     and answering with "front an MCP server in ~/.cursor/mcp.json" sends someone who just
@@ -4755,13 +5952,16 @@ def _demo_next_steps():
         # guaranteed blank screen, and the line under the CTA apologised for that in advance
         # ("Nothing caught is a result too"). Audit now records every call, so the offer is
         # what the reader actually gets: a list of what their own agent did.
-        # 🔴 THE CHEAP RUNG, ADDED 2026-08-12, AND IT GOES FIRST. What follows it asks the
+        # 🔴 THE CHEAP RUNG GOES FIRST. What follows it asks the
         # reader to go and change their own codebase, and measured against our own ladder
         # that step is where they stop: `agentx demo` then `agentx audit` lands on an EMPTY
         # screen every time (the demo pins enforce, and enforce writes no inventory row), so
         # the reader was being asked to instrument an application on the strength of a
         # fabricated table. One command now shows them the real thing.
-        " Audit is the other half: it watches every call and blocks nothing.",
+        # One clause, four screens: decorators.AUDIT_POSTURE_CLAUSE. This screen is where the
+        # wording came from; it is imported rather than repeated so the other three cannot
+        # drift away from it (they already had, three verbs for one fact).
+        f" Audit is the other half: it {_audit_posture_clause()}.",
         " See what it records, without touching your code:",
         "",
         "       agentx demo --audit",
@@ -4775,8 +5975,12 @@ def _demo_next_steps():
         # Correct on THIS door: the decorator writes to the same cwd-relative store
         # `agentx insights` reads, so a reader who runs both from their project directory
         # sees their catches. (The MCP proxy does not, which is what broke the old branch.)
-        "       AGENTX_ENFORCEMENT=audit python your_agent.py          # mac/linux",
-        '       $env:AGENTX_ENFORCEMENT="audit"; python your_agent.py  # PowerShell',
+        # 7-space indent, not the helper's default 6: these sit inside a snippet block whose
+        # other lines are indented 7. The indent is the ONLY thing this site varies, which is
+        # why it takes it as an argument instead of keeping its own copy of the two commands.
+        # Imported through the CLI's own accessor, which does the lazy import every other
+        # decorators use in this file does.
+        *_posture_command_lines("audit", "       "),
         # 🔴 A SENTENCE WAS REMOVED HERE, AND ITS JOB WAS NOT. It read "(Every ordinary call
         # is listed, not just the ones that tripped a policy.)" and it existed because the
         # demo peaks on a DROP TABLE being stopped and then sent the reader to a screen that
@@ -4805,12 +6009,19 @@ def execute_demo():
     invisible download — it shows up as activated. Fully offline; never raises out."""
     from . import agentx_protect, start_secure_session, is_block
     from .decorators import set_atexit_summary_quiet
+    # 🔴 THE CONSTANT, NOT THE STRING. This decorator's agent_id is what keeps `agentx demo`
+    # out of `own_agent_block` (P-107): db.is_our_agent is an EXACT-match closed set, so a
+    # literal that drifts from DEMO_AGENT_ID by one character makes our own canned block read
+    # as "a stranger was caught in code they wrote" -- the single number that field exists to
+    # produce, manufactured by the first command a new user runs. The `demo --audit` twin
+    # already imports it; this one spelled it out and nothing bound the two.
+    from .db import DEMO_AGENT_ID
 
     # Own a single, curated closing screen: suppress the atexit summary's duplicate box
     # while it STILL records the streak and fires the activation pulse (P3).
     set_atexit_summary_quiet(True)
 
-    # The per-call narration is deliberately NOT suppressed (founder call 2026-07-31), and the
+    # The per-call narration is deliberately NOT suppressed, and the
     # reasoning is worth keeping because it reversed once.
     #
     # It WAS suppressed for a day, on the grounds that the demo prints its own framed account
@@ -4850,7 +6061,7 @@ def execute_demo():
     # `enforcement=` is the documented per-tool override and always beats the env var. The
     # demo's own failure branch already asserts this contract ("the demo should always stop
     # this call") -- it just had no way to hold it.
-    @agentx_protect(agent_id="demo_cli", enforcement="enforce")
+    @agentx_protect(agent_id=DEMO_AGENT_ID, enforcement="enforce")
     def run_sql(query: str, db_session=None):
         # Runs ONLY when the shield ALLOWS a call — i.e. the agent's safe, revised
         # query. The catastrophic DROP TABLE is intercepted before it ever gets here.
@@ -4890,7 +6101,7 @@ def execute_demo():
     # exists to demonstrate. Anyone who had ever run `agentx adopt` was shown their own
     # wording while the screen claimed to be what a fresh install does, plus a stray
     # "Using your adopted safe-path for this policy" line that means nothing on a first run.
-    # Verified 2026-07-31: run from C:\ the demo printed 3 SDK lines; run from a repo holding
+    # Run from C:\ the demo printed 3 SDK lines; run from a repo holding
     # .agentx/overrides.json it printed 4.
     #
     # NB the MCP demo (mcp_demo.py) solves the same class by chdir-ing into a temp dir for its
@@ -4973,7 +6184,7 @@ def execute_audit_demo():
     construction: the demo pins enforce, and enforce writes no inventory rows, so not even
     the clean recovered call it makes leaves a trace. The first `agentx audit` a new user
     ever runs is therefore guaranteed blank, and the only picture of the format we could
-    offer was a fabricated table. Reproduced in a clean directory 2026-08-12.
+    offer was a fabricated table. Reproduced in a clean directory.
 
     The middle rung was also the only one with no command: demo (a command), decorate your
     own code (a change in their repo), agentx audit (a command). This makes it a command.
@@ -4990,11 +6201,12 @@ def execute_audit_demo():
     """
     from . import agentx_protect, start_secure_session, is_block
     from .db import DEMO_AGENT_ID
-    from .decorators import set_atexit_summary_quiet
+    from .decorators import set_atexit_summary_quiet, set_audit_banner_quiet
 
     set_atexit_summary_quiet(True)
+    set_audit_banner_quiet(True)
 
-    print("DEMO (AUDIT): nothing is blocked, and everything is written down")
+    print("DEMO (AUDIT): nothing is blocked, and everything is recorded")
     print("=" * 75)
 
     start_secure_session()
@@ -5094,8 +6306,7 @@ def execute_audit_demo():
     print("       from agentx_sdk import agentx_protect")
     print('       @agentx_protect(agent_id="my_agent")   # around any tool function')
     print("")
-    print("       AGENTX_ENFORCEMENT=audit python your_agent.py          # mac/linux")
-    print('       $env:AGENTX_ENFORCEMENT="audit"; python your_agent.py  # PowerShell')
+    _print_posture_command("audit", "       ")
     print("=" * 75)
 
 
@@ -5121,7 +6332,12 @@ def _print_cli_usage(advanced=False):
     # who wrapped one tool of ten would otherwise read the table as their agent's whole
     # activity. The help line promised more than the screen delivers, in the same PR that
     # wrote the screen's caveat.
-    print("  audit       What your wrapped tools actually DID, call by call, blocking nothing")
+    # 🔴 "grouped by tool", NOT "call by call". This line promised a per-call list for as
+    # long as the screen has grouped, which is the same claim `_print_local_blocks_section`
+    # made one file over. `--calls` is what makes the promise keepable, so the default view
+    # now says what it shows and the flag says where the rest is.
+    print("  audit       What your wrapped tools actually DID, grouped by tool, blocking nothing")
+    print("                ('audit --calls' lists them one call at a time; add '--json' for a program)")
     print("                (run your agent with AGENTX_ENFORCEMENT=audit first)")
     print("  status      Local protection stats + armed policies (default; live view needs the gateway)")
     print("  review      One-key pass over pending blocks: adopt a safe-path, or label a block")
@@ -5160,15 +6376,58 @@ def _print_cli_usage(advanced=False):
 
 
 def main():
+    # Buffering symmetry: logging.warning() (the audit-mode banner, the degraded/fail-open
+    # banners, ...) flushes to stderr per record, but stdout is block-buffered whenever this
+    # process isn't attached to a live terminal -- piped, redirected to a file, `tee`'d, or
+    # captured by CI/a log aggregator. So a warning that logically fires mid-command can print
+    # BEFORE anything this command already printed, in exactly the headless/logged contexts
+    # those banners exist to be seen in. A live interactive terminal was already line-buffered,
+    # which is why this never showed up in a hands-on run. reconfigure() is TextIOWrapper-only;
+    # tests replace sys.stdout with a plain StringIO (no such method), so guard it.
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
+
+    # 🔴 MIGRATE AN EXISTING LEDGER HERE, WHERE IT USED TO HAPPEN BY ACCIDENT. Until this
+    # landed, every `agentx` command inherited a schema upgrade as a side effect of importing the
+    # package -- decorators.py called init_db() at module scope -- and paid for it with a database
+    # file created in whatever directory the user happened to be standing in. ensure_ledger_current
+    # does the upgrade half and NEVER creates a file, so migration still happens at the same moment
+    # for the same commands, deliberately rather than incidentally, and a read-only command now
+    # leaves nothing behind.
+    #
+    # Placed before the banner because that is where the old import-time notice printed, so the
+    # ordering a reader sees is unchanged. No try/except: ensure_ledger_current is contractually
+    # non-raising, the same contract init_db has always relied on one line below its own docstring.
+    # Lazy import, like every other db use in this file.
+    from .db import ensure_ledger_current as _ensure_ledger_current
+    _ensure_ledger_current()
+
     # ONE brand line, not a boxed category. This prints before EVERY `agentx` command, and
     # every subcommand already announces itself underneath it -- so the old three-line box
     # ("AGENTX LOCAL OBSERVABILITY ENGINE") meant a reader met two stacked headers and five
     # lines of chrome before any content, on the first screen of the first command they run.
     # "Local observability engine" also named a category we use nowhere else, in the position
     # where a stranger decides what this thing is. The brand mark stays because the
-    # subcommand headers below carry no product name of their own. (Founder call 2026-07-31.)
-    print("🛡️  AgentX")
-    print("=" * 75)
+    # subcommand headers below carry no product name of their own.
+    # 🔴 STDOUT BELONGS TO THE COMMAND WHEN THE CALLER ASKED FOR MACHINE OUTPUT. This banner
+    # prints before EVERY command, so `agentx audit --json` emitted brand chrome above its
+    # document and the real command produced something no parser could read. The in-process
+    # tests never saw it because they call `execute_audit` directly and never reach `main`;
+    # it took driving the actual CLI in a subprocess to find.
+    #
+    # ROUTED TO STDERR RATHER THAN SUPPRESSED: someone piping JSON still wants to be told
+    # their install is stale, and a notice deleted for machine callers is a notice that
+    # never reaches the automated installs most likely to be old.
+    #
+    # The rule is FLAT -- any `--json` anywhere in argv, not a list of commands known to
+    # support it. A carve-out here would be a hole in the shape of the next command to grow
+    # the flag, which is the shape this codebase keeps having to re-fix.
+    _chrome = sys.stderr if "--json" in sys.argv[1:] else sys.stdout
+    print("🛡️  AgentX", file=_chrome)
+    print("=" * 75, file=_chrome)
 
     # --- OFFLINE STALENESS NOTICE (the third surface) ---
     # A CLI-only user never makes a protected tool call, so the decorator's session
@@ -5184,9 +6443,11 @@ def main():
     from . import pulse
     stale = pulse.staleness_notice()
     if stale:
-        print(f" 📦 Update AgentX: {stale}.")
-        print(f"    ▶ {pulse.UPGRADE_COMMAND}")
-        print("=" * 75)
+        # Same destination as the banner above, and for the same reason: this is chrome, and
+        # a document is not the place for it.
+        print(f" 📦 Update AgentX: {stale}.", file=_chrome)
+        print(f"    ▶ {pulse.UPGRADE_COMMAND}", file=_chrome)
+        print("=" * 75, file=_chrome)
 
     env = load_env_file()
 
@@ -5212,10 +6473,15 @@ def main():
     # run keyless against the sandbox.
     remote_plane = any(k in control_plane_url.lower() for k in ("vercel.app", "supabase.co", "agentx-core.com"))
     if not api_key and (mode == "cloud" or (mode == "linked" and remote_plane)):
-        print(f"❌ Error: AGENTX_API_KEY is required for AGENTX_MODE={mode} against a remote control plane.")
-        print("   Please append your cryptographic key string into your local .env file:")
-        print("   AGENTX_API_KEY=agentx_sk_test_XXXXX")
-        print("=" * 75)
+        # Same destination as the banner. This is the OTHER thing `main` can put on stdout
+        # before a command runs, and it would land inside a document exactly as the banner
+        # did -- one branch fixed and its sibling left is the shape this codebase keeps
+        # having to re-fix, so both go together.
+        print(f"❌ Error: AGENTX_API_KEY is required for AGENTX_MODE={mode} against a remote control plane.",
+              file=_chrome)
+        print("   Please append your cryptographic key string into your local .env file:", file=_chrome)
+        print("   AGENTX_API_KEY=agentx_sk_test_XXXXX", file=_chrome)
+        print("=" * 75, file=_chrome)
         sys.exit(1)
 
     api_key = api_key or "agentx_sk_local_sandbox"

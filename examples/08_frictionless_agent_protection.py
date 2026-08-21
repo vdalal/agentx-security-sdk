@@ -63,9 +63,9 @@ def run_frictionless_demo():
     # This keyless run BLOCKED the threat (deterministic Shield — no key, no LLM).
     # The next tier doesn't just block: it COACHES the agent back to a safe path so
     # the task still gets done. That re-planning needs your own LLM key.
-    print("💡 Next: add a Gemini key to unlock the Recover tier — AgentX coaches your")
-    print("   agent past the block to a safe completion, not just a dead-end. See it:")
-    print("       python examples/10_self_correction_coaching.py")
+    print("💡 Next: the Recover tier coaches your agent past the block to a safe")
+    print("   completion, not just a dead-end. It runs in the hosted gateway.")
+    print("   Request access: https://agentx-core.com")
     print("=" * 72 + "\n")
 
 

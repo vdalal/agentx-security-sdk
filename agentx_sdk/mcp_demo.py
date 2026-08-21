@@ -160,7 +160,12 @@ def _drive(run_proxy, stub_path, out):
     # well-behaved server's reader on an empty screen. The two doors move together on
     # purpose; a rung that means different things depending on how you wired us in is the
     # recurring defect here (copy true of one path, generalised to all).
-    print(" Now do it on your own server. Audit watches every call and stops nothing.", file=out)
+    # The clause comes from decorators.AUDIT_POSTURE_CLAUSE: this door said "stops nothing"
+    # while the Python door said "blocks nothing", which is the drift the comment above warns
+    # about ("a rung that means different things depending on how you wired us in") appearing
+    # in the sentence that DEFINES the rung.
+    from .decorators import AUDIT_POSTURE_CLAUSE
+    print(f" Now do it on your own server. Audit {AUDIT_POSTURE_CLAUSE}.", file=out)
     print(" In mcp.json:", file=out)
     # `"command": "uvx"`, matching ui/utils/mcp.ts -- the config this project actually ships.
     # The bare `"command": "agentx-mcp"` form only starts if agentx-mcp is on PATH, which a
@@ -216,7 +221,8 @@ def run_demo(out=None):
     # leaks "CI=1" and pinning=off into every test that runs after it, making results depend on
     # test order. Same leak class as the one that had these tests writing into the real ~/.agentx.
     _borrowed = ("CI", "AGENTX_MCP_TOOL_PINNING", "AGENTX_MCP_HARVEST_PATH",
-                 "AGENTX_MCP_PINS_PATH", "AGENTX_MCP_LEDGER_PATH")
+                 "AGENTX_MCP_PINS_PATH", "AGENTX_MCP_LEDGER_PATH",
+                 "AGENTX_MCP_OVERRIDES_PATH")
     previous_env = {k: os.environ.get(k) for k in _borrowed}
     os.environ.setdefault("CI", "1")                          # never emit a usage pulse from a demo
     os.environ.setdefault("AGENTX_MCP_TOOL_PINNING", "off")   # keep the relay a clean byte pump
@@ -229,9 +235,18 @@ def run_demo(out=None):
     # would silently put fake safe-paths into that user's review queue. These are set
     # unconditionally, not via setdefault, because a demo must never write to a real store
     # even if the caller has pointed those vars somewhere.
+    #
+    # 🔴 FOUR STORES, NOT THREE, AND THE FOURTH IS THE ONE THE COMMENT ABOVE IS ABOUT.
+    # The "fake safe-paths in a user's review queue" write is `_auto_coach` calling
+    # `adopt_override(path=_mcp_overrides_path())` -- which reads AGENTX_MCP_OVERRIDES_PATH and
+    # otherwise falls back to the real `~/.agentx/overrides.json`. Pinning the other three left
+    # the demo's ledger, harvest and pins in the temp dir and the ADOPTED OVERRIDES in the
+    # user's actual store, so the one file the comment named was the one still unpinned.
+    # The list to keep in step is the RESOLVERS, not the variables already written down here.
     os.environ["AGENTX_MCP_HARVEST_PATH"] = os.path.join(tmp, "mcp_harvest.jsonl")
     os.environ["AGENTX_MCP_PINS_PATH"] = os.path.join(tmp, "mcp_tool_pins.json")
     os.environ["AGENTX_MCP_LEDGER_PATH"] = os.path.join(tmp, "mcp-ledger.db")
+    os.environ["AGENTX_MCP_OVERRIDES_PATH"] = os.path.join(tmp, "overrides.json")
     try:
         from agentx_sdk.mcp_proxy import run_proxy            # lazy: AFTER the chdir above
         ok = _drive(run_proxy, stub_path, out)
