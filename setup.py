@@ -40,7 +40,7 @@ setup(
     url="https://agentx-core.com",
     project_urls={
         "Homepage": "https://agentx-core.com",
-        "Get Started": "https://bit.ly/agentfirewall",
+        "Get Started": "https://agentx-core.com/gateway",
         "Source": "https://github.com/vdalal/agentx-security-sdk",
     },
     packages=find_packages(include=["agentx_sdk", "agentx_sdk.*"]),

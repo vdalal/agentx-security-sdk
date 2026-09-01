@@ -1,5 +1,6 @@
 import os
 import sys
+import copy as _copy
 import json
 import atexit
 import time
@@ -124,14 +125,82 @@ def _note_policy_location(path, seed_dir, filename):
             file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------------------------
+# POLICY IDS, WRITTEN ONCE
+# ---------------------------------------------------------------------------------------------
+# 🔴 EVERY SITE REFERENCES THESE NAMES RATHER THAN RETYPING THE NUMBER. The floor rows below, the
+# switchable set, and the attribution lookups further down all read from here, so a renumber is
+# one line and every reader follows it. Retyped literals are exactly how ...106 came to name two
+# DIFFERENT rules across two surfaces without anything noticing (BACKLOG P-176).
+#
+# The `11111111-` space belongs to the gateway's seeds; ids here that share it name the SAME rule
+# on both doors on purpose, so an operator's decision keys across them. A rule that exists only on
+# this door takes a different prefix, so no control-plane row can ever name it.
+# the cross-surface floor-registry tripwire fails if either convention breaks.
+_ID_MASS_DESTRUCTIVE = "11111111-1111-1111-1111-111111111101"
+_ID_CUSTOMER_PRIVACY = "11111111-1111-1111-1111-111111111102"
+_ID_SSRF = "11111111-1111-1111-1111-111111111103"
+_ID_SECRETS = "11111111-1111-1111-1111-111111111104"
+_ID_SCHEMA_BOUNDARY = "11111111-1111-1111-1111-111111111105"   # gateway-side rule, no row here
+_ID_FS_BOUNDARY = "11111111-1111-1111-1111-111111111115"
+_ID_PROMPT_INJECTION = "a339b81f-0607-42d8-b0c2-9c2b221dd646"  # gateway-side rule, no row here
+_ID_DESTRUCTIVE_SHELL = "22222222-2222-2222-2222-222222222106"  # THIS DOOR ONLY -- see the row
+
+
+# The shipped ids whose `is_active` flag actually GOVERNS ENFORCEMENT, and therefore the only
+# ids an explicit `is_active: false` may deactivate on this door. BACKLOG P-176.
+#
+# 🔴 THE FLAG DOES NOT MEAN THE SAME THING ON EVERY SHIPPED ROW, WHICH IS WHY THIS SET EXISTS
+# RATHER THAN A BARE `is False` CHECK. On a deterministic-floor rule the gateway keeps
+# `is_active` FALSE ON PURPOSE, to hold the rule out of the Layer-3 vector loop while a regex
+# detector enforces it unconditionally. There, false means "do not also word-match this", NOT
+# "do not enforce this". Reading it as a deactivation deletes a floor rule nobody switched off:
+# Filesystem Path Boundary (...115) ships false in the cloud and armed here, so honouring it
+# blindly disarmed the keyless filesystem floor on every `agentx pull`.
+#
+# These three are the rules whose switch does something on BOTH doors: they ship armed and no
+# deterministic detector covers them. Mirrors SHIPPED_ARMED_POLICY_IDS minus the floor set in
+# ui/app/floor-policy-ids.ts. Two of them are not in this file's own floor list at all (Schema
+# Boundary and Prompt Injection Shield are gateway-side), and they are named anyway so this
+# states the RULE rather than this file's slice of it.
+_SWITCHABLE_SHIPPED_IDS = frozenset({
+    _ID_CUSTOMER_PRIVACY,
+    _ID_SCHEMA_BOUNDARY,
+    _ID_PROMPT_INJECTION,
+})
+
+
 def _merge_pulled_over_floor(pulled):
     """Union a pulled policy list ON TOP OF the built-in floor. BACKLOG P-49.
 
     🔴 THE RULE, AND IT IS A RULE RATHER THAN A LIST OF CASES: **the built-in floor is CODE
     and a pulled policy file is DATA. Data may ADD a policy, ADD blocked intents, and CHANGE
-    coaching. Data may never REMOVE a policy, REMOVE an intent, or DEACTIVATE a shipped
-    one.** Stating it as a rule is the point -- the previous attempt at this defect fixed
+    coaching. Data may never REMOVE a policy or REMOVE an intent by staying SILENT about
+    it.** Stating it as a rule is the point -- the previous attempt at this defect fixed
     the `blocked_intents` door and left the others open, which is the enumeration treadmill.
+
+    🔴 ONE EXCEPTION, AND IT TURNS ENTIRELY ON SILENCE VERSUS SPEECH (BACKLOG P-176). A row
+    that is PRESENT in the pulled file and explicitly carries `is_active: false` DEACTIVATES
+    the shipped rule it names, PROVIDED that rule's flag is what governs whether it is enforced
+    (`_SWITCHABLE_SHIPPED_IDS`). A row that is merely ABSENT does not. The intent is one answer
+    rather than two: an operator who switches a rule off at the paid gateway has it off on this
+    door too, so "is this rule on" cannot have two answers in the same project.
+
+    🔴 THAT PROVISO IS NOT A HEDGE, IT IS THE FLAG'S OWN MEANING. On a deterministic-floor rule
+    the gateway holds `is_active` false deliberately, to keep the rule out of the vector loop
+    while a regex detector enforces it every single time. False there means "do not also
+    word-match this". The first cut of this exception read it as "off" and so deleted floor
+    rules on a plain `agentx pull` that no operator had touched -- the exact subtraction P-49
+    exists to prevent, arriving through the door this exception opened.
+
+    **Why that is safe now when a blanket refusal was necessary before.** Until now the two
+    cases were IDENTICAL BYTES: the control plane omitted switched-off rows entirely, so a
+    truncated file, a misconfigured tenant, a network blip and a deliberate switch-off all
+    arrived looking exactly the same. Refusing every one of them was the only answer
+    available, not a preference. They are distinguishable now, so the refusal narrows to
+    precisely the ambiguous case. A partial, empty or hostile file still cannot disarm
+    anything, because all it can do is fail to MENTION a rule -- and an unmentioned rule
+    stays armed. That is P-49's protection, unchanged.
 
     **The defect this closes is live and user-facing.** `load_local_policy_keywords` ended
     with `if policies: return policies`, so a pulled file WHOLLY REPLACED the floor. The
@@ -144,9 +213,12 @@ def _merge_pulled_over_floor(pulled):
 
     Subtraction doors, each closed explicitly:
       * an OMITTED policy stays armed        -- the floor is the base, not the fallback
-      * `is_active: false` on a SHIPPED id is ignored -- data cannot deactivate code
+      * an EMPTY or unreadable file stays armed -- the same reason, with no special case
       * `blocked_intents` UNION, never replace -- a shorter cloud list cannot shorten ours
       * coaching may still be overridden      -- text is not enforcement
+      * `is_active: false` on a SWITCHABLE shipped id is HONOURED -- the one subtraction data
+        may make, only as an explicit false on a row that is actually present, and only for a
+        rule whose flag governs enforcement rather than vector loading (see above)
 
     ⚠️ `pii_targets` / `target_action` are named in P-49 but are NOT fields this loader
     carries (they are gateway-side; the keyless shield's rows are id/name/category/
@@ -170,20 +242,94 @@ def _merge_pulled_over_floor(pulled):
     """
     merged, floor_order, new_order = {}, [], []
     token_owner = {}
+    # A pristine copy of every shipped row, kept because an explicit off REMOVES the working one
+    # and a later row in the same file may name that id again. Without this the rule comes back
+    # as an UNKNOWN policy and the identity protections below never run. See the restore branch.
+    floor_base = {}
     for seed in _BUILTIN_POLICY_KEYWORDS:
         row = dict(seed)
         row["blocked_intents"] = list(seed.get("blocked_intents") or [])
         seed_id = str(seed.get("id"))
         merged[seed_id] = row
+        # A real copy, not a reference into the module-global floor. The single reader below
+        # copies on the way out, so a reference would work today and mutate the shipped floor
+        # process-wide the first time a reader forgot to.
+        floor_base[seed_id] = dict(row)
         floor_order.append(seed_id)
         for intent in row["blocked_intents"]:
             token_owner.setdefault(str(intent).lower().strip(), seed_id)
 
     for p in pulled:
         pid = str(p.get("id"))
+        # 🔴 THE ONE SUBTRACTION DATA MAY MAKE, AND IT IS DECIDED HERE AND NOWHERE ELSE.
+        # It lived in `load_local_policy_keywords` for about ten minutes and that was wrong:
+        # this function has a SECOND caller that hands it rows directly, so the loader-side
+        # version was honoured on one path and silently ignored on the other. One rule, one
+        # place -- otherwise which answer you get depends on who called, which is the defect
+        # class this whole file exists to hold shut.
+        #
+        # `is False`, never `not p.get("is_active", True)`. The latter reads a MISSING key,
+        # a None, an empty string and a 0 as "switch it off", so a hand-edited policies.json
+        # that merely fumbled the field would disarm a shipped rule. Only a literal boolean
+        # False, on a row that is actually PRESENT, is an operator decision. Everything else
+        # is read as saying nothing, because the safe direction to be wrong here is ARMED.
+        #
+        # `continue` matters as much as the pop: a switched-off row must not be re-added as a
+        # new policy further down, and an inactive row carrying an UNKNOWN id must never arm
+        # either -- the returned list IS the armed set on this door.
+        #
+        # THE POP IS NARROWER THAN THE `continue`, AND THEY ARE SEPARATE ON PURPOSE. Only a rule
+        # whose flag governs enforcement may be deactivated by it (`_SWITCHABLE_SHIPPED_IDS`).
+        # Everything else is SKIPPED WITHOUT BEING REMOVED: a floor rule the gateway holds
+        # inactive to keep it out of the vector loop, or a cloud rule this door has never heard
+        # of. `false` on those rows is not an operator switching anything off. Popping on a bare
+        # `is False` deleted the shell and filesystem floors on every `agentx pull` -- see the
+        # set's own comment for why the flag reads differently there.
+        if p.get("is_active") is False:
+            if pid in _SWITCHABLE_SHIPPED_IDS:
+                merged.pop(pid, None)
+            continue
         base = merged.get(pid)
+        if base is None and pid in floor_base:
+            # 🔴 A SHIPPED RULE THAT COMES BACK IS STILL A SHIPPED RULE. An explicit off earlier
+            # in this same file popped it, so it is missing from `merged` and would otherwise
+            # fall into the unknown-id path below and be stored as the file wrote it. That path
+            # bypasses every identity protection stated thirty lines down: the file's own `name`
+            # and `category` would stick (so a built-in block is REPORTED and pulse-tagged as
+            # whatever the file called it), and its `blocked_intents` would REPLACE the shipped
+            # list rather than union onto it -- data removing an intent, which the docstring rule
+            # forbids in as many words.
+            #
+            # Restoring the pristine row and falling through to the union path means an
+            # off-then-on round trip lands in exactly the state a file that never mentioned the
+            # off would have produced.
+            #
+            # 🔴 BUT ONLY ON AN EXPLICIT `is_active: true`. SILENCE CANNOT UNDO AN OFF, FOR THE
+            # SAME REASON SILENCE CANNOT CAUSE ONE. A second row that merely names the id and
+            # says nothing about the flag -- `{"id": "…102", "blocked_intents": [...]}` -- would
+            # otherwise resurrect a rule the operator explicitly disarmed, and the outcome would
+            # depend on which row happened to come last in a hand-edited file. Only speech acts,
+            # in both directions. A row that says nothing is skipped entirely: not restored, and
+            # not armed as a new policy under a shipped id either, which is the bypass this
+            # branch exists to close.
+            if p.get("is_active") is not True:
+                continue
+            base = dict(floor_base[pid])
+            base["blocked_intents"] = list(floor_base[pid].get("blocked_intents") or [])
+            merged[pid] = base
         if base is None:
-            merged[pid] = p
+            # COPY AND NORMALISE ON THE WAY IN, the same way the seeds are above. Storing the
+            # caller's dict raw is what let a REPEATED id corrupt the result: once an explicit
+            # off pops a floor row, a later row for that SAME id arrives here as an "unknown"
+            # one, and the raw dict carries neither the floor row's name nor a
+            # `blocked_intents` LIST. A third row for the id then reached `base["blocked_intents"]`
+            # and raised a bare KeyError -- not AgentXPolicyLoadError, so the import-time
+            # handler does not catch it and `import agentx_sdk` dies outright. It also meant a
+            # later union appended into the CALLER's list. The gateway twin
+            # was fixed for exactly this; this copy never was.
+            row = dict(p)
+            row["blocked_intents"] = list(p.get("blocked_intents") or [])
+            merged[pid] = row
             new_order.append(pid)
             continue
         # UNION, order-stable, case-sensitive as stored: an intent is a matching token and
@@ -231,7 +377,27 @@ def _merge_pulled_over_floor(pulled):
     # Ordering pulled-first restores the pre-P-49 attribution while keeping every floor
     # policy present, so it cannot weaken enforcement: anything an org rule does not match
     # still falls through to the floor immediately behind it.
-    return [merged[i] for i in new_order + floor_order]
+    #
+    # 🔴 `if i in merged` IS LOAD-BEARING, NOT DEFENSIVE. A floor id switched off in the loop
+    # above was POPPED, and `floor_order` still names it. Dropping the row rather than
+    # flagging it is the whole point: on this door the returned list IS the armed set, and
+    # `_merge_delivered_over_seeds` marks instead of dropping only because it has an arming
+    # filter downstream of it. This function has none.
+    #
+    # 🔴 AND IT MUST EMIT EACH ID ONCE, WHICH THE CONCATENATION ALONE DOES NOT GUARANTEE. A floor
+    # id that was switched off and then NAMED AGAIN by a later row in the same file is popped,
+    # re-added through the unknown-id path, and therefore ends up in BOTH lists -- so the plain
+    # comprehension returned the same rule twice. On this door the returned list IS the armed set
+    # and `evaluate_call_keyless` returns on the first match, so a duplicate is not merely untidy:
+    # it is one rule occupying two positions in a precedence-ordered list. Deduping keeps the
+    # FIRST occurrence, which is the `new_order` one, so a rule the file re-added keeps the
+    # pulled-first attribution the ordering above exists to give it.
+    seen, ordered = set(), []
+    for i in new_order + floor_order:
+        if i in merged and i not in seen:
+            seen.add(i)
+            ordered.append(merged[i])
+    return ordered
 
 
 
@@ -580,7 +746,7 @@ def _degraded_detail(reason):
 
     `engine_fault` is narrower than `answered` and exists for counting, not for copy: the
     engine returned a FAULT response (a 5xx, or a body that is not a verdict). That subset is
-    the one an attacker can steer. `backend/gateway.py` raises HTTPException(500) when the
+    the one an attacker can steer. The gateway raises HTTPException(500) when the
     evaluator itself crashes, which is exactly how P-21 was found, so any payload shape that
     reliably trips an evaluator bug converts "the gateway vets this" into "the tool runs"
     with only the Layer-0 keyword shield left. Under the default fail-open posture that is
@@ -1099,6 +1265,19 @@ _session_stats = {
     # matches an open pair, so it is never credited. The trace-level sets above stay in
     # lockstep for the streak nudge + back-compat.
     "open_challenges": set(),          # (trace, tool) pairs blocked and not yet recovered
+    # 🔴 A RECOVERY IS A NARROWING, AND THAT NEEDS THE BLOCKED CALL KEPT (BACKLOG P-191).
+    # The pair alone cannot answer "is this retry more constrained than what we stopped",
+    # so the blocked payload is held for the life of the episode and dropped when it closes.
+    # Text only, never shared: it stays in this process and is not written or pulsed.
+    "blocked_payloads": {},            # (trace, tool) -> the payload we blocked
+    # Episodes where the agent DID come back on the same tool but not with a narrowing.
+    # A separate bucket from abandoned on purpose: "kept working, differently" and "gave up"
+    # are different outcomes and the old counter called them both a recovery.
+    "continued_challenges": set(),     # (trace, tool) pairs that saw a non-narrowing retry
+    # Episodes where a retry arrived on a surface whose scope we cannot read (anything that is
+    # not a query). Its own bucket because "we could not tell" is not "the agent failed", and
+    # folding it into continued asserts a failure we have no evidence for.
+    "unmeasured_challenges": set(),    # (trace, tool) pairs whose retry could not be judged
     "challenge_episodes": 0,           # total policy-challenge episodes this session (rate denominator)
     "looped_traces": set(),            # runs whose runaway loop tripped a local breaker (the "looped" bucket)
     "consecutive_strikes": {},         # <-- Tracks repeated failures per tool function name
@@ -1107,7 +1286,7 @@ _session_stats = {
     "degraded_executions": 0,          # <-- Tool calls that ran fail-open (gateway unreachable / timed out)
     "reflection_failopens": 0,         # <-- Calls where argument reflection produced NEITHER scan text NOR structured args, so a constant placeholder shipped and the call went out effectively unscanned. Distinct from shield_failopens (the shield THREW) and from degraded_executions (the gateway was unreachable): here our own reflection could not read the call. LOCAL ONLY, not pulsed — see _record_reflection_failopen.
     "shield_failopens": 0,             # <-- Tool calls the LOCAL SHIELD failed to screen because it THREW (a shield BUG, not a policy decision) and fell through, so the tool ran unscreened. Distinct from degraded_executions (that is the gateway being unreachable, an infrastructure fact; this is our own code crashing). Counted so instance 3 of the fail-open class finds US instead of a customer's database — instances 1 and 2 were both found by luck on an EOD pass. Pulsed as a coarse int, NEVER the exception text (a traceback can carry a path, an argument, a fragment of the user's data).
-    "degraded_engine_faults": 0,       # <-- SUBSET of degraded_executions where the engine ANSWERED with a fault (5xx / non-verdict body) rather than being unreachable. An unreachable gateway is an infrastructure fact nobody chose, but backend/gateway.py raises HTTPException(500) when the evaluator itself CRASHES, so a payload shape that reliably trips an evaluator bug converts "the gateway vets this" into "the tool runs" under the default fail-OPEN posture. Folded into one counter, a steered fault and a cold-start 502 were indistinguishable. Coarse int; carries no payload.
+    "degraded_engine_faults": 0,       # <-- SUBSET of degraded_executions where the engine ANSWERED with a fault (5xx / non-verdict body) rather than being unreachable. An unreachable gateway is an infrastructure fact nobody chose, but the gateway raises HTTPException(500) when the evaluator itself CRASHES, so a payload shape that reliably trips an evaluator bug converts "the gateway vets this" into "the tool runs" under the default fail-OPEN posture. Folded into one counter, a steered fault and a cold-start 502 were indistinguishable. Coarse int; carries no payload.
     "policy_config_faults": 0,         # <-- AUDIT: calls released because the POLICY CONFIG could not be read (AgentXPolicyLoadError), so the shield never screened them. Deliberately NOT degraded_engine_faults: that counter's line tells the operator to check the ENGINE's logs, and the engine was never involved here — the fault is in their own .agentx/policies.json. Deliberately NOT shield_failopens either: that one says "a shield BUG", and this is a config the operator can fix. Wrong attribution costs an operator an afternoon in the wrong system. LOCAL ONLY, not pulsed.
     "gateway_reached": False,          # <-- True once any real gateway verdict came back this session (NOT unreachable). Coarse funnel-stage signal for the anonymous pulse: distinguishes "SDK only" from "SDK + gateway". Never carries identity.
     "reasoning_enabled": None,         # <-- Tri-state Recover signal for the pulse: None = no gateway ever advertised it (old gateway / SDK-only), False = gateway reported keyless, True = judge seen active (sticky). Never identity.
@@ -1118,6 +1297,20 @@ _session_stats = {
     # See _note_own_agent_block. Rides the pulse as a coarse boolean; never an agent NAME.
     "own_agent_block": False,
     "would_blocks": 0,                 # <-- AUDIT posture (AGENTX_ENFORCEMENT=audit): count of catches that WOULD have blocked but were recorded-and-let-through. Distinct from intercepts (an audit install is NOT "protected"): would_blocks>0 with intercepts==0 = an install EVALUATING, not yet enforcing. Rides the pulse as a coarse count. See _resolve_enforcement / _audit_and_proceed.
+    # 🔴 THE REASON THERE ARE TWO OF THESE. `would_blocks` above is gated on
+    # `not _is_demo_agent(...)` so our own scripted traffic cannot pollute the funnel -- right
+    # for a METRIC, and it was also the gate deciding whether the SUMMARY may say "nothing
+    # tripped a policy". So on `examples/12` the screen printed that sentence about fifteen
+    # lines under the example's own footer saying a call HAD tripped one, and swallowed the
+    # `agentx insights` step with it. One value cannot answer both questions: the funnel asks
+    # "did a STRANGER'S agent trip something", the screen asks "did anything trip on THIS RUN".
+    # This one answers the second and takes no view on who owns the agent. Both are written at
+    # ONE site (_record_would_block), which is what stops them drifting apart.
+    # Screen-facing ONLY, and that is enforced rather than intended: pulse.build_payload names
+    # every session key it sends one at a time, and test_payload_emits_exactly_the_allowlist
+    # asserts the result equals `_ALLOWED_SESSION_KEYS` EXACTLY (not a subset). So this counter
+    # cannot reach the wire by accident, and adding it deliberately reddens that test first.
+    "would_blocks_seen": 0,            # <-- every would-block this session, OURS INCLUDED.
     # 🔴 P-92, AND THE REASON IT IS SEPARATE FROM would_blocks ABOVE. `would_blocks` can only
     # count an install whose agent tripped one of our floors, so the population it CANNOT see
     # is the one this whole change is for: someone who wired us in, ran their agent, and did
@@ -1126,6 +1319,27 @@ _session_stats = {
     # with no dependence on whether anything was caught.
     "audit_calls": 0,                  # <-- P-92: calls recorded by the audit inventory this session. Coarse count; never a tool name or an argument.
     "audit_tools": 0,                  # <-- P-92: DISTINCT tools the inventory saw this session. A count only -- the names are the identity-bearing part and stay on the user's disk. Separates "one tool in a loop" from "a real agent" on the funnel.
+    # 🔴 DECLARED HERE, AND THEY WERE NOT BEFORE. `db.record_call`
+    # (db.py:3406-3418) creates SIX keys LAZILY with `.get(...)` / `.setdefault(...)`:
+    # recorded_calls / recorded_tool_names / recorded_tools and their audit_* twins. Only
+    # `audit_calls` and `audit_tools` were ever declared, so the other four existed at
+    # runtime and were invisible to anything reasoning about this surface from this dict --
+    # no generic reset could see them, and every test file had to name them by hand.
+    #
+    # This is the SAME CLASS as the three reset leaks above, arriving from a
+    # different direction: not a key that MOVED between gates, but one never declared at
+    # all. Lazy creation is what hides it: the code works, so nothing complains.
+    #
+    # ⚠️ AND IT PAID OUT TWICE, WHICH IS WHY THE COUNT IN THIS COMMENT IS SIX AND NOT THREE.
+    # The full-suite run surfaced the three `recorded_*` keys; `audit_tool_names` stayed
+    # hidden until a four-FILE subset happened to run a module that exercises the audit arm
+    # first. Same defect, one ordering apart. Declaring them costs nothing (`.get` and
+    # `.setdefault` behave identically against a present key) and puts them inside
+    # `reset_session_stats` permanently.
+    "recorded_calls": 0,               # <-- calls the DEFAULT posture recorded. Coarse count.
+    "recorded_tools": 0,               # <-- DISTINCT tools recorded, i.e. len(recorded_tool_names). A count only.
+    "recorded_tool_names": set(),      # <-- the NAMES, kept only to compute the count above. Identity-bearing: never on the pulse (build_payload names its keys one at a time and an exact-equality test pins that), never off this machine.
+    "audit_tool_names": set(),         # <-- the audit-inventory twin of recorded_tool_names, same rule: names stay here, only the COUNT (audit_tools) is coarse enough to leave.
     "overrides_applied": 0,            # <-- BUILD #2: blocks where an adopted org reframe replaced the gateway's generic challenge
     # Session budget meter. The gateway's budget-ceiling floor reads
     # the running total off the payload; we feed it from one of two sources:
@@ -1133,6 +1347,67 @@ _session_stats = {
     "reported_tokens": 0,              # REAL LLM usage fed via record_spend(); authoritative — replaces the estimate when present
     "reported_cost_usd": 0.0           # REAL $ via record_spend(); drives the dollar ceiling (no built-in $ estimate — that needs a model rate)
 }
+
+# 🔴 ONE OWNER FOR "WHAT A CLEAN SESSION LOOKS LIKE".
+# `_session_stats` is a module GLOBAL shared by the whole suite, and every test file that
+# touched it kept its OWN hand-written list of keys to zero. That makes correctness depend on
+# each author remembering each key, and it failed three different ways in ONE change:
+#
+#   * a key that MOVED between gates escaped a list DERIVED from the gate
+#     (`would_blocks` left `_TRIPPED_COUNTERS`, so test_quiet_session_cta's derived reset
+#     stopped covering it);
+#   * a key that moved escaped a HAND-WRITTEN list naming its old spelling
+#     (`test_enforcement_audit`'s tuple names `would_blocks`, never the new counter --
+#     MEASURED leaking at 18 after that module, while `would_blocks` correctly read 0);
+#   * a key a NEW HELPER started writing escaped a list that never named it
+#     (`block_category`, left at 'DESTRUCTIVE_ACTION' for the rest of the process).
+#
+# Three mechanisms, one class: THE RESET SURFACE WAS MAINTAINED BY HAND, PER FILE. So the
+# fix is not a fourth list. The defaults are snapshotted from the declaration ABOVE, at
+# import, before anything can mutate it -- so this is the declaration rather than a second
+# copy of it that can drift, and a key added tomorrow is covered without anyone remembering.
+_SESSION_STATS_DEFAULTS = _copy.deepcopy(_session_stats)
+
+
+def reset_session_stats(target=None):
+    """Restore every session counter to its declared initial value. Test support.
+
+    🔴 MUTATES IN PLACE AND NEVER REBINDS. The mutable members (`recovered_traces`,
+    `challenged_traces`, `consecutive_strikes`, ...) are handed out by reference -- the MCP
+    proxy passes its own dict into helpers that keep a hold of these, and the atexit summary
+    closes over them. Replacing the dict, or assigning a fresh set to a key, would leave a
+    live reader pointed at the old object and reading a session that no longer exists. So
+    containers are cleared and refilled, and only scalars are assigned.
+
+    Returns the dict it reset, so a caller can chain. Never raises on an unknown extra key:
+    anything a test added that is NOT in the declaration is left alone rather than deleted,
+    because this owns the DECLARED surface and guessing at the rest is how a reset starts
+    destroying state a caller deliberately put there."""
+    stats = _session_stats if target is None else target
+    # 🔴 UNDER `_stats_lock`, LIKE EVERY OTHER WRITER OF THIS DICT. `_incr`, `_incr_strike`
+    # and `_adopt_strike_trace` all take it because tool calls can be concurrent, and a
+    # reset is the widest write there is. Without it a reset racing a live `_incr` loses the
+    # increment or tears a container mid-iteration. It is an RLock, so a caller that already
+    # holds it re-enters for free.
+    with _stats_lock:
+        _reset_locked(stats)
+    return stats
+
+
+def _reset_locked(stats):
+    """The body of `reset_session_stats`, split out so the lock is taken at exactly one
+    place and cannot be forgotten by a future caller that wants the same work."""
+    for key, default in _SESSION_STATS_DEFAULTS.items():
+        current = stats.get(key)
+        if isinstance(current, dict) and isinstance(default, dict):
+            current.clear()
+            current.update(_copy.deepcopy(default))
+        elif isinstance(current, set) and isinstance(default, set):
+            current.clear()
+            current.update(default)
+        else:
+            stats[key] = _copy.deepcopy(default)
+    return stats
 
 # Per-tool ownership of the live strike run. Maps func_name -> the trace_id whose
 # blocked-retry run currently owns that tool's `consecutive_strikes` counter.
@@ -1249,13 +1524,17 @@ def _mark_trace(set_name, trace_id):
         _session_stats[set_name].add(trace_id)
 
 
-def _mark_challenged(trace_id, tool_name):
+def _mark_challenged(trace_id, tool_name, payload=None):
     """Open a challenge EPISODE at (trace, tool) granularity under the lock: bump the
     episode counter, add the open (trace, tool), and record the trace (streak nudge /
     back-compat). A recovery is credited later only when the SAME (trace, tool) pair is
     still open (see _credit_recovery), so a safe call on a DIFFERENT tool (the agent
     abandoned the blocked action) is never miscounted, and a re-block reopens the pair so
-    a genuine second recovery is credited again."""
+    a genuine second recovery is credited again.
+
+    `payload` is the call we blocked, kept so a later retry can be compared against it.
+    Optional because not every block site has one; without it the episode can still be
+    opened and closed, it simply cannot earn a recovery, which is the safe direction."""
     with _stats_lock:
         _session_stats["challenged_traces"].add(trace_id)
         # Bump the episode counter ONLY when the pair actually OPENS. A re-block of an
@@ -1270,47 +1549,98 @@ def _mark_challenged(trace_id, tool_name):
         if pair not in _session_stats["open_challenges"]:
             _session_stats["open_challenges"].add(pair)
             _session_stats["challenge_episodes"] += 1
+        # Kept on EVERY block, including a re-block of an already-open pair: the newest
+        # blocked call is the one a retry has to be narrower than. Storing only on the first
+        # block would compare against a stale statement after the agent had already moved.
+        if payload is not None:
+            _session_stats["blocked_payloads"][pair] = str(payload)
 
 
-def _credit_recovery(trace_id, tool_name):
+def _credit_recovery(trace_id, tool_name, payload=None):
     """Atomically credit a self-correction EPISODE for the (trace_id, tool_name) pair and
     return True iff THIS call closed an OPEN challenge for it — so the caller logs the DB
-    row exactly once, OUTSIDE the lock. Credited only if that SAME-tool pair is currently
-    open (2026-07 continuity check: a safe call on a DIFFERENT tool is abandonment, not
-    recovery) and the trace was not human-resolved. Closing the open challenge means a
-    re-block reopens it, so a genuine second recovery on the same pair is credited again;
-    self_corrections and the ledger both count episodes. Concurrent ALLOWs on one shared
+    row exactly once, OUTSIDE the lock.
+
+    THREE conditions, and the third is the one that was missing. The pair must be open, the
+    trace must not be human-resolved, and `payload` must be a NARROWER version of the call
+    we blocked (see _is_narrower). Same tool alone is necessary and was never sufficient: it
+    credits an agent that gave up and ran something unrelated on the same tool, so the
+    counter can read "3 of 4 recovered" on a run that finished nothing. A safe call on a
+    DIFFERENT tool never matches an open pair and is still never credited.
+
+    A same-tool call that is not a narrowing leaves the episode OPEN and marks it CONTINUED,
+    which is reported as its own outcome rather than as a recovery or an abandonment. A real
+    recovery closes the pair, so a re-block reopens it and a genuine second recovery on the
+    same pair is credited again; self_corrections and the ledger both count episodes. Concurrent ALLOWs on one shared
     open challenge can't double-credit / double-log: only the call that discards it wins
     (review #115 finding 6)."""
     with _stats_lock:
         s = _session_stats
         pair = (trace_id, tool_name)
-        if pair in s["open_challenges"] and trace_id not in s["human_resolved_traces"]:
-            s["open_challenges"].discard(pair)
-            s["recovered_traces"].add(trace_id)
-            s["self_corrections"] += 1
-            return True
-        return False
+        if pair not in s["open_challenges"] or trace_id in s["human_resolved_traces"]:
+            return False
+        # 🔴 THE NARROWING TEST. Same tool is necessary and was never sufficient: it is what
+        # let an agent blocked on a destructive statement score a recovery by running an
+        # unrelated read on the same tool. See _is_narrower for the three wrong versions.
+        blocked = s["blocked_payloads"].get(pair)
+        verdict = _is_narrower(blocked, payload)
+        if verdict is None:
+            # We cannot read scope on this surface, so we do not know whether the agent
+            # narrowed. Recorded as UNMEASURED rather than continued: claiming it came back
+            # and failed is a statement about the agent we have no evidence for.
+            s["unmeasured_challenges"].add(pair)
+            return False
+        if verdict is False:
+            # It came back and kept working, just not with a narrowing. That is CONTINUED,
+            # and the episode stays open: a genuine narrowing later still earns the credit.
+            s["continued_challenges"].add(pair)
+            return False
+        s["open_challenges"].discard(pair)
+        s["continued_challenges"].discard(pair)
+        s["unmeasured_challenges"].discard(pair)
+        s["blocked_payloads"].pop(pair, None)
+        s["recovered_traces"].add(trace_id)
+        s["self_corrections"] += 1
+        return True
 
 
 def _recovery_breakdown():
-    """The (total, recovered, abandoned, looped) split of this session's challenge
-    EPISODES, computed under ONE lock so the summary's rate line, its breakdown line, and
-    the continuity tripwire all share a single implementation (no drift between a
-    displayed number and its test). recovered = self_corrections (episodes a same-tool
-    safe call closed); looped = still-open episodes on a run a breaker halted; abandoned =
-    still-open episodes that neither recovered nor looped; human-approved episodes are
-    excluded (counted under Human Escalations). The buckets partition challenge_episodes."""
+    """The (total, recovered, continued, abandoned, looped) split of this session's
+    challenge EPISODES, computed under ONE lock so the summary's rate line, its breakdown
+    line, and the continuity tripwire all share a single implementation (no drift between a
+    displayed number and its test).
+
+      recovered  episodes closed by a NARROWER retry on the same tool (self_corrections)
+      continued  still open, but the agent came back on that tool with something that was
+                 not a narrowing. It kept working; it did not solve the blocked action.
+      abandoned  still open and nothing came back at all
+      looped     still-open episodes on a run a breaker halted
+
+    🔴 CONTINUED IS A SEPARATE BUCKET BECAUSE FOLDING IT EITHER WAY IS A LIE. Counted as a
+    recovery it inflates the headline on a run that finished nothing, which is what the old
+    same-tool rule did. Counted as abandoned it hides an agent that was still working.
+    Human-approved episodes are excluded (counted under Human Escalations). The buckets
+    partition challenge_episodes."""
     with _stats_lock:
         total = _session_stats["challenge_episodes"]
         recovered = _session_stats["self_corrections"]
         open_ch = set(_session_stats["open_challenges"])
+        continued = set(_session_stats["continued_challenges"])
+        unmeasured = set(_session_stats["unmeasured_challenges"])
         looped = set(_session_stats["looped_traces"])
         human = set(_session_stats["human_resolved_traces"])
     looped_ep = sum(1 for (_t, _tool) in open_ch if _t in looped)
     human_ep = sum(1 for (_t, _tool) in open_ch if _t in human and _t not in looped)
-    abandoned_ep = len(open_ch) - looped_ep - human_ep
-    return total, recovered, abandoned_ep, looped_ep
+    # Ordered so the buckets stay disjoint: a looped or human-resolved episode is reported
+    # as that, even if a retry also touched it. UNMEASURED outranks CONTINUED, because a pair
+    # that saw both a judgeable and an unjudgeable retry has at least one answer we cannot
+    # stand behind, and the weaker claim is the honest one to report.
+    _settled = lambda p: p[0] not in looped and p[0] not in human
+    unmeasured_ep = sum(1 for p in open_ch if p in unmeasured and _settled(p))
+    continued_ep = sum(1 for p in open_ch
+                       if p in continued and p not in unmeasured and _settled(p))
+    abandoned_ep = len(open_ch) - looped_ep - human_ep - continued_ep - unmeasured_ep
+    return total, recovered, continued_ep, unmeasured_ep, abandoned_ep, looped_ep
 
 
 def _returns_coroutine(fn):
@@ -1572,10 +1902,16 @@ def _print_novelty_line():
 # are the same thing. Same failure family as `_audit_posture_lines` in cli.py, which was
 # extracted after `agentx status` and `agentx insights` said one thing in two voices.
 #
-# A CLAUSE rather than a sentence because the four call sites need different lead-ins ("Audit
-# is the other half: it ...", "run once in audit mode. Audit ..."). Sharing a sentence is not
-# the same as sharing a clause, and forcing one sentence on all four is what pushed the last
-# de-duplication into a dangling half-sentence.
+# A CLAUSE rather than a sentence because the call sites need different lead-ins ("Audit is
+# the other half: it ...", "Now do it on your own server. Audit ..."). Sharing a sentence is
+# not the same as sharing a clause, and forcing one sentence on all of them is what pushed the
+# last de-duplication into a dangling half-sentence.
+#
+# ⚠️ THE SESSION SUMMARY WAS ONE OF THE FOUR AND NO LONGER IS, which is a subtraction rather
+# than a drift: P-112's enforce half deleted the "run it once in audit mode" ask outright,
+# because the default posture records and the ask bought the reader nothing. The clause is not
+# dead -- audit still means blocking off, and the surfaces below still have to say it in one
+# voice -- but it is now said on three screens, not four.
 #
 # ⚠️ NOT FOR THE MCP SERVER-BLOCK NOTE. `EntryFlow.tsx:239` states outright that its wording
 # is deliberately NOT shared with the Python door: the env var is process-wide but one
@@ -1583,6 +1919,67 @@ def _print_novelty_line():
 # SCOPE, this clause is about POSTURE; unifying them would re-introduce the "on every server
 # you wrap" claim that was false in the unsafe direction.
 AUDIT_POSTURE_CLAUSE = "watches every call and blocks nothing"
+
+# 🔴 THE SECOND FACT THAT SHIPPED IN THREE VERBS. `AUDIT_POSTURE_CLAUSE` above exists
+# because "watches every call and blocks nothing" had drifted into three wordings. The
+# RECORDING fact drifted the same way and nobody extracted it: cli.py said "writes down every
+# call your wrapped tools make, whichever posture you run", the help screen said "calls are
+# recorded whichever posture you run", and the docs page was about to add a fourth. One fact,
+# three verbs, and a reader who cannot tell whether they are the same promise -- which is the
+# exact sentence this module already carries about the other clause.
+#
+# TWO constants, composed, because the sites have different room. A terse help line cannot
+# carry the full sentence, and forcing it to would push someone into rewording it locally,
+# which is how this drifted in the first place. The long form is BUILT FROM the short one, so
+# the half that actually matters -- that recording does not depend on the posture -- cannot
+# drift out of it.
+#
+# ⚠️ PLAIN WORDS ON PURPOSE. The earlier wording said "whichever posture you run". `posture`
+# is our word: the docs define it in one section and a first-time reader meets it before that,
+# and the trust page uses the same word in its ordinary English sense. "Blocking on or off"
+# needs no glossary.
+RECORDING_UNIVERSAL = "whether blocking is on or off"
+# 🔴 "records", NOT "writes down": it is the plainer verb for the thing, and it is the one
+# the rest of the product already uses. ⚠️ "WRAPPED" IS LOAD-BEARING AND MUST NOT BE TRIMMED
+# OUT FOR BREVITY. A tool the developer never wrapped never appears on the screen, so a bare
+# "every tool call" reads their PARTIAL coverage as their whole activity -- the same
+# correction DocsQuickstart.tsx already carries against saying "your agent" here.
+RECORDING_CLAUSE = "records every wrapped tool call, " + RECORDING_UNIVERSAL
+
+# 🔴 THE THIRD TIME ONE SENTENCE SHIPPED IN TWO WORDINGS, so it is extracted rather than
+# corrected again. The CLI help row said "...grouped by tool, blocking nothing" while the docs
+# table said "...grouped by tool, whether blocking is on or off" -- the same command, described
+# two ways, on the two surfaces a reader compares.
+#
+# ⚠️ "BLOCKING NOTHING" IS GONE ON PURPOSE AND MUST NOT COME BACK. `agentx audit` is a READ
+# command; it has never blocked anything, so saying so of the COMMAND is noise at best. Sitting
+# one line above "calls are recorded whether blocking is on or off", it actively re-taught the
+# belief this whole change removes: that the screen only has content when nothing is blocking.
+# The posture belongs in the line about the posture, not in the command's own description.
+AUDIT_COMMAND_DESCRIPTION = "What your wrapped tools actually DID, grouped by tool"
+
+# 🔴 THE FOURTH, AND IT WAS RE-CREATED BY THE COMMIT THAT NAMED THE CLASS. The row directly
+# BELOW `audit` in the same docs table, and its CLI twin, describe `insights` in two wordings:
+# "Your wrapped tools' learned safe-paths (numbered), for adoption" on the page and "Review your
+# wrapped tools' learned safe-paths (numbered) for adoption" in the terminal. `audit` was
+# extracted and pinned in this PR; `insights` beside it was left free, which is the same
+# sentence-fixed / neighbour-untouched shape the PR exists to remove.
+#
+# ⚠️ ONLY THE SUBJECT IS PINNED, AND THAT IS DELIBERATE. Two differences here are CORRECT and a
+# byte-identical pin would destroy both:
+#   - the leading verb. The CLI's ADVANCED list opens every entry with one (Adopt, Record, List,
+#     Customize, Seed, Pull, Contribute) and the docs table describes what each screen SHOWS.
+#     Each screen follows its own neighbours; removing the CLI's verb once already made
+#     `insights` the only verbless entry on its own screen.
+#   - "for adoption" on the Python door and NOT on the MCP door, which ships no `--adopt`.
+#     Naming an action a door does not perform is the defect; consistency is not worth a false
+#     promise. So this constant is scoped to the CLI + docs pair and must NOT be forced onto
+#     mcp_proxy's `--insights`, which speaks of wrapped SERVERS, not wrapped tools.
+#
+# "WRAPPED TOOLS" is the load-bearing half, same as in RECORDING_CLAUSE above: a tool the
+# developer never wrapped never appears on that screen, so "your agents'" reads their PARTIAL
+# coverage as their whole activity. That is the drift this pin exists to catch.
+INSIGHTS_SUBJECT = "wrapped tools' learned safe-paths (numbered)"
 
 
 def posture_command_lines(posture, indent="      "):
@@ -1600,9 +1997,24 @@ def posture_command_lines(posture, indent="      "):
     per-tool argument WINS over this variable -- so that advice left the tool non-blocking
     permanently, and the "to block instead of watching: AGENTX_ENFORCEMENT=enforce" line on
     the same screen could not undo it. Measured: with the variable set to enforce, a pinned
-    tool still ran `rm -rf / --no-preserve-root`. This route lasts one run and leaves nothing
-    behind. It costs blast radius (every tool, not one), which is why the copy above every
-    call site says blocking is off, rather than leaving it to be discovered.
+    tool still ran `rm -rf / --no-preserve-root`. It costs blast radius (every tool, not one),
+    which is why the copy above every call site says blocking is off, rather than leaving it
+    to be discovered.
+
+    🔴 "THIS ROUTE LASTS ONE RUN AND LEAVES NOTHING BEHIND" WAS TRUE OF ONE OF THESE TWO LINES.
+    That sentence used to sit here as a property of the on-ramp. `VAR=value cmd` in bash is a
+    one-shot prefix and really does leave nothing behind. `$env:VAR="x"; cmd` in PowerShell
+    sets the variable for the REST OF THE SESSION. So the two forms we hand out side by side
+    do different things, and the claim was false for half our readers.
+
+    It has a consequence beyond the wording, found in review: `cli.execute_audit` decides
+    whether to offer the enforce route by reading this variable. A PowerShell reader who
+    followed the line above still has it set when they type `agentx audit`, and is correctly
+    read as watch-only. A bash reader who followed the equivalent line does NOT -- the prefix
+    is gone -- so the same person doing the same thing gets a different screen depending on
+    their shell. Recorded here rather than silently equalised: making bash persist (`export`)
+    would trade away the one-run property deliberately chosen above, and that is a product
+    call, not a wording fix.
     """
     return [
         "%sAGENTX_ENFORCEMENT=%s python your_agent.py          # mac/linux" % (indent, posture),
@@ -1613,7 +2025,11 @@ def posture_command_lines(posture, indent="      "):
 _TRIPPED_COUNTERS = (
     "intercepts",                # enforce: a policy catch that was terminal
     "critical_blocks",           # enforce: the keyless shield's own catch
-    "would_blocks",              # audit: caught and recorded, deliberately NOT an intercept
+    # 🔴 `would_blocks_seen`, NOT `would_blocks`, AND THE DIFFERENCE IS THE WHOLE POINT.
+    # The pulse-facing `would_blocks` excludes our own demo and examples by design, so gating
+    # this sentence on it made the claim TRUE-BY-EXCLUSION on exactly the runs a new user
+    # meets first. This gate asks "did anything trip on this run", which has no owner in it.
+    "would_blocks_seen",         # audit: caught and recorded, deliberately NOT an intercept
     "human_escalations",         # a human was asked to approve this action
     "circuit_breakers_tripped",  # a runaway loop was halted
 )
@@ -1631,6 +2047,32 @@ _TRIPPED_COUNTERS = (
 # that happened, against a smaller ruleset than they think they are running. Telling that
 # operator nothing tripped a policy is the same unsupported claim by a different route, and
 # an "unscreened" list would have argued its way out of including it.
+# 🔴 THE SUBSET OF `_TRIPPED_COUNTERS` WHOSE EVENT ACTUALLY LEAVES A ROW BEHIND, so a call to
+# action can name a screen that will have something on it. `human_escalations` and
+# `circuit_breakers_tripped` are real interventions and are printed above with their own
+# labels, but neither calls `log_intercept`, so neither puts anything on `agentx insights`.
+# Pointing a reader there because a counter moved is how an instruction ends in silence.
+#
+# Deliberately a SECOND list rather than a flag on the first: the two questions are different
+# ("may we claim nothing tripped" vs "is there a record to look at"), and collapsing them is
+# what produced the defect. A counter added to `_TRIPPED_COUNTERS` belongs here too only if it
+# writes a row -- and if that is unclear, leaving it out costs a reader a better screen, while
+# putting it in wrongly costs them an empty one.
+# `would_blocks_seen` is the right SPELLING here -- this list answers "is there a row to look
+# at", and `log_intercept` writes that row for every would-block including ours, so the
+# screen-facing counter is the one that matches the question.
+#
+# ⚠️ BUT IT IS UNREACHABLE AT THE ONLY READ SITE, AND SAYING SO IS THE POINT. This tuple is
+# summed in the LAST arm of the summary ladder, which is reached only after the
+# `would_blocks_seen > 0` arm above it has already failed -- so the value is provably 0 there
+# and contributes nothing to the sum, with either spelling. An earlier version of this comment
+# claimed the funnel-excluded counter "would have claimed there was nothing to see about a row
+# sitting right there on the screen". That outcome was impossible. It is corrected rather than
+# deleted because a comment asserting a defect it prevents, in the commit whose whole subject
+# is a comment that outran its code, is the class arriving through its own repair. The member
+# stays: it is semantically correct, and a future reordering of the ladder would need it.
+_LEAVES_A_LEDGER_ROW = ("intercepts", "critical_blocks", "would_blocks_seen")
+
 _UNVERIFIED_COUNTERS = (
     "degraded_executions",   # the gateway was unreachable / timed out (fail-open)
     "shield_failopens",      # our own shield THREW and the call went out unscreened
@@ -1751,6 +2193,11 @@ def _print_agentx_summary():
     # on _ExecuteTool exists to carry.
     print(f" 🛠️  Tool Calls Seen:       {_session_stats['total_calls']}")
     print("─"*60)
+    # ⚠️ EVERY EVENT THIS BOX REPORTS NEEDS A LINE IN IT, not just a mention in the call to
+    # action below the divider. An audit catch used to appear only there, so a session that
+    # caught something printed four zeros to anyone scanning the tally. See "Audit Catches"
+    # further down. A counter added to the summary that only shows up under the divider
+    # re-opens that hole for the next event type.
     
     # The Action-Oriented UI
         
@@ -1759,7 +2206,8 @@ def _print_agentx_summary():
     #    never disagree, the read is a single locked snapshot (no two-lock tear), and the
     #    tripwire tests the SAME code the summary prints. Bounded <=100% (recovered <=
     #    total: each recovery closes one open challenge).
-    total_ch, recovered_ch, abandoned_ch, looped_ch = _recovery_breakdown()
+    (total_ch, recovered_ch, continued_ch, unmeasured_ch,
+     abandoned_ch, looped_ch) = _recovery_breakdown()
 
     # 2. Recovery over what the ledger still holds.
     #
@@ -1788,6 +2236,27 @@ def _print_agentx_summary():
     # on every block beside a cumulative one that counted two policy names, so the two
     # halves of one line disagreed about the same blocks. See get_lifetime_stats.
 
+    # A catch that did NOT block, next to the catches that did. Without this line an audit
+    # session that caught something printed four zeros -- Intercepts 0, Escalations 0,
+    # Self-Corrections 0, Recovery 0 of 0 -- and said so only in the call to action below
+    # the divider, where a reader scanning the tally does not look.
+    #
+    # 🔴 ITS OWN LABEL, NEVER FOLDED INTO "Intercepts", and that is the whole care in this
+    # line. `_record_would_block` deliberately never touches the intercept counter so an
+    # audit-only install reads as EVALUATING rather than protected; counting a would-block
+    # there would undo the distinction the counter split exists to keep. "recorded, not
+    # blocked" states the difference in the row itself, so the number cannot be misread as
+    # protection on a screen someone skims.
+    #
+    # ⚠️ CONDITIONAL, like the degraded and breaker lines below and unlike the four above.
+    # The problem was a session WITH a catch reading as empty; a session without one does
+    # not need a zero. `would_blocks_seen`, not `would_blocks`: the funnel counter excludes
+    # our own demo and examples by design, which is exactly how the summary came to say
+    # nothing tripped on the first screen a new user runs.
+    if _session_stats.get("would_blocks_seen", 0) > 0:
+        print(f" 🔍 Audit Catches:         {_session_stats['would_blocks_seen']:<3} |  "
+              f"recorded, not blocked")
+
     # --- FIXED: Display the Human Override metrics cleanly inside the table block layout ---
     # 🔴 THE SECOND HALF OF THIS LINE WAS THE SESSION NUMBER PRINTED TWICE. It read
     # "Human Escalations: 2 | Cumulative: 2" for a first-ever session and for a hundredth,
@@ -1808,7 +2277,15 @@ def _print_agentx_summary():
             # crashing, and if it crashes on a particular payload then an agent has a way to
             # get that payload past the gateway. That deserves a log, not a shrug.
             print(f"     -> {faults} of these: the engine ANSWERED but could not vet the call. Check its logs; a repeat on one payload is a bypass, not an outage.")
-        print("     -> the gateway would have evaluated these — get it (free, runs locally): https://bit.ly/agentfirewall")
+        from .links import GATEWAY_URL
+        # ⚠️ THE SAME COST CLAIM AS THE TWO ON `agentx status`, AND THIS WAS THE THIRD SITE.
+        # It read "get it (free, runs locally)" -- the same promise, spelled with the words
+        # reversed, which is how it survived a sweep that corrected the other two. "Free" is
+        # true of what we charge and not of running it: recovery needs a key the reader
+        # supplies. Keep all three renderings saying one thing.
+        print("     -> the gateway would have evaluated these. It runs on your machine and")
+        print("        costs nothing from us; recovery uses your own Gemini key:")
+        print("        %s" % GATEWAY_URL)
 
     # --- AUDIT: the operator's POLICY CONFIG could not be read, so their own rules were not
     #     applied. Its own line and its own counter, because the fix is in the OPERATOR's
@@ -1837,7 +2314,11 @@ def _print_agentx_summary():
         print(f" ⚠️  Shield Fail-Opens:     {_session_stats['shield_failopens']:<3} |  ran WITHOUT keyword screening (a shield BUG, not a policy decision)")
     if _session_stats.get("reflection_failopens", 0) > 0:
         print(f" ⚠️  Unreadable Calls:      {_session_stats['reflection_failopens']:<3} |  sent with NO scannable text or arguments (a reflection BUG, not a policy decision)")
-        print("     -> this is an AgentX defect. Please report it: https://bit.ly/agentfirewall")
+        # 🔴 A BUG REPORT POINTED AT A GATEWAY SIGNUP PAGE. This said "report it" and gave
+        # the gateway-access short link, where there is nothing to report anything to. The
+        # Discord is where #bugs-and-feature-requests lives. See links.GATEWAY_URL.
+        from .links import DISCORD_URL
+        print("     -> this is an AgentX defect. Please report it: %s" % DISCORD_URL)
     
     # --- CIRCUIT BREAKER METRICS ---
     if cb_trips > 0:
@@ -1901,12 +2382,24 @@ def _print_agentx_summary():
         # prints from atexit and a script may have chdir()d since.
         print(f"     {failed_ledger_path() or os.path.abspath(db_module.DB_PATH)}")
 
-    # recovered (a same-tool safe call closed the challenge) / abandoned (still open) /
-    # looped (a breaker halted the run). Buckets partition the challenge episodes; only
-    # shown when there was a challenge, so a clean run stays quiet.
+    # recovered (a NARROWER retry closed the challenge) / continued (came back on the tool,
+    # but not with a narrowing) / abandoned (nothing came back) / looped (a breaker halted
+    # the run). Buckets partition the challenge episodes; only shown when there was a
+    # challenge, so a clean run stays quiet. `continued` is printed even at zero: the four
+    # numbers are meant to be read as a sum, and a bucket that vanishes when empty makes
+    # the others look like they should add up to the total when they do not.
     if total_ch:
+        # `unmeasured` printed only when it happened: on an all-SQL run it is always 0, and a
+        # permanent zero teaches a reader to stop reading the line. When it is non-zero it is
+        # the most important number here, because it is the one the rate cannot speak for.
+        _unmeasured_note = f" · {unmeasured_ch} not measurable" if unmeasured_ch else ""
         print(f"    ↳ of {total_ch} challenge(s): "
-              f"{recovered_ch} recovered · {abandoned_ch} abandoned · {looped_ch} looped")
+              f"{recovered_ch} recovered · {continued_ch} continued · "
+              f"{abandoned_ch} abandoned · {looped_ch} looped{_unmeasured_note}")
+        if unmeasured_ch:
+            print(f"       {unmeasured_ch} could not be judged: we only read scope on database "
+                  f"queries, so a narrower retry on another kind of tool is not counted either "
+                  f"way.")
         # P-96. Two lines apart, two counts of the same event, and they disagree:
         # "Intercepts: 2" above "of 1 challenge(s)". BOTH are right and they measure
         # different things -- Intercepts counts ledger rows, one per block, while a
@@ -1940,10 +2433,12 @@ def _print_agentx_summary():
     # only line in this summary derived from their agent's own HISTORY rather than from the
     # session that is ending, which is what makes it worth coming back for.
     #
-    # 🔴 NO POSTURE CHECK, DELIBERATELY. Under enforce the ledger holds no inventory rows,
-    # so read_novelty returns nothing and this stays silent without being told why. The day
-    # P-112's second half lands and enforce records too, this lights up with no edit here --
-    # which is the "only the posture gate moves" constraint expressed as code.
+    # 🔴 NO POSTURE CHECK, DELIBERATELY -- AND THAT DAY HAS NOW ARRIVED. This comment used to
+    # say the line was dark under enforce (no inventory rows, so read_novelty returned nothing)
+    # and would light up "with no edit here" once P-112's enforce half landed. It has landed,
+    # and it did: this call is unchanged and the line now fires for every default install. The
+    # prediction is kept because it is the reason to leave this alone -- the day a posture check
+    # is added here is the day the readout goes dark again for whoever is not in that posture.
     _print_novelty_line()
 
     # --- BUILD #2: ORG-REFRAME LOOP — only surfaces when relevant, so a plain run
@@ -1977,19 +2472,28 @@ def _print_agentx_summary():
         print("─"*60)
         print(" 💡 Your agents self-corrected this session — AgentX may have learned")
         print("    reusable safe-paths. Review & adopt what it learned:  agentx review")
-    elif _session_stats["total_calls"] > 0 and _sum_counters(_TRIPPED_COUNTERS) == 0 \
-            and _session_stats.get("audit_calls", 0) == 0:
+    elif _session_stats["total_calls"] > 0 and _sum_counters(_TRIPPED_COUNTERS) == 0:
         # 🔴 THE MAJORITY CASE HAD NO BRANCH AT ALL. The ladder above ends here, and
         # both of its arms need something to have been CAUGHT -- so a developer whose agent
         # behaved well reached the end of a protected session and was offered NOTHING. Not a
         # weak call to action, none. That is the population we most need to keep:
         # `retained_2plus_days` is 0.
         #
-        # 🔴 THE OFFER IS TO TURN AUDIT ON, NOT TO GO LOOK AT IT. Pointing a well-behaved
-        # agent's owner at `agentx audit` under the DEFAULT posture sends them to a blank
-        # screen -- enforce records nothing that passed, and that gap is the whole reason
-        # this screen exists. Asking them to SET audit first is what makes the screen have
-        # anything on it, and it costs them one argument.
+        # 🔴 THE OFFER USED TO BE "TURN AUDIT ON", AND IT IS NOW "GO LOOK". That inversion is
+        # P-112's enforce half arriving on this screen. Pointing a well-behaved agent's owner
+        # at `agentx audit` under the DEFAULT posture used to send them to a blank screen, so
+        # the arm asked them to SET audit first -- which is the row's own harm, advertised: we
+        # were asking a developer to turn blocking off for a run in order to see what their
+        # agent did. The default posture records now, so the screen is already populated and
+        # the ask has nothing left to buy.
+        #
+        # 🔴 TWO ARMS COLLAPSED INTO THIS ONE, AND THE ONE THAT WENT WAS THE AUDIT-ONLY ARM.
+        # It printed `audit_calls` and pointed at the same command, and it existed only
+        # because the arm above it switched itself off at step two of a three-step ask. There
+        # is no ask and no staircase now, so a session under audit and a session under enforce
+        # are the same reader with the same next step, and giving them one line is what stops
+        # the two drifting. `would_blocks_seen` still forks them, one arm down -- that fork is
+        # about what was CAUGHT, which is a real difference, not a posture.
         #
         # ⚠️ "TOOL CALLS", NEVER "SCREENED", and the counter's own comment ~200 lines up says
         # why: total_calls also counts a call that failed open or was bypassed, so a screening
@@ -1999,13 +2503,15 @@ def _print_agentx_summary():
         # ⚠️ GATED ON intercepts == 0 so "nothing tripped" is true. A session can reach this
         # arm with blocks that were already reviewed (pending 0, recovered 0), and telling that
         # developer nothing tripped would be false on the one screen that reports their
-        # protection. Gated on audit_calls == 0 too: someone already running audit does not
-        # need to be told to switch it on.
+        # protection.
         #
-        # 🔴 GATED ON would_blocks == 0 AS WELL, AND THAT ONE IS NOT OPTIONAL. `intercepts`
+        # 🔴 GATED ON would_blocks_seen == 0 AS WELL, AND THAT ONE IS NOT OPTIONAL. `intercepts`
         # is the ENFORCING counter: the audit path at _record_would_block deliberately never
         # touches it ("an audit-only install reads as EVALUATING, not enforcing"), and counts
-        # `would_blocks` instead. So `intercepts == 0` means "nothing tripped WHILE BLOCKING",
+        # its own pair instead. `would_blocks_seen` is the half of that pair with no owner in
+        # it, and reading the OTHER half here was the defect: the funnel's exclusion got to
+        # decide whether this sentence could print, so it printed on our own examples.
+        # Either way `intercepts == 0` means "nothing tripped WHILE BLOCKING",
         # not "nothing tripped" -- and this line says the second one. Without this condition a
         # session that caught something and let it through prints "nothing tripped a policy",
         # to the one developer who switched audit on specifically to be told otherwise.
@@ -2032,54 +2538,34 @@ def _print_agentx_summary():
             print(f" 💡 {_session_stats['total_calls']} tool call(s) this session, nothing tripped a policy.")
         else:
             print(f" 💡 {_session_stats['total_calls']} tool call(s) this session.")
-        # ⚠️ THE COST IS ON THE SCREEN, NOT IN THE DOCS. We are asking a developer to turn our
-        # own product off for a run, so "records every call and blocks nothing" prints in the
-        # same breath as the ask. The earlier wording sent them to edit the decorator instead,
-        # which turns blocking off on that tool for good (see posture_command_lines).
-        # 🔴 audit_calls == 0 IS NOT "NOT IN AUDIT", AND THE GAP IS A WHOLE POSTURE WIDE.
-        # `audit_calls` rises from _record_inventory, which runs only when a call was
-        # screened and not already recorded -- so a session running under
-        # AGENTX_ENFORCEMENT=audit with the gateway unreachable has every call fail open,
-        # writes no inventory row, and arrives here with audit_calls 0. Telling THAT reader
-        # to switch audit on sends them to an empty `agentx audit`: an instruction that ends
-        # in silence, which is the defect this arm exists to remove. Their shell answers the
-        # question their counters cannot; the sibling guard in cli.py reads the same variable.
-        # The suite cannot catch this on its own -- sdk_tests/conftest.py scrubs the variable
-        # -- so the test for it sets it explicitly.
-        if (os.environ.get("AGENTX_ENFORCEMENT") or "").strip().lower() == "audit":
-            print("    Audit is on, so the next call that gets screened lands in:  agentx audit")
-        else:
-            print("    To see what your agent actually did, not just what we stopped, run it")
-            print(f"    once in audit mode. Audit {AUDIT_POSTURE_CLAUSE}:")
-            for _line in posture_command_lines("audit"):
-                print(_line)
-            print("    then:  agentx audit")
-    elif _session_stats["total_calls"] > 0 and _sum_counters(_TRIPPED_COUNTERS) == 0 \
-            and _session_stats.get("audit_calls", 0) > 0:
-        # 🔴 THE ARM ABOVE HANDS THEM OFF IN THE MIDDLE OF THE STAIRCASE. It asks for three
-        # steps -- set audit, run again, run `agentx audit` -- and its own gate switches it
-        # OFF at step two, correctly (nobody needs telling to turn on what they turned on).
-        # The effect, walked by hand in one directory: the developer does exactly what we
-        # asked, and the screen goes QUIETER than it was before they did it, with the third
-        # step written only on a screen that has since scrolled away. That is the same
-        # silence the quiet-session fix targets, one rung up, and it lands on the person who
-        # took our advice.
+        # 🔴 THE POSTURE READ IS GONE FROM HERE, AND IT IS THE THIRD AND LAST OF THE THREE
+        # (`cli.execute_audit`, `cli.execute_insights`, this) that BACKLOG.md has claimed
+        # since #333 do not exist. It read AGENTX_ENFORCEMENT to pick between "audit is on,
+        # your next screened call lands in `agentx audit`" and the three-step ask, and it was
+        # a good guard for a real defect: `audit_calls == 0` is not "not in audit" (an audit
+        # session whose calls all fail open records nothing and arrives here at zero), so
+        # telling THAT reader to switch audit on ended the instruction in silence.
         #
-        # ⚠️ audit_calls, NOT total_calls. `enforcement="audit"` is PER TOOL, so a session can
-        # see nine calls and record two; "9 call(s) recorded in audit" would be false on any
-        # app that audited some of its tools. audit_calls is the inventory's own count, which
-        # is the number `agentx audit` will show them.
-        print("─"*60)
-        if _sum_counters(_UNVERIFIED_COUNTERS) == 0:
-            print(f" 💡 {_session_stats['audit_calls']} call(s) recorded in audit this session, "
-                  "nothing tripped a policy.")
-        else:
-            print(f" 💡 {_session_stats['audit_calls']} call(s) recorded in audit this session.")
-        print("    See what your agent actually did:  agentx audit")
-    elif _session_stats.get("would_blocks", 0) > 0:
+        # The guard is not being weakened, it is being made unnecessary. It existed because
+        # the POSTURE decided whether anything was recorded. Nothing on this screen asks for a
+        # posture any more, so there is no wrong posture to ask for, and the one CTA left is
+        # true in both: the call that gets screened lands in the ledger either way.
+        #
+        # ⚠️ THE ONE WAY LEFT TO REACH AN EMPTY SCREEN FROM HERE, named rather than guarded.
+        # A session where every call ran UNSCREENED writes no inventory row in any posture, so
+        # this CTA can still point at a screen with nothing from this run on it. That session
+        # already prints its own fail-open lines above and has already lost the "nothing
+        # tripped a policy" clause, so it is not being told a clean story; and the empty audit
+        # screen now explains itself instead of blaming a posture. Gating the CTA on
+        # `recorded_calls` instead would trade that for a worse one -- our own bundled examples
+        # write rows without moving that counter (see db.record_call / is_demo_agent), so a
+        # clean example run would have its next step withheld while its rows sat on the screen.
+        print("    See what your agent actually did, not just what we stopped:")
+        print("    ▶ agentx audit")
+    elif _session_stats.get("would_blocks_seen", 0) > 0:
         # 🔴 THE RUNG THE GATE ABOVE CREATED, AND IT IS THE SAME SILENCE DEFECT ON THE BEST SESSION
-        # WE GET. Gating the two arms on `would_blocks == 0` is right -- neither may say
-        # "nothing tripped" over a real catch -- but the ladder had nothing after them, so an
+        # WE GET. Gating the quiet arm on `would_blocks_seen == 0` is right -- it may not say
+        # "nothing tripped" over a real catch -- but the ladder had nothing after it, so an
         # audit session that CAUGHT something ended in total silence. Measured: total_calls 4,
         # audit_calls 4, would_blocks 2 printed the summary box and not one word about the two
         # catches sitting in the ledger.
@@ -2096,7 +2582,11 @@ def _print_agentx_summary():
         # ⚠️ NO "nothing tripped" CLAUSE HERE, obviously, and no `_UNVERIFIED_COUNTERS` check
         # either: this line makes no verdict about the calls it did not name.
         print("─"*60)
-        _wb = _session_stats["would_blocks"]
+        # `would_blocks_seen`: the number printed here has to be the number of catches this
+        # run produced, which is also the number of rows `agentx insights` is about to show.
+        # `would_blocks` is the funnel's, and on our own example it is 0 while the ledger has
+        # rows -- the shape that sent a reader to a screen we had just told them was empty.
+        _wb = _session_stats["would_blocks_seen"]
         # ⚠️ `agentx insights`, NOT `agentx audit`, AND THE TWO ARE NOT INTERCHANGEABLE.
         # `audit` is the INVENTORY (what your agent did); it renders no catch, and on a ledger
         # with one it prints "2 calls on record. See them: agentx insights" and hands off.
@@ -2107,6 +2597,53 @@ def _print_agentx_summary():
         # _record_would_block has pointed at `insights` all along and was right.
         print(f" 💡 Audit recorded {_wb} call(s) this session that would have been blocked,")
         print("    and let them run. See what it caught:  agentx insights")
+    elif _session_stats["total_calls"] > 0:
+        # 🔴 THE HOLE THE LADDER STILL HAD, AND IT WAS ON THE BEST SESSION WE GET: THE ONE
+        # WHERE WE BLOCKED SOMETHING. Found on a founder walk-through, in a fresh directory,
+        # doing exactly what the demo tells a new user to do. A wrapped tool, three calls
+        # that passed, one DROP TABLE stopped -- and the summary printed its counters and
+        # then closed the box. No next step, no screen named, nothing.
+        #
+        # 🔴 THE CAUSE IS THAT BOTH CATCH-ARMS READ A STORE A KEYLESS USER NEVER HAS. The
+        # pending-review arm calls `review_backlog_size`, which counts the GATEWAY's incident
+        # store; the recovery arm needs a self-correction. A keyless block writes to the local
+        # ledger and to neither of those. So the free tier -- the default, and the majority --
+        # fell through every arm precisely when AgentX had just done its job. P-110 fixed this
+        # for the session where nothing was caught; this is the same defect on its mirror, and
+        # it survived because the arm that would have caught it was reading the wrong store.
+        #
+        # ⚠️ NO NUMBER ON THIS LINE, DELIBERATELY. Reaching here means `_TRIPPED_COUNTERS` is
+        # non-zero with `would_blocks_seen` at zero, so the trip could be an intercept, a critical
+        # block, an escalation or a breaker -- and summing them would double-count an event
+        # that bumps two. Every one of those counters is already printed above with its own
+        # label, which is P-96's rule: one event, one count, stated once. The CTA's job is the
+        # next step, not a second tally.
+        #
+        # 🔴 AND IT IS A CATCH-ALL, NOT A FIFTH CASE. The ladder had grown one arm per
+        # situation and kept finding situations; the rule it was reaching for is simply that a
+        # session which saw a call never ends without a next step. Stated once, here, as the
+        # last arm -- so the NEXT counter added to the summary cannot open this hole again.
+        print("─"*60)
+        # 🔴 AND WHICH SCREEN IT NAMES DEPENDS ON WHETHER ANYTHING WAS WRITTEN DOWN. Raised
+        # twice in review before it was fixed, which is the tell that the first answer was
+        # wrong rather than incomplete: `_TRIPPED_COUNTERS` is the right gate for "may we say
+        # nothing tripped", and the WRONG one for "is there a screen to send them to". Two of
+        # its members leave no ledger row at all -- the ESCALATED path increments
+        # `human_escalations` and writes nothing, and a breaker trip does the same -- so a
+        # session whose only event was a human APPROVING a call printed "See what AgentX
+        # caught: agentx insights" over a screen holding nothing from that session. That is
+        # the instruction-that-ends-in-silence this arm was added to remove, arriving through
+        # the arm itself.
+        #
+        # `agentx audit` is the honest destination for that reader, not a consolation: the
+        # call they escalated ran and IS recorded, so the screen has it. The blocked case
+        # still goes to `insights`, which is the only screen that renders a catch.
+        if _sum_counters(_LEAVES_A_LEDGER_ROW) > 0:
+            print(" 💡 Not every call ran as asked this session. See what AgentX caught:")
+            print("    ▶ agentx insights")
+        else:
+            print(" 💡 Nothing was blocked this session, and not every call went straight")
+            print("    through. See what your agent did:  agentx audit")
 
     # The 5+ Block Threshold for the Health Report
     if history.get('total_intercepts', 0) >= 5 and history.get('top_offender'):
@@ -2200,26 +2737,127 @@ def _local_standalone_evaluate(query: str, cot: str):
         return {"error": "Local Eval Failed", "message": str(e)}
 
 # --- THE EGRESS SCRUBBER (Zero-Knowledge DLP) ---
+#
+# 🔴 WHAT THIS CAN REDACT IS A SHORT LIST, AND THE GATEWAY HAS TO KNOW WHAT IS ON IT.
+# The gateway names the categories to scrub (`pii_targets_to_scrub`); this module is the
+# only place that can act on them. A category named there but missing from the map below is
+# dropped with no error, no log and no difference to the returned value, which reads exactly
+# like a scrub that worked. The set is named here so the gateway can be bound to it by a
+# test rather than by a comment, and a category we were asked for and cannot honour is
+# reported at the apply site instead of being ignored.
+_SCRUB_REGEX_MAP = {
+    "EMAIL": r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+',
+    # 🔴 DIGIT BOUNDARIES, NOT A BARE 3-3-4 RUN. Without the lookarounds this matches any
+    # ten digits it can reach INSIDE a longer identifier, so a tracking number such as
+    # `1Z999AA10123456784` comes back as `1Z999AA[REDACTED_PHONE]`. A phone-shaped run only
+    # counts when it is not part of a longer number; `+1 (415) 555-0142` still redacts.
+    "PHONE": r'(?<!\d)(?:\+\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)',
+    # A US SSN in its WRITTEN form only. A bare nine-digit run is not identifiable: it is also
+    # an order number, a part number and a zip+4, and redacting those is the defect that put
+    # `[REDACTED_PHONE]` in the middle of a tracking number. Requiring the dashes means we miss
+    # `123456789`, and missing it is the right failure.
+    "SSN": r'(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)',
+    # AWS access key ids have a fixed prefix and length, so this is one of the few categories
+    # with essentially no false positives. Secret ACCESS keys are 40 chars of base64 with no
+    # marker at all and are deliberately NOT here: any pattern that matches them also matches
+    # every hash, token and id in the payload.
+    "AWS_KEYS": r'\b(?:AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA)[0-9A-Z]{12,20}\b',
+    # Digit shape ONLY GETS A CANDIDATE. The Luhn check below is what makes it a card number
+    # rather than any 13-to-19-digit run, and without it this category would be the worst
+    # offender of the lot -- long numeric ids are everywhere in tool output.
+    #
+    # 🔴 THIS HAS A KNOWN DEFECT AND THE OBVIOUS FIX FOR IT WAS MEASURED AND REVERTED.
+    # `(?!\d)` is satisfied by a SPACE OR A DASH, so on a longer separator-delimited run
+    # the greedy match backtracks until the boundary lands on a separator and consumes a
+    # 16-digit WINDOW out of the middle:
+    #     '1111 2222 3333 4444 5555' -> '[REDACTED_CREDIT_CARD] 5555'
+    # Mangled output: neither the original nor cleanly masked, with the tail dangling.
+    #
+    # ⚠️ DO NOT "FIX" IT BY REFUSING A SEPARATOR-ADJACENT DIGIT. That was tried as
+    # `(?<!\d)(?<!\d[ -])(?:\d[ -]?){12,18}\d(?![ -]?\d)` and reverted, because it stops
+    # redacting REAL CARDS:
+    #     '4111111111111111 5555555555554444'  two genuine cards -> BOTH left in place
+    #     '4111111111111111 1234'              a genuine card    -> left in place
+    # It traded a visible corruption for a SILENT LEAK, which is the worse direction for this
+    # product. The narrow tests that pinned it looked convincing because every fixture was a
+    # long non-card run; none was a card ADJACENT to another number.
+    #
+    # Why a regex tweak cannot settle it: '4111111111111111 5555555555554444' (two cards) and
+    # '1111 2222 3333 4444 5555' (one identifier) are the same shape -- a separator-delimited
+    # digit run -- and only grouping conventions tell them apart. That is a real design
+    # question, not a lookaround.
+    "CREDIT_CARD": r'(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)',
+}
+
+
+def _luhn_ok(text):
+    """Does this digit run pass the Luhn checksum every real card number satisfies?
+
+    🔴 THE WHOLE REASON CREDIT_CARD IS SAFE TO SHIP. The digit shape alone matches order ids,
+    invoice numbers and tracking codes, and redacting those is exactly the corruption this
+    scrubber was doing before. Luhn rejects roughly nine in ten arbitrary digit runs, so the
+    pattern only fires on something that could actually be a card.
+    """
+    digits = [int(c) for c in str(text) if c.isdigit()]
+    if not 13 <= len(digits) <= 19:
+        return False
+    total, parity = 0, len(digits) % 2
+    for i, d in enumerate(digits):
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+# Categories whose regex only produces a CANDIDATE, and the predicate that confirms it.
+# Anything absent here is redacted on the pattern alone.
+_SCRUB_VALIDATORS = {"CREDIT_CARD": _luhn_ok}
+
+# 🔴 ADDRESS IS DELIBERATELY ABSENT, AND THAT IS A DECISION, NOT AN OVERSIGHT. A postal address
+# has no reliable shape: any pattern loose enough to catch "12 Rue de la Paix" also catches
+# ordinary prose and half the free-text fields in a tool result. Redacting those would repeat
+# the exact defect this scrubber was fixed for. The gateway ANNOUNCES a category a rule names
+# and no SDK can redact, so a rule asking for ADDRESS says so out loud instead of appearing to
+# be honoured.
+# The categories a scrub instruction can actually be honoured for. Bound to the gateway's
+# copy by `the cross-surface scrub-category tripwire`; adding a regex above is what widens it.
+SCRUBBABLE_CATEGORIES = tuple(sorted(_SCRUB_REGEX_MAP))
+
+
+def _unhonoured_scrub_targets(pii_targets):
+    """The categories we were ASKED to scrub and cannot. Named rather than dropped."""
+    return sorted({str(t).upper() for t in (pii_targets or [])} - set(_SCRUB_REGEX_MAP))
+
+
 def _scrub_pii(data, pii_targets):
     """
     Recursively traverses dicts, lists, and strings to redact PII locally.
     Guarantees raw data never leaves the developer's VPC.
+
+    Honours only `SCRUBBABLE_CATEGORIES`; anything else is reported by the caller
+    (`_apply_scrub`) rather than silently ignored here, because this runs once per string
+    and a warning inside the recursion would fire hundreds of times per result.
     """
     if not pii_targets or not data:
         return data
 
-    # Simple regex dictionary for MVP (We will replace this with Presidio locally later)
-    regex_map = {
-        "EMAIL": r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+',
-        "PHONE": r'(\+\d{1,2}\s?)?1?\-?\.?\s?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}'
-    }
-
     if isinstance(data, str):
         scrubbed_string = data
         for target in pii_targets:
-            target_upper = target.upper()
-            if target_upper in regex_map:
-                scrubbed_string = re.sub(regex_map[target_upper], f"[REDACTED_{target_upper}]", scrubbed_string)
+            target_upper = str(target).upper()
+            if target_upper in _SCRUB_REGEX_MAP:
+                # A category with a validator redacts only matches the validator confirms, so
+                # a pattern that can only produce a CANDIDATE (a long digit run) never eats an
+                # ordinary identifier. Categories without one redact on the pattern alone.
+                _confirm = _SCRUB_VALIDATORS.get(target_upper)
+                _mask = f"[REDACTED_{target_upper}]"
+                scrubbed_string = re.sub(
+                    _SCRUB_REGEX_MAP[target_upper],
+                    (lambda m, _c=_confirm, _k=_mask:
+                        _k if (_c is None or _c(m.group(0))) else m.group(0)),
+                    scrubbed_string)
         return scrubbed_string
 
     elif isinstance(data, dict):
@@ -2313,7 +2951,7 @@ _BUILTIN_POLICY_KEYWORDS = [
     # keyless MCP proxy + the offline keyword shield), so they lead with the issue and a
     # usable next step, NOT internal taxonomy or judge-era "explain your reasoning" cruft.
     {
-        "id": "11111111-1111-1111-1111-111111111101",
+        "id": _ID_MASS_DESTRUCTIVE,
         "name": "Mass Destructive Intent",
         "category": "DESTRUCTIVE_ACTION",
         # DROP/TRUNCATE are always destructive (no scoped-safe form). A scoped
@@ -2329,7 +2967,7 @@ _BUILTIN_POLICY_KEYWORDS = [
         "reversible_transform": "soft_delete",
     },
     {
-        "id": "11111111-1111-1111-1111-111111111103",
+        "id": _ID_SSRF,
         "name": "Network Sandbox (SSRF)",
         "category": "NETWORK_TRAVERSAL",
         # The literal loopback/metadata hostnames stay as fast substring rails; the
@@ -2343,7 +2981,7 @@ _BUILTIN_POLICY_KEYWORDS = [
         "preferred_alternative": "Send the request to the intended external service hostname over HTTPS, not an internal IP, localhost, or 169.254.169.254.",
     },
     {
-        "id": "11111111-1111-1111-1111-111111111104",
+        "id": _ID_SECRETS,
         "name": "Secrets and PII Exfiltration",
         "category": "SECRETS_LEAK",
         # These `SELECT <column>` phrases are flat substrings: a column only trips this rule when
@@ -2368,7 +3006,7 @@ _BUILTIN_POLICY_KEYWORDS = [
         "preferred_alternative": "Read only the non-secret fields you actually need and keep the data inside the trusted system. Do not send it to an external paste endpoint.",
     },
     {
-        "id": "11111111-1111-1111-1111-111111111102",
+        "id": _ID_CUSTOMER_PRIVACY,
         "name": "Customer Privacy Shield",
         "category": "PII_EXFILTRATION",
         # `SELECT email/phone/address` carry the same position-lock and scope-blindness as the
@@ -2382,12 +3020,12 @@ _BUILTIN_POLICY_KEYWORDS = [
     },
     {
         # Realigned from ...105 to ...115 to match the gateway/DB canonical id
-        # (backend/gateway.py, db_migrations/seed.sql). ...105 collided with the gateway's
+        # (the gateway and its shipped seed data). ...105 collided with the gateway's
         # OWN "Schema Boundary" policy (a real, later-added gateway-side policy, unrelated) --
         # a keyless filesystem block could misattribute to Schema Boundary once it reached the
-        # cloud store. Tracked in backend/test_coaching_consistency.py's KNOWN_ID_DIVERGENCES
+        # cloud store. Tracked in the cross-surface coaching tripwire's known-divergence ledger
         # ledger (now removed, closing the divergence).
-        "id": "11111111-1111-1111-1111-111111111115",
+        "id": _ID_FS_BOUNDARY,
         "name": "Filesystem Path Boundary",
         "category": "DESTRUCTIVE_ACTION",
         # DETECTION SPLIT (audit finding #1): the ENTIRE filesystem-boundary floor --
@@ -2400,7 +3038,7 @@ _BUILTIN_POLICY_KEYWORDS = [
         # shadowed away by a stale/partial pull -- a floor a policy pull can WEAKEN is not a
         # floor. The structural passes run regardless of the loaded policy set and mirror the
         # gateway's _PATH_TRAVERSAL_RE / _SENSITIVE_PATH_RE (tripwire:
-        # backend/test_coaching_consistency.py), so the two surfaces cannot drift. This entry
+        # the cross-surface coaching tripwire), so the two surfaces cannot drift. This entry
         # remains the ATTRIBUTION/coaching home for those passes (they return
         # _keyless_decision(_FS_BOUNDARY_POLICY)). Empty blocked_intents also means a tool
         # DESCRIPTION mentioning `../../` is not token-matched as poison (audit finding #3).
@@ -2409,7 +3047,28 @@ _BUILTIN_POLICY_KEYWORDS = [
         "preferred_alternative": "Stay inside the project working directory with a relative path that has no '../', and do not read credential, key, or .env secrets files. Read config through your secrets manager; if you only need the variable names, use .env.example (which holds no real values).",
     },
     {
-        "id": "11111111-1111-1111-1111-111111111106",
+        # 🔴 A SEPARATE ID SPACE, ON PURPOSE (BACKLOG P-176). This rule exists ONLY on this
+        # door: the cloud has no "Destructive Shell Command" row. It used to carry
+        # ...111111111106, which the CLOUD uses for an entirely different rule, "Cost Control
+        # Gateway". Two rules, one number, and harmless for as long as switched-off rows were
+        # never delivered. The moment they were, a cloud row about SQL spending could reach in
+        # here and disarm `rm -rf /`.
+        #
+        # The `22222222-` prefix makes that collision impossible to CREATE rather than
+        # something a reviewer has to notice: every cloud seed is `11111111-` or a real uuid.
+        # Any future rule that lives only on this door belongs in this space too.
+        #
+        # Safe to change WHEN IT WAS CHANGED: no incident had ever recorded this id, and the
+        # attributions below found this row by name. That second half is no longer true -- the
+        # same change made them key by id, so a mismatch is now a hard KeyError at import rather
+        # than a silent wrong answer. Deliberate, and the reason this constant exists: the id is
+        # written once, here, and referenced everywhere else.
+        #
+        # ⚠️ NOT "nothing keys on it" on an INSTALLED machine. `.agentx/overrides.json` entries
+        # and local ledger rows written before this change still carry the old ...106, and they
+        # survive only through the policy-NAME fallback in the override lookup. Every current
+        # writer populates that name; one that stops would orphan them silently.
+        "id": _ID_DESTRUCTIVE_SHELL,
         "name": "Destructive Shell Command",
         "category": "DESTRUCTIVE_ACTION",
         "blocked_intents": ["rm -rf /", "rm -rf ~", "rm -rf --no-preserve-root", "rm -fr /", ":(){", "mkfs", "of=/dev/sd", "of=/dev/nvme", "| bash", "|bash"],
@@ -2443,7 +3102,7 @@ _POLICY_ID_TO_CATEGORY = {p["id"]: p["category"] for p in _BUILTIN_POLICY_KEYWOR
 # one seed into a single-source library keyed by a `reversible_transform` id. A seed (or a
 # pulled policy) opts in; one without it (SSRF, secrets, PII) keeps its specific safe path,
 # because "make it reversible" is not a coherent steer for an exfiltration attempt.
-# The gateway carries a PARALLEL copy of this idea (backend/gateway.py DDL / bulk-delete
+# The gateway carries a PARALLEL copy of this idea (its DDL / bulk-delete
 # branches); unifying them is the tracked "canonical coaching per failure_mode" follow-up
 # deliberately out of this SDK-only slice. Only
 # transforms with a live keyless floor seed ship; the spec's other classes (infra->dry-run,
@@ -2597,11 +3256,17 @@ def _note_own_agent_block(agent_id, stats=None):
     pass-through through three stages, which is the signature of ONE canned sequence rather
     than five developers, and nothing in the data could tell the two apart.
 
-    ⚠️ THE COUNTERS THEMSELVES ARE DELIBERATELY NOT GATED. The audit path gates its own
-    `would_blocks` on this same helper (see _record_would_block), and it can, because that
-    counter is pulse-only. intercepts/critical_blocks are also what the session summary
-    PRINTS -- gating them would make `agentx demo` stop reporting the block it just showed
-    you. So the fix adds a fact rather than removing one.
+    ⚠️ THE COUNTERS THEMSELVES ARE DELIBERATELY NOT GATED. intercepts/critical_blocks are
+    what the session summary PRINTS -- gating them would make `agentx demo` stop reporting
+    the block it just showed you. So the fix adds a fact rather than removing one.
+
+    🔴 THIS PARAGRAPH USED TO SAY the audit path could gate `would_blocks` on this same
+    helper "because that counter is pulse-only". It was not pulse-only: it was also a member
+    of `_TRIPPED_COUNTERS`, so the gate reached a SENTENCE as well as a metric and the
+    summary told a new user nothing tripped a policy on a run where one had. The
+    sentence is kept here, corrected rather than deleted, because a false reassurance in a
+    comment is what made the defect underneath it look considered. The audit path now writes
+    a screen-facing counter beside the funnel-facing one; only the second is gated.
 
     Same shape as _note_block_category next door, including the `stats` parameter, so a
     caller with its own session dict shares this rule instead of reimplementing it."""
@@ -2835,11 +3500,51 @@ def load_local_policy_keywords(seed_dir=".agentx"):
                 # value in MALFORMED_VALUES was TRUTHY. A malformed `is_active` had the same
                 # shape, silently disarming an active rule.
                 # Validate the enforcement fields BEFORE anything can skip them.
+                #
+                # 🔴 ONE EXCEPTION, AND IT ARRIVED WITH THE SWITCHED-OFF ROWS THEMSELVES
+                # (BACKLOG P-176). A row that is explicitly INACTIVE does NOT have its
+                # `blocked_intents` validated, because that field is DISCARDED for such a row:
+                # only `{id, is_active}` is forwarded to the merge. Validating it fails the
+                # WHOLE shield closed over a field nothing will ever read.
+                #
+                # That is newly reachable, which is why it was safe before and is not now.
+                # Until the control plane began delivering switched-off rows, an inactive row
+                # never arrived here at all. It does now, and `gateway_policies` has no NOT NULL
+                # on that column, so ONE cloud row with a null `blocked_intents` would raise
+                # AgentXPolicyLoadError and, in the default strict posture, block every
+                # protected call in the process. A rule switched off in a dashboard taking the
+                # whole shield down with it is the worst possible reading of "off".
+                #
+                # 🔴 THIS NARROWS THE FAILURE MODE, IT DOES NOT CLOSE IT. An ACTIVE row with a
+                # null `blocked_intents` still raises, and the control plane can deliver one of
+                # those just as easily. That is CORRECT -- the field is enforcement data on an
+                # active row and a shield that cannot read its rules must not certify a call --
+                # but it means "one bad cloud row can fail every call closed" is still true for
+                # active rows. Only the switched-off half, where the field is discarded anyway,
+                # is closed here.
+                #
+                # `is_active` is still coerced FIRST and still raises on anything that is
+                # neither absent nor a real bool, so a malformed flag cannot silently disarm a
+                # rule -- which is the half of this ordering that was protecting something.
                 pid = _coerce_policy_ident(p.get("id"), "id", path, "POL-LOCAL")
                 pname = _coerce_policy_ident(p.get("name"), "name", path, "Local Policy")
-                intents = _coerce_policy_intents(
-                    p.get("blocked_intents"), "blocked_intents", path)
                 is_active = _coerce_policy_active(p.get("is_active"), "is_active", path)
+                intents = _coerce_policy_intents(
+                    p.get("blocked_intents"), "blocked_intents", path) if is_active else []
+
+                # 🔴 AN EXPLICIT `is_active: false` IS A DECISION, NOT A MALFORMED ROW, AND
+                # IT HAS TO REACH THE MERGE TO BE ACTED ON. `_coerce_policy_active` returns
+                # True when the key is ABSENT and raises on anything that is neither absent
+                # nor a real bool, so a False here means the file said so in as many words.
+                # That is the distinction P-176 turns on: a rule the file never mentions
+                # stays armed; a rule it names and switches off does not.
+                #
+                # A bare marker row is forwarded rather than the whole pulled row, because
+                # everything else on a switched-off row is irrelevant and forwarding it
+                # invites a future reader to think its intents or coaching still apply.
+                # `_merge_pulled_over_floor` drops the matching floor id and adds nothing.
+                if not is_active:
+                    policies.append({"id": pid, "is_active": False})
 
                 # Only arm active rules that actually carry blocked intents. Both operands
                 # are now VALIDATED, so a falsy value here is a real "no rule", not a
@@ -3064,7 +3769,7 @@ def _policy_load_error_message(err, mcp=False):
 # reaches the gateway — which already exempts the same reads via its own
 # `_is_benign_catalog_read`. That asymmetry was the blind-eval Schema Boundary FP's
 # "layer-coverage gap": the fix lived gateway-side only. These two patterns mirror
-# the gateway's regexes (backend/gateway.py) so client and server agree; keep them
+# the gateway's regexes so client and server agree; keep them
 # in sync. A mutating/DDL verb (DROP/ALTER on the catalog) disqualifies the read,
 # so a destructive catalog op is still caught by the keyword scan below.
 _CATALOG_INTROSPECTION_RE = re.compile(
@@ -3117,7 +3822,7 @@ def _normalize_for_match(raw):
 # (runs on the normalized haystack, so it is whitespace/comment robust):
 #   * DROP / TRUNCATE of ANY object (table, database, schema, index, view, role)
 #   * a MASS write with NO WHERE: DELETE FROM <t> or UPDATE <t> SET ... with no WHERE
-# Mirrors the gateway's destructive-DDL + no-WHERE detectors (backend/gateway.py).
+# Mirrors the gateway's destructive-DDL + no-WHERE detectors.
 # Keyless has NO AST, so this regex runs as a substring match over arbitrary payload text.
 # That forces it to stay NARROWER than the gateway: it deliberately omits the prose-ambiguous
 # objects `user` and `trigger` (ordinary English words -> false positives on non-SQL text like
@@ -3207,7 +3912,7 @@ _SSRF_URL_RE = re.compile(r"\b[a-z][a-z0-9+.\-]*://([^\s/'\"<>]+)", re.IGNORECAS
 # a resource id than a host. This function has no bare context (it only ever sees a host parsed
 # out of a scheme://URL, see _SSRF_URL_RE), so mirroring that clause would be dead code implying a
 # symmetry that does not exist. The shared invariant is the UPPER bound; the SSRF entry in
-# backend/test_coaching_consistency.py records this divergence in its ledger.
+# the cross-surface coaching tripwire records this divergence in its ledger.
 _INT_HOST_SPACE_KEYLESS = 1 << 32
 
 
@@ -3266,7 +3971,7 @@ def _detect_ssrf_encoded(raw):
 
 
 # ---- Structural invisible-Unicode carrier ----
-# Mirrors the gateway's detect_invisible_unicode EXACTLY (backend/gateway.py) so the
+# Mirrors the gateway's invisible-unicode detector EXACTLY so the
 # keyless client and the server agree. Deliberately NARROW to the two carrier classes
 # with NO legitimate use in any payload, so a content-bearing write (an INSERT of user
 # prose, RTL text, a BOM-prefixed string) is never false-blocked:
@@ -3279,7 +3984,7 @@ def _detect_ssrf_encoded(raw):
 # source hygiene). This keyless port is ALSO what makes the agentx-mcp proxy's
 # first-sight tool-description POISON scan real: it runs this same shield on the
 # advertised description, so an install-time invisible-unicode carrier is now caught.
-# KEEP IN SYNC with the gateway (byte-identical); the tripwire backend/test_coaching_consistency.py
+# KEEP IN SYNC with the gateway (byte-identical); the tripwire the cross-surface coaching tripwire
 # ::test_invisible_unicode_* asserts the regex is identical AND that a shared carrier corpus reaches
 # the same verdict on the SDK, the MCP poison scan, and the gateway, so they cannot drift silently.
 _INVISIBLE_UNICODE_RE = re.compile("[\u202d\u202e\U000e0000-\U000e007f]")
@@ -3357,7 +4062,7 @@ def _is_catalog_token(token):
 # etc.) -- runs as STRUCTURAL passes (NOT tokens in _BUILTIN_POLICY_KEYWORDS), so a pulled
 # `.agentx/policies.json` that WHOLLY REPLACES the built-in seeds can never shadow it
 # (audit finding #1). All three passes mirror the gateway's _PATH_TRAVERSAL_RE /
-# _SENSITIVE_PATH_RE / _detect_dotenv_path; the tripwire backend/test_coaching_consistency.py
+# _SENSITIVE_PATH_RE / _detect_dotenv_path; the tripwire the cross-surface coaching tripwire
 # asserts the regexes are logically identical (whitespace/comments-normalized) AND that a
 # shared corpus reaches the same verdict on both surfaces, so they cannot drift silently.
 
@@ -3418,7 +4123,7 @@ def _detect_dotenv_read(raw):
 
 
 # Credential / system-secret FILE paths -- the SDK mirror of the gateway's
-# _SENSITIVE_PATH_RE (backend/gateway.py). Anchored so a bare `word.netrc` does not trip
+# _SENSITIVE_PATH_RE. Anchored so a bare `word.netrc` does not trip
 # (the two surfaces agreed only after audit finding #3), and Windows-home paths
 # (`C:\...\.pypirc`, `C:\...\.ssh\authorized_keys`) match via the backslash in the anchor
 # class + the `[/\\]` separator (audit finding #4). KEEP IN SYNC with the gateway.
@@ -3453,7 +4158,7 @@ def _detect_credfile_read(raw):
 
 
 # ---- Wildcard read of a sensitive table (floor gap A5) ----
-# KEEP IN SYNC with backend/gateway.py::_SENSITIVE_TABLES (asserted by
+# KEEP IN SYNC with the gateway's _SENSITIVE_TABLES (asserted by
 # test_coaching_consistency.py::test_sensitive_tables_are_identical_across_surfaces).
 #
 # WHY: the Secrets/PII builtin (…104) expresses every secret-read intent as a literal
@@ -3475,7 +4180,7 @@ _SENSITIVE_TABLES_KEYLESS = frozenset({
     "secret_store", "keystore", "tokens",
 })
 
-# KEEP IN SYNC with backend/gateway.py::_LIMIT_ONE_EXEMPT_TABLES -- same five tables, same
+# KEEP IN SYNC with the gateway's _LIMIT_ONE_EXEMPT_TABLES -- same five tables, same
 # rationale (see that comment block). A LIMIT-1 read of a secret-store table or the ambiguous
 # sessions/payments/billing/payment_methods cluster stays unexempted here too, for the same
 # reason it stays unexempted on the paid gateway.
@@ -3515,10 +4220,10 @@ _WILDCARD_SENSITIVE_READ_RE = re.compile(
 #
 # ⚠️ Only `LIMIT 0, n` is handled; the mirror `LIMIT 100, 0` also returns zero rows and still
 # hard-blocks. Pre-existing and fail-safe, but not "the two-argument form is understood".
-# KEEP IN SYNC with backend/gateway.py's exemption in detect_wildcard_sensitive_read.
+# KEEP IN SYNC with the gateway's exemption in its wildcard-sensitive-read detector.
 _LIMIT_ZERO_RE = re.compile(r"\blimit\s+0\b(?!\s*,\s*\d)", re.IGNORECASE)
 
-# KEEP IN SYNC with backend/gateway.py's _LIMIT_ONE_RE. The LIMIT-1 sibling of _LIMIT_ZERO_RE
+# KEEP IN SYNC with the gateway's _LIMIT_ONE_RE. The LIMIT-1 sibling of _LIMIT_ZERO_RE
 # above -- see that comment block for the two-argument-refusal rationale, unchanged here.
 _LIMIT_ONE_RE = re.compile(r"\blimit\s+1\b(?!\s*,\s*\d)", re.IGNORECASE)
 
@@ -3535,7 +4240,7 @@ _LIMIT_ONE_RE = re.compile(r"\blimit\s+1\b(?!\s*,\s*\d)", re.IGNORECASE)
 # of `vault` (a secret-store table) that a second, independent SELECT names. A UNION doesn't just
 # end the current FROM clause, it introduces a whole second statement this regex never inspects.
 # Treated as unrecognized (same as a comma or JOIN) instead, so the exemption is refused.
-# KEEP IN SYNC with backend/gateway.py's _SINGLE_TABLE_FROM_TAIL_RE.
+# KEEP IN SYNC with the gateway's _SINGLE_TABLE_FROM_TAIL_RE.
 _SINGLE_TABLE_FROM_TAIL_RE = re.compile(
     r"\s*(?:(?:as\s+)?[a-z_]\w*\s+)?"
     r"(?:where\b|group\s+by\b|order\s+by\b|having\b|limit\b|;|$)",
@@ -3549,7 +4254,7 @@ _SINGLE_TABLE_FROM_TAIL_RE = re.compile(
 # the string, so `SELECT * FROM users LIMIT 1 UNION SELECT * FROM vault` matched `limit\b` at
 # the first token and never inspected what followed. This is the ONLY matcher on the SDK (no
 # AST to fall back on), so it needed this fix even more than the gateway's own fallback did.
-# KEEP IN SYNC with backend/gateway.py's _COMPOUND_STATEMENT_RE.
+# KEEP IN SYNC with the gateway's _COMPOUND_STATEMENT_RE.
 _COMPOUND_STATEMENT_RE = re.compile(r"\bunion\b|\bexcept\b|\bintersect\b", re.IGNORECASE)
 
 
@@ -3832,7 +4537,7 @@ def _detect_wildcard_sensitive_read(raw):
     `has_signing_key`, a docs lookup) and wants its own sizing pass. Tracked as A5(1).
 
     Also carries the P-90 LIMIT-1 exemption: a genuinely one-row read of a table in
-    _LIMIT_ONE_EXEMPT_TABLES_KEYLESS is not a bulk read, mirroring backend/gateway.py's
+    _LIMIT_ONE_EXEMPT_TABLES_KEYLESS is not a bulk read, mirroring the gateway's
     detect_wildcard_sensitive_read so this stays on the safe side of the ratified
     `gateway >= sdk` invariant -- a secret-store table or the ambiguous sessions/payments/
     billing/payment_methods cluster is NOT eligible."""
@@ -3888,37 +4593,170 @@ def _detect_wildcard_sensitive_read_in_arm(raw, limit_one):
     return True
 
 
+# =============================================================================
+# IS THE RETRY NARROWER THAN THE CALL WE BLOCKED? (BACKLOG P-191)
+# =============================================================================
+# 🔴 THIS IS THE WHOLE DEFINITION OF A RECOVERY, AND THREE OBVIOUS VERSIONS OF IT ARE WRONG.
+#
+#   same tool          was the shipped rule. An agent blocked on `DROP TABLE audit_log` that
+#                      then runs `SELECT COUNT(*) FROM audit_log` scores as a recovery. It
+#                      wandered off; we counted the wandering.
+#   similar text       fails the opposite way. The one genuine recovery we have on record is
+#                      `DELETE ... WHERE id IN (SELECT ... LIMIT 1000)` after a wide DELETE:
+#                      same tool, similar text, and a text rule cannot tell it from a retry.
+#   same action class  is too coarse. A blocked DELETE followed by `CREATE TABLE backup AS
+#                      SELECT ...` is the same class of database write and is not a recovery.
+#
+# What separates them is whether the agent came back with a MORE CONSTRAINED version of the
+# action it was stopped on. That is computable without knowing its goal: the verb has to be
+# the same, and the retry has to have gained a constraint the blocked call did not have.
+#
+# Reuses the statement/arm slicing and paren masking the floor already owns. A second copy of
+# "where does this clause bind" is how the two doors came to disagree in the first place.
+
+_SQL_VERBS = ("select", "insert", "update", "delete", "drop", "truncate", "create", "alter",
+              "replace", "merge", "pragma", "vacuum", "grant", "revoke")
+_SQL_VERB_RE = re.compile(r"\b(%s)\b" % "|".join(_SQL_VERBS), re.IGNORECASE)
+_LEADING_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+_TOP_LEVEL_WHERE_RE = re.compile(r"\bwhere\b", re.IGNORECASE)
+_TOP_LEVEL_ROW_CAP_RE = re.compile(r"\blimit\s+([1-9]\d*)\b", re.IGNORECASE)
+
+
+def _action_verb(payload):
+    """What KIND of action this payload performs, or None when there is nothing to read.
+
+    The first SQL verb if the payload contains one -- which is what makes this work on the
+    MCP proxy's flattened shape (`query_db SELECT * FROM users`), where the leading token is
+    the tool name and the verb sits behind it. Otherwise the leading identifier, so an
+    ordinary tool call still compares against itself.
+    """
+    text = _strip_sql_comments(str(payload or ""))
+    if not text.strip():
+        return None
+    match = _SQL_VERB_RE.search(_blank_sql_strings(text))
+    if match:
+        return match.group(1).lower()
+    lead = _LEADING_TOKEN_RE.search(text)
+    return lead.group(0).lower() if lead else None
+
+
+def _has_sql_shape(payload):
+    """Does this payload contain a SQL verb, so the scope signals below mean anything?
+
+    The narrowing test reads WHERE, a row cap and a named projection. Those are readable only
+    on a query. Everywhere else their absence says nothing about the call.
+    """
+    text = _strip_sql_comments(str(payload or ""))
+    return bool(text.strip()) and bool(_SQL_VERB_RE.search(_blank_sql_strings(text)))
+
+
+def _scan_view(statement):
+    """The view every top-level question below is asked of: comments gone, string literals
+    blanked, parenthesised groups masked. A WHERE inside a subquery does not bound the
+    statement that contains it, and a LIMIT inside one does not cap it."""
+    return _mask_paren_groups(_blank_sql_strings(_strip_sql_comments(str(statement or ""))))
+
+
+def _constraints_on(payload):
+    """The set of top-level constraints this payload carries, as plain names.
+
+    Deliberately a SET rather than a boolean: "narrower" means the retry gained something,
+    and a count cannot tell a gained WHERE from a dropped LIMIT.
+    """
+    found = set()
+    for statement in _top_level_statements(str(payload or "")):
+        scan = _scan_view(statement)
+        if _TOP_LEVEL_WHERE_RE.search(scan):
+            found.add("where")
+        if _TOP_LEVEL_ROW_CAP_RE.search(scan):
+            found.add("row_cap")
+        if "*" not in scan:
+            found.add("named_columns")
+    return found
+
+
+def _is_narrower(blocked_payload, retry_payload):
+    """True when the retry is a MORE CONSTRAINED version of the blocked action.
+
+    Returns False for "came back, but not with a narrowing" and for "did something else"
+    alike -- the caller records both as CONTINUED, which is a different bucket from
+    abandoned. Nothing here guesses: a payload we cannot read yields no constraints, so it
+    cannot earn a recovery, and the summary reports that population rather than hiding it.
+    """
+    blocked_verb = _action_verb(blocked_payload)
+    retry_verb = _action_verb(retry_payload)
+    if not blocked_verb or not retry_verb:
+        return None
+    if blocked_verb != retry_verb:
+        # Wandered off. This is the case that produced every false recovery on record, and it
+        # is a real NO on any surface: a different action is not a narrower version of the one
+        # we stopped, whether or not we can read either one's scope.
+        return False
+    # 🔴 THREE SIGNALS AND ALL THREE ARE SQL, SO EVERY OTHER SURFACE ANSWERS "no" FOR FREE.
+    # `_constraints_on` can only ever produce `where`, `row_cap` and `named_columns`. On a
+    # payload that is not a query the first two never appear and the third appears identically
+    # on both sides (neither contains a star), so nothing is ever gained and the answer was
+    # always False. `rm_rf_workspace(path="/")` followed by
+    # `rm_rf_workspace(path="/tmp/scratch")` is a textbook narrowing and scored as an agent
+    # that came back and failed -- a claim we have no evidence for.
+    #
+    # The argument-shape scope signal this SDK already has does not rescue it: it reads
+    # argument NAMES, and both calls carry a `path`, so both read "scoped" and nothing is
+    # gained. The narrowing lives in the VALUE, and comparing values per surface is one rule
+    # per surface, which is the enumeration treadmill.
+    #
+    # So the honest answer here is None, not False. We do not know. The caller records it as
+    # its own outcome instead of asserting the agent failed.
+    if not (_has_sql_shape(blocked_payload) and _has_sql_shape(retry_payload)):
+        return None
+    # 🔴 SAME VERB IS NOT SAME ACTION. Caught by its own test rather than by review: with
+    # only the verb and the constraint set, `SELECT * FROM users` blocked and then
+    # `SELECT name FROM products` allowed scored as a NARROWING, because naming columns
+    # instead of a star looks like a tightened projection. It is a different read of a
+    # different table. A retry may only ever touch tables the blocked call already touched;
+    # reaching a new one is a new action, however tightly scoped it is.
+    blocked_tables, _ = _sql_tables(_scan_view(blocked_payload))
+    retry_tables, _ = _sql_tables(_scan_view(retry_payload))
+    if blocked_tables and retry_tables and not retry_tables <= blocked_tables:
+        return False
+    gained = _constraints_on(retry_payload) - _constraints_on(blocked_payload)
+    return bool(gained)
+
+
 # The Secrets and PII Exfiltration builtin (…104), used to attribute the structural wildcard
 # floor so its category/coaching stay stable regardless of pulled policies -- same pattern as
 # _SSRF_POLICY above.
-_SECRETS_POLICY = next(
-    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Secrets and PII Exfiltration"),
-    _BUILTIN_POLICY_KEYWORDS[0])
+# 🔴 KEYED BY ID, AND A MISS IS FATAL ON PURPOSE (BACKLOG P-176). The five attributions below
+# used to SEARCH this list for a rule by its DISPLAY NAME, falling back to
+# `_BUILTIN_POLICY_KEYWORDS[0]` when the search found nothing. That fallback is Mass Destructive
+# Intent, so a rename -- an ordinary copy edit, on text we deliberately rewrite for clarity --
+# did not break the lookup. It silently returned the WRONG RULE, and every block that detector
+# produced would have been reported to the customer, and written into the incident record, under
+# the wrong name with the wrong coaching. The block still fires; only the explanation lies, which
+# is the hardest kind of defect to notice.
+#
+# A KeyError here means the floor list and this code disagree. That is a build error, not
+# something a user should ever meet, and it names the missing id. Loud beats plausible.
+_BUILTIN_BY_ID = {str(p["id"]): p for p in _BUILTIN_POLICY_KEYWORDS}
 
-_MASS_DESTRUCTIVE_POLICY = next(
-    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Mass Destructive Intent"),
-    _BUILTIN_POLICY_KEYWORDS[0])
+_SECRETS_POLICY = _BUILTIN_BY_ID[_ID_SECRETS]
+
+_MASS_DESTRUCTIVE_POLICY = _BUILTIN_BY_ID[_ID_MASS_DESTRUCTIVE]
 
 # The SSRF builtin, used to attribute the structural encoded-IP floor so its
 # category/coaching stay stable regardless of pulled policies.
-_SSRF_POLICY = next(
-    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Network Sandbox (SSRF)"),
-    _BUILTIN_POLICY_KEYWORDS[0])
+_SSRF_POLICY = _BUILTIN_BY_ID[_ID_SSRF]
 
 # The Filesystem Path Boundary builtin, used to attribute the structural `.env`
 # secrets-file floor (_detect_dotenv_read) so its category/coaching stay stable
 # regardless of pulled policies -- the same pattern as _SSRF_POLICY above.
-_FS_BOUNDARY_POLICY = next(
-    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Filesystem Path Boundary"),
-    _BUILTIN_POLICY_KEYWORDS[0])
+_FS_BOUNDARY_POLICY = _BUILTIN_BY_ID[_ID_FS_BOUNDARY]
 
 # The Destructive Shell Command builtin, used to attribute the structural pipe-to-shell
 # floor (_PIPE_TO_SHELL_RE) so a privilege-prefixed `curl … | sudo bash` blocks with the
 # SAME category/coaching as the flat "| bash" token -- statelessly, on the first strike,
 # regardless of session state or a pulled policy. Same pattern as _SSRF_POLICY above.
-_DESTRUCTIVE_SHELL_POLICY = next(
-    (p for p in _BUILTIN_POLICY_KEYWORDS if p["name"] == "Destructive Shell Command"),
-    _BUILTIN_POLICY_KEYWORDS[0])
+_DESTRUCTIVE_SHELL_POLICY = _BUILTIN_BY_ID[_ID_DESTRUCTIVE_SHELL]
 
 # The Invisible-Unicode carrier builtin, used to attribute the structural
 # carrier floor. Structural-ONLY: no keyword rails (blocked_intents is empty), so it is
@@ -3947,7 +4785,7 @@ _INVISIBLE_UNICODE_POLICY = {
 
 # The Reverse Shell Egress builtin, used to attribute the structural reverse-shell floor
 # (_detect_reverse_shell). Same policy_id as the gateway floor (…122) so an adopted org
-# override keys across both paths, and so backend/test_coaching_consistency.py sees the
+# override keys across both paths, and so the cross-surface coaching tripwire sees the
 # shared name agree on id + failure category (NETWORK_ABUSE). category=NETWORK_ABUSE is
 # deliberately OFF the keyless pulse vocab (_BLOCK_CATEGORY_VOCAB, same as …120 the
 # gateway scan floor): _note_block_category drops it fail-safe, so the block still fires
@@ -4197,7 +5035,7 @@ def suppress_atexit_summary():
 # single-sourced there — this side no longer has a copy of either. What IS duplicated
 # is the mechanical name split (`_name_tokens` below has a hand copy in the gateway as
 # `_tool_name_tokens`, since neither package may import the other); that copy is pinned
-# by `backend/test_tool_name_channel.py::test_tokenizer_matches_the_sdk`.
+# by the cross-surface tool-name tripwire.
 #
 # WHY IT MOVED. Here it could only be spent by writing "filesystem_delete" into the
 # `action` field, which is the field the gateway ROUTES on — so a database tool named
@@ -4396,6 +5234,31 @@ class _ExecuteTool:
         self.screened = screened
 
 
+def _audit_scope_phrase():
+    """"Audit is on" or "Audit is on for this tool", whichever is TRUE for this call.
+
+    🔴 THREE NARRATIONS SAID "for this tool" UNCONDITIONALLY, AND IT IS FALSE IN THE UNSAFE
+    DIRECTION. A run that set AGENTX_ENFORCEMENT=audit has EVERY wrapped tool auditing, but
+    the would-block line told the reader audit was on "for this tool" -- so a developer who
+    set the variable process-wide could read it as a per-tool setting and believe the rest of
+    their app was still blocking. That is the same shape as the MCP door's "on every server
+    you wrap", which was fixed for the same reason: a scope claim that overstates protection.
+    Caught by running the example and reading the banner and this line together.
+
+    ⚠️ THE FIX IS NOT TO DELETE THE PHRASE. When `enforcement="audit"` is set on one decorator
+    while the global posture is enforce, "for this tool" is exactly right and the bare form
+    would understate protection instead. So say the true one.
+
+    Derived here rather than threaded through three call chains: this runs only on the audit
+    path, so if AGENTX_ENFORCEMENT is audit the posture is global (an override agreeing with
+    it changes nothing the reader can act on), and if it is not, the only way to reach this
+    code is the per-tool argument. One entry point, because the same sentence lives at three
+    sites and a rule stated beside each gets obeyed at some of them."""
+    if os.environ.get("AGENTX_ENFORCEMENT", "").strip().lower() == "audit":
+        return "Audit is on"
+    return "Audit is on for this tool"
+
+
 def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, category,
                         narration=None, arguments=None):
     """The RECORD half of the audit route, split out so EVERY audit path writes the same
@@ -4405,9 +5268,11 @@ def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, c
         can show exactly what audit caught, and get_lifetime_stats / get_block_frequency
         (which count only CHALLENGED / RECOVERED) never fold an audited catch into the
         recovery rate, and
-      * a coarse `would_blocks` pulse count + the block_category (what KIND of action),
-        but NEVER the intercepts / critical_blocks counters that mark an install
-        "protected". So an audit-only install reads as EVALUATING, not enforcing.
+      * `would_blocks_seen` (every catch this session, screen-facing) alongside a coarse
+        `would_blocks` pulse count (stranger's-agent only) + the block_category (what KIND
+        of action), but NEVER the intercepts / critical_blocks counters that mark an install
+        "protected". So an audit-only install reads as EVALUATING, not enforcing, while the
+        SCREEN still describes the run the reader just watched.
     Takes NONE of the challenge accounting the enforce path does (no challenged-trace
     mark, no incident park, no strike). Best-effort (log_intercept swallows its own
     errors); the wrapped tool runs regardless.
@@ -4428,6 +5293,20 @@ def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, c
     # ⚠️ `_note_block_category` is NOT gated, deliberately. It records what KIND of action
     # was blocked, and `agentx demo` has always set it on its own scripted catch; gating it
     # here would make the two demos disagree about a field neither of them is measured on.
+    #
+    # 🔴 TWO COUNTERS, TWO READERS, AND THE GATE BELONGS TO ONLY ONE OF THEM. The
+    # exclusion above is a rule about the FUNNEL, and `is_our_agent`'s own docstring already
+    # scopes it that way -- "it gates the counters that answer 'did someone run THEIR OWN
+    # agent under audit', and nothing else" (db.py). It was applied one step too wide: the
+    # same `would_blocks` is a member of `_TRIPPED_COUNTERS`, so suppressing the metric
+    # suppressed the truth of a SENTENCE, and `examples/12` printed "nothing tripped a
+    # policy" on a run where one did. `would_blocks_seen` is what the screen reads; it takes
+    # no view on who owns the agent, because the screen is not asking.
+    #
+    # ⚠️ THE ORDER OF THESE TWO LINES IS NOT THE POINT -- THEIR ADJACENCY IS. A future
+    # counter that means "we caught something" must be written HERE, beside these, or the
+    # next reader gating on ownership re-opens the same defect under a different name.
+    _incr("would_blocks_seen")
     if not _is_demo_agent(agent_id):
         _incr("would_blocks")
     _note_block_category(category)
@@ -4440,7 +5319,7 @@ def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, c
     try:
         print(narration or (
             f"🔍 [AgentX AUDIT] Would have blocked '{tool_name}' on policy '{policy_name}'. "
-            f"Audit is on for this tool, so the call was allowed through and recorded. "
+            f"{_audit_scope_phrase()}, so the call was allowed through and recorded. "
             f"Review what audit caught with: agentx insights"))
     except Exception:
         pass
@@ -4453,10 +5332,18 @@ def _bound_arguments(sig, args, kwargs):
     passes nothing by keyword, so reading `kwargs` alone reports a call with no arguments and
     the report's most useful column is empty exactly where agents are most conventional.
 
-    Uses the signature the decorator already cached at decoration time -- binding is per call
-    but only on the AUDIT path, so the enforce path every existing install runs is untouched.
-    `bind_partial` tolerates a call this decorator never validated; anything it rejects falls
-    back to the keyword arguments, which is a smaller record but never a wrong one.
+    Uses the signature the decorator already cached at decoration time. `bind_partial`
+    tolerates a call this decorator never validated; anything it rejects falls back to the
+    keyword arguments, which is a smaller record but never a wrong one.
+
+    🔴 THIS RUNS ON THE ENFORCE PATH TOO SINCE P-112's ENFORCE HALF, and the line that used to
+    be here said the opposite ("binding is per call but only on the AUDIT path, so the enforce
+    path every existing install runs is untouched"). It now runs inside every protected tool
+    call on every install, which is why the enforce site calls it only once a row is actually
+    DUE, unlike the audit site, which needs it eagerly for its would-block branches. It is also
+    why the no-values guarantee is asserted through this path end to end
+    (test_a_passing_call_under_the_default_posture_never_leaks_a_raw_value): a defect here was
+    theoretical while only audit bound arguments, and is universal now.
 
     `self` / `cls` are dropped: they are an artefact of how the tool was written, not
     something the agent chose to pass, and they would otherwise appear on every method.
@@ -4485,7 +5372,53 @@ def _bound_arguments(sig, args, kwargs):
         return kwargs or {}
 
 
-def _record_inventory(trace_id, agent_id, tool_name, arguments):
+def _inventory_due(outcome):
+    """Does this outcome owe the ledger an inventory row?
+
+    🔴 ONE PREDICATE, BECAUSE TWO POSTURES NOW ASK IT. Until P-112's enforce half this
+    question was asked in exactly one place, inside `_audit_release`, so it could live as a
+    bare `if`. Now the default posture records too, and the two askers sit in different
+    functions on different control-flow paths. That is precisely the shape this codebase has
+    been bitten by before -- a rule stated at one site and not its sibling -- so the rule
+    lives here and both call it. If recording ever changes, it changes once.
+
+    THE RULE, unchanged from where it was extracted: record a call only when the shield
+    actually LOOKED at it and had nothing to say.
+      * `screened` -- see below. `scrub_targets` is deliberately NOT excluded any more.
+
+    🔴 THE SCRUB CARVE-OUT IS GONE, AND IT WAS LEAVING THE ONE CASE WHERE WE CHANGE A
+    DEVELOPER'S OUTPUT AND KEEP NO RECORD OF IT. The excluded condition read: "a scrub IS a
+    verdict (it alters the developer's return value), so it is a would-block, not inventory."
+    That reasoning was written when only AUDIT recorded, and in audit it is still exactly
+    right -- `_audit_release` files the scrub as a WOULD_BLOCK row through its own branch and
+    never reaches this predicate at all.
+
+    Under ENFORCE there is no such branch. `_audit_release` is audit-only, so a gateway verdict
+    carrying `pii_targets_to_scrub` rewrote the return value, printed "Local DLP Active", and
+    wrote NOTHING: absent from `agentx audit` and from `agentx insights` both. Which also made
+    this branch's own copy false: the wrap nudge promises a record of every wrapped tool call
+    regardless of posture (it renders from RECORDING_CLAUSE above).
+
+    So the call is recorded. Audit is untouched (its scrub path returns before this runs), and
+    enforce gets the row it was missing.
+
+    ⚠️ THE SCRUB ITSELF STILL HAS NO STATUS OF ITS OWN, and that is a real residual, filed
+    rather than invented here. `WOULD_BLOCK` means "we had an opinion and let it run", which is
+    false of an enforce scrub -- we ACTED. `CHALLENGED` means "we stopped it", also false: the
+    call ran. Picking either would put a wrong word on three screens, and adding a third status
+    is a schema and reader decision. The row below at least tells the developer the call
+    happened; what it does not yet say is that we altered its output.
+      * `screened` -- excludes a call that ran because we could not form an opinion at all;
+        an unevaluated call is not a clean one.
+      * `not recorded` -- excludes a would-block released upstream, which already has a row.
+        The invariant is one row per call.
+    """
+    return (isinstance(outcome, _ExecuteTool)
+            and outcome.screened
+            and not outcome.recorded)
+
+
+def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit):
     """P-92: record ONE call we had NO opinion about. Best-effort; never raises.
 
     The other half of the audit record, and the half that was missing. `_record_would_block`
@@ -4506,8 +5439,12 @@ def _record_inventory(trace_id, agent_id, tool_name, arguments):
         # decorator and the MCP proxy cannot disagree about whether a recorded call was
         # counted. They did: the proxy recorded and never counted, and only a funnel row
         # reading 0 for every MCP install would have shown it.
+        # `in_audit` splits the two funnel counters: `recorded_*` counts what was written
+        # in ANY posture, `audit_*` stays audit-only so `ran_audit` keeps meaning adoption
+        # rather than "ran a protected tool at all". See db._bump_audit_counters.
         record_call(trace_id, agent_id, tool_name, arguments,
-                    stats=_session_stats, stats_lock=_stats_lock)
+                    stats=_session_stats, stats_lock=_stats_lock,
+                    in_audit=in_audit)
     except Exception:
         # Deliberately silent, unlike the would-block narration. This runs on EVERY passing
         # call, so a per-call complaint would turn one broken ledger into thousands of lines
@@ -4610,19 +5547,29 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None):
             # does: this is the chokepoint both the sync and async paths already pass
             # through, so the inventory cannot end up covering one of them and not the other.
             #
-            # THE INVENTORY RULE, STATED ONCE: record a call only when the shield actually
-            # LOOKED at it and had nothing to say. `recorded` excludes a would-block released
-            # upstream (it already has a row); `screened` excludes a call that ran because we
-            # could not form an opinion at all. Both arrive here as a bare _ExecuteTool and
-            # are otherwise indistinguishable from a genuinely clean call.
-            if outcome.screened and not outcome.recorded:
-                _record_inventory(trace_id, agent_id, tool_name, arguments)
+            # THE INVENTORY RULE NOW LIVES IN `_inventory_due`, because the DEFAULT posture
+            # asks the same question since P-112's enforce half and a rule stated at one site
+            # and not its sibling is this codebase's most repeated defect. The predicate
+            # re-checks the `_ExecuteTool` type this branch has already established; that
+            # redundancy is deliberate, so the rule reads completely at its definition instead
+            # of being half here and half there.
+            #
+            # ⚠️ IT DOES NOT RE-CHECK `scrub_targets`, AND AN EARLIER VERSION OF THIS COMMENT
+            # SAID IT DID. That carve-out was deliberately dropped so ENFORCE records a scrub
+            # (see `_inventory_due`); what keeps AUDIT out of it is the `if not
+            # outcome.scrub_targets` above, not the predicate. A reader who trusted the old
+            # sentence would conclude enforce skips scrubs, which is the opposite of the change.
+            if _inventory_due(outcome):
+                # `in_audit=True` is a literal because this function is REACHED only in audit;
+                # the enforce path calls the same writer with False. See db._bump_audit_counters
+                # for why the two postures must not share one counter.
+                _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit=True)
             return outcome
         _record_would_block(
             trace_id, agent_id, tool_name, "local-dlp", "Local DLP (PII scrub)",
             "PII_EXFILTRATION",
             narration=(f"🔍 [AgentX AUDIT] Would have scrubbed {outcome.scrub_targets} from "
-                       f"'{tool_name}' output. Audit is on for this tool, so the result was "
+                       f"'{tool_name}' output. {_audit_scope_phrase()}, so the result was "
                        f"returned UNCHANGED. Recorded: agentx insights"),
             arguments=arguments)
         # recorded=True on every path that just wrote a would-block row, including the two
@@ -4696,7 +5643,7 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None):
         # is the honest outcome — better an absent category than a guessed one.
         None,
         narration=(f"🔍 [AgentX AUDIT] Would have stopped '{tool_name}' ({policy_name}). "
-                   f"Audit is on for this tool, so the call ran and control returned to your "
+                   f"{_audit_scope_phrase()}, so the call ran and control returned to your "
                    f"code unchanged. Recorded: agentx insights"),
         arguments=arguments)
     return _ExecuteTool(recorded=True)
@@ -5029,12 +5976,12 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             #
             # The verb list holds `delete`/`rmtree`/`rmdir` but not `rm`, so the tool
             # that is literally named rm -rf was the one it missed. And the mislabel
-            # reaches further than a label: `gateway.py` skips a surface-scoped policy
+            # reaches further than a label: the gateway skips a surface-scoped policy
             # whose `target_action` does not equal the declared action, so a database
             # tool whose name contains "delete" routed itself off the database surface
             # — the exact harm the anchored URL match above is written to avoid. (How
             # much that costs in practice is unproven and filed as P-88; see the note
-            # on `_fs_action_from_tool` in gateway.py.)
+            # on the gateway's filesystem-action mapper.)
             #
             # The verb still reaches the detector, by the honest route: the tool NAME
             # now ships as its own `tool` field and the gateway reads the verb off it
@@ -5305,9 +6252,34 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         # gateway block below). One would have been the usual half-landing.
                         _note_own_agent_block(agent_id)
                         _note_block_category(matched_policy.get("category") or _POLICY_ID_TO_CATEGORY.get(policy_id))
-                        _mark_challenged(current_trace_id, func_name)
+                        # The blocked payload rides along: a later retry has to be NARROWER
+                        # than THIS, and without it the episode can only ever be continued.
+                        _mark_challenged(current_trace_id, func_name, query)
 
-                        log_intercept(current_trace_id, agent_id, func_name, policy_id, policy_name, "CHALLENGED")
+                        # 🔴 THE SHAPE GOES ON THE BLOCK ROW TOO, AND THIS IS THE SET THAT
+                        # P-92-B FIXED ONLY ONE MEMBER OF. `_record_would_block` was taught
+                        # to carry arg_names/amount/target_class; its two CHALLENGED
+                        # siblings were not, so every blocked row landed NULL/0.0/NULL --
+                        # the exact defect that comment says was repaired. Measured on a
+                        # real ledger: 31 blocked and 6 recovered rows with no arguments and
+                        # no surface. That is why `--calls` printed "(none)" against a
+                        # blocked run_sql sitting beside an allowed one showing `query`, and
+                        # why that screen cannot carry a SURFACE column today.
+                        #
+                        # Built with `_bound_arguments`, the SAME builder the allowed path
+                        # uses. Constructing it any other way here would let a blocked call
+                        # and an allowed call of the same tool record different shapes, which
+                        # is a subtler version of the bug being fixed.
+                        #
+                        # RECOVERED needs no site of its own: `log_self_correction` UPDATES
+                        # this row's status rather than inserting a new one, so it inherits
+                        # whatever shape is written here. Two sites fix four statuses.
+                        _blocked_shape = _call_shape(
+                            func_name, _bound_arguments(_func_sig, args, kwargs))
+                        log_intercept(current_trace_id, agent_id, func_name, policy_id,
+                                      policy_name, "CHALLENGED",
+                                      arg_names=_blocked_shape[0], amount=_blocked_shape[1],
+                                      target_class=_blocked_shape[2])
 
                         # ONE line, not two. These said the same thing twice ("fast-path
                         # intercept engaged on policy X" / "policy X matched a blocked intent")
@@ -5505,7 +6477,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     # challenged, the same gate as the gateway ALLOWED path) + narrate the
                     # heal beat, so the keyless "the run survived" moment is finally
                     # visible AND countable on the pulse (self_corrections).
-                    if _credit_recovery(current_trace_id, func_name):
+                    if _credit_recovery(current_trace_id, func_name, query):
                         log_self_correction(current_trace_id, agent_id, func_name)
                         print(f"🔄 [AgentX SDK] Recovered: '{func_name}' was revised and ran.")
                     # 🔴 `screened` IS THE KEYLESS TIER'S WHOLE ANSWER. This is the keyless
@@ -5643,9 +6615,10 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # in its own per-trace _STRIKE_TRACKER and owns the Path B decision
                 # (issue #80). The local counter accrues only on the OFFLINE fail-closed
                 # path, so an online block must not double-count into it.
-                # +++ SENSOR: mark this trace as challenged so a later safe call on the
+                # +++ SENSOR: mark this trace as challenged so a later NARROWER call on the
                 # same trace is counted as a self-correction (per-trace, bounded) +++
-                _mark_challenged(current_trace_id, func_name)
+                # The gateway twin of the keyless block above: same payload, same reason.
+                _mark_challenged(current_trace_id, func_name, query)
                 
                 actual_policy_id = eval_res.get("policy_id", "POL-UNKNOWN")
                 policy_name = eval_res.get("policy_triggered", "Unknown Policy")
@@ -5689,7 +6662,15 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # discriminator) is comparing two different quantities.
                 _incr("critical_blocks")
 
-                log_intercept(current_trace_id, agent_id, func_name, actual_policy_id, policy_name, "CHALLENGED")
+                # The gateway half of the same fix. See the keyless block site above for why
+                # the shape belongs on a CHALLENGED row and why it must come from
+                # `_bound_arguments` rather than be rebuilt here.
+                _blocked_shape = _call_shape(
+                    func_name, _bound_arguments(_func_sig, args, kwargs))
+                log_intercept(current_trace_id, agent_id, func_name, actual_policy_id,
+                              policy_name, "CHALLENGED",
+                              arg_names=_blocked_shape[0], amount=_blocked_shape[1],
+                              target_class=_blocked_shape[2])
 
                 print(f"🛑 [AgentX SDK] Policy '{policy_name}' violated. Routing challenge instruction string.")
                 
@@ -5714,7 +6695,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 #
                 # NOTE the gateway can still SEND this verdict in audit today — it keeps
                 # accruing strikes on the documented premise that the SDK halts on them
-                # (gateway.py "Bumped even in audit so the runaway breaker still trips").
+                # (the gateway: "Bumped even in audit so the runaway breaker still trips").
                 # That premise dies with this release, and the gateway is reconciled
                 # separately; releasing HERE means the guarantee holds against any gateway
                 # version, including one deployed before that change lands.
@@ -5849,7 +6830,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # Atomic credit-and-claim: only the call that actually transitions the
                 # trace to recovered logs the DB row, so concurrent ALLOWs on one
                 # shared async session can't double-log (#115 finding 6).
-                if _credit_recovery(current_trace_id, func_name):
+                if _credit_recovery(current_trace_id, func_name, query):
                     log_self_correction(current_trace_id, agent_id, func_name)
                     # The heal-narration beat. The block is narrated loudly and the
                     # session summary counts corrections, but without this line the
@@ -5909,7 +6890,18 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             home for the post-execution scrub, shared by the sync and async finishers
             so DLP behaviour can't drift between them (#115 cleanup)."""
             if decision.scrub_targets:
-                print(f"🧹 [AgentX SDK] Local DLP Active. Scrubbing {decision.scrub_targets} from output...")
+                # 🔴 SAY WHAT WE CANNOT DO, RATHER THAN LETTING THE LIST IMPLY WE DID IT ALL.
+                # The banner used to echo the gateway's whole list, so a developer read
+                # "Scrubbing ['EMAIL', 'AWS_KEYS', 'SSN', 'PHONE']" on a run where two of the
+                # four were dropped unimplemented. Print what was HONOURED, then name the rest.
+                unhonoured = _unhonoured_scrub_targets(decision.scrub_targets)
+                honoured = [t for t in decision.scrub_targets
+                            if str(t).upper() in _SCRUB_REGEX_MAP]
+                if honoured:
+                    print(f"🧹 [AgentX SDK] Local DLP Active. Scrubbing {honoured} from output...")
+                if unhonoured:
+                    print(f"⚠️  [AgentX SDK] Asked to scrub {unhonoured}, which this build cannot "
+                          f"redact. Those values were NOT removed.", file=sys.stderr)
                 return _scrub_pii(result, decision.scrub_targets)
             return result
 
@@ -5918,15 +6910,38 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
 
             Every verdict this decorator can produce — returned or RAISED — passes through
             here on its way to the caller, which is what lets `_audit_release` state the
-            watch-only rule once instead of per exit site. In `enforce` this is a straight
-            pass-through and costs one env read, so the enforcing path (every existing
-            install) is unchanged.
+            watch-only rule once instead of per exit site.
+
+            🔴 SINCE P-112's ENFORCE HALF, THE DEFAULT POSTURE RECORDS TOO — AND STILL BLOCKS.
+            This is the whole change, and it is easy to misread as "audit by default", which it
+            is emphatically not. Two things were welded together and are now separated:
+
+                recording every call  =  OBSERVABILITY   (both postures)
+                audit posture         =  ENFORCEMENT OFF (audit only)
+
+            They were joined only by where the code happened to return. Enforce now takes the
+            inventory row and NONE of the suppression: `_decide` still raises on a block, that
+            raise still propagates, and `_audit_release` — which converts verdicts into
+            "run the tool" — is still reached only in audit. A firewall that records is not a
+            firewall that stopped firing.
 
             Deliberately wraps ONLY the decision core, never the tool's own execution: an
             exception from the developer's function is THEIR control flow and must
             propagate untouched. That is the same guarantee read from the other side."""
             if _resolve_enforcement(enforcement) != "audit":
-                return _decide(args, kwargs)
+                # No try/except: a block RAISES here and must keep raising. Only a call that
+                # came back clean reaches the next line, which is exactly the set that owes
+                # the ledger a row.
+                outcome = _decide(args, kwargs)
+                # `_bound_arguments` is computed ONLY when a row is actually due, unlike the
+                # audit path below, which needs it eagerly for its would-block branches. On
+                # the default posture this runs inside every protected tool call, so the
+                # signature bind is worth not paying on the calls that will not use it.
+                if _inventory_due(outcome):
+                    _record_inventory(trace_id_var.get(), agent_id, _func_name,
+                                      _bound_arguments(_func_sig, args, kwargs),
+                                      in_audit=False)
+                return outcome
             try:
                 outcome = _decide(args, kwargs)
             except _AUDIT_SUPPRESSIBLE_RAISES as stop:

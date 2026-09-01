@@ -11,7 +11,8 @@ import os
 #    persists for the whole PowerShell session. This script has the opposite contract to the
 #    demo (it needs AUDIT, the demo needs ENFORCE), and the same fix applies to both: pin it.
 #
-# Nothing here is blocked. Audit records what a call touched and lets it run.
+# Nothing here is blocked. AgentX records every wrapped tool call, whether blocking is on
+# or off; audit is what lets this one RUN.
 os.environ["AGENTX_ENFORCEMENT"] = "audit"
 
 import sys
@@ -59,9 +60,20 @@ except ImportError:
 # escalation. This one is the other half, and it is the half that tells you something about
 # YOUR agent rather than about our floor.
 #
-# In audit posture AgentX vets every call exactly as it normally would, records what the
-# call touched, and then lets it run. Nothing is blocked. What lands in your local ledger
-# is the SHAPE of each call:
+# WHAT AUDIT BUYS YOU HERE IS NOT THE RECORD. AgentX records every wrapped tool call,
+# whether blocking is on or off, and `agentx audit` reads them back. What audit
+# changes is that NOTHING IS STOPPED -- including the poisoned call at the end, which on the
+# default posture would have been blocked. That is the only reason this example sets the
+# posture at all.
+#
+# ⚠️ THAT LAST CALL IS THE ONE EXCEPTION ON THE AUDIT SCREEN. A call that tripped a
+# policy is filed as a would-block, so it shows in `agentx insights`, not in the `agentx
+# audit` table. Run this and the table lists FOUR calls while the session summary counts
+# five. Said here because the sentence above used to claim audit read them all back the
+# same, and a reader who counts is the reader this example is for.
+#
+# In audit posture AgentX vets every call exactly as it normally would, and then lets it run
+# instead of stopping it. What lands in your local ledger is the SHAPE of each call:
 #
 #     the argument NAMES the agent passed   (never the values)
 #     the SURFACE it touched                (DB / HTTP / FS / SHELL / CLOUD / -)
@@ -117,11 +129,11 @@ def write_ticket_note(path: str, contents: str):
 
 def run_audit_example():
     print("=" * 72)
-    print("🤖 AGENTX DEMO 12: WHAT YOUR AGENT DID (AUDIT MODE)")
+    print("🤖 AGENTX DEMO 12: AN ORDINARY DAY, NOTHING STOPPED (AUDIT)")
     print("=" * 72)
-    print("Scenario: a support agent works one refund ticket end to end. AgentX is")
-    print("watching in audit mode, so it blocks nothing and writes down what each")
-    print("call touched. The last call is poisoned, and audit lets that one run too.\n")
+    print("Scenario: a support agent works one refund ticket end to end. AgentX records")
+    print("every wrapped tool call, whether blocking is on or off. This run is in audit,")
+    print("so nothing is stopped: the poisoned last call runs too.\n")
 
     start_secure_session()
 
@@ -157,7 +169,12 @@ def run_audit_example():
     # No counts in this copy, deliberately. A hardcoded "five calls" beside the list of
     # calls it counts goes stale the first time somebody adds one, and the numbers the
     # reader should trust are the ones `agentx audit` derives from the ledger itself.
-    print("✅ Every call above ran, including the poisoned one. Nothing was blocked.")
+    # 🔍 NOT ✅. A green tick is the glyph this codebase uses for "that went well", and it sat
+    # on the sentence describing the UNPROTECTED outcome -- fifteen lines under a banner that
+    # says "Your agent is NOT protected: a flagged call still runs". The two read as opposite
+    # verdicts on one run. 🔍 is the glyph the AUDIT narration above already uses, and audit is
+    # an observation, not a success.
+    print("🔍 Every call above ran, including the poisoned one. Nothing was blocked.")
     print("   AgentX recorded the shape of each call in your local ledger:")
     print(f"      {os.path.abspath(DB_PATH)}")
     print("")
@@ -174,11 +191,24 @@ def run_audit_example():
     print("   Run it from this folder, or you will read a different ledger. You get a")
     print("   table of every tool above and what it touched, printed directly above the")
     print("   list of what the built-in floor watches for. Read the two together:")
+    # 🔴 SAY THE COUNT DIFFERENCE ON SCREEN, NOT IN A SOURCE COMMENT. This was first written
+    # into the `#` header above, which only somebody reading the file ever sees. The person who
+    # RUNS this counts five calls here and then finds four in the table, with nothing on either
+    # screen accounting for the fifth. A gap a reader can measure has to be answered where they
+    # measure it.
+    # ⚠️ ORDER IS LOAD-BEARING, AND INSERTING THE COUNT NOTE HERE BROKE IT ONCE. "Read the two
+    # together:" leads into the sentence below; "that list" is the floor's watch-list printed
+    # just above it. Wedged between the two, the count note put 'agentx insights' in between --
+    # so "that list" read as insights, and the one word carrying the antecedent pointed at the
+    # wrong screen. The count gets its own beat AFTER the pair instead.
     # The screen renders the bucket as "≥1,000"; this said ">=1,000". A reader comparing the
     # two has to decide whether they are the same thing, on the one line whose point is that
     # we store a shape and not their number.
     print("   issue_refund is not on that list. The refund is recorded as '≥1,000',")
     print("   never as $2,400, because the ledger keeps the shape and not the figure.")
+    print("")
+    print("   The table lists FOUR calls, not five. The poisoned one tripped a policy,")
+    print("   so it is filed as a would-block and shows in 'agentx insights' instead.")
     print("")
     print("   These rows came from this example, not from your own agent. Delete the")
     print("   ledger file above to start clean.")

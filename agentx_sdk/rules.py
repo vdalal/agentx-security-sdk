@@ -35,7 +35,7 @@ import uuid
 from .overrides import (_anchored_root, _incident_db_path, _now_iso,
                         cluster_near_duplicates)
 
-# The gateway's local policy store (backend/policy_store.py) lives next to incidents.db
+# The gateway's local policy store lives next to incidents.db
 # in the project's ONE .agentx/ home. BACKLOG P-76.
 #
 # 🔴 THIS WAS A CANDIDATE LIST SEARCHED FOR "the first that EXISTS", the same defect the
@@ -43,14 +43,14 @@ from .overrides import (_anchored_root, _incident_db_path, _now_iso,
 # module WRITES: `agentx rules apply` creates the policy row the gateway is supposed to
 # arm. On the pre-P-76 layout the root store does not exist and the nested one does, so
 # the CLI wrote `agentx_sdk/.agentx/policies.db`, reported success, and the gateway --
-# now root-anchored (backend/policy_store.py) -- read a different file. The rule never
+# now root-anchored on the gateway side too -- read a different file. The rule never
 # armed and nothing said so. A silent write to the wrong store is worse than a silent
 # read from one.
 #
 # An explicit AGENTX_POLICY_DB always wins (what the tests use).
 DEFAULT_POLICY_DB = os.path.join(".agentx", "policies.db")
 
-# Mirrors backend/policy_store.py init_db exactly so a rule the CLI writes is read
+# Mirrors the gateway's policy-store schema exactly so a rule the CLI writes is read
 # back verbatim by the gateway. Kept in sync by the parity test in test_rules.py.
 _CREATE_POLICIES_SQL = """
     CREATE TABLE IF NOT EXISTS policies (
@@ -77,7 +77,7 @@ def _policy_db_path(path=None):
     else the ONE canonical store under the project root.
 
     Existence is deliberately NOT part of the rule -- see the comment on
-    DEFAULT_POLICY_DB. This resolves to the same file backend/policy_store.py writes, from
+    DEFAULT_POLICY_DB. This resolves to the same file the gateway's policy store writes, from
     any subdirectory, which is the whole point: the CLI writes the policy the gateway
     arms."""
     if path:

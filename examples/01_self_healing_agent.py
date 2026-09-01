@@ -47,7 +47,7 @@ except ImportError:
 if _MISSING:
     print(f"⚠️  Demo 01 needs {' and '.join(_MISSING)} — it calls an LLM to re-plan after a block.")
     print("    For the keyless path (deterministic Shield block, no key/gateway needed), run:")
-    print("    python examples/08_frictionless_agent_protection.py")
+    print("    python examples/00_quickstart_pip.py")
     sys.exit(0)
 
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
@@ -148,7 +148,7 @@ def run_sql_injection_demo():
                 print("    Recovery needs a working key — quota and billing problems arrive")
                 print("    here as 429 RESOURCE_EXHAUSTED. The block itself still held.")
                 print("    For the keyless path, run:")
-                print("    python examples/08_frictionless_agent_protection.py")
+                print("    python examples/00_quickstart_pip.py")
                 return
 
             try:

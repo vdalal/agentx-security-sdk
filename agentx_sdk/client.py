@@ -6,6 +6,24 @@ import warnings
 import threading
 import requests
 
+# 🔴 HOW LONG WE WAIT FOR A VERDICT, AND WE NOW TELL THE GATEWAY (P-157).
+#
+# This was a bare `timeout=30.0` at the request while the gateway's judge deadline also
+# defaulted to 30s and could be configured higher. Two equal clocks, ours starting EARLIER
+# because it begins before the request is sent, so a verdict that took the full judge deadline
+# could never reach us: we gave up first and failed open, and the gateway's answer — including
+# a correct block on a destructive write — was discarded in transit.
+#
+# A NAMED CONSTANT, not a literal, because it is now read in two places (the request bound and
+# the forwarded field) and those two drifting apart is the whole defect restated. The gateway
+# caps its judge to this minus its own overhead; see `_effective_judge_timeout` there, and the
+# cross-surface tripwire that pins the relationship.
+#
+# Kept at 30.0 deliberately: raising it would trade a correct verdict for a longer hang, and
+# the gateway now fits inside whatever we say rather than us waiting out whatever it chose.
+EVALUATE_TIMEOUT_S = 30.0
+
+
 class AgentXClient:
     def __init__(self, gateway_url="http://localhost:8000"):
         self.gateway_url = gateway_url
@@ -143,6 +161,36 @@ class AgentXClient:
             # ORDERING is not something a released SDK can be made to respect.
             payload["audit_releases_all"] = True
 
+        # How long we will still be listening. The gateway fits its judge inside this so a
+        # verdict cannot be produced after we have stopped waiting (P-157). Sent on EVERY
+        # request, not only when it differs from the default, because the gateway's fallback
+        # for an absent field has to assume the oldest released SDK rather than this one.
+        payload["client_timeout_s"] = EVALUATE_TIMEOUT_S
+
+        # What THIS build can actually redact, so the gateway only asks for what we can do.
+        #
+        # 🔴 SENT ON EVERY REQUEST, AND IT IS A CAPABILITY RATHER THAN A VERSION. The gateway
+        # deploys separately from this package and can be AHEAD of it: a newer gateway naming a
+        # category this build has no pattern for used to be told to scrub it, and `_scrub_pii`
+        # skips a category it does not recognise -- so the values came back unredacted with no
+        # error, no log and nothing the caller could see. Silent non-redaction, reported as
+        # protection.
+        #
+        # Read from the scrubber's own map rather than restated, so it cannot go stale: adding a
+        # regex there is what widens this, which is the same single source
+        # `SCRUBBABLE_CATEGORIES` already gives the parity tripwire.
+        #
+        # Absent, an older SDK gets the legacy EMAIL/PHONE pair from the gateway -- exactly what
+        # it has always been able to do. Correct whichever side deploys first, same as
+        # `audit_releases_all` above.
+        try:
+            from .decorators import SCRUBBABLE_CATEGORIES
+            payload["scrubbable_categories"] = list(SCRUBBABLE_CATEGORIES)
+        except Exception:
+            # Never let a capability advert break an evaluation. Omitting it is the SAFE
+            # direction: the gateway falls back to the legacy pair rather than over-asking.
+            pass
+
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
@@ -153,8 +201,10 @@ class AgentXClient:
                 f"{self.gateway_url}/v1/evaluate", 
                 json=payload,
                 headers=headers,
-                timeout=30.0 # Bounds a real gateway hang while surviving cold starts
-                             # (first Next.js route compile + cold Gemini can exceed 15s)
+                timeout=EVALUATE_TIMEOUT_S  # Bounds a real gateway hang while surviving cold
+                                            # starts (first Next.js route compile + cold Gemini
+                                            # can exceed 15s). Forwarded above so the gateway
+                                            # can fit its judge inside it — see P-157.
             )
             
             # AUTH IS NOT AVAILABILITY, and the availability contract must not swallow it.
@@ -170,7 +220,7 @@ class AgentXClient:
             # These belong to a human, not to a retry: nobody's session expires their way out
             # of it and no amount of waiting fixes a bad credential. Safe to hard-error
             # because the gateway itself NEVER returns 401/403/407 (verified against every
-            # response path in backend/gateway.py), so one of these can only have come from
+            # response path in the gateway), so one of these can only have come from
             # something standing in front of it.
             #
             # 429 deliberately NOT here: rate limiting IS a transient capacity condition, and
@@ -222,7 +272,7 @@ class AgentXClient:
             #                         the steered-fault counter, and any advice of the form
             #                         "go read the engine's logs".
             # Review proposed gating the 5xx branch on the header outright. PROBED FIRST, and
-            # the premise does not hold: gateway.py's middleware stamps the header AFTER
+            # the premise does not hold: the gateway's middleware stamps the header AFTER
             # `await call_next(...)`, so an HTTPException(500) keeps it but an UNHANDLED
             # exception never reaches the stamp — and an unhandled exception is precisely the
             # P-21 shape (`.strip()` on a JSON number). Gating 5xx on the header would

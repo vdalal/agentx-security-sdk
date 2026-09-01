@@ -9,14 +9,19 @@
 # file to hand someone who has just run pip install.
 python-dotenv>=1.0.0
 
-# NOTHING ELSE, DELIBERATELY, AND `google-genai` IS THE DELIBERATE OMISSION. Three of the four
-# published examples run on the SDK plus python-dotenv: no API key, no gateway, no LLM
-# credentials. The fourth, 01, is the recovery demo, and recovery makes a real LLM call to
-# re-plan, so it needs an LLM client and your own key.
+# NOTHING ELSE, DELIBERATELY, AND `google-genai` IS THE DELIBERATE OMISSION. Two of the three
+# published numbered examples run on the SDK plus python-dotenv: no API key, no gateway, no
+# LLM credentials. The third, 01, is the recovery demo, and recovery makes a real LLM call
+# to re-plan, so it needs an LLM client and your own key.
+#
+# (Counts derived from MANIFEST.in, not decremented: 00, 01 and 12 are the published
+# numbered set since 08 was dropped as a duplicate of 00. This paragraph said "four" for
+# a while after that, which is what a maintained number beside a list it does not name
+# always does.)
 #
 # Pinning that client here would make every reader install it, including the majority who have
 # no key and cannot run 01 either way. So 01 asks for it at the point of use instead: run it
-# without the client or without the key and it names what is missing and points at 08. A
+# without the client or without the key and it names what is missing and points at 00. A
 # dependency for one optional script belongs in that script's own message, not in the file a
 # reader installs from before they know which script they want.
 #

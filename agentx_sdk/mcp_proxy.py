@@ -65,6 +65,7 @@ try:
         _abstract_call,
         _apply_org_override,
         _call_signature,
+        _is_narrower,
         _coerce_arg_value,
         _max_cognitive_turns,
         # _scope / _target_action read as unused HERE — the module body calls neither directly,
@@ -122,15 +123,35 @@ _USAGE = (
     # who by construction has NEITHER script on PATH -- so the bare forms it used to print
     # were not runnable by the person reading them. (Caught in review of #287.)
     "  Start here:\n"
-    "    uvx agentx-mcp --demo       watch a DROP TABLE get stopped. No key, no signup.\n"
+    "    uvx agentx-mcp --demo       Watch a DROP TABLE get stopped. No key, no signup.\n"
+    # The middle rung, and it belongs directly under the rung it follows rather than beside
+    # the readers below: this is the step between "watch a block" and "wire us into your own
+    # server", and until now the only way to take it was to edit mcp.json and restart your
+    # client. Indented to the same column so the ladder reads as a ladder.
+    "    uvx agentx-mcp --demo --audit\n"
+    "                              Same call, watch-only. Nothing is stopped.\n"
     "\n"
     "  Then wrap your server, in mcp.json:\n"
     "    \"command\": \"uvx\",\n"
     "    \"args\": [\"agentx-mcp\", \"npx\", \"-y\", \"@modelcontextprotocol/server-filesystem\", \"/data\"]\n"
     "\n"
-    "  uvx agentx-mcp --review     see what was stopped. Approve a fix your agent found,\n"
+    "  uvx agentx-mcp --review     See what was stopped. Approve a fix your agent found,\n"
     "                              or mark a block right or wrong.\n"
-    "  uvx agentx-mcp --insights   see what your agents have learned to do instead.\n"
+    # 🔴 SAME TWO CORRECTIONS AS THE --audit LINE BELOW, because it is the same door and the
+    # same overclaim. "Your agents" covers servers the reader WRAPPED, not everything their
+    # agents do; scoped to wrapped servers, which is what this reader actually reads.
+    #
+    # 🔴 LEAD WITH AN ACTIONABLE VERB (founder rule). This went the wrong way first: the
+    # verb was stripped on the theory that every line should say WHAT THE SCREEN SHOWS. That
+    # is the MAIN command list's convention (audit, status, review), not this one. Flags name
+    # an action, and the advanced list next door proves it -- Adopt, Record, List, Customize,
+    # Seed, Pull. Removing the verb made these the odd ones out on their own screen.
+    #
+    # ⚠️ AND IT CANNOT SAY "FOR ADOPTION", though the Python door's twin does. That door ships
+    # `agentx adopt`; this one has no --adopt, and approving happens under --review. The
+    # asymmetry is real and deliberate: naming an action this flag does not perform is the
+    # defect, not the inconsistency.
+    "  uvx agentx-mcp --insights   Review the safe paths learned on your wrapped servers.\n"
     # Listed for the same reason the Python door lists `agentx audit`: mcp_demo now sends the
     # reader here, and a command the on-ramp names and --help hides is unfindable the moment
     # that footer scrolls away.
@@ -138,7 +159,22 @@ _USAGE = (
     # long as the screen has grouped. `--audit --calls` is the one that keeps the promise,
     # and everything after --audit is forwarded to the same reader, so it needs no dispatch
     # of its own here.
-    "  uvx agentx-mcp --audit      see what your agents actually DID, grouped by tool.\n"
+    # 🔴 "RECORDED", NOT "SEE", AND "WRAPPED SERVERS", NOT "YOUR AGENTS". Two corrections in
+    # one line, both to match what this door actually does.
+    #
+    # The verb: "records" is the word the rest of the product uses for this fact
+    # (decorators.RECORDING_CLAUSE), and EntryFlow's own MCP card already says "AgentX records
+    # a wrapped server's calls". The landing page and the help screen for the SAME door were
+    # describing one thing two ways.
+    #
+    # The subject: NOT "wrapped tools" -- that is the Python door's word and it is wrong here,
+    # because a proxy needs no decoration and screens every tools/call passing through it. But
+    # NOT "your agents" either: this covers servers the reader WRAPPED, not everything their
+    # agents do, and EntryFlow records the real bug from exactly that confusion (a reader with
+    # three wrapped servers edited one block and believed all three had stopped blocking).
+    # "Wrapped servers" is the widest honest claim: the ledger is a single per-user store
+    # (`_ledger_path` -> ~/.agentx/mcp-ledger.db), so --audit really does span all of them.
+    "  uvx agentx-mcp --audit      List what your wrapped servers recorded, grouped by tool.\n"
     # Both flags, because this is the ONLY help an uvx reader has and every flag after
     # --audit is forwarded to the same reader. Advertising one and not the other made the
     # other undiscoverable on this door while the Python door named both.
@@ -1235,7 +1271,11 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         _note_mcp_policy_degraded(log)
 
     try:
-        decision = evaluate_call_keyless(_flatten_call(name, params.get("arguments")))
+        # Hoisted: the SAME flattened text the shield judged is what a later retry has to be
+        # narrower than (BACKLOG P-191). Recomputing it at the two sites below would be a
+        # second copy of the payload shape, which is how these two paths drift.
+        flat_payload = _flatten_call(name, params.get("arguments"))
+        decision = evaluate_call_keyless(flat_payload)
     except Exception as err:
         # STILL FAIL-OPEN, on purpose (hard-blocking on ANY shield exception was rejected:
         # it turns a latent bug into an outage of the user's agent on the free tier). This is
@@ -1261,7 +1301,36 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # trace-keyed decorator would not. Counts-only / advisory: harvest-IN
         # block->allow correlation hook used purely to
         # COUNT (capturing the revised-safe call is later).
-        if streaks.pop(tool_key, None):
+        # 🔴 SAME TOOL IS NOT ENOUGH, AND THIS SURFACE HAD THE SAME HOLE AS THE DECORATOR.
+        # A tool blocked on `DROP TABLE users` followed by a clean `SELECT 1` on that tool
+        # scored a recovery here too. The agent changed the subject. `_is_narrower` is the
+        # shared predicate -- imported from the decorator rather than reimplemented, because
+        # two copies of this decision is exactly how the two keyless paths came to disagree.
+        # 🔴 TWO DIFFERENT QUESTIONS, AND THEY USED TO SHARE ONE VARIABLE. The STREAK is the
+        # runaway breaker's state and a clean call is progress, so it resets on any clean
+        # call -- gating that on the narrowing would leave the breaker armed on a tool the
+        # agent is using fine. The RECOVERY credit is the other question and it needs the
+        # blocked payload, which outlives the streak: an episode stays open until something
+        # narrower arrives, however many unrelated clean calls pass through first.
+        _blocked_payloads = session_stats.setdefault("_blocked_payloads", {})
+        _blocked_payload = _blocked_payloads.get(tool_key)
+        _had_open_block = bool(streaks.pop(tool_key, None)) or _blocked_payload is not None
+        _verdict = _is_narrower(_blocked_payload, flat_payload) if _had_open_block else False
+        _recovered = _verdict is True
+        if _had_open_block and _verdict is None:
+            # We cannot read scope on this surface. UNMEASURED, not continued: claiming the
+            # agent came back and failed is a statement we have no evidence for. This surface
+            # sees more non-SQL tools than the decorator does, so it is where the bucket
+            # actually fills.
+            session_stats["unmeasured_challenges"] = (
+                session_stats.get("unmeasured_challenges", 0) + 1)
+        elif _had_open_block and _verdict is False:
+            # Came back on the tool, but not with a narrowing. The episode stays open so a
+            # genuine narrowing later still counts, and no recovery is claimed.
+            session_stats["continued_challenges"] = (
+                session_stats.get("continued_challenges", 0) + 1)
+        if _recovered:
+            _blocked_payloads.pop(tool_key, None)
             session_stats["self_corrections"] = session_stats.get("self_corrections", 0) + 1
             # Flip EXACTLY the latest open ledger block for this tool to RECOVERED (see the
             # block-logging twin), so one clean call counts as one recovery. A session-wide
@@ -1299,11 +1368,23 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # an inventory covering only the decorator would make `agentx audit` quietly mean
         # something different depending on how the user wired us in.
         #
-        # Audit posture only, matching the decorator. A clean call carries no verdict, so
-        # unlike the would-block twin below there is nothing to release and nothing to
-        # narrate -- this path stays SILENT, because it now runs on every passing call and a
-        # per-call line would bury the developer's own tool output.
-        if session_stats.get("_enforcement") == "audit" and session_stats.get("_ledger"):
+        # 🔴 BOTH POSTURES, MATCHING THE DECORATOR -- AND THIS GATE HAD TO MOVE WITH IT.
+        # It used to read `_enforcement == "audit"`, the twin of the decorator's own audit-only
+        # gate. P-112's enforce half moved that one so the DEFAULT posture records while still
+        # blocking; leaving this one behind would have made `agentx audit` mean something
+        # different depending on how the user wired us in -- an MCP user on the default posture
+        # would still get an empty screen, under copy that had been rewritten to promise them a
+        # full one. The comment above already says these two surfaces are kept from drifting
+        # deliberately; this is that rule being applied rather than restated.
+        #
+        # RECORDING IS NOT WATCH-ONLY. Nothing else here changes: the block path below is
+        # untouched, so an enforcing MCP session still answers with coaching and still refuses
+        # the call. Only the passing-call row is new.
+        #
+        # A clean call carries no verdict, so unlike the would-block twin below there is
+        # nothing to release and nothing to narrate -- this path stays SILENT, because it runs
+        # on every passing call and a per-call line would bury the developer's own tool output.
+        if session_stats.get("_ledger"):
             try:
                 seq = session_stats.get("_ledger_seq", 0)
                 session_stats["_ledger_seq"] = seq + 1
@@ -1312,7 +1393,8 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 # wrote a full inventory and pulsed audit_calls=0, so every MCP install
                 # reported "never ran audit" and the rung read 0 for that whole population.
                 record_call(inv_trace, "mcp_proxy", tool_key, params.get("arguments"),
-                            stats=session_stats)
+                            stats=session_stats,
+                            in_audit=session_stats.get("_enforcement") == "audit")
             except Exception:
                 pass
         return "forward"
@@ -1325,6 +1407,15 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     # two keyless surfaces can't drift. Placed before the breaker: a would-block that
     # actually runs is not a blocked-retry loop.
     if session_stats.get("_enforcement") == "audit":
+        # 🔴 BOTH HALVES OF THE PAIR, BECAUSE THIS IS THE SECOND INDEPENDENT WOULD-BLOCK
+        # WRITER. The decorator's `_record_would_block` keeps a screen-facing counter beside
+        # the funnel-facing one: the funnel excludes our own demo and example agents by
+        # design, and gating a SENTENCE on that exclusion is what made the session summary
+        # say nothing tripped on a run where something had. This door has no summary reader
+        # today, so it is latent here -- and that is exactly the state an earlier miss at
+        # this same call site was in before it bit. A rule applied at one of two independent
+        # writers still leaves the other one carrying the original defect.
+        session_stats["would_blocks_seen"] = session_stats.get("would_blocks_seen", 0) + 1
         session_stats["would_blocks"] = session_stats.get("would_blocks", 0) + 1
         _note_block_category(decision.get("category"), session_stats)
         if session_stats.get("_ledger"):
@@ -1370,6 +1461,12 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     # the free text a pulled policy could carry), shared with the decorator via the
     # parameterized recorder so the two can't drift.
     _note_block_category(decision.get("category"), session_stats)
+    # 🔴 OUTSIDE THE LEDGER GATE, DELIBERATELY. The recovery DEFINITION must not depend on
+    # whether a ledger happens to be attached: with this inside `if _ledger`, the routing
+    # core would hold no blocked payload, every retry would fail the narrowing test for lack
+    # of a comparison, and the surface would report zero recoveries forever while looking
+    # like it was applying a rule. That is a check measuring nothing (BACKLOG P-191).
+    session_stats.setdefault("_blocked_payloads", {})[tool_key] = flat_payload
     # Record the block in the local flight-recorder ledger (CHALLENGED) so a real MCP
     # catch fills `agentx status`. Each block gets a UNIQUE trace and remembers itself as
     # this tool's latest open block, so a later clean call recovers exactly ONE block
@@ -1622,9 +1719,11 @@ def _protection_report(session_stats, log):
         # surfaces report, or a fix wired into one reaches none of the other's users.
         failopens_n = int(session_stats.get("shield_failopens", 0) or 0)
         if failopens_n:
+            # Bug channel, not the gateway signup page. See links.GATEWAY_URL.
+            from .links import DISCORD_URL
             print("[agentx-mcp]   -> %d call(s) could NOT be checked and were allowed through (a BUG on "
-                  "our side, not a policy decision). Please report: https://bit.ly/agentfirewall"
-                  % failopens_n, file=log)
+                  "our side, not a policy decision). Please report: %s"
+                  % (failopens_n, DISCORD_URL), file=log)
         # Broken policy config in AUDIT. _screen_message increments this counter; without a
         # line here it was WRITE-ONLY, which is the same defect §0⑦ of the spec records on the
         # decorator: a test asserted the counter and passed while the operator saw nothing. The
@@ -1766,11 +1865,11 @@ def _point_stores_at_mcp_home():
       2. AGENTX_INCIDENT_DB    -- overrides._incident_db_path(), behind incident_db_census(),
                                   harvest_candidates() via _collect_candidates(), and
                                   reviewable_items(). Setting only (1) fixed the audit section
-                                  and left "SAFE-PATHS YOUR AGENTS LEARNED" and `--review`
+                                  and left "SAFE-PATHS YOUR WRAPPED TOOLS LEARNED" and `--review`
                                   reporting an empty store -- half a bug, fixed loudly enough
                                   to look done. (Caught on the THIRD review of #287.)
       3. AGENTX_OVERRIDES      -- overrides._overrides_path(), the ADOPTED safe-paths the
-                                  "SAFE-PATHS YOUR AGENTS LEARNED" section actually renders,
+                                  "SAFE-PATHS YOUR WRAPPED TOOLS LEARNED" section actually renders,
                                   and what adopt_override() writes. Setting (1)+(2) left the
                                   audit counts correct and that section still answering off
                                   the caller's cwd, so half the screen was authoritative and
@@ -1813,7 +1912,14 @@ def main(argv=None):
         # atexit pulse/report): the demo is a self-contained run against a bundled stub,
         # not a wrapped server, so it must not register a session or emit a pulse.
         from agentx_sdk.mcp_demo import run_demo
-        return run_demo()
+        # 🔴 `--demo --audit` IS THE MIDDLE RUNG, AND IT WAS THE ONLY ONE ON THIS DOOR WITH
+        # NO COMMAND. The ladder ran: `--demo` (a command), then EDIT mcp.json AND RESTART
+        # YOUR CLIENT (a change in the reader's own repo), then `--audit` (a command). The
+        # Python door turned the same rung into a command for the same stated reason, and
+        # that argument was never inherited here. The config block the demo footer prints is
+        # still how you wrap a REAL server; what it should not be is the only way to SEE
+        # watch-only before deciding to wire anything up.
+        return run_demo(audit="--audit" in argv[1:])
     if argv and argv[0] == "--review":
         # The uvx door installs exactly ONE console script (agentx-mcp), never `agentx`, so
         # without this an MCP user has no way to reach `agentx review` at all and the loop

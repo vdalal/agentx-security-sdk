@@ -29,15 +29,16 @@ recursive-exclude sdk_tests *
 # excluded it was measuring the wrong property.
 #
 # RULE 2, A CHOICE: of the files that pass rule 1, publish the smallest set that shows
-# distinct things -- a block (00), recovery after a block (01), the same block with zero
-# configuration (08), and a run where nothing is blocked and the ledger is the point (12).
+# distinct things -- a block (00), recovery after a block (01), and a run where nothing is
+# blocked and the ledger is the point (12).
 # More examples is not more value on a page a stranger is skimming.
 #
 # This replaced an `include examples/*.py` glob that published all thirteen numbered scripts,
-# a set nobody chose. Of the nine now unpublished, the reasons differ and are worth keeping
+# a set nobody chose. Of the ten now unpublished, the reasons differ and are worth keeping
 # straight: 02, 09, 10 and 11 drive a gateway the reader does not have; 03 and 07 need an LLM
-# client or key and, unlike 01, have not been made to decline gracefully; 04, 05 and 06 pass
-# rule 1 outright and were dropped under rule 2 alone -- said plainly, because an unexplained
+# client or key and, unlike 01, have not been made to decline gracefully; 04, 05, 06 and 08
+# pass rule 1 outright and were dropped under rule 2 alone (08 last, because it turned out to
+# demonstrate the same thing as 00 rather than something distinct) -- said plainly, because an unexplained
 # drop reads like an oversight and the next person will "fix" it by re-adding them.
 #
 # A script a reader can open but not run is not an example, it is an advertisement with a
@@ -62,7 +63,6 @@ recursive-exclude sdk_tests *
 # gateway is the part nobody outside can read.
 include examples/00_quickstart_pip.py
 include examples/01_self_healing_agent.py
-include examples/08_frictionless_agent_protection.py
 include examples/12_audit_what_your_agent_did.py
 include examples/requirements.txt
 include examples/README.md

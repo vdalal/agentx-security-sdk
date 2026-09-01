@@ -2,12 +2,12 @@
 
 Runnable scripts, each one a single behaviour you can watch happen.
 
-Four numbered examples ship with the package. Three of them run with no API key, no gateway
-and no LLM credentials. The fourth, `01_self_healing_agent.py`, shows recovery: it needs your
-own Gemini key, and if you run it without one it says so and points you at `08`.
+Three numbered examples are published with the SDK. They come in the source archive, not the wheel a plain `pip install` fetches, so if you installed from PyPI you will not have this folder: clone the repo, or download the sdist. Two of them run with no API key, no gateway
+and no LLM credentials. The third, `01_self_healing_agent.py`, shows recovery: it needs your
+own Gemini key, and if you run it without one it says so and points you at `00`.
 
 If you are reading this in a **clone of the repository** you will see more scripts than these
-four. Those extra ones are not part of the published package, and several of them do need a
+three. Those extra ones are not part of the published package, and several of them do need a
 Gemini key and a running gateway. Do not trust their headers to tell you which: some open
 straight into `from google import genai` with nothing above it. `requirements.txt` lists which
 script needs what, script by script.
@@ -16,7 +16,7 @@ script needs what, script by script.
 
 ```bash
 pip install agentx-security-sdk
-pip install -r requirements.txt     # python-dotenv, for the three that load a local .env
+pip install -r requirements.txt     # python-dotenv, for the two that load a local .env
 ```
 
 `00_quickstart_pip.py` needs neither of those beyond the SDK itself. It is the file to run
@@ -27,8 +27,7 @@ first if you have just installed and want to see a block in ten seconds.
 | | | Needs |
 |---|---|---|
 | `00_quickstart_pip.py` | A prompt-injected `DROP TABLE` is stopped in-process | nothing, not even `requirements.txt` |
-| `08_frictionless_agent_protection.py` | The same, on a tool with no configuration at all | `requirements.txt` (it loads a `.env`) |
-| `12_audit_what_your_agent_did.py` | **Nothing is blocked.** A support agent works a refund ticket and AgentX records what each call touched, then `agentx audit` reads it back | `requirements.txt` (it loads a `.env`) |
+| `12_audit_what_your_agent_did.py` | **Nothing is blocked**, not even the poisoned call at the end. A support agent works a refund ticket, AgentX records every wrapped tool call, whether blocking is on or off. `agentx audit` lists four of them; the poisoned one tripped a policy, so it shows in `agentx insights` | `requirements.txt` (it loads a `.env`) |
 | `01_self_healing_agent.py` | **Recovery.** A blocked agent reads the challenge, re-plans, and completes the task instead of dying | `requirements.txt`, `pip install google-genai`, and your own `GEMINI_API_KEY` |
 
 `12` is the odd one out and worth running second. The other two end in an intervention, so

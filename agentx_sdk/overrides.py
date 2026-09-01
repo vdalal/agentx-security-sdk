@@ -52,7 +52,7 @@ _SCHEMA_VERSION = 1
 # recording perfectly. A resolution rule that silently re-points is worse than one that
 # is simply wrong, because nothing about the output says which file it read.
 #
-# The gateway now anchors to the same project root (backend/agentx_home.py), so there
+# The gateway now anchors to the same project root, so there
 # is one answer on both sides. Any OTHER store found under the root is a STRAY -- it is
 # reported (see incident_db_strays), never silently substituted. An explicit
 # AGENTX_INCIDENT_DB still wins, and is what the tests use.
@@ -72,7 +72,7 @@ def _find_project_root(start=None):
 
     Prefers the ``.git`` REPO ROOT — it is unique and cwd-independent, and matches
     the "commit overrides.json to your repo" sharing model — so that NESTED
-    ``.agentx/`` dirs (a repo can have several: root, agentx_sdk/, backend/, …)
+    ``.agentx/`` dirs (a repo can have several: the root and any package or service dir)
     cannot split the store between adopt-time and run-time. Only when there is no
     ``.git`` ancestor (not a git checkout) does it fall back to the nearest
     ``.agentx/`` ancestor, then cwd. ``AGENTX_OVERRIDES`` / ``AGENTX_INCIDENT_DB``
@@ -137,7 +137,7 @@ def _incident_db_path(path=None):
     Returns the canonical path whether or not it exists, so a caller can report a
     not-found path rather than guessing at a different file. Project-root-anchored, so
     it resolves the same from any subdirectory and matches what the gateway writes
-    (backend/agentx_home.py). Existence is deliberately NOT part of the rule -- see the
+    (shared with the gateway). Existence is deliberately NOT part of the rule -- see the
     comment on DEFAULT_INCIDENT_DB for what "first one that exists" cost."""
     if path:
         return path
@@ -1103,7 +1103,7 @@ def enumerate_candidates(harvest):
 #
 # 🔴 SECOND COPY OF A CLOSED VOCABULARY. The gateway owns _DOMAIN_TAG_VOCAB and this is a
 # duplicate of it, which drifts by construction -- a KEEP IN SYNC comment is not a guard. The
-# guard is backend/test_recovery_summary_vocab_parity.py, which fails when the two diverge.
+# guard is the cross-surface recovery-vocabulary tripwire, which fails when the two diverge.
 # The vocabulary is what stops a drifting tag becoming a real-looking action class and
 # inflating whichever group it lands in.
 _DOMAIN_TAG_VOCAB = frozenset({
@@ -1148,7 +1148,7 @@ COACHING_MIN_SAMPLE = 20
 # defensively, because a store can be written by a NEWER gateway than the SDK reading it. A
 # value we do not recognise is counted as exactly that -- never bucketed by prefix match, which
 # would quietly fold a future `recovered_but_slower` into `recovered` and move the headline
-# rate. Guarded by backend/test_recovery_summary_vocab_parity.py.
+# rate. Guarded by the cross-surface recovery-vocabulary tripwire.
 _RECOVERED_OUTCOMES = frozenset({"recovered", "recovered_continued", "recovered_stopped"})
 # 🔴 A HUMAN APPROVAL IS NOT A RECOVERY and must never reach the recovery rate: our coaching did
 # not produce it, a person did. Deliberately OUTSIDE _RECOVERED_OUTCOMES, and the rows carrying
@@ -1242,7 +1242,7 @@ def settle_stale_blocks(older_than_seconds=SETTLE_AFTER_SECONDS, db_path=None, n
     for the same reason -- at READ time, immediately before the readout that consumes it.
 
     🔴 IT LIVES HERE, BESIDE ITS READER, BECAUSE IT SHIPPED WITH NO CALLER AT ALL. The first
-    cut of P-59 put both sweeps in ``backend/incident_store.py``, which the SDK cannot import
+    cut put both sweeps in the gateway's incident store, which the SDK cannot import
     and the gateway never called -- so nothing settled in any real deployment, `open` never
     drained, and "N blocks recorded, none settled yet" was the permanent state for every user
     whose agents never recovered. The readout printed that sentence as though it were news.
@@ -1699,14 +1699,14 @@ def coaching_scoreboard(path=None, min_sample=COACHING_MIN_SAMPLE):
     the old one. Detection is automatic; the rewrite is a person's job.
 
     Grouped by ``(policy_id, coaching_version)``. Identity is ``policy_id`` -- there is
-    deliberately no second coaching id (incident_store.py) -- and the version is stamped at PARK
+    deliberately no second coaching id in the ledger -- and the version is stamped at PARK
     time, so a rewrite of OUR canonical coaching starts a fresh score with no flag for anyone to
     remember to set. That is the spec's "a score goes provisional when its coaching text changes
     version": the old text keeps its history, the new text has none yet and reads as such.
 
     🔴 THAT HOLDS FOR CANONICAL COACHING ONLY, AND AN EARLIER VERSION OF THIS DOCSTRING CLAIMED IT
     UNCONDITIONALLY. ``coaching_version`` is ``POLICY_BASELINE_VERSION``, a BUILD stamp bumped when
-    ``CANONICAL_COACHING_BY_FAILURE_MODE`` / ``_GATEWAY_BLOCK_SAFE_PATHS`` change (gateway.py, which
+    ``CANONICAL_COACHING_BY_FAILURE_MODE`` / ``_GATEWAY_BLOCK_SAFE_PATHS`` change (the gateway, which
     says so in its own comment). A developer-customised policy and a judge-authored
     ``socratic_prompt`` carry the generation they were ISSUED under, not one we wrote -- so if a
     developer edits their own coaching text, the version does NOT move and the new text is scored

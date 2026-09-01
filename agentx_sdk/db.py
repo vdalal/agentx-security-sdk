@@ -1,6 +1,8 @@
+import atexit
 import json
 import re
 import sqlite3
+import threading
 import time
 import os
 import sys
@@ -30,9 +32,14 @@ _BUSY_TIMEOUT_MS = 5000
 # and recovery readers filter those, so a WOULD_BLOCK row never inflates the recovery rate.
 WOULD_BLOCK_STATUS = "WOULD_BLOCK"
 
-# The AUDIT-posture INVENTORY status (P-92): one row per call that PASSED, written only in
-# audit mode by the same two keyless surfaces. Every other status in this ledger records a
-# call we had an opinion about; this is the one that records a call we did not.
+# The INVENTORY status (P-92): one row per call that PASSED, written by the same two keyless
+# surfaces. Every other status in this ledger records a call we had an opinion about; this is
+# the one that records a call we did not.
+#
+# ⚠️ IT SAID "written only in audit mode", WHICH P-112's ENFORCE HALF INVERTED. This is the
+# module-level definition of the status the whole feature turns on, so a reader who trusts it
+# re-derives the old rule and concludes the default posture writes nothing. Both postures
+# write these now; audit posture means blocking is off, and nothing more.
 #
 # 🔴 IT IS ALSO THE EVICTION KEY, WHICH IS WHY IT IS A CONSTANT AND NOT A BARE STRING.
 # prune_ledger drops these BEFORE anything else (see the SIZE rule), because the inventory is
@@ -160,6 +167,244 @@ def _connection(path=None):
             conn.close()
         except Exception:
             pass
+
+
+# --- THE HOT WRITE PATH (P-112 enforce half) ------------------------------------------
+#
+# 🔴 WHY THIS EXISTS AND WHY IT IS NOT `_connection`. Once the DEFAULT posture records, this
+# writer runs inside every protected tool call instead of only on the rare block. `_connection`
+# opens a fresh handle per call, and that is far too slow to sit on that path. MEASURED on
+# Windows 11 / py3.12, warmup 100 then 1000 iterations, against a 178 us protected call:
+#
+#     connect + insert + commit + close, per call (what _connection does)   6620 us
+#     persistent handle, NO WAL                                             3456 us
+#     persistent handle + WAL                                                535 us
+#     persistent handle + WAL + synchronous=NORMAL                            66 us
+#
+# ⚠️ TWO THINGS THAT MEASUREMENT OVERTURNED, recorded because the old numbers are still quoted.
+# (1) "~95% of the cost is opening the connection" is FALSE here -- the connection is under
+# half. The fsyncs together cost more: journal ~2921 us, commit ~469 us, the INSERT itself 66 us.
+# (2) A persistent handle ALONE is not enough. Without WAL, journal_mode=DELETE writes and
+# fsyncs a rollback journal per commit, so plain persistence still costs +1937% on the baseline.
+# WAL is REQUIRED, not an optimisation to reach for later.
+#
+# 🔴 AND THE INSERT IS NOT WHAT THIS PATH COSTS ONCE THE LEDGER IS FULL. THE PRUNE IS.
+# `_writes_since_prune` fires `prune_ledger()` inline every 200 writes. Before this change the
+# default posture wrote ~nothing, so that effectively never ran from a protected call. It now
+# runs on a ledger this same change drives every install to the 10,000-row cap, where the
+# prune has real rows to delete and `event_log` carries no indexes. Measured by stubbing
+# `prune_ledger` and interleaving, on a ledger seeded to 9,000 rows:
+#
+#     record_call with the prune stubbed out                                  25.7 us
+#     record_call as it ships (prune amortized over 200 writes)              123.3 us
+#     -> the prune is ~98 us per call, about 79% of what recording costs
+#
+# ⚠️ SO QUOTE 123 us FOR THE STEADY STATE, NOT 97. The 97 us figure this branch reported was
+# measured on a FRESH ledger, where the prune's scans find nothing to delete and are cheap. It
+# is the right number for a new install and the wrong one for the state this change creates.
+# Against a 178-328 us protected call that is roughly +38% to +69%, not the +30% to +55% first
+# reported. An earlier note here read "prune +66.6 us per call, 6% of recording", which cannot
+# be both and was not re-derived; these numbers were.
+#
+# NOT CHANGED HERE, because the two cheap fixes both alter something ratified: raising the
+# 200-write cadence lets the ledger overshoot P-97's cap between prunes, and indexing
+# `event_log` is a schema migration. Founder decision, with the numbers above rather than
+# without them.
+#
+# `_connection` is deliberately left exactly as it was: 20 read/admin call sites depend on its
+# always-closes contract and two tests pin it (test_db.py::test_connection_context_manager_*).
+# This is a second, narrower door for the one path that needs speed.
+#
+# ⚠️ synchronous=NORMAL IS A DURABILITY CHOICE, SAID OUT LOUD RATHER THAN SLIPPED IN. In WAL
+# mode it CANNOT corrupt the database; it risks losing only the most recent commits on an OS
+# crash or power cut. WAL frames survive process death, so this is strictly LESS lossy than the
+# buffer-and-flush design considered and rejected, which loses everything on a kill -9.
+_write_conn = None
+_write_conn_path = None
+
+# 🔴 WHETHER THE SPEED TRADE ACTUALLY GOT TAKEN, RECORDED RATHER THAN ASSUMED. The paragraph
+# above argues `synchronous=NORMAL` is safe because "in WAL mode it CANNOT corrupt the
+# database". That argument is CONDITIONAL on WAL, and the first cut never checked: `PRAGMA
+# journal_mode=X` RETURNS the resulting mode instead of raising when the filesystem refuses
+# the change (measured: it answers ('wal',) / ('delete',)), so the `except sqlite3.Error`
+# fallback below can never see the case it was written for. On a mount without shared memory
+# -- an SMB/NFS home directory, which is exactly the "some network mounts" that fallback
+# names -- the ledger would have stayed on a rollback journal AND been dropped to NORMAL,
+# which SQLite documents as corruption-capable after a power cut. A guard that cannot fire is
+# this repo's most repeated defect; this one is answered by reading the result.
+#
+# It is also what `log_intercept` restores TO. Only a handle that was lowered needs raising
+# for a block row, and only a handle that was lowered may be put back to NORMAL afterwards.
+_write_conn_fast = False
+
+# 🔴 A NEW LOCK, AND IT MAY NOT BE decorators._stats_lock. That lock is documented as never held
+# across I/O (see record_call below), and widening it to span a SQLite write would put file
+# contention on the developer's tool-call path. This one guards only this handle.
+_write_lock = threading.RLock()
+
+
+def _write_connection():
+    """The persistent ledger handle, opened lazily and keyed on the resolved path.
+
+    🔴 KEYED ON THE PATH, NOT A BARE "already open" FLAG. `DB_PATH` genuinely moves inside one
+    process: `mcp_proxy._point_stores_at_mcp_home()` reassigns it and `main()` never restores it
+    (correctly -- the proxy owns its process), `_reader_globals` moves and restores it, and the
+    root conftest restores it after every test. A handle cached on nothing keeps writing to
+    whichever ledger it opened first, and `log_intercept` swallows the error, so the rows are
+    lost in silence. `decorators._LEDGER_MIGRATION_CHECKED` had exactly this bug and was fixed
+    exactly this way; pinned by test_db.py::test_a_write_follows_db_path_when_it_moves_mid_process.
+
+    🔴 ...AND THE KEY IS THE ABSOLUTE PATH, WHICH THE FIRST VERSION OF THIS FUNCTION GOT WRONG
+    WHILE ITS DOCSTRING CLAIMED OTHERWISE. `DB_PATH` defaults to the RELATIVE ".agentx.db".
+    `_connection()` re-resolves that against the current directory on every call; a cached
+    handle resolves it exactly ONCE. So a process that changed directory after its first write
+    -- an agent moving into a per-task workspace, which is ordinary -- kept writing into the
+    ledger it opened first, while `agentx audit` run from the new directory read an empty one.
+
+    Measured before the fix: write in A, chdir to B, write again, and BOTH rows are in
+    A/.agentx.db with B's ledger empty. At the previous commit the second row correctly
+    followed the directory. That is a regression this change introduced, and it was NOT
+    confined to the new inventory rows: `log_intercept` is also the writer for CHALLENGED
+    block rows, so an agent's catches went to the wrong file. The outer `except Exception:
+    pass` hides nothing here, which is what makes it nasty -- the writes SUCCEED, into the
+    wrong ledger.
+
+    The pinned guard could not have caught it: that test moves the VARIABLE to an absolute
+    path, and the root conftest pins `DB_PATH` absolute for the whole session, so the relative
+    case is structurally invisible to the suite. See
+    test_db.py::test_a_write_follows_the_working_directory_when_the_path_is_relative.
+
+    🔴 check_same_thread=False PLUS THE LOCK, not `threading.local()`. Three thread families
+    reach this writer: the caller's own thread, up to 16 `agentx-protect` pool threads (so every
+    async-decorated tool records off the event loop), and the MCP relay pump. Thread-local would
+    mean ~18 handles with no closer between them, and under WAL the sidecars outlive a handle
+    that is never closed. One handle has one lifecycle and one closer; the lock costs far less
+    than the write it guards. Pinned by
+    test_db.py::test_every_thread_that_writes_a_row_gets_that_row_on_disk.
+
+    ⚠️ LAZY, NEVER AT IMPORT. `import agentx_sdk` must leave no file behind (P-133), and
+    test_import_writes_nothing.py drives that in a subprocess. Opening here means the first
+    WRITE creates the ledger, which is the same moment it was created before.
+
+    Callers hold `_write_lock`.
+    """
+    global _write_conn, _write_conn_path, _write_conn_fast
+    # abspath, not realpath: it normalises "./x.db" and "x.db" to one key and costs a getcwd,
+    # where realpath would stat every component of the path on a per-call route. Symlinked
+    # ledgers reaching this by two different names is not a case anything here creates.
+    #
+    # Measured, because this runs on every recorded call: `abspath` itself is 0.46 us, and an
+    # interleaved A/B of the whole write (7 rounds, min taken) put the fix 4 us FASTER than
+    # the broken version -- i.e. the difference is under this harness's noise floor. It costs
+    # nothing worth stating.
+    path = os.path.abspath(DB_PATH)
+    if _write_conn is not None and _write_conn_path == path:
+        return _write_conn
+    _close_write_connection()
+    conn = sqlite3.connect(path, timeout=_BUSY_TIMEOUT_MS / 1000.0, check_same_thread=False)
+    _write_conn_fast = False
+    try:
+        conn.execute("PRAGMA busy_timeout=%d" % _BUSY_TIMEOUT_MS)
+        # 🔴 READ THE ANSWER, DO NOT ASSUME IT. This pragma reports the mode the database
+        # ENDED UP IN and does not raise when the change is refused, so the `except` below is
+        # not the WAL fallback it looks like. `synchronous=NORMAL` is only safe under WAL, so
+        # it is only taken when WAL is what we actually got. See _write_conn_fast above.
+        _mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        if _mode and str(_mode[0]).strip().lower() == "wal":
+            conn.execute("PRAGMA synchronous=NORMAL")
+            _write_conn_fast = True
+    except sqlite3.Error:
+        # A ledger on a filesystem that refuses WAL (some network mounts) still has to work.
+        # It will be slow, and slow is the correct trade against not recording at all.
+        pass
+    # The writer stands up the table it writes, same rule as log_intercept's own CREATE and for
+    # the same reason: init_db() no longer runs at import, so this may be first to touch the
+    # file. Done ONCE per handle here rather than per call, which is most of what the per-call
+    # CREATE was costing.
+    # ⚠️ AND IF THAT CREATE RAISES, THE CONNECTION IS CLOSED RATHER THAN ABANDONED. It is not
+    # cached until the line below, so an exception here used to drop the only reference to an
+    # OPEN sqlite handle -- on a read-only ledger or a full disk that is one leaked handle per
+    # protected tool call, with `log_intercept`'s outer swallow hiding every one. The per-call
+    # COST of that failure is unchanged from before this branch (the old code opened a
+    # connection per call too, so a broken ledger always re-paid the open); the leak is the
+    # part that is new, and this is the whole of it.
+    try:
+        conn.execute(_CREATE_EVENT_LOG_SQL)
+        conn.commit()
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+    _write_conn, _write_conn_path = conn, path
+    return conn
+
+
+def _close_write_connection():
+    """Close and forget the persistent handle. Safe to call when there is none.
+
+    🔴 REGISTERED AT IMPORT (below), NOT LAZILY ON FIRST WRITE, AND THE ORDER IS THE REASON.
+    atexit runs LIFO. `decorators` imports this module, so registering here at import time puts
+    this closer FIRST on the stack and therefore LAST to run -- after
+    `decorators._print_agentx_summary`, which READS the ledger and WRITES through
+    `advance_watermark`. Registered on first write instead, it would land after that handler and
+    run BEFORE it, closing the ledger out from under the session-end readout. Everything on that
+    path is best-effort, so the symptom would be the summary silently going quiet.
+
+    Also the answer to `_quarantine_ledger`: on Windows `os.rename` fails while a handle is open,
+    which flips that path into "this session will not be recorded". Callers that move the ledger
+    aside close this first.
+    """
+    # 🔴 UNDER THE LOCK, BECAUSE TWO OF THE FOUR CALLERS DO NOT HOLD IT. `log_intercept`'s
+    # recovery path and `_write_connection` both call this with `_write_lock` held (it is an
+    # RLock, so re-entering is free); `_quarantine_ledger` and the atexit hook did not. With
+    # one handle shared across the caller's thread, up to 16 protect-pool threads and the MCP
+    # relay pump, an unlocked close can land between another thread's `execute` and its
+    # `commit` -- and that row disappears into the outer swallow.
+    #
+    # ⚠️ BOUNDED, NOT BLOCKING FOREVER. This also runs from atexit, where a writer wedged on a
+    # locked ledger must not turn process exit into a hang.
+    #
+    # 🔴 AND IF THE LOCK CANNOT BE TAKEN, IT DOES NOT CLOSE. The first cut closed anyway, on
+    # the reasoning that this "is exactly the behaviour this had before, so the timeout can
+    # only ever leave us where we already were". That argument is wrong in the way that
+    # matters: closing a shared handle without the lock is precisely the mid-execute/commit
+    # race this function took the lock to prevent, so the guard had a hole in the shape of its
+    # own bug. Both callers that can reach the timeout are SAFER not closing -- at exit the OS
+    # releases the handle, and `_quarantine_ledger` sees the False and takes its documented
+    # "could not move it, your file is untouched" branch instead of renaming a file another
+    # thread is mid-write on.
+    #
+    # Returns whether the handle is now closed, so a caller that needs it CLOSED (rather than
+    # merely asked to close) can tell.
+    global _write_conn, _write_conn_path, _write_conn_fast
+    if not _write_lock.acquire(timeout=_BUSY_TIMEOUT_MS / 1000.0):
+        return False
+    try:
+        # `_write_conn_fast` is a property of the HANDLE, so it is forgotten with the handle.
+        # Left standing it would describe a connection that no longer exists, and the next one
+        # may open on a different filesystem (DB_PATH moves) with a different answer.
+        conn, _write_conn, _write_conn_path = _write_conn, None, None
+        _write_conn_fast = False
+        if conn is None:
+            return True
+        try:
+            conn.close()
+        except Exception:
+            # ⚠️ NOT RESTORED, AND NOT A LEAK EITHER. A review called this a silent leak;
+            # measured, it is not: dropping the only reference lets CPython finalise the
+            # connection, which closes it (verified by renaming the file straight afterwards on
+            # Windows, where an open handle would refuse). Deliberately not put back, because
+            # the caller that reaches here most is `log_intercept`'s recovery path, whose whole
+            # purpose is to stop a bad handle being handed to every later write.
+            return False
+        return True
+    finally:
+        _write_lock.release()
+
+
+atexit.register(_close_write_connection)
 
 
 # The event_log schema, in ONE place. Both the CREATE below and the add-missing-column
@@ -350,9 +595,9 @@ def _plan_migration(have):
                 which is far worse than shipping without the column — and worse than the
                 pre-P-57 behaviour, which merely skipped it.
 
-    Mirrors backend/incident_store.py::_reconcile_columns, which fixed the same class for
+    Mirrors the gateway's incident-store column reconciler, which fixed the same class for
     the gateway's incident store in 2026-07 and likewise returns what it could NOT add so
-    the caller can report it. The SDK ships standalone and cannot import from backend/, so
+    the caller can report it. The SDK ships standalone and cannot import the gateway, so
     this is a deliberate second copy of the PATTERN, not of any value.
     """
     addable, foreign, unaddable = [], [], []
@@ -368,6 +613,42 @@ def _plan_migration(have):
     return addable, foreign, unaddable
 
 
+# 🔴 A SQLITE LEDGER IS A FAMILY OF FILES, AND THIS IS THE ONE PLACE THAT SAYS SO.
+#
+# Under WAL a committed row lives in `<name>-wal` until a checkpoint, and `<name>-shm` is the
+# shared-memory index beside it. Anything that MEASURES, MOVES, COPIES or DELETES a ledger and
+# looks only at the `.db` is working on a fraction of it.
+#
+# This is a rule this branch has now been bitten by five times, in five different files, each
+# found separately:
+#
+#   - the conftest store tripwire went green on the leak it exists to catch, because it samples
+#     (exists, size, mtime) of the `.db` and a committed row does not touch it
+#   - four privacy assertions read the `.db` bytes and reported "no value on disk" over a value
+#     that was in the `-wal`
+#   - the founder-runnable pr328 check had the same blind spot
+#   - `_quarantine_ledger` renamed the `.db` and left the sidecars, so the quarantined copy was
+#     missing its newest rows AND the orphaned `-wal` sat next to a fresh ledger for SQLite to
+#     try to recover into
+#
+# By the fifth instance the answer stops being another local fix. The suffixes were already
+# written down in SIX places (this module, `conftest.py`, two test helpers, two scripts, and a
+# demo utility) -- a rule restated at each site, which is this codebase's most repeated defect
+# and gets obeyed at some of them. It lives here now and the others import it.
+LEDGER_SIDECARS = ("-wal", "-shm")
+
+
+def ledger_files(path=None):
+    """Every path a ledger occupies on disk, main file first. Pure; never touches the disk.
+
+    Returns names, not existing files: a caller measuring drift WANTS a missing `-wal` in its
+    list, because one that APPEARS during a run is itself the change worth seeing. Callers that
+    need only what exists filter on `os.path.exists` themselves.
+    """
+    base = path or DB_PATH
+    return (base,) + tuple(base + suffix for suffix in LEDGER_SIDECARS)
+
+
 def _quarantine_ledger():
     """Move a ledger we cannot read ASIDE, never delete it, and return the backup path.
 
@@ -381,15 +662,75 @@ def _quarantine_ledger():
     quarantine would show up as an untracked file in the developer's own repo. Caught by
     running this against the real repo ledger rather than only against tmp_path.
     """
+    # 🔴 THE FREE-NAME CHECK COVERS THE WHOLE FAMILY, AND THE FIRST VERSION OF THIS CHECKED
+    # ONLY THE `.db`. That is this branch's own one-file blindness, reintroduced INSIDE the
+    # commit that fixed it -- left written down, because it says the class is not fixed by
+    # knowing about it.
+    #
+    # Measured: leave a stale `.agentx.db.bak-wal` with no `.agentx.db.bak` beside it (what a
+    # user deleting a backup and missing its sidecar produces), and the loop picks
+    # `.agentx.db.bak` as free. The sidecar rename then hits an existing file and fails into
+    # the swallowing `except OSError` -- so the quarantined database ends up paired with a
+    # STALE write-ahead log from an older rescue, while the live one holding the user's newest
+    # rows is orphaned beside the path a fresh ledger is about to be created at. Both halves of
+    # the harm this hunk exists to prevent, caused by the hunk.
+    def _family_free(base):
+        return not any(os.path.exists(name) for name in ledger_files(base))
+
     target = DB_PATH + ".bak"
     n = 1
-    while os.path.exists(target):
+    while not _family_free(target):
         n += 1
         target = "%s.%d.bak" % (DB_PATH, n)
-    try:
-        os.rename(DB_PATH, target)
-    except OSError:
-        return None
+    # 🔴 DROP OUR OWN HANDLE FIRST, OR THIS FAILS ON WINDOWS FOR A REASON WE CAUSED. The
+    # docstring above already names a file lock as the usual cause of the None branch; since
+    # P-112's enforce half the writer holds a persistent handle on this exact file, so without
+    # this line we would be that lock ourselves, and the caller would tell the user "this
+    # session will not be recorded" about a rename only we were blocking. Under WAL there are
+    # also -wal/-shm sidecars open, which closing releases.
+    #
+    # 🔴 THE CLOSE AND THE RENAME ARE ONE STEP, UNDER THE LOCK. Closing and then renaming as
+    # two unlocked steps leaves a window in which another writer thread calls
+    # `_write_connection()` and CREATES `.agentx.db` again at the exact path being moved
+    # aside -- so the rename either fails, or succeeds and the "moved aside, nothing was
+    # deleted" message describes a file that now has a fresh sibling holding the rows written
+    # in between. `_write_lock` is an RLock and `_close_write_connection` takes it too, so
+    # nesting here costs nothing.
+    with _write_lock:
+        if not _close_write_connection():
+            # Could not be sure our own handle is shut. Renaming a file another thread may be
+            # mid-write on is worse than declining: this is the documented None branch, and it
+            # leaves the user's ledger exactly as it was.
+            return None
+        try:
+            os.rename(DB_PATH, target)
+        except OSError:
+            return None
+        # 🔴 THE SIDECARS GO WITH IT, AND UNTIL NOW THEY DID NOT. Renaming only the `.db` left
+        # two problems behind, and the second is the worse one: the quarantined copy is missing
+        # whatever sat in its `-wal` (its NEWEST rows -- and this function's whole promise is
+        # that the user's bytes survive), and the orphaned `-wal` stays beside the path a fresh
+        # ledger is about to be created at, where SQLite will try to recover it into a database
+        # it never belonged to.
+        #
+        # Windows hid this: with any other connection open the rename fails outright and we
+        # return None, which is the safe documented branch. On POSIX it succeeds, so the
+        # damage lands only on the platforms most users are on.
+        #
+        # Renamed to `target + suffix` so the pair still MATCHES: SQLite looks for a WAL beside
+        # the database by name, so `x.db.bak` needs `x.db.bak-wal` to be readable later.
+        #
+        # ⚠️ BEST-EFFORT, AFTER the main file, and the residual is stated rather than hidden.
+        # The main rename is the guarded step and keeps its all-or-nothing contract. If a
+        # sidecar move then fails we are left with an orphan, which is strictly better than
+        # the alternative of moving sidecars first and failing on the main file -- and deleting
+        # one is never an option, because it may hold rows.
+        for _side in ledger_files()[1:]:
+            if os.path.exists(_side):
+                try:
+                    os.rename(_side, target + _side[len(DB_PATH):])
+                except OSError:
+                    pass
     return target
 
 
@@ -438,9 +779,12 @@ def _upgrade_existing_ledger():
     if unaddable:
         # Loud, but NOT a reason to touch their data. See _plan_migration: this is a bad
         # DDL string on our side, and the ledger keeps working without the column.
+        # A bug report goes to the bug channel, not to the gateway signup page the short
+        # link resolved to. See links.GATEWAY_URL for the three jobs that link was doing.
+        from .links import DISCORD_URL
         _notice("🔴 [AgentX SDK] Cannot add %s to an existing ledger, so this install will "
-              "run without it. Your history is untouched. Please report this: "
-              "https://bit.ly/agentfirewall" % ", ".join(unaddable))
+              "run without it. Your history is untouched. Please report this: %s"
+              % (", ".join(unaddable), DISCORD_URL))
     if not addable:
         return True                                   # already current
 
@@ -522,7 +866,7 @@ def init_db():
     no longer calls this at import time, but mcp_proxy.main() calls it at proxy startup where a
     raise kills the JSON-RPC session before it speaks, and examples/01 and examples/03 call it at
     MODULE scope, where a raise still breaks a shipped example on import. That is the opposite of
-    the sibling in backend/incident_store.py, which is documented as write-path-only and allowed
+    the sibling in the gateway's incident store, which is documented as write-path-only and allowed
     to raise.
 
     ⚠️ THIS CREATES A FILE, so it is the wrong call for anything a reader triggers. To bring an
@@ -677,7 +1021,7 @@ _CLASS_HINTS = (
 # carries a `currency` key holding a real value. The currency field is the developer's own
 # declaration, written for their reasons and not for us, so there is nothing for us to guess.
 #
-# WHY IT IS SPELLED THIS WAY: it is what `backend/gateway.py::_labelled_transfer_pair` already
+# WHY IT IS SPELLED THIS WAY: it is what the gateway's own transfer-pair labeller already
 # does, shipped in #317 as the fixed half of P-83. Its own row states the principle -- "the
 # argument NAME carries the meaning and no verb is needed". Both halves of the product now
 # answer "which number is money" the same way instead of guessing separately.
@@ -1343,11 +1687,15 @@ def format_ratio(numerator, denominator):
     # 🔴 A ZERO DENOMINATOR MUST NOT ERASE A NON-ZERO NUMERATOR. This returned the literal
     # "0 of 0" for ANY input whose denominator was 0, discarding `hits` -- so the gateway
     # screen rendered "0 of 0 recovered" over three real recoveries. It is reachable, not
-    # theoretical: gateway.py bumps `successful_agent_pivots` on any allow carrying a
+    # theoretical: the gateway bumps `successful_agent_pivots` on any allow carrying a
     # receipt_id (a deterministic-floor block issues one and never bumps
     # `socratic_nudges_issued`), and the gateway itself documents a cross-restart case where
-    # pivots outrun nudges -- which is why /v1/telemetry CLAMPS its own rate to 100. The CLI
-    # renders the two raw counters instead, so both skews arrive here. Report what we hold.
+    # pivots outrun their denominator. ⚠️ THIS USED TO SAY "which is why /v1/telemetry CLAMPS
+    # its own rate to 100". It no longer does: the ceiling was removed precisely because it was
+    # hiding a numerator larger than its denominator rather than protecting a reader, so a rate
+    # above 100 is now VISIBLE there. This function is the CLI's answer to the same skew and it
+    # has always been the honest one. The CLI renders the two raw counters, so both skews arrive
+    # here. Report what we hold.
     if hits > total:
         # No percentage: a ratio above 1 is a counter skew, not a recovery rate, and
         # `%.0f%%` would print "120%" or (below the sample floor) hide it entirely.
@@ -1455,6 +1803,40 @@ def get_call_inventory(path=None, limit=25):
     the reader to treat it as their agent's whole history when it is a 30-day / 10,000-row
     window. `covers_all` says whether anything was ever dropped, so the caller can state the
     honest sentence instead of guessing. P-97 ratified that a drop is reported, not silent.
+
+    🔴 P-130 MEASURED (Windows 11, Python 3.12.1, sqlite 3.43.1, 10,000-row ledger at P-97's
+    cap, timestamps spread across the 30-day window). This asks the ledger once for the tool
+    list and then TWO MORE QUESTIONS PER TOOL, so the cost is driven by DISTINCT TOOL COUNT,
+    not by row count:
+
+                                    12 tools   500 tools   10,000 tools
+        screen (limit=25)             22.7ms      32.5ms         55.4ms     <= 63 queries
+        --json (uncapped, #350)       31.1ms     573.0ms      11,367.0ms    20,013 queries
+        control: no inventory rows    12.6ms
+
+    The SCREEN is bounded by its 25-tool page, so it cannot get worse than ~55ms whatever the
+    ledger holds. `--json` is bounded only by the retention cap, and the row's derived ceiling
+    of "~20,000 queries in one command" is now an observation rather than an estimate: 20,013.
+
+    ⚠️ WHY THIS WAS MEASURED NOW, AND WHY IT IS STILL NOT FIXED. P-130's severity was LOW on
+    the stated grounds that "no measurement of a real ledger exists" -- which held because
+    enforce wrote no inventory rows, so this loop ran ~zero times for every default install.
+    P-112's enforce half ended that: every default install has inventory rows now. The
+    severity did not rise, but the REASON changed, and a reason nobody re-checks is how a
+    stale LOW survives. It is now conditional on an agent calling thousands of DISTINCT tool
+    names, which is a generated dispatcher or a fuzzer, not an agent. At the realistic 12-50
+    tools this is tens of milliseconds on a command a human typed.
+
+    THE TRIGGER TO FIX IT, so the next reader does not have to re-derive it: a real ledger
+    with more than a few hundred distinct tool names, or `--json` becoming something a program
+    calls in a loop rather than something a person runs. The fix is named in the row -- fold
+    the two per-tool queries into one grouped pass over `event_log`. The ANTI-fix is named
+    too: do NOT put the cap back on `--json`. A silently truncated document is a worse failure
+    than a slow one, and that completeness contract is why #350 removed it.
+
+    ⚠️ AND DO NOT RAISE THE ROW CAP FIRST. The 10,000 -> 20,000 raise goes AFTER this, because
+    the cap is a query-time backstop rather than a disk one: doubling it makes this worst case
+    ~4x in wall clock, not 2x. Fixing the loop first makes the raise free.
     """
     # 🔴 `flagged_total` IS LOAD-BEARING ON THE EMPTY SCREEN, not a nicety. An agent whose
     # every call tripped a policy has an EMPTY INVENTORY and a non-empty ledger, and the
@@ -1497,10 +1879,31 @@ def get_call_inventory(path=None, limit=25):
                 # never true, so a row whose tool_name was never written matches nothing --
                 # including its OWN group, which `GROUP BY tool_name` happily produced. The
                 # rule was applied to one column and not the other in the same WHERE clause.
+                # 🔴 `agent_id` RIDES THE QUERY THAT WAS ALREADY BEING RUN. This function's
+                # own docstring measures its cost in QUESTIONS PER TOOL, and `--json` is
+                # already at a measured 20,013 queries on the pathological ledger, so a third
+                # per-tool question to answer "whose agent was this" would worsen the exact
+                # number that docstring is watching. This DISTINCT scan was already reading a
+                # row per (arg_names, target_class); reading the agent alongside them costs
+                # no extra query and no extra pass.
                 cursor.execute(
-                    "SELECT DISTINCT arg_names, target_class FROM event_log "
+                    "SELECT DISTINCT arg_names, target_class, agent_id FROM event_log "
                     "WHERE status IS ? AND tool_name IS ?", (INVENTORY_STATUS, name))
-                names, classes = _union_arg_names_and_classes(cursor.fetchall())
+                distinct_rows = cursor.fetchall()
+                # Sliced to pairs here rather than widening `_union_arg_names_and_classes`,
+                # which get_would_block_summary also calls. Changing a shared signature to
+                # serve one of its two callers is how the other one acquires a bug.
+                names, classes = _union_arg_names_and_classes(
+                    [(r[0], r[1]) for r in distinct_rows])
+                # 🔴 OUR OWN DEMO AGENT IS NOT ONE OF THEIR AGENTS. `agentx demo` writes its
+                # scripted rows under the tool name `run_sql`, and the flagged count below
+                # was split for precisely this reason: our traffic annotating the developer's
+                # own row is a claim about their code that is not true. Without the same rule
+                # here, a single-agent developer who has run the demo sees TWO agents on the
+                # screen and one of them is ours -- on the first run of the ladder, which is
+                # the run this screen exists to make legible.
+                agents = sorted({r[2] for r in distinct_rows
+                                 if r[2] and r[2] not in OUR_AGENT_IDS})
                 # `IS NOT`, not `!=`. In SQLite `NULL != 'ALLOWED'` evaluates to NULL, which
                 # is not true, so a legacy row with no status (the P-57 migration path
                 # explicitly contemplates them) counted as NEITHER inventory nor flagged and
@@ -1522,7 +1925,7 @@ def get_call_inventory(path=None, limit=25):
                 flagged = cursor.fetchone()[0] or 0
                 tools.append({
                     "tool": name, "calls": calls, "max_amount": amount or 0.0,
-                    "arg_names": names, "classes": classes,
+                    "arg_names": names, "classes": classes, "agents": agents,
                     "first_ts": first_ts, "last_ts": last_ts, "flagged": flagged,
                 })
 
@@ -2140,9 +2543,16 @@ def current_call_shape(path=None):
     ⚠️ AND THIS DOES NOT HAVE TO BE A FULL SCAN. Every signal here is a union, a running
     maximum or a count, so new rows could be folded into the stored bookmark without
     re-reading the old ones -- bounded by activity rather than by ledger size. Deliberately
-    NOT done yet: it needs a read-up-to marker whose failure mode is news silently lost
-    forever, and it buys nothing at 5 ms. It becomes the right trade when enforce starts
-    recording and every ledger sits at the cap permanently, which is P-112's second half.
+    NOT done: it needs a read-up-to marker whose failure mode is news silently lost forever.
+
+    🔴 THE CONDITION THIS NOTE SET HAS NOW HAPPENED, AND THE ANSWER IS STILL NO. It said the
+    trade "becomes the right one when enforce starts recording and every ledger sits at the
+    cap permanently, which is P-112's second half" -- and that half has landed. Re-measured on
+    that world (10,000 rows spread across the window): 41.4 ms at 12 tools, 96.2 ms at a
+    pathological 10,000. Still ONCE PER PROCESS, at exit, off the tool-call path entirely, so
+    a tenth of a second at the far end of a session does not buy a marker that can lose news
+    silently. A note that names a trigger has to be re-read on the day it fires, which is the
+    only reason this one is being answered rather than left standing.
 
     ⚠️ SAY HOW OFTEN IT RUNS, NOT WHICH PATH IT IS ON. Every number above is ONCE PER
     SESSION, at exit. Nothing in this file runs PER TOOL CALL -- the per-call code costs
@@ -2943,7 +3353,7 @@ def get_retention_status(path=None):
 
 # Update your log_intercept function signature to accept the new ID!
 # FIXED: Signature updated to accept trace_id and agent_id
-def count_call_for_pulse(tool_name, stats, stats_lock=None):
+def count_call_for_pulse(tool_name, stats, stats_lock=None, in_audit=False):
     """Move the P-92 funnel counters for one recorded call. Best-effort; never raises.
 
     `stats_lock` is the caller's own lock, taken ONLY around the mutation. The decorator
@@ -2968,9 +3378,9 @@ def count_call_for_pulse(tool_name, stats, stats_lock=None):
     try:
         if stats_lock is not None:
             with stats_lock:
-                _bump_audit_counters(tool_name, stats)
+                _bump_audit_counters(tool_name, stats, in_audit)
         else:
-            _bump_audit_counters(tool_name, stats)
+            _bump_audit_counters(tool_name, stats, in_audit)
     except Exception:
         pass
 
@@ -2986,7 +3396,46 @@ def count_call_for_pulse(tool_name, stats, stats_lock=None):
 _MAX_AUDIT_TOOL_NAMES = 1000
 
 
-def _bump_audit_counters(tool_name, stats):
+def _bump_audit_counters(tool_name, stats, in_audit):
+    """Two counters, and the split is what keeps our own funnel readable.
+
+    🔴 `audit_calls` ANSWERS "DID SOMEONE RUN THEIR AGENT UNDER AUDIT POSTURE", AND IT HAS TO
+    KEEP ANSWERING THAT. It rides the anonymous pulse, and `scripts/funnel.py` derives
+    `ran_audit` from it (`d["ran_audit"] |= bool(r.get("audit_calls"))`). Before P-112's
+    enforce half only audit posture recorded, so "a row was written" and "the developer chose
+    audit" were the same event and one counter could serve both.
+
+    They are no longer the same event. Bumping `audit_calls` on every recorded call would make
+    EVERY install pulse `audit_calls > 0`, including installs that never touched audit -- so
+    `ran_audit` would quietly stop meaning adoption and start meaning "ran a protected tool at
+    all". Nothing would break, no test would fail, and the funnel would keep reporting a
+    number that answers a different question than the one its name asks. That is the failure
+    this project keeps calling "a zero (or a one) that has not earned its meaning".
+
+    So: `recorded_*` counts what was written, in any posture. `audit_*` counts audit posture
+    only and is unchanged.
+
+    ⚠️ `recorded_*` IS DELIBERATELY SESSION-LOCAL AND NOT ON THE PULSE. Nothing has a question
+    for it yet -- not the funnel, and not, as an earlier version of this line claimed, "the
+    screens". It has no production reader at all: the one screen that might have used it
+    explicitly declines to (see the quiet-session arm in decorators.py, which gates on the
+    posture-free rule instead and says why). It is written because the split is what keeps
+    `audit_*` honest, and a counter that exists is cheaper to explain than one invented later.
+
+    Adding a pulse field means the receiver allowlist plus an idempotent `usage_pulses`
+    migration the founder has to run against live Supabase, and that is not worth paying
+    for a signal nobody has asked a question of.
+    `pulse.py` builds its payload from an explicit allowlist, so these keys cannot leak into
+    it by accident -- if a question does turn up later, adding them is a deliberate act.
+    """
+    stats["recorded_calls"] = stats.get("recorded_calls", 0) + 1
+    recorded_names = stats.setdefault("recorded_tool_names", set())
+    if len(recorded_names) < _MAX_AUDIT_TOOL_NAMES:
+        recorded_names.add(tool_name)
+    stats["recorded_tools"] = len(recorded_names)
+
+    if not in_audit:
+        return
     stats["audit_calls"] = stats.get("audit_calls", 0) + 1
     names = stats.setdefault("audit_tool_names", set())
     if len(names) < _MAX_AUDIT_TOOL_NAMES:
@@ -2994,8 +3443,12 @@ def _bump_audit_counters(tool_name, stats):
     stats["audit_tools"] = len(names)
 
 
-def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats_lock=None):
-    """P-92: record ONE call that passed, in audit posture. Best-effort, never raises.
+def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats_lock=None,
+                in_audit=False):
+    """P-92: record ONE call that passed, in ANY posture. Best-effort, never raises.
+
+    (Said "in audit posture" until P-112's enforce half. This is the writer that half turns
+    on, so its own first line claiming otherwise is the worst place for that to go stale.)
 
     The inventory writer. Deliberately a thin wrapper over log_intercept rather than its own
     INSERT, so it inherits the retention ceiling that hangs off that function instead of
@@ -3004,7 +3457,14 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
     Callers pass the developer's raw kwargs; _call_shape reduces them to names, a magnitude
     bucket and a bounded class BEFORE anything reaches SQL, so no call site can hand a value
     to the ledger even by accident. That ordering is the guarantee, and
-    test_audit_inventory_records_no_values.py is what stops a future edit from inverting it.
+    sdk_tests/test_audit_inventory.py is what stops a future edit from inverting it -- four
+    tests under its "Shape, never values" heading, one per writer: this one called directly,
+    the WOULD_BLOCK path, and the decorator under each posture.
+
+    ⚠️ THE FILE NAMED HERE USED TO BE `test_audit_inventory_records_no_values.py`, WHICH HAS
+    NEVER EXISTED. A citation to a file nobody can open is worse than none: it reads as
+    evidence and cannot be followed, and the same wrong name was copied into BACKLOG.md as
+    the guarantee's home. Both corrected together.
     """
     names, amount, target_class = _call_shape(tool_name, arguments)
     # Counted BEFORE the write, and outside its failure mode. log_intercept swallows its own
@@ -3030,7 +3490,7 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
     # coarse ints with no room for provenance, so on that surface the only honest options are
     # "count ours as theirs" or "do not count ours". See is_demo_agent.
     if stats is not None and not is_demo_agent(agent_id):
-        count_call_for_pulse(tool_name, stats, stats_lock)
+        count_call_for_pulse(tool_name, stats, stats_lock, in_audit)
     log_intercept(trace_id, agent_id, tool_name, None, None, INVENTORY_STATUS,
                   arg_names=names, amount=amount, target_class=target_class)
 
@@ -3078,34 +3538,111 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
     _values = (time.time(), trace_id, agent_id, tool_name, policy_id, policy_name, status,
                tokens, time_saved)
     try:
-        with _connection() as conn:
-            # 🔴 THE WRITER CREATES THE TABLE IT WRITES. init_db() no longer runs at
-            # import time, so this may be the first thing in the process to touch the ledger.
-            # Without this line the INSERT below fails into the best-effort `except` and takes
-            # EVERY row with it, silently -- no error, no complaint, an empty ledger that reads
-            # exactly like a quiet agent. Same shape as prune_ledger's self-heal for
-            # ledger_retention and advance_watermark's for the two novelty tables; this
-            # generalises the rule those two already follow rather than adding a third
-            # convention for the same job.
-            #
-            # ⚠️ IT DOES NOT MIGRATE, AND THAT IS THE POINT. `IF NOT EXISTS` is a no-op against
-            # an existing pre-P-92 event_log, which is correct: the retry below stays the WHOLE
-            # guarantee that a catch still gets recorded on a ledger the migration has not
-            # reached. Running the migration from here would leave the legacy-retry tests green
-            # while quietly disabling the path they exist to cover. Upgrading an existing ledger
-            # is ensure_ledger_current's job and it runs at the entry points, never on this path.
-            conn.execute(_CREATE_EVENT_LOG_SQL)
-            cursor = conn.cursor()
+        # 🔴 THE PERSISTENT HANDLE, NOT `_connection()`. Once the default posture records, this
+        # runs inside every protected tool call, where opening a connection per write costs
+        # ~6620 us against a 178 us call. See _write_connection for the measurements and for why
+        # WAL is required rather than optional. The lock spans execute+commit as one unit.
+        #
+        # 🔴 THE WRITER STILL CREATES THE TABLE IT WRITES -- it moved to _write_connection, which
+        # runs it ONCE per handle instead of once per call. init_db() no longer runs at import,
+        # so this may still be the first thing in the process to touch the ledger, and without
+        # that CREATE the INSERT below fails into the best-effort `except` and takes EVERY row
+        # with it, silently. Doing it per handle rather than per call is most of what the
+        # per-call CREATE was costing.
+        #
+        # ⚠️ IT STILL DOES NOT MIGRATE, AND THAT IS STILL THE POINT. `IF NOT EXISTS` is a no-op
+        # against an existing pre-P-92 event_log, which is correct: the retry below stays the
+        # WHOLE guarantee that a catch still gets recorded on a ledger the migration has not
+        # reached. Upgrading an existing ledger is ensure_ledger_current's job and it runs at the
+        # entry points, never on this path.
+        with _write_lock:
             try:
-                cursor.execute(
-                    "INSERT INTO event_log (%s, arg_names, amount, target_class) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" % _COLUMNS,
-                    _values + (arg_names, amount if amount is not None else 0.0, target_class))
-            except sqlite3.OperationalError:
-                cursor.execute(
-                    "INSERT INTO event_log (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)" % _COLUMNS,
-                    _values)
-            conn.commit()
+                conn = _write_connection()
+                # 🔴 THE CATCH ROW COMMITS DURABLY; THE ROUTINE ROW DOES NOT. The handle runs
+                # `synchronous=NORMAL`, and that choice was argued entirely from the inventory
+                # hot path -- "it risks only the most recent commits on an OS crash or power
+                # cut" is an acceptable trade for routine traffic we now write on every call.
+                # It is NOT the same trade for a block. This function is the single writer for
+                # CHALLENGED rows too, which this file elsewhere calls "the record this
+                # product exists to keep", and before this branch those committed at SQLite's
+                # default FULL. Quietly weakening them was a side effect of speeding up a
+                # different row, and nothing on any screen would have shown it.
+                #
+                # Paid only where it is owed: blocks are rare by construction, so the extra
+                # disk sync costs nothing in aggregate, while the routine rows that made the
+                # persistent handle necessary keep NORMAL.
+                #
+                # 🔴 PUT BACK IN A `finally`, AND THE FIRST CUT'S ARGUMENT FOR NOT NEEDING ONE
+                # COVERED HALF THE EXITS. It read "if anything below raises, the handle is
+                # dropped in the `except`, so a connection can never be left sitting at FULL"
+                # -- true of an `Exception`, false of a `BaseException`. This function runs
+                # inside every protected tool call, so a Ctrl-C between the pragma and the
+                # commit is ordinary, and it walks straight past that `except Exception`: the
+                # handle stays CACHED and stays at FULL for the life of the process, so every
+                # later routine row pays the fsync this handle exists to avoid. Measured: the
+                # next inventory row committed at synchronous=2.
+                #
+                # 🔴 AND THE PRAGMA MOVED INSIDE THE `try`, BECAUSE OUTSIDE IT THE `finally`
+                # DID NOT COVER THE STATEMENT IT EXISTS FOR. A Ctrl-C landing after this
+                # execute returned but before the `try` was entered left the cached handle at
+                # FULL with nothing to put it back -- the exact defect the paragraph above
+                # describes, in a one-statement window, in the fix for it.
+                #
+                # ⚠️ `_write_conn_fast` GATES IT. A handle whose filesystem refused WAL was
+                # never lowered to NORMAL (see _write_connection), so it is ALREADY at FULL:
+                # raising it is a no-op and "restoring" it to NORMAL afterwards would hand
+                # every later routine row the rollback-journal + NORMAL combination SQLite
+                # documents as corruption-capable. The switch only ever undoes what we did.
+                _durable = _write_conn_fast and status != INVENTORY_STATUS
+                try:
+                    if _durable:
+                        conn.execute("PRAGMA synchronous=FULL")
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute(
+                            "INSERT INTO event_log (%s, arg_names, amount, target_class) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" % _COLUMNS,
+                            _values + (arg_names, amount if amount is not None else 0.0,
+                                       target_class))
+                    except sqlite3.OperationalError:
+                        cursor.execute(
+                            "INSERT INTO event_log (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            % _COLUMNS, _values)
+                    conn.commit()
+                finally:
+                    # 🔴 ROLL BACK BEFORE RESTORING, OR THE RESTORE CANNOT RUN AT ALL. SQLite
+                    # refuses the pragma inside an open transaction -- verbatim, "Safety level
+                    # may not be changed inside a transaction" -- and an interrupt between the
+                    # INSERT and the commit leaves exactly that: the implicit BEGIN still open
+                    # on a handle every later call reuses. So the two halves are one fix, and a
+                    # `finally` holding only the pragma would still have measured stuck-at-FULL.
+                    # Rolling back also stops the next write inheriting a stranded transaction,
+                    # and under WAL the writer lock it holds against other processes.
+                    #
+                    # Swallowed on purpose: on the failure path the handle is about to be
+                    # dropped anyway, and a cleanup that raises here would REPLACE the real
+                    # error with a meaningless one.
+                    #
+                    # This runs on the hot path, so it was measured rather than assumed:
+                    # `conn.in_transaction` is 0.031 us, and after a successful commit it is
+                    # False so the rollback is never called. Against the 123 us this write
+                    # costs on a full ledger that is 0.03%.
+                    try:
+                        if conn.in_transaction:
+                            conn.rollback()
+                        if _durable:
+                            conn.execute("PRAGMA synchronous=NORMAL")
+                    except Exception:
+                        pass
+            except Exception:
+                # 🔴 A BAD HANDLE MUST NOT POISON EVERY LATER WRITE. With a fresh connection per
+                # call a failure was self-limiting: the next call opened a new one. A cached
+                # handle is not -- if the ledger was deleted, moved, or the disk went read-only,
+                # the same broken handle would be handed to every write for the life of the
+                # process, and the outer swallow would hide all of it. Dropping it here means the
+                # next write reopens and can recover, which is the behaviour this path had before.
+                _close_write_connection()
+                raise
     except Exception:
         pass
 
