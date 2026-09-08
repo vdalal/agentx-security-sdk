@@ -431,6 +431,66 @@ _EVENT_LOG_COLUMNS = [
     ("arg_names",       "TEXT"),
     ("amount",          "REAL NOT NULL DEFAULT 0"),
     ("target_class",    "TEXT"),
+    # --- WHAT WE SAID, so a recovery can be attributed to the words that caused it --------
+    #
+    # 🔴 THIS COLUMN IS A DIFFERENT KIND FROM THE THREE ABOVE, AND THE DISTINCTION IS THE
+    # PRIVACY BOUNDARY. Those are DERIVED FROM the caller's payload and are bounded so they
+    # cannot carry a value. This one is not derived from the payload: it is the coaching text
+    # WE emitted. Do not read this as a relaxation of the rule above; a column holding
+    # anything the CALLER supplied still belongs under that rule.
+    #
+    # ⚠️ AND THE BOUND IS NARROWER THAN IT FIRST LOOKS, SO IT IS STATED PROPERLY RATHER THAN
+    # COMFORTABLY. An earlier version of this comment said the text is always "our own
+    # string, already on the user's disk in the shipped seeds or in their own
+    # .agentx/overrides.json". That is true of the KEYLESS path and false of the gateway one:
+    # there the challenge can be composed by the judge per call, so it is neither shipped nor
+    # on disk beforehand, and nothing stops a judge from quoting the payload it was shown
+    # back into its own sentence.
+    #
+    # This still stays inside the rule, because what lands here is what we HANDED THE AGENT:
+    # if it echoes the caller's data, the caller has already read it. But that is a different
+    # and weaker guarantee than "our own string", and the difference matters the moment
+    # anything considers sending this field anywhere. The contribution channel does not carry
+    # it today. Any change to that is a privacy decision, not a plumbing one.
+    #
+    # WHY IT EXISTS. The ledger already records that a block happened (`policy_name`) and
+    # whether the agent came back (`status`). What it could not say is WHICH WORDING was in
+    # front of the agent, so attribution stopped at the policy. Change a policy's coaching
+    # and nothing distinguishes before from after; write your own with `agentx customize`
+    # and nothing tells you whether it worked. That is the free tier "never improving" in
+    # one missing field, and it is the door most users arrive through.
+    #
+    # NULL on any row that was not a block, which is most of them: only a blocked call has
+    # coaching. Bounded by the same 30-day / 10,000-row retention as everything else here.
+    ("challenge_issued", "TEXT"),
+    # --- COUNTED QUANTITY, a bucket floor and NOT a value ---------------------------------
+    #
+    # 🔴 APPENDED AT THE END ON PURPOSE, not slotted in beside `amount` where it reads better.
+    # A fresh ledger gets its columns from _CREATE_EVENT_LOG_SQL in THIS order, while an
+    # existing one gets them from ALTER TABLE ADD COLUMN, which can only append. Inserting
+    # mid-list would give a new install and an upgraded install different column ORDERS for
+    # the same schema, and anything reading positionally would then be correct on one and
+    # wrong on the other, with nothing on either to say so.
+    #
+    # Same privacy rule as `amount`: `_magnitude_bucket` stores the power-of-ten FLOOR, so
+    # 4,200 lands as 1000.0. The number itself never reaches the ledger. See `_is_count_key`
+    # for which argument names qualify and why there is no corroborating field.
+    ("quantity",        "REAL NOT NULL DEFAULT 0"),
+    # --- WHICH POSTURE THIS CALL RAN UNDER ------------------------------------------------
+    #
+    # 🔴 THE QUESTION NOBODY COULD ANSWER: "which of my tools ran unprotected?" A per-tool
+    # `enforcement="audit"` argument turns off blocking for that WHOLE tool, permanently, in
+    # the developer's own source. It fails OPEN and it is invisible: it lives in code, not in
+    # any store we can read, so no screen could ever list it.
+    #
+    # Recording the posture the call actually resolved to answers it from DATA instead. It
+    # catches both shapes at once -- a whole run in audit, and one tool pinned to audit inside
+    # an otherwise-enforcing run -- because both arrive here having already resolved.
+    #
+    # Bounded to 'audit' / 'enforce', so it carries no caller text. Appended at the END for
+    # the same reason `quantity` was: a fresh ledger takes its column order from CREATE and an
+    # existing one from ALTER TABLE ADD COLUMN, which can only append.
+    ("posture",         "TEXT"),
 ]
 
 _CREATE_EVENT_LOG_SQL = "CREATE TABLE IF NOT EXISTS event_log (\n    %s\n)" % ",\n    ".join(
@@ -1083,6 +1143,34 @@ def _amount_prefix(name):
     return name[:-len(_AMOUNT_KEY)].rstrip("_")
 
 
+# 🔴 A COUNTED QUANTITY IS NOT MONEY, AND IT GETS ITS OWN COLUMN. For an infrastructure or
+# data agent the consequential number is a ROW COUNT, not a dollar figure. Measured over a
+# synthetic day of 199 protected calls, not one carried a size: a 4,200-row delete and a
+# 98,000-row export were stored identically to the 120 routine queries beside them.
+#
+# 🔴 THIS IS NOT "THE BIGGEST INTEGER", AND MUST NEVER BECOME IT. That heuristic is the defect
+# the money rule was rewritten to remove -- a row limit, an order number or a timestamp became
+# "the amount" by being the largest number in the payload. The rule here is the SAME SHAPE as
+# the money one: the developer's own argument NAME decides, nothing is guessed.
+#
+# ⚠️ WHY THERE IS NO CORROBORATING FIELD, unlike money. `amount` needs `currency` beside it
+# because "amount" alone is ambiguous across units and range bounds. A `count` has no unit to
+# disagree about, so requiring a second field would only mean recording nothing. The cost is
+# that `retry_count=3` also records a quantity -- true, and harmless: it is genuinely a count,
+# and `_magnitude_bucket` floors it to 1.0, which sorts below everything that matters.
+#
+# ⚠️ `limit` IS DELIBERATELY NOT A QUANTITY. It bounds a READ; nothing is acted on. This is the
+# same distinction `_RANGE_BOUND_PREFIXES` already draws for money, kept consistent on purpose:
+# 120 `run_query(limit=100)` calls must not outrank one 4,200-row delete.
+_COUNT_KEY = "count"
+
+
+def _is_count_key(name):
+    """True when a NORMALISED key names a counted quantity. Mirrors `_is_amount_key`, so the
+    writer and any future display cannot answer this question two different ways."""
+    return name == _COUNT_KEY or name.endswith("_" + _COUNT_KEY)
+
+
 def _is_real_currency_value(value):
     """A currency key must CARRY a currency, not merely exist.
 
@@ -1177,8 +1265,38 @@ def _classify_target(tool_name, names):
     return _CLASS_OTHER
 
 
-def _call_shape(tool_name, arguments):
-    """Derive (arg_names, amount, target_class) for one call. Pure, and never raises.
+def _classify_text(text):
+    """The same bounded class, derived from a tool's own advertised DESCRIPTION.
+
+    🔴 WHY THIS EXISTS. Names alone leave most calls unclassified: over a synthetic day of 199
+    protected calls, 134 came back `other`, and every consequential one was among them -- a
+    4,200-row delete, a 98,000-row export, a production deploy, a credential rotation. Only
+    `fetch_url` and `write_file` earned a class. A SURFACE column that resolves for the routine
+    calls and shrugs at the dangerous ones is worse than empty: it reads as coverage.
+
+    The sentence a server author wrote to tell the MODEL what a tool does is the obvious signal,
+    and we already parse it on the way past for drift detection, then throw the text away.
+
+    🔴 THE OUTPUT IS A CLOSED SET, AND THAT IS THE SAFETY PROPERTY, NOT A DETAIL. A tool
+    description is ATTACKER-CONTROLLED text from a remote server -- the same input
+    `_description_poisoned` exists to screen. Deriving one of six fixed labels from it can at
+    worst mislabel a surface. Persisting or DISPLAYING the sentence itself would put attacker
+    text on the developer's screen, which is a different and much larger decision.
+
+    ⚠️ AND THE CLASS MUST STAY DISPLAY-ONLY WHILE THIS INPUT EXISTS. Nothing that ranks, blocks
+    or decides may read it, because a server author would then be steering our behaviour by
+    writing a sentence. Rankings use argument shape and recorded magnitude, which the caller
+    supplies, not the server.
+    """
+    tokens = _name_tokens(str(text or ""))
+    for needles, klass in _CLASS_HINTS:
+        if tokens.intersection(needles):
+            return klass
+    return _CLASS_OTHER
+
+
+def _call_shape(tool_name, arguments, description=None):
+    """Derive (arg_names, amount, target_class, quantity) for one call. Pure, never raises.
 
     `arguments` is the developer's own kwargs dict. ONLY ITS KEYS ARE READ, plus the numeric
     magnitude of its values via _magnitude_bucket -- which returns a bucket, not the number.
@@ -1263,7 +1381,27 @@ def _call_shape(tool_name, arguments):
     except Exception:
         amount = 0.0
 
-    return joined, amount, _classify_target(tool_name, names)
+    # Same MAX-not-first rule as the amount block above, and for the same reason: taking
+    # the first non-zero would let a small labelled count silence a large one in the same call.
+    quantity = 0.0
+    try:
+        for key, value in (arguments or {}).items():
+            if not _is_count_key(_normalise_key(key)):
+                continue
+            bucket = _magnitude_bucket(value)
+            if bucket > quantity:
+                quantity = bucket
+    except Exception:
+        quantity = 0.0
+
+    # The caller's own words decide first. The DESCRIPTION is only consulted when the name and
+    # arguments leave us with nothing, so a server author's sentence can never override what the
+    # developer actually called -- it can only fill a blank that would otherwise print as "-".
+    target_class = _classify_target(tool_name, names)
+    if target_class == _CLASS_OTHER and description:
+        target_class = _classify_text(description)
+
+    return joined, amount, target_class, quantity
 
 
 def _union_arg_names_and_classes(rows):
@@ -1792,6 +1930,84 @@ def get_ledger_census(path=None):
     return census
 
 
+# ONE template, two column sets. Written as a format slot rather than two literal queries so
+# the legacy retry cannot drift from the real one -- the failure mode being that a pre-migration
+# ledger silently returns a DIFFERENT shape (different grouping, different order) than a current
+# one, on a screen whose whole job is describing what the ledger holds.
+# 🔴 THE DEMO SPLIT RIDES THE GROUPED PASS, IT DOES NOT ADD A QUESTION. This function's own
+# docstring measures its cost in QUESTIONS PER TOOL and names the fix for the next person who
+# needs a per-tool number: fold it into the group. A per-tool `SELECT COUNT(*) WHERE agent_id
+# IN (...)` would have been a third question per tool, worsening the exact figure that
+# docstring is watching. A conditional SUM in the pass already running costs nothing.
+#
+# The `?` marks in the ours-clause sit in the SELECT list, so they bind BEFORE the status
+# parameter in the WHERE -- hence `_INVENTORY_PARAMS` rather than a bare tuple at each call.
+_INVENTORY_SQL = """
+    SELECT tool_name,
+           COUNT(*),
+           MAX(amount),
+           MIN(timestamp),
+           MAX(timestamp),
+           %s,
+           SUM(CASE WHEN {ours} THEN 1 ELSE 0 END)
+      FROM event_log
+     WHERE status IS ?
+  GROUP BY tool_name
+  ORDER BY COUNT(*) DESC, tool_name ASC
+""".replace("{ours}", _our_agents_clause()[0])
+
+_INVENTORY_PARAMS = tuple(_our_agents_clause()[1]) + (INVENTORY_STATUS,)
+
+
+def get_unprotected_tools(path=None, exclude_agents=None):
+    """Which tools RAN but were not defended, and how many times. Never raises.
+
+    🔴 THE QUESTION THIS ANSWERS CANNOT BE ANSWERED ANY OTHER WAY. A per-tool
+    `enforcement="audit"` argument turns blocking off for that whole tool, permanently, in the
+    developer's own source. Nothing else can see it: it is code, not configuration, so no
+    store lists it and no screen could enumerate it. Reading it back from rows the calls
+    themselves wrote is the only route.
+
+    Returns ``[(tool_name, calls), ...]`` busiest first. An empty list means every recorded
+    call was defended, which is the good answer and the common one.
+
+    ⚠️ IT IS SILENT ON A PRE-POSTURE LEDGER RATHER THAN WRONG. Rows written before the column
+    existed carry NULL, and NULL is not 'audit', so they are simply absent. A caller must not
+    read an empty list as "everything was protected" on a ledger that predates this -- see
+    `posture_coverage` for the denominator that makes the difference visible.
+    """
+    excluded = [a for a in (exclude_agents or []) if a]
+    frag, frag_params = _exclude_agents_fragment(excluded)
+    try:
+        with _connection(path or DB_PATH) as conn:
+            return [(row[0], row[1]) for row in conn.execute(
+                "SELECT tool_name, COUNT(*) FROM event_log "
+                "WHERE posture = 'audit' AND tool_name IS NOT NULL AND tool_name != ''"
+                + frag + " GROUP BY tool_name ORDER BY COUNT(*) DESC, tool_name ASC",
+                tuple(frag_params))]
+    except Exception:
+        return []
+
+
+def posture_coverage(path=None):
+    """``{audit, enforce, unknown}`` row counts, so a reader can state its own denominator.
+
+    `unknown` is rows written before the posture column existed. A screen that reports "0
+    tools ran unprotected" while most of the ledger is `unknown` is answering a question it
+    cannot see, which is the failure this exists to prevent.
+    """
+    out = {"audit": 0, "enforce": 0, "unknown": 0}
+    try:
+        with _connection(path or DB_PATH) as conn:
+            for posture, n in conn.execute(
+                    "SELECT posture, COUNT(*) FROM event_log GROUP BY posture"):
+                key = posture if posture in ("audit", "enforce") else "unknown"
+                out[key] += n
+    except Exception:
+        pass
+    return out
+
+
 def get_call_inventory(path=None, limit=25):
     """P-92: what the agent DID, aggregated per tool. Never raises; returns a dict.
 
@@ -1855,21 +2071,22 @@ def get_call_inventory(path=None, limit=25):
     try:
         with _connection(path) as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT tool_name,
-                       COUNT(*),
-                       MAX(amount),
-                       MIN(timestamp),
-                       MAX(timestamp)
-                  FROM event_log
-                 WHERE status IS ?
-              GROUP BY tool_name
-              ORDER BY COUNT(*) DESC, tool_name ASC
-            """, (INVENTORY_STATUS,))
+            # 🔴 THE LEGACY RETRY IS THE SAME ONE `log_intercept` KEEPS FOR ITS INSERT, AND
+            # FOR THE SAME REASON. Naming a newer column unconditionally makes this whole
+            # SELECT fail with "no such column" on any ledger the migration has not reached,
+            # and because the caller treats a failed read as UNREADABLE, one added column
+            # turned every pre-migration ledger into "we cannot read your ledger". A missing
+            # column is a missing FIELD, never a missing ledger.
+            _legacy = False
+            try:
+                cursor.execute(_INVENTORY_SQL % "MAX(quantity)", _INVENTORY_PARAMS)
+            except sqlite3.OperationalError:
+                _legacy = True
+                cursor.execute(_INVENTORY_SQL % "0", _INVENTORY_PARAMS)
             rows = cursor.fetchall()
 
             tools = []
-            for name, calls, amount, first_ts, last_ts in rows[:limit]:
+            for name, calls, amount, first_ts, last_ts, quantity, demo_calls in rows[:limit]:
                 # Argument names and classes are collected per tool rather than per row: the
                 # question the report answers is "what does this tool take", and one row is
                 # only one call's worth of that. A tool called with different optional
@@ -1925,8 +2142,20 @@ def get_call_inventory(path=None, limit=25):
                 flagged = cursor.fetchone()[0] or 0
                 tools.append({
                     "tool": name, "calls": calls, "max_amount": amount or 0.0,
+                    # The counted-quantity twin of max_amount. Kept a SEPARATE key rather than
+                    # folded into it: a row count and a sum of money are different kinds of
+                    # thing, and merging them is how the biggest-integer defect got in.
+                    "max_quantity": quantity or 0.0,
                     "arg_names": names, "classes": classes, "agents": agents,
                     "first_ts": first_ts, "last_ts": last_ts, "flagged": flagged,
+                    # 🔴 THE PER-TOOL SPLIT, SO A ROW CAN BE RECONCILED WHERE IT IS READ. The
+                    # screen-level note says "21 of those came from AgentX's own demo code",
+                    # which is a total across every tool -- so a reader looking at `run_sql 26`
+                    # beside "run_sql ran 21 of your 39 calls" two lines above has nothing on
+                    # screen that gets them from 26 to 21. Found by the founder on his own
+                    # ledger, where the demo TOTAL also happened to be 21, which made the
+                    # screen-level note look like the explanation when it was a coincidence.
+                    "from_demo": int(demo_calls or 0),
                 })
 
             cursor.execute(
@@ -3444,7 +3673,7 @@ def _bump_audit_counters(tool_name, stats, in_audit):
 
 
 def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats_lock=None,
-                in_audit=False):
+                in_audit=False, description=None):
     """P-92: record ONE call that passed, in ANY posture. Best-effort, never raises.
 
     (Said "in audit posture" until P-112's enforce half. This is the writer that half turns
@@ -3466,7 +3695,7 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
     evidence and cannot be followed, and the same wrong name was copied into BACKLOG.md as
     the guarantee's home. Both corrected together.
     """
-    names, amount, target_class = _call_shape(tool_name, arguments)
+    names, amount, target_class, quantity = _call_shape(tool_name, arguments, description)
     # Counted BEFORE the write, and outside its failure mode. log_intercept swallows its own
     # errors, so an unwritable ledger is invisible from here -- and that install is exactly
     # the one we most want on the funnel, not the one we quietly drop off it.
@@ -3491,13 +3720,18 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
     # "count ours as theirs" or "do not count ours". See is_demo_agent.
     if stats is not None and not is_demo_agent(agent_id):
         count_call_for_pulse(tool_name, stats, stats_lock, in_audit)
+    # `in_audit` has already been resolved by the caller through _resolve_enforcement, so a
+    # tool pinned to audit by its own decorator argument arrives here as True even when the
+    # rest of the run is enforcing. That is the case this column exists to make visible.
     log_intercept(trace_id, agent_id, tool_name, None, None, INVENTORY_STATUS,
-                  arg_names=names, amount=amount, target_class=target_class)
+                  arg_names=names, amount=amount, target_class=target_class,
+                  quantity=quantity, posture=("audit" if in_audit else "enforce"))
 
 
 def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status, tokens=None, time_saved=None,
-                  arg_names=None, amount=0.0, target_class=None):
-    # 🔴 CONTRACT: `arg_names`/`amount`/`target_class` MUST ALREADY BE REDUCED, via
+                  arg_names=None, amount=0.0, target_class=None, challenge_issued=None,
+                  quantity=0.0, posture=None):
+    # 🔴 CONTRACT: `arg_names`/`amount`/`target_class`/`quantity` MUST ALREADY BE REDUCED, via
     # `_call_shape`, before they reach here — never pass a raw `arguments` dict, a raw
     # query string, or an unreduced value to these three parameters. This function does
     # not call `_call_shape` itself and does not validate its inputs; it trusts every
@@ -3600,10 +3834,13 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
                     cursor = conn.cursor()
                     try:
                         cursor.execute(
-                            "INSERT INTO event_log (%s, arg_names, amount, target_class) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" % _COLUMNS,
+                            "INSERT INTO event_log (%s, arg_names, amount, target_class, "
+                            "challenge_issued, quantity, posture) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" % _COLUMNS,
                             _values + (arg_names, amount if amount is not None else 0.0,
-                                       target_class))
+                                       target_class, challenge_issued,
+                                       quantity if quantity is not None else 0.0,
+                                       posture))
                     except sqlite3.OperationalError:
                         cursor.execute(
                             "INSERT INTO event_log (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -4007,6 +4244,115 @@ def get_block_frequency(path=None, exclude_agents=None):
             "tools": _tool_list(tools),
         })
     return out
+
+
+def get_coaching_effectiveness(path=None, exclude_agents=None):
+    """Rank the ledger BY THE WORDING THE AGENT WAS SHOWN: how often each piece of coaching
+    was delivered, and how often the agent came back from it.
+
+    This is the reader for `challenge_issued`. Until it existed the column was written and
+    never read, so the ledger could say a rule fired and whether the agent recovered, and
+    never which words were in front of it. That makes "did my coaching work" unanswerable,
+    which is the question `agentx adopt` exists to let a developer act on.
+
+    Same definitions as get_block_frequency, deliberately reusing its status filter rather
+    than restating it: a "block" is a challenge episode (CHALLENGED or the RECOVERED it is
+    flipped to in place), a "recovery" is a RECOVERED row. Two screens disagreeing about what
+    a recovery is would be worse than either screen alone.
+
+    🔴 IT REPORTS ITS OWN DENOMINATOR, AND THAT IS NOT DECORATION. `challenge_issued` is new,
+    so every block recorded before it is NULL, and a ledger with hundreds of real blocks
+    renders as an EMPTY list here. Without `unattributed` beside it, a developer reads "no
+    coaching recorded" as "the feature is broken" or, worse, as "my agents were never
+    coached". The two are different facts and the caller is given both:
+
+        attributed   -- blocks whose wording we captured, the honest n for any rate below
+        unattributed -- blocks that predate the column, or came through a path that does
+                        not record it. NOT evidence of anything except our own blindness.
+
+    Grouped by (policy, wording) rather than wording alone: the same sentence can be reached
+    through two policies, and merging them would attribute one policy's recoveries to
+    another's coaching.
+
+    path: read a specific ledger file (default: the module DB_PATH in the CWD).
+    exclude_agents: iterable of agent_id values to drop (demo/test traffic).
+
+    Returns {"wordings": [{policy_id, policy_name, coaching, blocks, recoveries,
+    recovery_rate}, ...] most-delivered first, "attributed": int, "unattributed": int}.
+    Zeroed and empty when there is no DB, an error, or no blocks.
+    """
+    empty = {"wordings": [], "attributed": 0, "unattributed": 0}
+    p = path or DB_PATH
+    if not os.path.exists(p):
+        return empty
+    excluded = [a for a in (exclude_agents or []) if a]
+    frag, frag_params = _exclude_agents_fragment(excluded)
+    # The SAME episode filter get_block_frequency uses. Written once here and passed to both
+    # queries below so the grouped rows and the unattributed count cannot describe different
+    # populations -- a mismatch would make `attributed + unattributed` fail to equal the
+    # block count the rest of the screen prints, and nobody would know which was wrong.
+    episode = "status IN ('CHALLENGED', 'RECOVERED')" + frag
+    recorded = "challenge_issued IS NOT NULL AND TRIM(challenge_issued) != ''"
+    try:
+        with _connection(p) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT policy_name,
+                       MAX(policy_id) AS policy_id,
+                       challenge_issued,
+                       COUNT(*) AS n,
+                       SUM(CASE WHEN status = 'RECOVERED' THEN 1 ELSE 0 END) AS recoveries
+                FROM event_log
+                WHERE {episode} AND {recorded}
+                GROUP BY policy_name, challenge_issued
+                ORDER BY n DESC, policy_name ASC
+                """,
+                list(frag_params),
+            )
+            rows = cursor.fetchall()
+            cursor.execute(
+                f"""
+                SELECT SUM(CASE WHEN {recorded} THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN {recorded} THEN 0 ELSE 1 END)
+                FROM event_log
+                WHERE {episode}
+                """,
+                list(frag_params),
+            )
+            attributed, unattributed = cursor.fetchone() or (0, 0)
+    # Wider than sqlite3.Error, because the docstring promises an empty dict on "no DB, an
+    # error, or no blocks" and a connection can fail in ways that are not sqlite3 errors: an
+    # OS/path failure, a lock wrapper. The CLI happens to swallow those; the founder walk
+    # calls this directly and would have died on one.
+    #
+    # ⚠️ BUT NOT BARE `Exception`, WHICH WAS THE FIRST FIX AND WAS TOO WIDE. A TypeError or
+    # AttributeError from our own code inside this block would be rendered to the user as
+    # "no coaching recorded" -- a silent, confident absence, which is the exact failure the
+    # denominator paragraph above exists to prevent. A bug in our code must not come out
+    # looking like a fact about the user's ledger.
+    #
+    # (An earlier version of this comment justified the narrowing by saying the try "also
+    # covers the query construction". It does not: the fragments and clauses are built above
+    # the try. The narrowing is still right, for the reason stated above; the reason given
+    # was about code that is not in the block, which would mis-scope it for the next reader.)
+    except (sqlite3.Error, OSError):
+        return empty
+    out = []
+    for policy_name, policy_id, coaching, blocks, recoveries in rows:
+        blocks = blocks or 0
+        recoveries = recoveries or 0
+        out.append({
+            "policy_id": policy_id,
+            "policy_name": policy_name,
+            "coaching": coaching,
+            "blocks": blocks,
+            "recoveries": recoveries,
+            "recovery_rate": round(recoveries / blocks, 3) if blocks else 0.0,
+        })
+    return {"wordings": out,
+            "attributed": attributed or 0,
+            "unattributed": unattributed or 0}
 
 
 def get_would_block_summary(path=None, exclude_agents=None):

@@ -23,7 +23,13 @@ start_secure_session()
 # Wrap ANY existing tool function with one decorator. AgentX reads the
 # call's string arguments by signature reflection — you write no schema,
 # no extraction lambda, and structural args (db sessions, etc.) are ignored.
-@agentx_protect(agent_id="demo_quickstart_agent")
+#
+# 🔴 posture="enforce" IS PINNED HERE ON PURPOSE, and your own install is different.
+# A fresh install WATCHES: it records what would have been blocked and lets the call
+# run, so wrapping a tool cannot break an agent that already works. This file's whole
+# subject is watching a block happen, so it asks for the blocking posture explicitly.
+# Drop the argument and you get the watching default.
+@agentx_protect(agent_id="demo_quickstart_agent", posture="enforce")
 def run_sql(query: str, db_session=None):
     # If you ever see this line print, the shield FAILED to intercept.
     print(f"[DB] EXECUTING (would be irreversible): {query}")
@@ -48,9 +54,18 @@ def main():
         print(f"  policy:  {result.policy}")
         print(f"  receipt: {result.receipt_id}")
         print("\nThe DROP TABLE never reached your database.")
-    else:
-        print(f"NOT BLOCKED — unexpected. Tool returned: {result}")
+        print("=" * 64)
+        return
+
+    print(f"NOT BLOCKED, unexpected. Tool returned: {result}")
     print("=" * 64)
+    # 🔴 NON-ZERO ON PURPOSE, AND IT IS WHAT MAKES THE SUITE MEAN SOMETHING.
+    # test_published_example_surface.py already runs this file as a keyless stranger would
+    # and asserts it exits 0. Until this line existed that assertion only meant "it did not
+    # crash": when the posture default flipped to watching, this file printed
+    # "NOT BLOCKED, unexpected" on every run, exited 0, and the suite stayed green. The
+    # file announced its own failure and the harness read it as ordinary stdout.
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":

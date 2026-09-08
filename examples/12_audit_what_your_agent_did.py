@@ -13,7 +13,7 @@ import os
 #
 # Nothing here is blocked. AgentX records every wrapped tool call, whether blocking is on
 # or off; audit is what lets this one RUN.
-os.environ["AGENTX_ENFORCEMENT"] = "audit"
+os.environ["AGENTX_POSTURE"] = "audit"
 
 import sys
 from dotenv import load_dotenv
@@ -102,25 +102,31 @@ TICKET = "SUP-1191"
 
 
 # Four ordinary functions. The only change to any of them is the line above the def.
-@agentx_protect(agent_id=EXAMPLE_AGENT_ID)
+#
+# 🔴 posture="audit" IS PINNED even though it is also the default, because a file whose
+# whole subject is a posture must not be silent about which one it is in. It read
+# correctly for months while pinning nothing, and it did so by luck: the default happened
+# to agree with it. When the default moved, every OTHER example in this folder inverted
+# without a single character changing. Stating it costs one argument and removes the luck.
+@agentx_protect(agent_id=EXAMPLE_AGENT_ID, posture="audit")
 def query_orders_db(sql: str, limit: int = 50):
     print(f"   [DB]   {sql[:58]}{'...' if len(sql) > 58 else ''}")
     return [{"id": "ORD-8842", "total_usd": 2400.0, "status": "charged_twice"}]
 
 
-@agentx_protect(agent_id=EXAMPLE_AGENT_ID)
+@agentx_protect(agent_id=EXAMPLE_AGENT_ID, posture="audit")
 def fetch_invoice_pdf(url: str):
     print(f"   [HTTP] GET {url}")
     return {"bytes": 48_112}
 
 
-@agentx_protect(agent_id=EXAMPLE_AGENT_ID)
+@agentx_protect(agent_id=EXAMPLE_AGENT_ID, posture="audit")
 def issue_refund(order_id: str, amount: float, currency: str, reason: str):
     print(f"   [PAY]  refunding {order_id}")
     return {"refund_id": "RF-5501", "status": "settled"}
 
 
-@agentx_protect(agent_id=EXAMPLE_AGENT_ID)
+@agentx_protect(agent_id=EXAMPLE_AGENT_ID, posture="audit")
 def write_ticket_note(path: str, contents: str):
     # Prints rather than writes: an example must not leave files in your project.
     print(f"   [FS]   note appended to {path}")
@@ -161,8 +167,8 @@ def run_audit_example():
     if is_block(result):
         # Cannot happen in audit, and worth saying out loud rather than assuming: if this
         # ever prints, the posture did not take and the run above is not an audit run.
-        print("⚠️  That call was BLOCKED, so this run was not in audit posture.")
-        print("    Nothing below describes what you just saw. Check AGENTX_ENFORCEMENT.")
+        print("⚠️  That call was BLOCKED, so this run was not watching after all.")
+        print("    Nothing below describes what you just saw. Check AGENTX_POSTURE.")
         print("=" * 72 + "\n")
         return
 

@@ -9,7 +9,7 @@ every `tools/call` before it runs.
 ## 1. The config (`mcp.json`)
 
 `agentx-mcp` is a **wrapping proxy**: it launches your real MCP server as a child process
-and relays the protocol verbatim, blocking only the dangerous `tools/call`. You wire it by
+and relays the protocol verbatim, screening only the `tools/call` traffic. You wire it by
 editing the server entry you already have in your MCP client's config (Claude Desktop,
 Cursor, Claude Code, Windsurf, VS Code) so `agentx-mcp` runs in front of your real command:
 
@@ -35,8 +35,11 @@ your PATH). To install nothing, use the `uvx` variant instead:
 ```
 
 Restart your client so it re-spawns the server. Now the client launches the proxy, the
-proxy launches the real server, and every tool call is screened. A blocked call returns to
-your agent as a coaching error it self-corrects on. To install persistently instead of
+proxy launches the real server, and every tool call is screened. Out of the box the proxy
+watches: a dangerous call is recorded and forwarded, and `agentx-mcp --audit` shows what it
+would have stopped. Add `"env": { "AGENTX_POSTURE": "enforce" }` to the server entry and a
+blocked call returns to your agent as a coaching error it self-corrects on. To install
+persistently instead of
 `uvx`: `pip install agentx-mcp` (or `pipx install agentx-mcp`), then set `command` to
 `agentx-mcp`.
 
@@ -52,7 +55,9 @@ uvx agentx-mcp --demo
 ```
 
 You will see the `DROP TABLE` call blocked with coaching (it never reaches the server) and
-the scoped `SELECT` allowed through. The demo runs against a bundled stub server that is a
+the scoped `SELECT` allowed through. The demo pins the enforce posture so you can watch a
+block; your own wrap watches by default, recording the catch and forwarding the call, until
+you add `"env": { "AGENTX_POSTURE": "enforce" }` to that server's entry. The demo runs against a bundled stub server that is a
 dumb stand-in for a real one, it runs whatever reaches it, which is exactly why the proxy
 has to stop the dangerous call first.
 
@@ -62,8 +67,9 @@ the older path still works from a clone.
 
 ## What this door is, said honestly
 
-- **Keyless Shield only.** The block is a deterministic hard-block from the offline floor.
-  Your own model reads the coaching and self-corrects. This is not the gateway judge;
+- **Keyless Shield only.** The catch is deterministic, from the offline floor, and it is a
+  hard-block only once the posture is set to enforce; by default it is recorded and the call
+  runs. Your own model reads the coaching and self-corrects. This is not the gateway judge;
   gateway-backed Recover over MCP is on the roadmap.
 - **stdio transport only.** This wraps a local MCP server your client launches by command.
   A remote MCP server reached over HTTP/SSE is not covered today.

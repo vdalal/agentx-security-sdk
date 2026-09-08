@@ -276,9 +276,21 @@ def load_overrides(path=None, warn=False):
         # _SCOPE_DIMENSIONS for why that separation is the safety property and not just tidiness.
         if not isinstance(data.get("scoped_overrides"), list):
             data["scoped_overrides"] = []
+        # READ BOTH. Verdicts now live in a sibling file, but an existing store still holds
+        # them until its next save, so both are merged into the view every caller already
+        # expects. The sibling wins on a key present in both: it is the file being written now.
+        _merged = dict(data.get("verdicts") or {})
+        _merged.update(_load_verdicts(path))
+        if _merged:
+            data["verdicts"] = _merged
         return data
     except FileNotFoundError:
-        return {"version": _SCHEMA_VERSION, "overrides": {}, "scoped_overrides": []}
+        empty = {"version": _SCHEMA_VERSION, "overrides": {}, "scoped_overrides": []}
+        # A developer whose coaching store is gone may still have verdicts beside it.
+        _v = _load_verdicts(path)
+        if _v:
+            empty["verdicts"] = _v
+        return empty
     except (OSError, ValueError, json.JSONDecodeError) as e:
         if warn:
             print(f"⚠️  [AgentX] Could not read your override store at {p}: {e}\n"
@@ -288,19 +300,90 @@ def load_overrides(path=None, warn=False):
         return {"version": _SCHEMA_VERSION, "overrides": {}, "scoped_overrides": []}
 
 
+def _verdicts_path(path=None):
+    """The sibling file verdicts live in, beside the override store.
+
+    🔴 WHY THEY ARE SEPARATING. One file was doing two unrelated jobs: `overrides` is the
+    coaching an agent is SHOWN on a block, and `verdicts` is bookkeeping about whether OUR
+    block was right. Five screens tell a developer to commit the store so their team inherits
+    the coaching -- and a declared verdict SKIPS that block in review, so committing it also
+    handed teammates a review queue silently missing blocks someone else had already judged.
+    Measured on a real file: 1 override, 17 verdicts.
+
+    Derived from the override path rather than resolved independently, so an explicit
+    `AGENTX_OVERRIDES` (what the tests and the MCP door both set) keeps both halves together
+    and a caller cannot end up reading one developer's coaching beside another's verdicts.
+    """
+    p = _overrides_path(path)
+    base, ext = os.path.splitext(p)
+    return base + "-verdicts" + (ext or ".json")
+
+
+def _load_verdicts(path=None):
+    """Verdicts from the sibling file. Missing or malformed yields {} and never raises."""
+    try:
+        with open(_verdicts_path(path), "r", encoding="utf-8") as f:
+            raw = f.read()
+        if not raw.strip():
+            return {}
+        data = json.loads(raw)
+        # 🔴 isinstance ON `data` FIRST, NOT ONLY ON THE FIELD. A hand-edited file whose top
+        # level is `[]` or a string makes `.get` an AttributeError, which is in neither this
+        # except clause nor load_overrides', so one stray sibling file took down every screen
+        # that reads the override store -- from a function whose docstring promises it never
+        # raises.
+        if not isinstance(data, dict):
+            return {}
+        return data.get("verdicts") if isinstance(data.get("verdicts"), dict) else {}
+    except (OSError, ValueError, AttributeError, json.JSONDecodeError):
+        return {}
+
+
 def save_overrides(data, path=None):
     """Persist the override store ATOMICALLY (temp file + os.replace) so a crash
     mid-write can't truncate the live store into corruption; creates ``.agentx/``
-    if needed. Returns the path written."""
+    if needed. Returns the path written.
+
+    🔴 VERDICTS ARE WRITTEN TO THE SIBLING FILE, NOT THIS ONE. Read-both / write-new: an
+    existing store keeps its verdicts and they are still READ (see load_overrides), so nothing
+    is lost the moment this ships, and they migrate out on the next save. The split is done
+    HERE and in load_overrides rather than at the ~15 call sites that touch `verdicts`,
+    because a split applied at each site is a split one site will eventually miss.
+    """
     p = _overrides_path(path)
     parent = os.path.dirname(p)
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+    payload = dict(data or {})
+    verdicts = payload.pop("verdicts", None)
+    # 🔴 `is not None`, NOT truthiness, AND THE SUITE CAUGHT THE DIFFERENCE. Gating on
+    # `if verdicts:` writes the sibling when there is something to say and does nothing when
+    # the caller has just CLEARED the last one -- so the old file survived, load_overrides
+    # merged the cleared verdicts back, and `agentx verdict --clear` silently did nothing.
+    # An empty dict is a statement ("none now"), not an absence. A missing KEY is the absence,
+    # and that still writes nothing.
+    if verdicts is not None:
+        vp = _verdicts_path(path)
+        if verdicts:
+            vtmp = vp + ".tmp"
+            with open(vtmp, "w", encoding="utf-8") as f:
+                json.dump({"version": _SCHEMA_VERSION, "verdicts": verdicts}, f,
+                          indent=2, ensure_ascii=False)
+            os.replace(vtmp, vp)
+        else:
+            # Cleared to nothing: remove the file rather than leave an empty one behind, so
+            # the on-disk state matches "this developer has judged nothing".
+            try:
+                os.remove(vp)
+            except OSError:
+                pass
+
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         # ensure_ascii=False so hand-editors see real text (em-dashes, accents),
         # not \uXXXX escapes — this file is meant to be read and edited by humans.
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        json.dump(payload, f, indent=2, ensure_ascii=False)
     os.replace(tmp, p)                  # atomic swap on the same filesystem
     return p
 
@@ -815,6 +898,59 @@ def record_outcome(receipt_id, *, verdict=None, safe_path=None, harm=None, sourc
         # Locked / corrupt DB — report a no-op rather than crash the CLI.
         return False
     return changed > 0
+
+
+def clear_outcome(receipt_id, db_path=None):
+    """Remove the VERDICT from one block, leaving every other axis untouched.
+
+    🔴 THIS CANNOT BE EXPRESSED THROUGH ``record_outcome``. That function COALESCEs every
+    axis, so passing ``verdict=None`` means "leave the verdict alone" — the exact opposite
+    verb from an undo, and it returns False for an all-None call rather than clearing
+    anything. An undo needs its own statement.
+
+    The undo existed at the POLICY grain (``agentx verdict --policy <name> --clear``) and
+    not at the BLOCK grain, so a person who mislabelled one block had no way back except
+    ``agentx review --labeled``, which is a queue walk rather than a correction — and is not
+    where anyone looks for it.
+
+    ``label_verdict_source`` is cleared with the verdict on purpose: a row with no verdict
+    but a lingering "human" provenance claims a judgment nobody made, and the harvest reads
+    that column to tell a person's call from a standing rule's.
+
+    ``label_safe_path`` and ``label_harm`` are deliberately KEPT. They are separate axes —
+    a safe_path is reconciled from what the agent actually did next, not judged — so
+    dropping them here would discard observations to undo an opinion.
+
+    Returns ``(changed, prior_source)``: whether a row was updated, and the provenance the
+    verdict had, so the caller can say whether a standing policy rule is about to write the
+    same label straight back.
+    """
+    p = _incident_db_path(db_path)
+    if not os.path.exists(p):
+        return False, None
+    try:
+        conn = sqlite3.connect(p)
+        try:
+            _ensure_label_columns(conn)
+            row = conn.execute(
+                "SELECT label_verdict, label_verdict_source FROM incidents "
+                "WHERE receipt_id = ?", (receipt_id,)).fetchone()
+            if row is None or row[0] is None:
+                # No row, or a row carrying no verdict: nothing to undo. Reported as a
+                # no-op rather than a success, so the CLI never says it cleared something
+                # that was never set.
+                return False, None
+            prior_source = row[1]
+            cur = conn.execute(
+                "UPDATE incidents SET label_verdict = NULL, label_verdict_source = NULL, "
+                "outcome_at = ? WHERE receipt_id = ?", (_now_iso(), receipt_id))
+            conn.commit()
+            changed = cur.rowcount
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False, None
+    return changed > 0, prior_source
 
 
 def delete_incident(receipt_id, db_path=None):
@@ -2238,8 +2374,8 @@ def label_stats(db_path=None):
     return stats
 
 
-# ------------------------------------------------- org rules file (cold-start seed)
-# `.agentx/rules.json` is a plain-language, human-authored front-end over the override
+# ------------------------------------------------- org import file (cold-start seed)
+# `.agentx/import.json` is a plain-language, human-authored front-end over the override
 # store: an org writes its safe-path REFRAMES and pre-declared VERDICTs once, up front, so
 # the org brain is seeded before any harvest data exists. Human-authored -> poisoning-safe
 # (only auto-applying AGENT-generated text is forbidden). REFRAME-AND-LABEL ONLY: a rule
@@ -2255,6 +2391,12 @@ def label_stats(db_path=None):
 #                                `WHERE created_at < now() - interval '90 days'` and retry."}]}
 #
 # It stays REDIRECT-only even when scoped: the block still fires, the coaching changes.
+DEFAULT_ORG_IMPORT_PATH = os.path.join(".agentx", "import.json")
+# 🔴 THE OLD NAME, STILL READ. This file was `.agentx/rules.json`, which collided with the
+# DETECTION RULES that `agentx adopt` arms and the gateway enforces -- two unrelated things
+# under one word, sitting in one help listing, where the only way to tell them apart was to
+# run both. The founder hit it on his own product. An existing rules.json is still read:
+# renaming a file out from under somebody's repo is not a rename, it is a deletion.
 DEFAULT_ORG_RULES_PATH = os.path.join(".agentx", "rules.json")
 _ORG_RULES_KEYS = ("reframes", "verdicts")
 # The fields each entry may carry. Enforced as an ALLOWLIST because the failure mode of a
@@ -2267,16 +2409,32 @@ _ORG_RULES_LOOSENING_KEYS = ("suppress", "allow", "never_block", "unblock", "exc
 
 
 def _org_rules_path(path=None):
+    """Resolve the import file: explicit arg, then AGENTX_RULES, then import.json, then a
+    legacy rules.json IF IT EXISTS.
+
+    Falls back to import.json when NEITHER exists, so a "no file yet" message names the one
+    we want people to create rather than teaching the name we just retired. The env var
+    keeps its old spelling on purpose: it is a path override, it appears in no help text,
+    and adding a second spelling would put back a duplicate name to reduce name duplication.
+    """
     if path:
         return path
     env = os.environ.get("AGENTX_RULES")
     if env:
         return env
-    return os.path.join(_anchored_root(), DEFAULT_ORG_RULES_PATH)
+    root = _anchored_root()
+    current = os.path.join(root, DEFAULT_ORG_IMPORT_PATH)
+    if os.path.exists(current):
+        return current
+    legacy = os.path.join(root, DEFAULT_ORG_RULES_PATH)
+    if os.path.exists(legacy):
+        return legacy
+    return current
 
 
 def load_org_rules(rules_path=None):
-    """Read + validate `.agentx/rules.json`. Returns ``(rules, errors)``: ``rules`` is the
+    """Read + validate `.agentx/import.json` (or a legacy `rules.json`). Returns
+    ``(rules, errors)``: ``rules`` is the
     parsed dict (empty if the file is absent), ``errors`` a list of human-readable problems.
     Never raises. Enforces the REFRAME-AND-LABEL-ONLY guardrail — a loosening key is an
     ERROR that names the higher-bar path, never a silent no-op."""

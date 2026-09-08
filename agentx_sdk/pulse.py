@@ -557,9 +557,10 @@ def record_protection(session_stats, state=None, today=None):
     ``{"streak_days", "protected_sessions", "since"}``.
 
     Streak semantics (calendar days, local clock): consecutive days with at least
-    one protected session. A same-day session keeps the streak, the first session
-    on the NEXT day extends it, a gap (or clock weirdness) resets it to 1.
-    ``protected_sessions`` counts every qualifying session since install; ``since``
+    one session that ran AgentX over a call. A same-day session keeps the streak, the
+    first session on the NEXT day extends it, a gap (or clock weirdness) resets it to 1.
+    ``protected_sessions`` (the state key is historical; a WATCHING session counts too,
+    and the printed line says "session(s)") counts every qualifying session since install; ``since``
     is the first day protection was counted (0.4.6+), NOT the older install-identity
     date, so the report never overstates the protection window.
 
@@ -615,15 +616,39 @@ def record_protection(session_stats, state=None, today=None):
         return None
 
 
-def format_protection_line(protection):
-    """The canonical protection-streak phrase shown by BOTH session-end surfaces (the
-    decorator summary and the agentx-mcp report), so the wording cannot drift across
-    the two integration paths (the same anti-drift discipline as the shared detector /
-    org-override helpers). Takes record_protection's return dict; each surface adds
-    only its own prefix."""
-    return ("%d day(s) | %d protected session(s) since %s"
+def format_protection_line(protection, posture=None, blocked=0):
+    """The canonical streak phrase shown by BOTH session-end surfaces (the decorator
+    summary and the agentx-mcp report), so the wording cannot drift across the two
+    integration paths (the same anti-drift discipline as the shared detector /
+    org-override helpers). Takes record_protection's return dict plus the session's
+    resolved ``posture`` ('audit' | 'enforce') and how many calls it ``blocked``; each
+    surface adds only its own prefix, and the posture-to-wording decision is made HERE,
+    once, rather than by each caller.
+
+    🔴 "session(s)", NOT "protected session(s)". A founder walk of the MCP door read
+    "protection streak: 1 day(s) | 2 protected session(s)" after two runs in which the
+    proxy was WATCHING and the DROP TABLE reached the server both times. Nothing was
+    protected in them. The count is of sessions that ran AgentX (that is the activation
+    signal `record_protection` documents), and the noun now says so. When THIS session
+    watched AND blocked nothing, the line says that too, so a reader cannot take the
+    streak as evidence of blocking. Watching sessions DO count toward the streak, by founder
+    decision: the streak exists to bring a developer back for a second session, and under the
+    watching default nearly every session is a watching one, so a streak of enforcing sessions
+    only would read zero for almost everyone and the hook would be dead on arrival. The count is
+    "sessions you ran AgentX over a call", the line says so, and a watching session says it
+    watched.
+
+    ⚠️ BOTH CONDITIONS, because the ambient posture is not the whole story: a keyless run
+    whose one dangerous tool is pinned `posture="enforce"` resolves to 'audit' at exit and
+    still blocked twice, and "nothing was blocked" under an "Intercepts: 2" line is the
+    self-contradiction this whole change exists to remove. With a pin in play the clause
+    is simply left off; the noun "session(s)" already claims nothing."""
+    line = ("%d day(s) | %d session(s) since %s"
             % (protection["streak_days"], protection["protected_sessions"],
                protection["since"]))
+    if posture == "audit" and not blocked:
+        line += " (this session watched; nothing was blocked)"
+    return line
 
 
 # --- OFFLINE STALENESS NOTICE ------------------------------------------------
@@ -765,6 +790,12 @@ def on_session_end(session_stats):
 # class as mode / block_category): the @agentx_protect decorator (the in-process
 # path, default) vs the agentx-mcp stdio proxy. Names HOW the install integrates,
 # never identity. KEEP IN SYNC with the JS mirror in ui/app/api/pulse/route.ts.
+#
+# The receiver accepts a THIRD value this module never emits: "ts", sent by the TypeScript
+# SDK (ts-sdk/src/pulse.ts), which builds the same payload from its own runtime. So
+# the route's set is a superset of this one, on purpose, and
+# sdk_tests/test_ts_sdk_matches_python.py pins both directions: the TS field list equals
+# _ALLOWED_KEYS / _ALLOWED_SESSION_KEYS below, and the route accepts every emitter.
 _INTEGRATION_VOCAB = frozenset({"decorator", "mcp"})
 
 

@@ -256,7 +256,7 @@ class AgentXClient:
             # REASONING_ENGINE_UNREACHABLE as "the gateway was never reached", so a PAYING
             # install whose gateway answers but answers badly emitted a pulse
             # byte-identical to one that never configured a gateway at all — corrupting the
-            # very activation funnel we read to judge the paid tier. (2) dropping
+            # signal that tells those two states apart. (2) dropping
             # response.text discarded the only clue that the gateway is UP and crashing,
             # which is exactly how P-21 was found in the first place. Carry both: the
             # verdict is availability, the FACTS say the server answered.

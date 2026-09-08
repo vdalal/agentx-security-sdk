@@ -65,7 +65,10 @@ init_db()
 @agentx_protect(
     agent_id=AGENT_ID,
     extract_query_func=lambda query, **kwargs: query,
-    extract_cot_func=lambda query, cot, **kwargs: cot
+    extract_cot_func=lambda query, cot, **kwargs: cot,
+    # Pinned: a fresh install WATCHES and lets the call run. This example's subject is
+    # the block, so it asks for the blocking posture explicitly. Drop it for the default.
+    posture="enforce",
 )
 # NOTE: no `receipt_id` parameter. You pass receipt_id= on a retry (see below) but your
 # tool never has to declare it — the decorator strips it before your function is called.

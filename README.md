@@ -6,7 +6,7 @@
 
 LLM agents are powerful and brittle. Given the wrong prompt they will drop a production table, read a secret, or POST your data to an attacker's URL. A traditional guardrail answers with a hard `403` that kills the run and burns the tokens you already spent.
 
-AgentX is different, and it protects you with zero keys. The hero is a deterministic **Shield** that runs in-process: it hard-blocks the catastrophic call (`DROP TABLE`, SSRF, secret reads, destructive shell and cloud teardown) and escalates the consequential-but-legitimate ones (large transfers, external publishes, runaway spend, bulk deletes) for a human to approve. No API key, no signup, no LLM round-trip.
+AgentX is different, and it protects you with zero keys. The hero is a deterministic **Shield** that runs in-process, screening every call against a floor that needs no LLM and no network: `DROP TABLE`, SSRF, secret reads, destructive shell and cloud teardown. Out of the box it watches and records what it finds and blocks nothing, so adding it cannot break an agent that already works. Set `AGENTX_POSTURE=enforce`, or pin a single tool with `posture="enforce"`, and the same floor stops those calls before they run and hands your agent coaching to self-correct on. It escalates the consequential-but-legitimate ones (large transfers, external publishes, runaway spend, bulk deletes) for a human to approve. No API key, no signup, no LLM round-trip.
 
 This repository is the MIT-licensed SDK: the keyless Shield, which you can read, audit, and run yourself with no AgentX account.
 
@@ -44,7 +44,9 @@ def dispatch_crm_update(client_id: str, profile_notes: str, db_session=None):
     print(f"Updating records for {client_id}")
 ```
 
-Your code reacts to a block with `is_block()`. You never parse message text, you read structured fields:
+That wrap watches and records every call it sees. To have it stop a flagged one, export `AGENTX_POSTURE=enforce` for the whole process, or pin the single tool with `@agentx_protect(agent_id="crm_agent", posture="enforce")`. A pinned tool keeps that posture until you delete the argument, and it wins over the environment variable.
+
+Once blocking is on, your code reacts with `is_block()`. You never parse message text, you read structured fields:
 
 ```python
 from agentx_sdk import agentx_protect, is_block
@@ -112,7 +114,7 @@ pip install agentx-security-sdk
 python examples/00_quickstart_pip.py
 ```
 
-`00_quickstart_pip.py` needs nothing beyond the SDK itself. A prompt-injected `DROP TABLE` reaches a protected tool and is stopped in-process, with no key and no network call.
+`00_quickstart_pip.py` needs nothing beyond the SDK itself. A prompt-injected `DROP TABLE` reaches a protected tool and is stopped in-process, with no key and no network call. It pins `posture="enforce"` on the tool so you can watch the block happen, and says so in a comment; your own fresh install watches until you ask it to block.
 
 The other scripts load a local `.env` for convenience, so install their extras first:
 
@@ -124,7 +126,7 @@ pip install -r examples/requirements.txt
 
 ## What is open, and what is hosted
 
-This repo is the keyless **Shield**: deterministic, in-process blocking with in-band coaching, MIT-licensed, no account required. It is the whole story for stopping the catastrophic call before it executes.
+This repo is the keyless **Shield**: a deterministic in-process floor with in-band coaching, MIT-licensed, no account required. It watches by default and stops the catastrophic call once you turn blocking on, and that is the whole story for keeping it from executing.
 
 The **Recover** tier turns a block into a completed task. When you connect the hosted gateway, the agent gets a task-fitting path back and finishes the run instead of crashing, with human-in-the-loop review on the consequential calls. Recover runs in the hosted gateway, not in this SDK. Request access at [agentx-core.com](https://agentx-core.com).
 

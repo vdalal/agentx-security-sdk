@@ -9,6 +9,7 @@ import uuid
 import requests
 import re
 import logging
+import warnings
 import atexit
 import asyncio
 import inspect
@@ -445,6 +446,12 @@ _FAILOPEN_BANNER_SHOWN = False
 _FAILOPEN_BANNER_CLASS = None
 _FAILMODE_WARNED = False
 _ENFORCEMENT_WARNED = False
+# Same once-per-process discipline, for the two posture env vars disagreeing. Declared beside
+# its sibling so the next person adding a warning to this hot path sees both.
+_POSTURE_CONFLICT_WARNED = False
+# ...and for a fail-closed setting that the audit posture makes inert. Same hot path, same
+# once-per-process rule, declared with its siblings for the same reason.
+_FAILCLOSED_INERT_WARNED = False
 _AUDIT_BANNER_SHOWN = False
 _audit_banner_quiet = False
 _SHIELD_FAILOPEN_BANNER_SHOWN = False
@@ -500,14 +507,65 @@ def _warn_policy_load_audit_once(error):
         "Fix it with: agentx policies --check  (%s)", error)
 
 
+def _warn_failclosed_is_inert_in_audit():
+    """One once-per-process warning that AGENTX_FAIL_MODE=closed is doing nothing.
+
+    🔴 A SETTING THAT READS AS ON AND IS OFF. Audit deliberately overrides fail-closed (see
+    the offline-fallback branch: fail-closed is a choice about ENFORCEMENT, and audit is the
+    posture that enforces nothing). That was defensible while audit was opt-in — the operator
+    who chose audit chose it over their own fail-mode. It stopped being defensible when audit
+    became the DEFAULT: an existing deploy that exports AGENTX_FAIL_MODE=closed now has that
+    control silently doing nothing, having changed nothing on their side.
+
+    So we say it. The alternative is that the only signal of an inert security control is its
+    absence of effect during an outage, which is the worst possible time to discover it."""
+    global _FAILCLOSED_INERT_WARNED
+    if _FAILCLOSED_INERT_WARNED:
+        return
+    _FAILCLOSED_INERT_WARNED = True
+    logger.warning(
+        "[AgentX] AGENTX_FAIL_MODE=closed has no effect right now: this install is watching, "
+        "which never blocks, so a call we cannot verify still runs. Set AGENTX_POSTURE=enforce "
+        "if you want unverified calls refused."
+    )
+
+
+def _print_banner(text, *args):
+    """Print a safety banner straight to stderr, bypassing the `agentx` logger on purpose.
+
+    🔴 A BANNER ROUTED THROUGH A LOGGER IS EXACTLY AS VISIBLE AS THE HOST APP'S LOGGING
+    CONFIG LETS IT BE. The WATCHING banner below is the one line telling a keyless deploy
+    that upgraded across the posture flip that every block just became a pass-through. It
+    went through `logger.warning`. This package configures no handler (correctly: it is a
+    library), so an app that had called `logging.basicConfig(level=logging.ERROR)`, or any
+    framework that did so for it, dropped the banner, and the first visible sign of the flip
+    was the post-hoc "Would have blocked" line, printed after the action had already run. A
+    security notice whose delivery depends on somebody else's logging level is a notice by
+    omission. The per-call narration already prints; the banner now takes the same kind of
+    path. stderr, not stdout, so it survives any logging level AND never lands in a stdout
+    that an in-process MCP server may be using as its protocol channel.
+
+    The degraded-protection banner and the posture-conflict warnings still go through the
+    logger; that is the same class and is filed as its own row rather than folded in here.
+    `%`-style lazy args are kept so the call sites read as they did.
+    """
+    print(text % args if args else text, file=sys.stderr)
+
+
 def _emit_audit_banner(via_override=False):
-    """One LOUD, once-per-process warning that AgentX is in AUDIT posture — recording, NOT
-    blocking. Audit is a deliberate observe-first on-ramp (and the shipped `.env.example`
-    default), but a security control that is not blocking must announce itself so a headless
+    """One once-per-process notice that AgentX is in AUDIT posture — recording, NOT
+    blocking. Audit is the default on the client doors WHEN KEYLESS, so on the free SDK this
+    is the ordinary state rather than an opt-in one, and on a keyed install it fires only
+    when the posture was asked for — the rung resolves to enforce there. (`_default_posture_for_rung`.)
+    It can still be set on the run, and never in a file —
+    this resolver reads the process environment and the SDK does not load `.env`, so
+    `.env.example` carries no assignment for it. A security control that is not blocking
+    must announce itself, so a headless
     prod deploy can't be silently unprotected: the developer sees, at the first protected
-    call, that their agent is being watched but not defended. Same channel + once-per-process
-    style as the fail-open degraded banner (logger.warning -> stderr, ops-alertable), because
-    audit is the same category of fact: a posture in which the tool runs unblocked.
+    call, that their agent is being watched but not defended. Once-per-process like the
+    fail-open degraded banner, because audit is the same category of fact: a posture in which
+    the tool runs unblocked. Unlike that banner it is PRINTED to stderr rather than routed
+    through the logger -- see `_print_banner` for why a logger is the wrong channel for it.
 
     🔴 IT NAMED AN ENVIRONMENT VARIABLE THE READER HAD NOT SET. Caught by the founder running
     `agentx demo --audit` in a clean shell: the banner announced "AGENTX_ENFORCEMENT=audit"
@@ -517,9 +575,19 @@ def _emit_audit_banner(via_override=False):
     he is protected — and the second was a fix for a problem he did not have, since his shell
     default was already enforce.
 
-    ⚠️ THE ENV BRANCH IS UNCHANGED, DELIBERATELY. This is a production surface every audit
-    install sees; the wording that was right for them stays exactly as it was, and only the
-    path that could not previously happen gets new text.
+    🔴 THREE BRANCHES NOW, AND THE THIRD IS NOT A WARNING. A plain install
+    resolves to audit with nothing set, so this fires on every install:
+      * per-tool `posture=`/`enforcement=` argument -> "this tool sets it in code"
+      * an env var the reader exported themselves -> the warning, naming the spelling THEY
+        used (both are accepted; hardcoding one made a false statement about the other)
+      * nothing set, the default -> a STATEMENT that we are watching
+    The env branch keeps the wording that was right for the reader who asked for audit. What
+    changed is that it is no longer the only way to arrive here, and warning a new user about
+    the state WE chose for them would make our own default read as a fault.
+
+    ⚠️ ALL THREE STILL PRINT. "Nothing is blocked" is the fact a security tool may not leave
+    to inference: a developer who assumes they are protected must not be able to confuse that
+    with being protected, and silence cannot carry a state that an accident produces too.
 
     Once per process, so a program mixing both sources shows whichever posture it hit first.
     That is the pre-existing behaviour of this banner and is left alone: the sentence it
@@ -548,25 +616,75 @@ def _emit_audit_banner(via_override=False):
     # their shell about fifteen lines above the screen handing them a shell command. One
     # screen, two opposite routes. Three review rounds passed over it; one manual run caught
     # it, which is what a sentence-level defect costs to find.
-    _env_audit = (os.environ.get("AGENTX_ENFORCEMENT") or "").strip().lower() == "audit"
+    # 🔴 BOTH SPELLINGS, OR THIS BANNER PICKS THE WRONG BRANCH FOR ANYONE ON THE NEW NAME.
+    # `AGENTX_POSTURE` is the current name (`_resolve_enforcement` accepts both), so reading
+    # only the old one meant a reader who exported AGENTX_POSTURE=audit and also pinned a tool
+    # was told "this tool sets it in code" while their whole shell was in audit — the exact
+    # false claim about the other tools that the gate below exists to prevent, arriving through
+    # the spelling nobody updated here. Same class as the conftest fixture that had to close
+    # both doors (`sdk_tests/conftest.py`, `_AMBIENT_POSTURE_VARS`).
+    _env_name = next(
+        (n for n in ("AGENTX_POSTURE", "AGENTX_ENFORCEMENT")
+         if (os.environ.get(n) or "").strip().lower() == "audit"),
+        None,
+    )
+    _env_audit = _env_name is not None
     if via_override and not _env_audit:
-        logger.warning(
+        _print_banner(
             "\n"
             "════════════════════════════════════════════════════════════\n"
             " ⚠️  AgentX is in AUDIT mode for this tool\n"
             "────────────────────────────────────────────────────────────\n"
             " Detections are RECORDED but NOT blocked: a flagged call\n"
-            " still runs. This tool sets it in code (enforcement=\"audit\"),\n"
+            " still runs. This tool sets it in code (posture=\"audit\"),\n"
             " which stays until you remove it.\n"
             " See what it recorded:  agentx audit\n"
             "════════════════════════════════════════════════════════════"
         )
         _AUDIT_BANNER_SHOWN = True
         return
-    logger.warning(
+    # 🔴 THE DEFAULT IS NOT A WARNING. A plain KEYLESS install resolves to audit with nothing
+    # set, so this fires for every free-SDK reader rather than only for someone who asked for
+    # it. ("EVERY install" is what this said before the rung rule; a keyed install resolves to
+    # enforce and never reaches here unless the posture was chosen.) The reader this branch
+    # exists for is unchanged, and it is the larger one. The env wording below cannot serve
+    # that reader: it names a variable
+    # they never typed, and warning somebody about the state WE chose for them makes the first
+    # thing a new user sees an alarm about our own default. So the default gets a STATEMENT.
+    #
+    # ⚠️ IT STILL PRINTS, AND THAT IS THE POINT. Silence would leave a developer who believes
+    # they are protected unable to tell that from being protected — a state expressed by
+    # omission is unreadable, and "nothing is blocked" is exactly the fact a security tool may
+    # not leave to inference. Loud on the consequence, quiet on the mechanism.
+    #
+    # ⚠️ ONE CTA, AND IT IS `agentx audit`, NOT "set enforce". Show the value, then ask: the
+    # enforce step is earned on the audit screen once they have seen what we recorded, which
+    # is the same reasoning that took the enforce CTA off the env banner below. Two calls to
+    # action on the first screen a stranger reads is one too many.
+    if not _env_audit:
+        _print_banner(
+            "\n"
+            "════════════════════════════════════════════════════════════\n"
+            "    AgentX is WATCHING. Nothing is being blocked.\n"
+            "────────────────────────────────────────────────────────────\n"
+            " Every call your protected tools make is screened and\n"
+            " recorded. A flagged call is recorded and still runs, so\n"
+            " nothing we get wrong can break your agent.\n"
+            " See what your agent did:  agentx audit\n"
+            "════════════════════════════════════════════════════════════"
+        )
+        _AUDIT_BANNER_SHOWN = True
+        return
+    _print_banner(
         "\n"
         "════════════════════════════════════════════════════════════\n"
-        " ⚠️  AgentX is in AUDIT mode (AGENTX_ENFORCEMENT=audit)\n"
+        # 🔴 NAMES THE SPELLING THE READER ACTUALLY EXPORTED. Hardcoding AGENTX_ENFORCEMENT
+        # here told anyone on the current name that a variable they had not set was the reason
+        # for their posture -- the same false-statement-about-your-environment defect the
+        # per-tool branch above was already fixed for. Lazy %s arg, not an f-string: it was
+        # the logger's style when this went through `logger.warning`, and `_print_banner`
+        # keeps the same signature so the three call sites read alike.
+        " ⚠️  AgentX is in AUDIT mode (%s=audit)\n"
         "────────────────────────────────────────────────────────────\n"
         # 🔴 THE ENFORCE STEP IS FOLDED INTO THE WARNING, NOT STANDING AS ITS OWN CTA.
         # It used to sit at the bottom as " Block for real:  set
@@ -596,7 +714,8 @@ def _emit_audit_banner(via_override=False):
         # exactly that reasoning and left the banner behind: fixing the instances and leaving
         # the one that speaks first.
         " See what your agent did:  agentx audit\n"
-        "════════════════════════════════════════════════════════════"
+        "════════════════════════════════════════════════════════════",
+        _env_name,
     )
     _AUDIT_BANNER_SHOWN = True
 
@@ -604,7 +723,7 @@ def _emit_audit_banner(via_override=False):
 def set_audit_banner_quiet(quiet=True):
     """Let a curated caller (`agentx demo --audit`) own its own explanation of audit
     posture instead of also printing the production banner above it -- the demo already
-    says the same fact in its own narration ("Audit blocks nothing"), so the banner is
+    says the same fact in its own narration ("Watching blocks nothing"), so the banner is
     pure redundant alarm there, in a register the rest of the demo doesn't use. Same
     process-lifetime-toggle shape as set_atexit_summary_quiet: the demo is a one-shot CLI
     process, so there's nothing to restore. Real usage (a developer's own
@@ -1023,37 +1142,226 @@ def _resolve_fail_mode():
     return "open"
 
 
-def _resolve_enforcement(override=None):
+_HITL_DEFAULT_SECONDS = 120
+
+
+def _hitl_timeout_seconds():
+    """How long to wait for a human SOC decision before aborting the action.
+
+    A MODULE-LEVEL FUNCTION RATHER THAN A LITERAL IN THE LOOP, and the reason is testability
+    rather than tidiness. The escalation branch is only reachable with a live gateway that
+    returns ESCALATED, so anything written inline there is code no test in this suite can
+    drive. Pulled out, the budget can be driven directly in both polarities.
+
+    🔴 THE DEFAULT IS SHORT AND THAT IS A PRODUCT DECISION, NOT A LIMIT. Two minutes suits a
+    demo, where the person is already watching the terminal. It is short for the case this
+    feature is actually for: an analyst who has to notice, open the dashboard, read the
+    incident and decide. Anyone in that position sets this variable, which is why it exists.
+
+    ⚠️ FALLS BACK RATHER THAN RAISING. A typo in a timeout must not be the thing that takes
+    down the escalation path itself: refusing to run would turn a bad env var into an outage
+    on the human-in-the-loop queue. It warns and uses the default, which is the same choice
+    `_resolve_enforcement` makes for an unrecognised posture.
+    """
+    raw = (os.environ.get("AGENTX_HITL_TIMEOUT_SECONDS") or "").strip()
+    if not raw:
+        return _HITL_DEFAULT_SECONDS
+    try:
+        parsed = int(raw)
+        if parsed <= 0:
+            raise ValueError(raw)
+        return parsed
+    except ValueError:
+        logger.warning(
+            "[AgentX] AGENTX_HITL_TIMEOUT_SECONDS=%r is not a positive whole number of "
+            "seconds; waiting %ds instead.", raw, _HITL_DEFAULT_SECONDS)
+        return _HITL_DEFAULT_SECONDS
+
+
+def _expire_escalation(gateway_url, receipt_id, headers):
+    """Tell the gateway we stopped waiting, so the incident leaves the human queue.
+
+    🔴 WITHOUT THIS THE QUEUE FILLS WITH THINGS NOBODY CAN ACT ON. The escalation path
+    suspends the caller, polls for a human decision, and on timeout aborts the action. It
+    used to abort silently: the incident stayed ESCALATED in the gateway forever, and the SOC
+    tab lists exactly ESCALATED, so every dead run left a permanent item that looks identical
+    to one a live process is blocked on. A founder walk hit it with two queued: they denied
+    the wrong one, the running script kept waiting, and neither screen explained why.
+
+    ⚠️ BEST EFFORT, AND DELIBERATELY SO. The action has already been refused by the time we
+    get here, which is the part that matters for safety. Making the abort depend on a second
+    round trip would mean a gateway that went away during the wait could turn a clean refusal
+    into an exception in the caller's tool. A failure here leaves one stale row, which is the
+    old behaviour and is recoverable with Dismiss; raising here would break the run.
+
+    Logged at debug rather than warning on purpose: this fires immediately after a timeout
+    message the reader is already acting on, and a second scary line about our own
+    bookkeeping competes with it for attention without giving them anything to do.
+    """
+    try:
+        resp = requests.post(
+            f"{gateway_url}/v1/incidents/{receipt_id}/resolve",
+            headers=headers,
+            json={"status": "EXPIRED"},
+            timeout=2.0,
+        )
+        # 🔴 A NON-2xx IS NOT AN EXCEPTION, SO THIS PATH USED TO REPORT NOTHING AT ALL. Only
+        # a transport failure raises; a gateway that answers 404 or 401 returns normally and
+        # the call looked like it worked. That is not hypothetical: on the CLOUD tier
+        # `park_incident` writes no local row (it uploads to Supabase and returns), so the
+        # local resolve endpoint has nothing to update and answers 404 every time. Without
+        # this line the close fails on that whole tier and leaves no trace anywhere.
+        if resp is not None and resp.status_code >= 300:
+            logger.debug("[AgentX] escalation %s was not closed: gateway answered %s",
+                         receipt_id, resp.status_code)
+    except Exception as exc:                                        # pragma: no cover - net
+        logger.debug("[AgentX] could not close escalation %s: %s", receipt_id, exc)
+
+
+def _default_posture_for_rung():
+    """The DEFAULT posture, which depends on WHICH RUNG OF THE LADDER this install is on.
+
+    Keyless watches. Keyed enforces.
+
+    🔴 THE KEY IS NOT A PROXY FOR THE RUNG, IT IS THE RUNG. `AgentXClient.evaluate_intent`
+    returns REASONING_ENGINE_UNREACHABLE *before issuing any HTTP request* when
+    `AGENTX_API_KEY` is unset, so a keyless install cannot reach a gateway whatever is
+    listening on the port. The free SDK is keyless; the gateway is gated behind registration and a key.
+    So "a key is present" and "this install reaches a gateway" are the SAME FACT, not a
+    correlation that might drift.
+
+    ⚠️ ON THE DOORS THAT HAVE A GATEWAY LEG. The MCP proxy has none ("Keyless by design: no
+    gateway, no API key", its own header), so on that door a key in the host's environment
+    means nothing about a gateway and must not decide the posture. It says so by calling
+    `_resolve_enforcement(keyless_door=True)`, which skips this function. Before that seam
+    existed, exporting AGENTX_API_KEY for a Python agent and launching Cursor from the same
+    shell made every wrapped MCP server ENFORCE, against every MCP surface's "out of the box
+    it blocks nothing".
+
+    🔴 WHY THE DEFAULT CANNOT BE A FLAT 'audit'. THE GATEWAY DOES NOT DECIDE WHETHER THE
+    CALL RUNS -- this module does, on every tier. The gateway returns a verdict and the
+    client chooses whether to honour it, so a flat watching default hands someone who
+    deliberately set up blocking an install that records what it would have stopped and
+    then runs it anyway. A developer who climbs to a gateway must not be handed a weaker
+    posture than the rung below it.
+
+    ⚠️ NOT `AGENTX_GATEWAY_URL`, which is the obvious signal and the wrong one:
+    `AgentXClient` carries its URL as a CONSTRUCTOR DEFAULT (`http://localhost:8000`), so
+    it is always set and its presence distinguishes nothing. This module never reads that
+    variable at all, although four of its error strings advise a human to go check it.
+
+    ⚠️ NOT `AGENTX_MODE` either. That is the control-plane switch (local/linked/cloud) and
+    is a deliberately ORTHOGONAL axis; letting it decide posture too would mean one
+    variable quietly changing two unrelated things.
+    """
+    return "enforce" if (os.environ.get("AGENTX_API_KEY") or "").strip() else "audit"
+
+
+def _resolve_enforcement(override=None, *, keyless_door=False):
     """Resolve the ENFORCEMENT LEVEL (posture) to 'audit' or 'enforce'.
+
+    ``keyless_door=True`` is passed by a door that has NO gateway leg (today: the MCP proxy).
+    For such a door the rung rule's premise, "a key means a gateway", is false by construction,
+    so with nothing set it watches whatever AGENTX_API_KEY says. Everything a person wrote down
+    (the per-tool override, AGENTX_POSTURE, AGENTX_ENFORCEMENT) still wins over it, in the same
+    order as everywhere else. It is a flag and not a free-form default on purpose: a caller
+    cannot use it to hand itself 'enforce'.
 
     A FOURTH, orthogonal axis, distinct from
     AGENTX_MODE (local/linked/cloud), AGENTX_FAIL_MODE (open/closed), and per-detector
     warn/block/off:
-      * enforce (default) — a policy catch is terminal: coach-and-continue / HITL /
-        the AgentXBlock substitution. Nothing changes for existing installs.
-      * audit — run the SAME detection but RECORD what WOULD have blocked and let the
-        original call proceed. The trust-before-enforce on-ramp: a developer runs
-        AgentX in staging non-blocking for a week and sees exactly what it would have
-        caught (and what it would have caught WRONGLY) with zero risk.
+      * audit (the default on the client doors WHEN KEYLESS) — run the SAME detection
+        but RECORD what WOULD have blocked and let the original call proceed.
+      * enforce — a policy catch is terminal: coach-and-continue / HITL / the AgentXBlock
+        substitution.
 
-    Precedence: an explicit per-tool ``override`` (the ``enforcement=`` decorator arg)
-    wins — the surgical exception for a genuinely dangerous tool kept hard-blocked while
-    the rest of the app is in audit — else the global ``AGENTX_ENFORCEMENT`` env var,
-    else the safe default 'enforce'. Like the fail-mode resolver, an unrecognized value
-    never silently downgrades enforcement: it falls back to 'enforce' but warns once."""
-    global _ENFORCEMENT_WARNED
+    🔴 WHY THE DEFAULT IS THE NON-BLOCKING ONE, AND THE REASON IS NOT A TRUST LADDER.
+    Starting non-blocking means there is no risk in trying AgentX. The ladder argument
+    (watch, build trust, climb to enforce) needs a SECOND session to pay off, and second
+    sessions are not something we can assume. What justifies it on the FIRST run alone is
+    that the recorded harm of blocking by default is a FALSE block taking down an agent
+    that was working. It costs the developer no visibility either way, because
+    `record_call` writes on the allow path in EVERY posture.
+
+    🔴 THE GATEWAY IS NOT COVERED BY THIS AND CANNOT BE, WHICH IS WHY THE RUNG IS READ
+    HERE. The gateway has no posture default of its own: it reads the posture the SDK
+    forwards on each request, and uses it only to decide whether to persist a challenged
+    incident. Whether the tool actually RUNS is decided HERE, client-side, on every tier.
+    So this function is the enforcement default for the WHOLE product, including for
+    people who run a gateway — which is exactly why the default cannot be a flat
+    'audit'. See `_default_posture_for_rung`.
+
+    Precedence: an explicit per-tool ``override`` (the ``posture=``/``enforcement=``
+    decorator arg) wins — the surgical exception for a genuinely dangerous tool kept
+    hard-blocked while the rest of the app watches — else ``AGENTX_POSTURE`` /
+    ``AGENTX_ENFORCEMENT``, else ``_default_posture_for_rung()``: 'audit' keyless,
+    'enforce' when a key is present. **The default is not one literal any more.** Read
+    that function before writing "the default is audit" anywhere; it is true of the free
+    SDK and false of a gateway install.
+
+    🔴 THE TWO FAILURE PATHS STILL RESOLVE TO 'enforce', WHICH IS NOT AN OVERSIGHT. A
+    typo'd value and two env vars that disagree both mean somebody was TRYING to set the
+    posture, and the only posture worth setting is the one that is not the default. Falling
+    back to 'audit' there would silently drop the protection they were reaching for."""
+    global _ENFORCEMENT_WARNED, _POSTURE_CONFLICT_WARNED
     if override is not None:
         raw = str(override).strip().lower()
     else:
-        raw = os.environ.get("AGENTX_ENFORCEMENT", "enforce").strip().lower()
+        # AGENTX_POSTURE is the new spelling; AGENTX_ENFORCEMENT is kept working because
+        # existing runbooks, CI jobs and shell histories carry it. Same stricter-wins rule as
+        # the decorator argument: if both are set and disagree, take 'enforce'. Letting the
+        # new name win would mean a stray AGENTX_POSTURE=audit silently switching off a
+        # deployment that deliberately exports AGENTX_ENFORCEMENT=enforce.
+        _new = (os.environ.get("AGENTX_POSTURE") or "").strip().lower()
+        _old = (os.environ.get("AGENTX_ENFORCEMENT") or "").strip().lower()
+        if _new and _old and _new != _old:
+            # 🔴 ONCE PER PROCESS, like the audit banner directly below. This resolver runs
+            # inside EVERY protected tool call, so a deploy exporting both names would have
+            # emitted one warning per call -- thousands of lines describing one unchanging
+            # configuration mistake, in the middle of the developer's own tool output.
+            global _POSTURE_CONFLICT_WARNED
+            if not _POSTURE_CONFLICT_WARNED:
+                logger.warning(
+                    "[AgentX] AGENTX_POSTURE=%r and AGENTX_ENFORCEMENT=%r disagree. Using "
+                    "'enforce' (the stricter of the two). Set only AGENTX_POSTURE.",
+                    _new, _old)
+                _POSTURE_CONFLICT_WARNED = True
+            raw = "enforce"
+        else:
+            # 🔴 THE DEFAULT IS RESOLVED BY RUNG, and it is the whole client-side posture
+            # choice. Both client doors resolve here -- the decorator calls it and the MCP
+            # proxy imports it rather than keeping its own copy -- so there is no second
+            # surface to keep in step. Two surfaces each resolving a posture under the same
+            # name, differently, is how a word ends up meaning two things. The MCP proxy is
+            # the one caller that passes `keyless_door=True`: it has no gateway leg, so for it
+            # the key is not a rung (see `_default_posture_for_rung`).
+            if _new or _old:
+                raw = _new or _old
+            elif keyless_door:
+                raw = "audit"
+            else:
+                raw = _default_posture_for_rung()
+    # An explicitly EMPTY override (`posture=""`) is a malformed setting, not an unset one:
+    # the caller passed an argument. Same reasoning as the two failure paths below -- somebody
+    # reaching for a posture gets the one that is not the default.
     if raw == "":
         raw = "enforce"
     if raw in ("audit", "enforce"):
         return raw
     if not _ENFORCEMENT_WARNED:
         logger.warning(
-            f"[AgentX] Unrecognized AGENTX_ENFORCEMENT={raw!r}; expected 'audit' or 'enforce'. "
-            f"Falling back to 'enforce' — fix the value to run in audit (non-blocking) mode."
+            # 🔴 THE ADVICE INVERTED WITH THE DEFAULT. This used to end "fix the value to run
+            # in audit (non-blocking) mode", which now tells the reader to work for what they
+            # would get by setting nothing. The only reason to set this variable any more is
+            # to enforce, so that is what the message helps them do.
+            f"[AgentX] Unrecognized posture {raw!r}; expected 'audit' or 'enforce'. "
+            f"Using 'enforce'. Set AGENTX_POSTURE=enforce to block, or AGENTX_POSTURE=audit "
+            f"to watch without blocking. "
+            # The tail names THIS door's default: the resolver knows the door (the flag), so
+            # telling an MCP user that "a keyed install enforces" would be false for them.
+            + ("Unset, this door watches; it has no gateway, so a key does not change that."
+               if keyless_door else
+               "Unset, a keyless install watches and a keyed one enforces.")
         )
         _ENFORCEMENT_WARNED = True
     return "enforce"
@@ -1752,7 +2060,7 @@ def record_spend(tokens: int = 0, cost_usd: float = 0.0):
 
 def _apply_org_override(policy_id, challenge_text, safe_path, policy_name=None,
                         signature=None):
-    """BUILD #2 — swap an adopted org reframe into a block before delivery. The
+    """BUILD #2 — swap adopted coaching into a block before delivery. The
     SINGLE home for the override logic, shared by BOTH block paths (the gateway
     "Policy Violation" path and the Layer-0 keyword shield) so they can't drift.
     Returns ``(challenge_text, safe_path)``.
@@ -1769,7 +2077,7 @@ def _apply_org_override(policy_id, challenge_text, safe_path, policy_name=None,
 
     Total best-effort: no/blank override → inputs returned unchanged. Counts and
     announces a swap ONLY when it actually changes the delivered block, so the
-    'Org Reframes Applied' proof metric never inflates on a no-op override whose
+    'Your Coaching Used' proof metric never inflates on a no-op override whose
     text already equals the generic challenge."""
     override = get_active_override(policy_id, policy_name=policy_name, signature=signature)
     if not override:
@@ -1779,7 +2087,12 @@ def _apply_org_override(policy_id, challenge_text, safe_path, policy_name=None,
     if new_challenge == challenge_text and new_safe == safe_path:
         return challenge_text, safe_path          # adopted override is a no-op — don't count it
     _incr("overrides_applied")
-    print("🧭 [AgentX SDK] Using your adopted safe-path for this policy.")
+    # 🔴 "your coaching", NOT "your adopted safe-path", AND THIS WAS A WRONG STATEMENT RATHER
+    # THAN A WORD CHOICE. An override may set the challenge half, the safe-path half, or
+    # both; the founder's own override sets `challenge` with `safe_path` null. This line
+    # announced the half it had not touched. Naming the whole thing is true in all three
+    # cases, and "coaching" is the settled word for the whole thing.
+    print("🧭 [AgentX SDK] Using your coaching for this policy.")
     return new_challenge, new_safe
 
 
@@ -1920,6 +2233,19 @@ def _print_novelty_line():
 # you wrap" claim that was false in the unsafe direction.
 AUDIT_POSTURE_CLAUSE = "watches every call and blocks nothing"
 
+# 🔴 THE mcp.json ENV BLOCK, WHICH HAD FOUR HAND-ROLLED COPIES. `cli._print_posture_command`'s
+# MCP branch, `mcp_proxy`'s startup banner, and two config snippets in `mcp_demo` all printed
+# this line by hand, and the emitter's docstring called itself "the ONE place that answers it"
+# while three others answered it too. They had already drifted in the surrounding words, and
+# only the emitter's copy was pinned by a test -- change that one and the other three keep the
+# old form with nothing red.
+#
+# ⚠️ THE INNER FORM ONLY, NO TRAILING COMMA. mcp_demo renders it inside a config block where a
+# comma is required and the others render it standalone where a comma is a syntax error, so the
+# punctuation belongs to the caller. What must not differ is the KEY and the SPELLING: this is
+# a payload a reader pastes into a JSON file, so its exact text is behaviour, not copy.
+MCP_POSTURE_ENV_LINE = '"env": { "AGENTX_POSTURE": "%s" }'
+
 # 🔴 THE SECOND FACT THAT SHIPPED IN THREE VERBS. `AUDIT_POSTURE_CLAUSE` above exists
 # because "watches every call and blocks nothing" had drifted into three wordings. The
 # RECORDING fact drifted the same way and nobody extracted it: cli.py said "writes down every
@@ -1971,19 +2297,43 @@ AUDIT_COMMAND_DESCRIPTION = "What your wrapped tools actually DID, grouped by to
 #     Customize, Seed, Pull, Contribute) and the docs table describes what each screen SHOWS.
 #     Each screen follows its own neighbours; removing the CLI's verb once already made
 #     `insights` the only verbless entry on its own screen.
-#   - "for adoption" on the Python door and NOT on the MCP door, which ships no `--adopt`.
-#     Naming an action a door does not perform is the defect; consistency is not worth a false
-#     promise. So this constant is scoped to the CLI + docs pair and must NOT be forced onto
-#     mcp_proxy's `--insights`, which speaks of wrapped SERVERS, not wrapped tools.
+#   - an adoption CTA belongs only where the door performs it. Naming an action a door does
+#     not perform is the defect; consistency is not worth a false promise. So this constant is
+#     scoped to the CLI + docs pair and must NOT be forced onto mcp_proxy's `--insights`,
+#     which speaks of wrapped SERVERS, not wrapped tools.
+#
+#     ⚠️ THE EXAMPLE THIS USED TO GIVE IS NOW INVERTED. It read "'for adoption' on the Python
+#     door and NOT on the MCP door". The CLI row no longer carries "for adoption" at all
+#     (adoption is one third of that screen and `adopt` has its own row), while the /docs row
+#     ends "ready to adopt". The PRINCIPLE stands and the distribution moved, so the principle
+#     is stated on its own rather than through an example that no longer matches either
+#     surface.
 #
 # "WRAPPED TOOLS" is the load-bearing half, same as in RECORDING_CLAUSE above: a tool the
 # developer never wrapped never appears on that screen, so "your agents'" reads their PARTIAL
 # coverage as their whole activity. That is the drift this pin exists to catch.
-INSIGHTS_SUBJECT = "wrapped tools' learned safe-paths (numbered)"
+# 🔴 IT NAMED THE SCREEN'S THIRD SECTION, SO BOTH SURFACES LED WITH THE LEAST-WANTED THING.
+# The old value was "wrapped tools' learned safe-paths (numbered)", which describes only the
+# adoption list at the bottom. `agentx insights` OPENS with "WHAT WAS BLOCKED HERE", so a
+# reader hunting for what AgentX stopped read this line and went elsewhere -- the command
+# they wanted was the one they had just skipped. A second help line was added under it as a
+# patch; naming all three sections in render order makes that patch unnecessary and it is
+# gone. "wrapped tools" is retained deliberately: a tool the developer never wrapped never
+# appears on that screen, so "your agents'" would read partial coverage as whole activity.
+# ⚠️ "safe-paths", NOT "fixes". The first cut of this said "the fixes learned", which renamed
+# the POINTER and left the DESTINATION alone: the screen's third section is still headed
+# "SAFE-PATHS YOUR WRAPPED TOOLS LEARNED", and `adopt` says "Adopt a learned safe-path". One
+# word for one thing, and the hyphenated noun is the form the rest of the product already
+# uses. Caught by the founder reading his own walk output.
+INSIGHTS_SUBJECT = "wrapped tools' blocks, what came after, and the safe-paths learned"
 
 
 def posture_command_lines(posture, indent="      "):
-    """"Run your agent with AGENTX_ENFORCEMENT=<posture>", in BOTH shells. ONE place.
+    """"Run your agent with AGENTX_POSTURE=<posture>", in BOTH shells. ONE place.
+
+    ⚠️ This line said `AGENTX_ENFORCEMENT` until the return below moved to the current spelling,
+    and describing the string you no longer emit is the first thing a reader of this function
+    trusts. The old name still WORKS (`_resolve_enforcement` accepts both); it is not TAUGHT.
 
     🔴 THIS IS SHARED WITH `cli.py` ON PURPOSE. The session summary and the audit screen now
     print the same instruction, and the rule it has to obey is old and already been broken
@@ -1993,7 +2343,7 @@ def posture_command_lines(posture, indent="      "):
     extracted for exactly this after one call site printed PowerShell only).
 
     ⚠️ WHY THE ENV VAR AND NOT THE DECORATOR ARGUMENT. Both CTAs used
-    to say `@agentx_protect(..., enforcement="audit")`. Per `_resolve_enforcement`, the
+    to say `@agentx_protect(..., posture="audit")`. Per `_resolve_enforcement`, the
     per-tool argument WINS over this variable -- so that advice left the tool non-blocking
     permanently, and the "to block instead of watching: AGENTX_ENFORCEMENT=enforce" line on
     the same screen could not undo it. Measured: with the variable set to enforce, a pinned
@@ -2017,8 +2367,16 @@ def posture_command_lines(posture, indent="      "):
     call, not a wording fix.
     """
     return [
-        "%sAGENTX_ENFORCEMENT=%s python your_agent.py          # mac/linux" % (indent, posture),
-        '%s$env:AGENTX_ENFORCEMENT="%s"; python your_agent.py  # PowerShell' % (indent, posture),
+        # 🔴 THE CURRENT SPELLING, AND THE CROSS-SURFACE CHANGE THE OLD COMMENT HERE WAS
+        # WAITING FOR. That comment said this string stays on the old name until README, the
+        # security page and the docs cards move together, because our printed copy disagreeing
+        # with our own docs is worse than teaching an older name that still works. That is
+        # still true; what changed is that the move is happening, in the same pass that
+        # rewrites these same sentences for the new default. Both env names keep working in
+        # `_resolve_enforcement`, so nobody's existing runbook breaks -- this is only what we
+        # TEACH.
+        "%sAGENTX_POSTURE=%s python your_agent.py          # mac/linux" % (indent, posture),
+        '%s$env:AGENTX_POSTURE="%s"; python your_agent.py  # PowerShell' % (indent, posture),
     ]
 
 
@@ -2191,7 +2549,20 @@ def _print_agentx_summary():
     # also counts a call that failed open or was bypassed. "Checked" would be a claim about
     # screening that this number cannot support -- the same distinction the `screened` flag
     # on _ExecuteTool exists to carry.
-    print(f" 🛠️  Tool Calls Seen:       {_session_stats['total_calls']}")
+    # "Seen" was our side of it — seen BY US. It is their agent's calls; the count is the
+    # same. Zero test files pinned this one, which is why it moves in this pass and the
+    # heavier labels around it do not.
+    # 🔴 NAMES ITS POPULATION, BECAUSE THE OTHER SCREEN COUNTS A DIFFERENT ONE. This is every
+    # call the decorator saw; `agentx audit`'s header counts only the ones that tripped
+    # nothing. Both are right and they are far apart on a busy ledger -- 47 here against 35
+    # there, for the same run -- so a reader comparing them finds two answers to what looks
+    # like one question and has no way to tell which is wrong. Neither is. They reconcile as
+    # allowed + blocked + recorded-and-let-through, and this half now says which end it is.
+    #
+    # Uses the `{:<3} |  note` shape of the counters below it rather than inventing a second
+    # layout for one line.
+    print(f" 🛠️  Tool calls:            {_session_stats['total_calls']:<3} "
+          f"|  every call, blocked or not")
     print("─"*60)
     # ⚠️ EVERY EVENT THIS BOX REPORTS NEEDS A LINE IN IT, not just a mention in the call to
     # action below the divider. An audit catch used to appear only there, so a session that
@@ -2335,9 +2706,19 @@ def _print_agentx_summary():
     #
     # BOTH numbers are gated, not just the ledger one: a run with a single challenge printed
     # "100.0%" for the session as readily as for the lifetime.
-    print(f" 📈 Recovery:              {format_ratio(recovered_ch, total_ch)} this run"
-          f" |  On record: "
-          f"{format_ratio(history.get('total_self_corrections', 0), history.get('total_intercepts', 0)) if _ledger_read else _NO_RECORD}")
+    # 🔴 EACH HALF NAMES WHAT IT COUNTED, BECAUSE THE TWO HALVES COUNT DIFFERENT THINGS.
+    # "0 of 1 this run | On record: 0 of 8" put a CHALLENGE denominator and a BLOCK
+    # denominator under one label, so the only way to know they were different populations
+    # was to read this source. A reader doing the obvious thing -- comparing 1 to 8 and
+    # concluding their run was quiet -- was comparing two different questions.
+    #
+    # The rule this follows: a count printed beside another count either names the population
+    # it counted, or the screen reconciles the two. Naming is the cheap half, so it is the one
+    # done here. Four words, and the line stops needing a footnote.
+    print(f" 📈 Recovery:              {format_ratio(recovered_ch, total_ch)} challenges"
+          f" this run |  On record: "
+          f"{format_ratio(history.get('total_self_corrections', 0), history.get('total_intercepts', 0)) if _ledger_read else _NO_RECORD}"
+          f"{' blocks' if _ledger_read else ''}")
 
     # 🔴 DELETION IS NEVER INVISIBLE. P-57 removed an entire ledger quietly and printed
     # "Clean slate!"; the rule taken from it is that the person whose data it was gets told.
@@ -2425,7 +2806,14 @@ def _print_agentx_summary():
         _protection_recorded = True
         protection = pulse.record_protection(_session_stats)
         if protection:
-            print(f" 🔥 Protection Streak:     {pulse.format_protection_line(protection)}")
+            # "Streak", not "Protection Streak", and the phrase says when this session only
+            # watched: a keyless default install protects nothing, and a summary line that
+            # called every such session "protected" was the over-claim a founder walk read on
+            # the MCP twin of this line. The helper decides the wording from the ambient
+            # posture at exit AND the block count, so a pinned `posture="enforce"` tool that
+            # blocked under a watching default is not described as "nothing was blocked".
+            print(f" 🔥 Streak:                "
+                  f"{pulse.format_protection_line(protection, posture=_resolve_enforcement(), blocked=_session_stats.get('intercepts', 0))}")
 
     # --- P-112: WHAT IS NEW ABOUT THIS AGENT, AND THE REASON TO OPEN `agentx audit` ------
     # The other half of the retention story next to the streak. The streak says we were
@@ -2441,11 +2829,16 @@ def _print_agentx_summary():
     # is added here is the day the readout goes dark again for whoever is not in that posture.
     _print_novelty_line()
 
-    # --- BUILD #2: ORG-REFRAME LOOP — only surfaces when relevant, so a plain run
+    # --- BUILD #2: ADOPTED-COACHING LOOP — only surfaces when relevant, so a plain run
     #     stays clean. The "applied" line is proof the org brain is compounding;
     #     the nudge points devs at this session's freshly-harvested safe paths. ---
+    #
+    # 🔴 "Org Reframes Applied" WAS THE ONE LINE STILL USING A WORD WE DROPPED. "Reframe" was
+    # abandoned in favour of "coaching", and this counter kept it on the last screen of every
+    # session, next to "adopted safe-paths" for a swap that may have replaced only the
+    # challenge half. Two names for one thing on one line, neither of them the settled one.
     if _session_stats.get("overrides_applied", 0) > 0:
-        print(f" 🧭 Org Reframes Applied:  {_session_stats['overrides_applied']:<3} |  your adopted safe-paths replaced the generic challenge")
+        print(f" 🧭 Your Coaching Used:    {_session_stats['overrides_applied']:<3} |  your coaching replaced what we ship")
     # Count what's actually waiting in the incident store — blocks needing a verdict +
     # reframes ready to adopt — and nudge toward the batched one-key review. Defensive
     # (0 on any error / absent store), so a plain or keyless run stays clean and this
@@ -2645,13 +3038,27 @@ def _print_agentx_summary():
             print(" 💡 Nothing was blocked this session, and not every call went straight")
             print("    through. See what your agent did:  agentx audit")
 
-    # The 5+ Block Threshold for the Health Report
+    # The 5+ block threshold for the recurring-policy line.
+    #
+    # 🔴 IT CALLED THEIR AGENT AN OFFENDER AND THEN TOLD THEM TO GO FIX THEIR PROMPT. This
+    # read: "🩺 AGENT HEALTH INSIGHT" / "⚠️ Top Offender: '<policy>'" / "💡 Tip: Consider
+    # refining your agent's system prompt to avoid this." Three problems, and it prints after
+    # EVERY run, which makes it the most-seen text we ship.
+    #
+    # "Offender" is our judgment of their work, unasked. "AGENT HEALTH INSIGHT" is our
+    # category name for a thing they never asked to be diagnosed. The Tip is unsolicited
+    # advice about code we cannot see, vague enough to be unactionable ("consider refining"
+    # — how?), and it assumes the blocks were correct: a recurring FALSE positive gets the
+    # same lecture. And ⚠️ is this codebase's mark for "something is wrong", spent here on a
+    # plain fact about a tally.
+    #
+    # What survives is the only part that is theirs: across everything recorded here, one
+    # policy accounts for most of it. That is genuinely new — every other number on this
+    # banner is about THIS run. No CTA: the block eight lines up already sent them to a
+    # screen, and a second one competing with it is the defect this file has filed twice.
     if history.get('total_intercepts', 0) >= 5 and history.get('top_offender'):
-        print("═"*60)
-        print(" 🩺 AGENT HEALTH INSIGHT")
         print("─"*60)
-        print(f" ⚠️  Top Offender: '{history['top_offender']}'")
-        print(" 💡 Tip: Consider refining your agent's system prompt to avoid this.")
+        print(f" Most blocks in this ledger are one policy: '{history['top_offender']}'")
 
     # --- OFFLINE STALENESS NOTICE ---
     # The only channel that reaches a pinned install: pip cannot declare a minimum
@@ -2955,12 +3362,70 @@ _BUILTIN_POLICY_KEYWORDS = [
         "name": "Mass Destructive Intent",
         "category": "DESTRUCTIVE_ACTION",
         # DROP/TRUNCATE are always destructive (no scoped-safe form). A scoped
-        # DELETE/UPDATE (with a WHERE) is legitimate, so those are NOT flat tokens:
-        # the WHERE-aware _detect_destructive_sql floor catches only the no-WHERE
-        # mass form, which is why "DELETE FROM" is deliberately absent here.
+        # DELETE/UPDATE (with a WHERE) is legitimate, so those are NOT flat tokens,
+        # which is why "DELETE FROM" is deliberately absent here.
+        #
+        # ⚠️ `_detect_destructive_sql` IS WHAT DRAWS THE LINE, AND THIS COMMENT SPENT A ROUND
+        # SAYING IT WAS NOT. Called directly on the lowercased payload:
+        #
+        #   drop table users / truncate users / drop schema … / drop database …  -> True
+        #   delete from sessions            (no WHERE)                           -> True
+        #   delete from sessions where 1=1  (tautology)                          -> True
+        #   delete from sessions where id = 42                                   -> False
+        #
+        # That is exactly the shipped behaviour, so the ORIGINAL wording ("the WHERE-aware
+        # _detect_destructive_sql floor catches only the no-WHERE mass form") was right, and
+        # the round that replaced it with "returns False for BOTH, so something else does"
+        # was measuring something else. The likeliest cause is the trap this branch hit twice
+        # elsewhere: a pulled `.agentx/policies.json` in the working directory shadowing the
+        # shipped rules, which changes what blocks without changing this function.
+        #
+        # 🔴 THE TOKEN LIST BELOW IS NOT WHAT STOPS THESE. Emptying `blocked_intents`
+        # entirely leaves every case above still blocked, because the structural detector
+        # catches them first. The tokens are a second rail, not the rail. Do not reason about
+        # coverage from that list alone; drive the detector.
         "blocked_intents": ["DROP TABLE", "TRUNCATE TABLE", "DROP DATABASE"],
-        "socratic_prompt": "This is a destructive, irreversible write that drops or mass-deletes data.",
-        "preferred_alternative": "Add a WHERE clause so the change touches only the specific rows you intend.",
+        # 🔴 THE FIRING SET, ENUMERATED THROUGH THE REAL DECORATOR RATHER THAN READ OFF THIS
+        # DICT, because blocked_intents above is only three of the eight cases. Keyless,
+        # builtins armed, from a directory with no .agentx/policies.json shadowing them:
+        #
+        #   BLOCKED   DROP TABLE / TRUNCATE TABLE / DROP DATABASE      (structure removal)
+        #             DELETE or UPDATE with no WHERE                   (every row)
+        #             DELETE or UPDATE with WHERE 1=1 / WHERE true     (every row)
+        #   ALLOWED   DELETE or UPDATE with a condition that excludes something
+        #             (`WHERE id = 42`, `WHERE created_at < now() - interval '30 days'`)
+        #
+        # Every blocked case has ONE property in common: the statement is not limited to a
+        # subset. It drops the table or database outright, or it matches every row. So the
+        # copy below may name that, and a previous revision of this comment was wrong to
+        # forbid it -- it asserted the seed "fires on a scoped one-row delete", which the
+        # enumeration above shows it does not.
+        #
+        # ⚠️ WHAT THE REAL INCIDENT WAS, AS FAR AS THE EVIDENCE GOES. The old safe path said
+        # "Add a WHERE clause so the change touches only the specific rows you intend". The
+        # recorded loop is an agent that complied, was blocked again, retried, tripped the
+        # circuit breaker and failed its job. The reason cannot be that its clause was
+        # scoped, because a scoped clause is allowed above. It fits the tautological WHERE:
+        # an eval transcript has an agent reasoning that "the most direct way to satisfy the
+        # 'add a WHERE clause' requirement is to use `WHERE 1=1`", which the tautology
+        # detector blocks. The instruction was satisfiable by a
+        # clause that narrows nothing, and we never said the clause had to exclude anything.
+        # That is the defect: not that we named the shape, but that we asked for a WHERE
+        # instead of asking for a NARROWING, and then blocked the difference silently.
+        #
+        # (The original incident transcript is not in the repo, so the tautology reading is
+        # inference from the two things that ARE checkable: the firing set, and the quoted
+        # eval reasoning. If the transcript ever shows a genuinely bounded clause blocked,
+        # this comment is wrong and the firing set above is where to start.)
+        "socratic_prompt": (
+            "This is not scoped to a subset: it drops the table or database outright, or it "
+            "matches every row."
+        ),
+        "preferred_alternative": (
+            "If only some rows should change, give a condition that leaves the rest "
+            "untouched, and check it excludes something before running it. A condition that "
+            "matches every row, like 1=1 or true, narrows nothing."
+        ),
         # Reversibility-first coaching (recover-depth slice 2): steer onto the reversible
         # equivalent and let the run proceed. The soft-delete clause that used to live in
         # the string above is now single-sourced in _REVERSIBLE_ALTERNATIVES (below).
@@ -3110,13 +3575,19 @@ _POLICY_ID_TO_CATEGORY = {p["id"]: p["category"] for p in _BUILTIN_POLICY_KEYWOR
 _REVERSIBLE_ALTERNATIVES = {
     # Only the Mass Destructive Intent policy is a homogeneous, cleanly-reversible class
     # (DROP / TRUNCATE / DROP DATABASE / no-WHERE mass UPDATE|DELETE), so it is the only
-    # transform that ships today. The steer is deliberately action-GENERAL (it must fit an
-    # UPDATE and a DROP DATABASE, not only a table DELETE) so it never misdescribes a case
-    # the same policy fires on.
+    # transform that ships today. The steer is deliberately action-GENERAL: it must fit an
+    # UPDATE and a DROP DATABASE, not only a table DELETE.
+    #
+    # 🔴 IT USED TO END "instead of an irreversible DROP, TRUNCATE, or unscoped bulk write",
+    # AND THE COMMENT ABOVE CLAIMED THAT MADE IT NEVER MISDESCRIBE A CASE THIS POLICY FIRES
+    # ON. Measured false: this policy also fires on a SCOPED one-row delete, which is none of
+    # those three shapes, so the steer named the action as something it was not. Naming
+    # shapes is what made it action-SPECIFIC while the comment called it action-general. The
+    # clause is gone; what remains is the reversibility steer, which is true of every case.
     "soft_delete": (
         "Prefer a reversible form you can undo: back up or snapshot the data first, or "
         "stage the change behind a deleted or status flag you can revert, so it can be "
-        "restored, instead of an irreversible DROP, TRUNCATE, or unscoped bulk write."
+        "restored rather than lost."
     ),
 }
 
@@ -3133,6 +3604,29 @@ def _reversible_alternative(policy):
     # prints "bypassed" and FALLS THROUGH -- fail-open, so the blocked tool would execute.
     # Drop the malformed id rather than let it disarm the keyless block path.
     return _REVERSIBLE_ALTERNATIVES.get(tid) if isinstance(tid, str) and tid else None
+
+
+def _delivered_coaching(challenge, safe_path):
+    """What the agent was actually handed, for the ledger's `challenge_issued`.
+
+    🔴 BOTH HALVES, AND THE SECOND ONE IS THE POINT. The challenge says what is wrong; the
+    safe path says what to do instead, and the safe path is the half that decides whether an
+    agent recovers, and we have watched that go wrong: "Add a WHERE clause so the change touches only the
+    specific rows you intend" was the SAFE PATH, and it is what a real agent complied with,
+    was re-blocked on, and looped to death against. Recording only the challenge would leave
+    the wording that actually caused the failure unattributable.
+
+    ⚠️ THE GATEWAY'S FIELD OF THE SAME NAME IS NARROWER, AND THAT DIVERGENCE IS DELIBERATE
+    RATHER THAN OVERLOOKED. `incident_store.challenge_issued` holds the challenge only,
+    because on that path the safe path is composed separately at render time. Named here so
+    the two are not read as one thing: a query joining them would be comparing a pair against
+    a half. Same word, two scopes.
+
+    Returns None when there is nothing to record, so an absent value stays absent rather than
+    becoming an empty string that reads like "we said nothing" instead of "not captured".
+    """
+    parts = [p.strip() for p in (challenge, safe_path) if isinstance(p, str) and p.strip()]
+    return " ".join(parts) if parts else None
 
 
 def _effective_safe_path(policy):
@@ -5235,28 +5729,42 @@ class _ExecuteTool:
 
 
 def _audit_scope_phrase():
-    """"Audit is on" or "Audit is on for this tool", whichever is TRUE for this call.
+    """"Audit is on". One phrase, because the scope claim can no longer be made safely.
 
-    🔴 THREE NARRATIONS SAID "for this tool" UNCONDITIONALLY, AND IT IS FALSE IN THE UNSAFE
-    DIRECTION. A run that set AGENTX_ENFORCEMENT=audit has EVERY wrapped tool auditing, but
-    the would-block line told the reader audit was on "for this tool" -- so a developer who
-    set the variable process-wide could read it as a per-tool setting and believe the rest of
-    their app was still blocking. That is the same shape as the MCP door's "on every server
-    you wrap", which was fixed for the same reason: a scope claim that overstates protection.
-    Caught by running the example and reading the banner and this line together.
+    🔴 THREE NARRATIONS SAID "for this tool" UNCONDITIONALLY, AND IT WAS FALSE IN THE UNSAFE
+    DIRECTION. A run that set the posture globally has EVERY wrapped tool auditing, but the
+    would-block line told the reader audit was on "for this tool" -- so a developer could read
+    a process-wide setting as a per-tool one and believe the rest of their app was still
+    blocking. That is a scope claim that overstates protection, the same shape as the MCP
+    door's "on every server you wrap". Caught by running the example and reading the banner and
+    this line together.
 
-    ⚠️ THE FIX IS NOT TO DELETE THE PHRASE. When `enforcement="audit"` is set on one decorator
-    while the global posture is enforce, "for this tool" is exactly right and the bare form
-    would understate protection instead. So say the true one.
+    🔴 THE CONDITIONAL FIX FOR THAT IS NOW WRONG TOO, AND FOR THE SAME REASON IT WAS RIGHT.
+    It read the env var: set to audit meant global, unset meant the only remaining way to reach
+    this code was the per-tool argument. That inference held exactly while enforce was the
+    default. Since the default became audit, "unset" is the COMMON case and it is global, so
+    the old branch returned "for this tool" on a plain install where every wrapped tool was
+    watching. The defect the conditional was built to remove, restored by a change somewhere
+    else entirely, on a line that fires for every caught call.
 
-    Derived here rather than threaded through three call chains: this runs only on the audit
-    path, so if AGENTX_ENFORCEMENT is audit the posture is global (an override agreeing with
-    it changes nothing the reader can act on), and if it is not, the only way to reach this
-    code is the per-tool argument. One entry point, because the same sentence lives at three
-    sites and a rule stated beside each gets obeyed at some of them."""
-    if os.environ.get("AGENTX_ENFORCEMENT", "").strip().lower() == "audit":
-        return "Audit is on"
-    return "Audit is on for this tool"
+    ⚠️ SO THE PHRASE GOES RATHER THAN GAINING A THIRD BRANCH. This function cannot see whether
+    the posture came from the default or from a per-tool argument -- one word, 'audit', is
+    written for both -- and threading that through three call chains is what the original note
+    here deliberately avoided. What it CAN do is pick the phrasing whose error is safe. Bare
+    "Audit is on" is exactly right when the posture is global, and UNDERSTATES protection in
+    the per-tool case, where the reader thinks less of their app is defended than really is.
+    Understating is the safe direction; the discarded phrase erred the other way.
+
+    The reader who wants the scope has the banner, which fires once at the first protected call
+    and does distinguish the three cases.
+
+    🔴 AND "Audit is on" WENT THE SAME WAY AS "while audit was on". The insights heading and
+    the audit screen's split both stopped saying a mode was ON, because since the flip nobody
+    turned anything on and a screen that says otherwise credits the reader with a decision
+    they never made. This line says the same thing and fires on EVERY caught call, so it is
+    the most-read of the three and was the one left behind. Same replacement the audit screen
+    uses ("2 ran because nothing was"), so the two agree word for word."""
+    return "Nothing is blocking"
 
 
 def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, category,
@@ -5310,9 +5818,12 @@ def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, c
     if not _is_demo_agent(agent_id):
         _incr("would_blocks")
     _note_block_category(category)
-    names, amount, target_class = _call_shape(tool_name, arguments)
+    names, amount, target_class, quantity = _call_shape(tool_name, arguments)
+    # A WOULD_BLOCK row exists only because the posture was audit; the literal is the same
+    # kind as the `in_audit=True` literal this path already carries.
     log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, WOULD_BLOCK_STATUS,
-                 arg_names=names, amount=amount, target_class=target_class)
+                 arg_names=names, amount=amount, target_class=target_class,
+                 quantity=quantity, posture="audit")
     # Best-effort narration: a broken/closed stdout must NOT raise out of here, or the
     # caller's `except Exception` (the Layer-0 shield's) would swallow it and fall through
     # to the gateway path, double-counting this one call. The record above already stood.
@@ -5418,7 +5929,7 @@ def _inventory_due(outcome):
             and not outcome.recorded)
 
 
-def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit):
+def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, description=None):
     """P-92: record ONE call we had NO opinion about. Best-effort; never raises.
 
     The other half of the audit record, and the half that was missing. `_record_would_block`
@@ -5444,7 +5955,7 @@ def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit):
         # rather than "ran a protected tool at all". See db._bump_audit_counters.
         record_call(trace_id, agent_id, tool_name, arguments,
                     stats=_session_stats, stats_lock=_stats_lock,
-                    in_audit=in_audit)
+                    in_audit=in_audit, description=description)
     except Exception:
         # Deliberately silent, unlike the would-block narration. This runs on EVERY passing
         # call, so a per-call complaint would turn one broken ledger into thousands of lines
@@ -5506,7 +6017,7 @@ _AUDIT_SUPPRESSIBLE_RAISES = _AUDIT_SUPPRESSIBLE_VERDICTS + _AUDIT_RELEASED_FAUL
 _SYSTEM_ERROR_PREFIX = "AgentX System Error:"
 
 
-def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None):
+def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, description=None):
     """THE gate that makes watch-only TOTAL instead of a list of four fixed cases.
 
     The guarantee is one sentence — *in audit, no verdict of ours alters control flow or
@@ -5563,7 +6074,8 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None):
                 # `in_audit=True` is a literal because this function is REACHED only in audit;
                 # the enforce path calls the same writer with False. See db._bump_audit_counters
                 # for why the two postures must not share one counter.
-                _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit=True)
+                _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit=True,
+                                  description=description)
             return outcome
         _record_would_block(
             trace_id, agent_id, tool_name, "local-dlp", "Local DLP (PII scrub)",
@@ -5650,15 +6162,52 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None):
 
 
 # --- 3. THE MAIN SENSOR DECORATOR ---
-def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None, action: str = None, budget_pool_id: str = None, enforcement: str = None):
+def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None, action: str = None, budget_pool_id: str = None, enforcement: str = None, posture: str = None):
     """Wrap a tool function so AgentX vets every call.
 
-    ``enforcement`` is the per-tool ENFORCEMENT-LEVEL override (audit | enforce): a
-    surgical exception to the global ``AGENTX_ENFORCEMENT`` env switch. Leave it unset to
-    inherit the global (default 'enforce'); pass ``enforcement="enforce"`` to keep a
-    genuinely dangerous tool hard-blocked even while the rest of the app runs in audit,
-    or ``enforcement="audit"`` to record-and-proceed for just this tool. An explicit
-    per-tool value ALWAYS wins over the env var."""
+    ``posture`` is the per-tool override (audit | enforce): a surgical exception to the
+    global env switch. Leave it unset to inherit the global, whose default follows the rung:
+    'audit' on a keyless install, where it runs the same detection, records what WOULD have
+    been blocked, and lets the call proceed; 'enforce' once AGENTX_API_KEY is set. (The
+    gateway has no default of its own: it takes the posture this decorator forwards on each
+    call, and whether the tool runs is decided here. An earlier version of this sentence said
+    the gateway's default was 'enforce', which contradicted `_resolve_enforcement`'s own
+    docstring in this file.) Pass
+    ``posture="enforce"`` to keep a genuinely dangerous tool hard-blocked even while the
+    rest of the app runs in audit, or ``posture="audit"`` to record-and-proceed for just
+    this tool. An explicit per-tool value ALWAYS wins over the env var.
+
+    ``enforcement`` is the DEPRECATED spelling of the same argument. Both are accepted and
+    mean the same thing; the old one warns once per decorated tool.
+
+    🔴 RENAMED NOW, BEFORE PEOPLE HAVE IT IN THEIR SOURCE. This argument is the one part of
+    the posture surface that gets written into a DEVELOPER'S codebase, so the cost of
+    renaming it only ever rises. The env var is typed per run and stays cheap to change.
+
+    🔴 IF BOTH ARE PASSED AND THEY DISAGREE, THE STRICTER ONE WINS, LOUDLY. This is a
+    security control: the alternative rules -- "the new name wins", "the last one wins" --
+    both let `posture="audit"` silently switch off a tool the author had explicitly pinned to
+    `enforcement="enforce"`. The same principle already governs an unrecognised value, which
+    falls back to enforce rather than downgrading in silence.
+    """
+    if enforcement is not None:
+        warnings.warn(
+            "agentx_protect(enforcement=...) is deprecated; use posture=... instead. "
+            "Both are accepted and mean the same thing.",
+            DeprecationWarning, stacklevel=2)
+    if posture is not None and enforcement is not None:
+        _p, _e = str(posture).strip().lower(), str(enforcement).strip().lower()
+        if _p != _e:
+            # Not a warning that can be missed in a log: this decides whether a tool is
+            # defended, and the two spellings were handed conflicting instructions.
+            logger.warning(
+                "[AgentX] '%s' was given posture=%r AND enforcement=%r, which disagree. "
+                "Using 'enforce' (the stricter of the two). Pass only posture=.",
+                agent_id, posture, enforcement)
+            posture = "enforce"
+    # One resolved value from here down, so nothing below has to know there were two names.
+    enforcement = posture if posture is not None else enforcement
+
     def decorator(func):
         # Async tool functions (LangGraph / autogen / asyncio.gather swarms) get an
         # async wrapper; sync tools keep the original synchronous path unchanged.
@@ -5673,6 +6222,14 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             _func_sig = None
         # Partial-safe tool name (a functools.partial has no __name__) — resolved once.
         _func_name = _func_display_name(func)
+        # The decorated function's own docstring is this door's equivalent of the description
+        # an MCP server advertises: the sentence the author wrote to say what the tool does.
+        # Resolved ONCE here for the same reason the signature is -- this runs inside every
+        # protected call. Used only to fill a surface class the name and arguments left blank.
+        try:
+            _func_doc = inspect.getdoc(func)
+        except Exception:
+            _func_doc = None
         # Strike/breaker key: per-decorated-tool identity. For a plain function/method
         # it IS the display name (preserves existing per-tool semantics + tests); for a
         # functools.partial or a callable OBJECT — two of which can share one display
@@ -5767,6 +6324,12 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # the reason this call is in audit -- the same precedence _resolve_enforcement
                 # applies one line up, read here rather than re-derived.
                 _emit_audit_banner(via_override=enforcement is not None)
+                # ...and if they ALSO asked for fail-closed, say that it is inert. Checked
+                # beside the banner rather than at the offline-fallback branch that overrides
+                # it, because that branch only runs during an outage -- the developer would
+                # learn their availability control was off at the exact moment it mattered.
+                if _resolve_fail_mode() == "closed":
+                    _warn_failclosed_is_inert_in_audit()
 
             # =========================================================
             # THE RETURN ROUTER (Dynamic Type Reflection)
@@ -6276,10 +6839,24 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         # whatever shape is written here. Two sites fix four statuses.
                         _blocked_shape = _call_shape(
                             func_name, _bound_arguments(_func_sig, args, kwargs))
+                        # 🔴 `challenge_issued` GOES TO THE LOCAL LEDGER TOO, NOT ONLY TO THE
+                        # GATEWAY. The same text is handed to `register_incident` below, which
+                        # is why the gateway's incident store can answer "which wording did an
+                        # agent actually come back from" and the keyless ledger could not: it
+                        # recorded that a block happened and whether the agent recovered, but
+                        # never what was in front of the agent. Attribution stopped at the
+                        # policy, so changing a policy's coaching left nothing to compare
+                        # before against after, and a developer who wrote their own with
+                        # `agentx customize` had no way to see whether it worked. That is the
+                        # free tier never improving, in one missing field, on the door
+                        # most users arrive through.
                         log_intercept(current_trace_id, agent_id, func_name, policy_id,
                                       policy_name, "CHALLENGED",
                                       arg_names=_blocked_shape[0], amount=_blocked_shape[1],
-                                      target_class=_blocked_shape[2])
+                                      target_class=_blocked_shape[2],
+                                      quantity=_blocked_shape[3], posture="enforce",
+                                      challenge_issued=_delivered_coaching(
+                                          challenge_text, ls_safe_path))
 
                         # ONE line, not two. These said the same thing twice ("fast-path
                         # intercept engaged on policy X" / "policy X matched a blocked intent")
@@ -6667,10 +7244,17 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # `_bound_arguments` rather than be rebuilt here.
                 _blocked_shape = _call_shape(
                     func_name, _bound_arguments(_func_sig, args, kwargs))
+                # Same field as the keyless site above, and it matters MORE here rather than
+                # less: on this path the text can come from the judge, so it varies per call
+                # instead of being one of a handful of seeds. Without it the ledger records
+                # that a bespoke challenge was issued and never what it said.
                 log_intercept(current_trace_id, agent_id, func_name, actual_policy_id,
                               policy_name, "CHALLENGED",
                               arg_names=_blocked_shape[0], amount=_blocked_shape[1],
-                              target_class=_blocked_shape[2])
+                              target_class=_blocked_shape[2],
+                              quantity=_blocked_shape[3], posture="enforce",
+                              challenge_issued=_delivered_coaching(
+                                  challenge_text, _gateway_safe_path))
 
                 print(f"🛑 [AgentX SDK] Policy '{policy_name}' violated. Routing challenge instruction string.")
                 
@@ -6762,15 +7346,27 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 _incr("human_escalations")
 
                 receipt_id = eval_res.get("receipt_id")
-                print(f"\n🚨 [AgentX SDK] Task suspended. Request escalated to Human SOC.")
-                print(f"⏳ [AgentX SDK] Polling for human decision (Receipt: {receipt_id})...")
                 
                 api_key = os.environ.get("AGENTX_API_KEY")
                 headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
                 
-                max_poll_seconds = 120 # 2-minute max wait
+                # 🔴 THE DEADLINE GOES ON THE SCREEN, AND IT IS SETTABLE. This waited 120
+                # seconds and announced neither the budget nor where to act: the line read
+                # "Polling for human decision (Receipt: ...)" and nothing else, so the person
+                # who has to click did not know a clock was running, or where. A founder walk
+                # hit exactly that -- the incident appeared in the SOC Sandbox and the run
+                # gave up before they could reach it. On a feature whose entire premise is
+                # waiting for a human, an invisible deadline is the detail that decides
+                # whether it works at all.
+                max_poll_seconds = _hitl_timeout_seconds()
                 poll_interval = 3
                 elapsed = 0
+
+                print("\n🚨 [AgentX SDK] Task suspended. Request escalated to Human SOC.")
+                print(f"⏳ [AgentX SDK] Polling for human decision (Receipt: {receipt_id})...")
+                print(f"   Waiting up to {max_poll_seconds}s for a person to Approve or Deny")
+                print("   in the dashboard's SOC Sandbox tab. Nothing runs until they do.")
+                print("   Set AGENTX_HITL_TIMEOUT_SECONDS to wait longer.")
                 
                 # The Polling Loop
                 while elapsed < max_poll_seconds:
@@ -6806,6 +7402,29 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                                     "error": "AgentX Human Override Denied",
                                     "instruction": "The SOC analyst explicitly denied this action. You must find an alternative path or fail the task."
                                 })
+
+                            # 🔴 DISMISSED IS TERMINAL AT THE GATEWAY AND WAS NOT TERMINAL HERE.
+                            # The SOC tab's Dismiss button writes it, `resolve_local_incident`
+                            # accepts it and `check_status` hands it back -- and this loop, which
+                            # only knew APPROVED and DENIED, went on polling an incident that had
+                            # already been decided. The analyst watched the row leave their queue
+                            # while the agent hung for the REST of its budget and then reported
+                            # "Timeout waiting for SOC approval", which is not what happened.
+                            # Raising the default wait makes that worse, not better, and this
+                            # branch recommends raising it.
+                            #
+                            # 🔴 IT DOES NOT RUN THE ACTION. Dismiss means "this alert is not
+                            # worth my attention", which is a statement about the QUEUE, not an
+                            # approval of the call. Reading "not worth reviewing" as "go ahead"
+                            # on a human-approval control is the one direction that cannot be
+                            # taken back, so it stops here and says which of the two happened.
+                            elif current_status == "DISMISSED":
+                                print("\n🗂️ [AgentX SDK] Human SOC DISMISSED the escalation "
+                                      "without approving it.")
+                                return json.dumps({
+                                    "error": "AgentX Human Escalation Dismissed",
+                                    "instruction": "A SOC analyst cleared this escalation from the queue without approving the action. Treat it as not approved: find an alternative path or fail the task."
+                                })
                                 
                         elif status_check.status_code == 401:
                             print(f"\n❌ [AgentX SDK] Auth Error: Gateway rejected polling request.")
@@ -6815,7 +7434,14 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         print(f"⚠️ Ignore transient network drops. Keep trying. Polling error: {e}")
                         
                 if elapsed >= max_poll_seconds:
-                    print("⚠️ [AgentX SDK] SOC Polling Timeout reached. Failing safe.")
+                    # Close our own escalation BEFORE announcing the timeout, so the queue is
+                    # already tidy by the time the reader goes to look at it.
+                    _expire_escalation(_client.gateway_url, receipt_id, headers)
+                    # Says what happened, not what the code did. "Failing safe" is our word
+                    # for it; the reader needs to know their action did not run.
+                    print(f"⚠️ [AgentX SDK] No human decision within {max_poll_seconds}s. "
+                          f"The action was NOT executed.")
+                    print("   Set AGENTX_HITL_TIMEOUT_SECONDS to give a person longer.")
                     return "AgentX Error: Timeout waiting for SOC approval. Aborting action."
 
             # 3. Check for the "Success" path
@@ -6940,7 +7566,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 if _inventory_due(outcome):
                     _record_inventory(trace_id_var.get(), agent_id, _func_name,
                                       _bound_arguments(_func_sig, args, kwargs),
-                                      in_audit=False)
+                                      in_audit=False, description=_func_doc)
                 return outcome
             try:
                 outcome = _decide(args, kwargs)
@@ -6952,7 +7578,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # decision core files every other ledger row under — using anything else here
             # would split one tool across two names in `agentx insights`.
             return _audit_release(outcome, trace_id_var.get(), agent_id, _func_name,
-                                  arguments=_bound_arguments(_func_sig, args, kwargs))
+                                  arguments=_bound_arguments(_func_sig, args, kwargs),
+                                  description=_func_doc)
 
         def _finish_sync(decision, args, kwargs):
             """Run the tool for a SYNC verdict and apply any scrub, or pass the

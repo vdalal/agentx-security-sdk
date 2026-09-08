@@ -65,6 +65,7 @@ try:
         _abstract_call,
         _apply_org_override,
         _call_signature,
+        _delivered_coaching,
         _is_narrower,
         _coerce_arg_value,
         _max_cognitive_turns,
@@ -179,6 +180,18 @@ _USAGE = (
     # --audit is forwarded to the same reader. Advertising one and not the other made the
     # other undiscoverable on this door while the Python door named both.
     "                              --calls lists them one at a time; --json for a program.\n"
+    # 🔴 THE SAME RULE, THE NEXT TWO FLAGS. `--share` shipped in #375 and `--limit`/`--all` in
+    # #350, and this line named neither -- so the /docs MCP tab promised flags this door's only
+    # help screen hid, which is exactly the drift the comment above was written about, one
+    # release later.
+    #
+    # ⚠️ `--share` IS NAMED AND THE PAGING FLAGS ARE NOT, deliberately. --share WRITES A FILE,
+    # which is a consequence a reader should not have to discover; --limit and --all only size
+    # a screen. Naming all four needs a third line and every other entry here has one, so the
+    # `--help` pointer carries them: `_audit_usage()` resolves the command per door and prints
+    # the full set, so `uvx agentx-mcp --audit --help` is a real answer on THIS door, not the
+    # Python one.
+    "                              --share writes agentx-audit.json; --help for the rest.\n"
 )
 
 
@@ -987,7 +1000,8 @@ def _report_pin_events(events, mode, drifted, session_stats, log):
                     trace = "%s-drift-%s" % (session_stats.get("_trace_id") or "mcp-session",
                                              uuid.uuid4().hex[:8])
                     log_intercept(trace, "mcp_proxy", name, None,
-                                  "MCP Tool Description Drift", "CHALLENGED")
+                                  "MCP Tool Description Drift", "CHALLENGED",
+                                  posture="enforce")
                 except Exception:
                     pass
             if mode == "block" and drifted is not None:
@@ -1018,6 +1032,25 @@ def _inspect_list_line(line, pins, pending_list_ids, server_key, mode, drifted, 
         tools = result.get("tools") if isinstance(result, dict) else None
         if not isinstance(tools, list):
             return
+        # Keep each tool's advertised description for the SURFACE column. Names alone leave
+        # most calls unclassified, and the server already told us what the tool does -- we
+        # parse it here for drift detection and then discard the text.
+        #
+        # 🔴 SESSION-SCOPED AND NEVER PERSISTED. The leading underscore is this file's
+        # convention for state the screen may read and the pulse may not. The text is
+        # attacker-controlled (see _description_poisoned), so it is used ONLY to derive one of
+        # six fixed surface labels and is never stored, displayed or sent anywhere.
+        try:
+            descs = session_stats.setdefault("_tool_desc", {})
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                name = tool.get("name")
+                desc = tool.get("description")
+                if isinstance(name, str) and name and isinstance(desc, str) and desc:
+                    descs[name] = desc
+        except Exception:
+            pass
         events = pins.inspect(server_key, tools)
         if events:
             _report_pin_events(events, mode, drifted, session_stats, log)
@@ -1223,7 +1256,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 # calls ARE screened by the built-ins and DO appear in the insights. What is
                 # lost is the operator's own rules. Saying "unscreened" sent them looking
                 # for findings that were already there.
-                print("[agentx-mcp] AUDIT: your policy config could not be READ, so calls "
+                print("[agentx-mcp] WATCHING: your policy config could not be READ, so calls "
                       "are screened by the BUILT-IN floor only and your own rules are NOT "
                       "applied. Findings under-report what your policies would catch: %s"
                       % load_err, file=log)
@@ -1394,7 +1427,8 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 # reported "never ran audit" and the rung read 0 for that whole population.
                 record_call(inv_trace, "mcp_proxy", tool_key, params.get("arguments"),
                             stats=session_stats,
-                            in_audit=session_stats.get("_enforcement") == "audit")
+                            in_audit=session_stats.get("_enforcement") == "audit",
+                            description=(session_stats.get("_tool_desc") or {}).get(tool_key))
             except Exception:
                 pass
         return "forward"
@@ -1428,22 +1462,27 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 # own ledger, its own call site -- and was missed the first time. A rule
                 # applied at only one of two independent call sites still leaves the other
                 # one carrying the original defect.
-                names, amount, target_class = _call_shape(tool_key, params.get("arguments"))
+                names, amount, target_class, quantity = _call_shape(
+                    tool_key, params.get("arguments"),
+                    (session_stats.get("_tool_desc") or {}).get(tool_key))
                 log_intercept(wb_trace, "mcp_proxy", tool_key,
                               decision.get("policy_id"), decision.get("policy_name"), WOULD_BLOCK_STATUS,
-                              arg_names=names, amount=amount, target_class=target_class)
+                              arg_names=names, amount=amount, target_class=target_class,
+                              quantity=quantity, posture="audit")
             except Exception:
                 pass
         try:
             # `agentx-mcp --insights`, never `agentx insights`: under uvx the SDK's `agentx`
             # script is not on PATH, so the bare form sent this reader to a command not found.
-            # "audit is on", not "AGENTX_ENFORCEMENT=audit". On THIS door the env var is
-            # genuinely the only source, so the old wording was true here -- and it is changed
-            # anyway, so the rule that stops the other four sites regressing can be flat.
-            # A tripwire with a carve-out is a tripwire with a hole in exactly the shape of
-            # the next bug; test_audit_copy_never_asserts_the_env_var.py is that rule.
-            print("[agentx-mcp] AUDIT: would have stopped '%s' (%s), but audit is on, "
-                  "so it ran. Recorded. See it: uvx agentx-mcp --insights"
+            # 🔴 NO MODE IS NAMED. This said "AUDIT: ... but audit is on, so it ran", which
+            # reads as a mode somebody switched on, eight lines under a box that calls the
+            # same state WATCHING and eight lines above a reader who set nothing. Watching is
+            # the default on this door, so the line states what happened and nothing more.
+            # (Before that it said "AGENTX_ENFORCEMENT=audit", which was a claim about the
+            # reader's environment; test_audit_copy_never_asserts_the_env_var.py is the rule
+            # that keeps that one out, with no carve-out for this door.)
+            print("[agentx-mcp] WATCHING: would have stopped '%s' (%s); it ran and was "
+                  "recorded. See it: uvx agentx-mcp --insights"
                   % (tool_key, decision.get("policy_name")), file=log)
         except Exception:
             pass
@@ -1472,18 +1511,63 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     # this tool's latest open block, so a later clean call recovers exactly ONE block
     # (matches the decorator's per-call keying, keeps the recovery rate honest). Gated +
     # best-effort (see the clean-call twin above).
+    # 🔴 THE OVERRIDE IS RESOLVED BEFORE THE LEDGER WRITE, AND THE ORDER IS THE POINT.
+    # The row has to record the text the agent was ACTUALLY handed, not the seed it started
+    # from, or a developer who rewrote this policy's coaching with `agentx customize` would
+    # see their own blocks attributed to our wording. `_apply_org_override` is total
+    # best-effort and returns its inputs unchanged when nothing is adopted, so hoisting it
+    # above the write costs a cold install nothing.
+    req_id = msg.get("id")
+    _mcp_args = params.get("arguments")
+    ch, safe = decision.get("challenge_text"), decision.get("preferred_alternative")
+    # 🔴 ONLY WHEN COACHING WILL ACTUALLY BE DELIVERED. An id-less blocked tools/call is
+    # dropped without an answer (see the else branch below), so resolving the override for it
+    # announced "Using your coaching for this policy" and incremented `overrides_applied` for
+    # a block the agent never received a word of. That counter is the proof metric behind the
+    # session summary's "Your Coaching Used" line, and its own docstring promises it never
+    # inflates on a no-op. Delivering nothing is the emptiest no-op there is.
+    #
+    # ⚠️ AND IT MUST NOT BE ABLE TO COST US THE LEDGER ROW. This resolution reads
+    # .agentx/overrides.json, and it now runs BEFORE the CHALLENGED write below (deliberately,
+    # so the row records the text actually handed over). "Total best-effort" describes what
+    # the helper RETURNS when nothing is adopted, not what it does with an unreadable or
+    # corrupt file. Without this guard a bad overrides file turned a recorded block into an
+    # unrecorded one, which is the one outcome this path must never produce.
+    if req_id is not None:
+        try:
+            ch, safe = _apply_org_override(
+                decision.get("policy_id"), decision.get("challenge_text"),
+                decision.get("preferred_alternative"),
+                policy_name=decision.get("policy_name"),
+                signature=_call_signature(
+                    "mcp_proxy", tool_key,
+                    _mcp_args.keys() if isinstance(_mcp_args, dict) else ()))
+        except Exception:
+            pass          # keep the shipped wording; never lose the block over it
+
     if session_stats.get("_ledger"):
         try:
             seq = session_stats.get("_ledger_seq", 0)
             session_stats["_ledger_seq"] = seq + 1
             block_trace = "%s-%d" % (session_stats.get("_trace_id") or "mcp-session", seq)
             session_stats.setdefault("_open_blocks", {})[tool_key] = block_trace
+            # ⚠️ None WHEN NOTHING WAS SENT. An id-less blocked tools/call is dropped without
+            # coaching (see the branch below), so writing `ch` on that row would record a
+            # challenge the agent never received -- a false entry in the one field this
+            # column exists to make trustworthy.
+            # A CHALLENGED row on this door means the call was stopped, which only happens
+            # while enforcing. Omitting it left real blocks NULL, invisible to the
+            # unprotected-tools reader, and counted as "recorded before we tracked posture" --
+            # a screen telling a developer that today's block predates a column we shipped
+            # today.
             log_intercept(block_trace, "mcp_proxy", tool_key,
-                          decision.get("policy_id"), decision.get("policy_name"), "CHALLENGED")
+                          decision.get("policy_id"), decision.get("policy_name"), "CHALLENGED",
+                          posture="enforce",
+                          challenge_issued=(_delivered_coaching(ch, safe)
+                                            if req_id is not None else None))
         except Exception:
             pass
 
-    req_id = msg.get("id")
     if req_id is not None:
         if harvest is not None:
             # (B): only a block that was actually COACHED (had an id to answer) is a harvest
@@ -1494,23 +1578,14 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
             harvest.note_block(tool_key, decision.get("category"),
                                policy_name=decision.get("policy_name"),
                                policy_id=decision.get("policy_id"))
-        # A1b: enrich the keyless coaching with the org's adopted reframe (challenge +
-        # safe-path) via the SHARED _apply_org_override the decorator uses, so the org
-        # brain reaches the MCP wedge too and the two keyless paths can't drift. Keyless:
-        # it reads the local .agentx/overrides.json (no gateway). Total best-effort — it
-        # returns the inputs unchanged when nothing is adopted, so the cold install (the
-        # funnel target, no overrides) is completely unaffected.
+        # A1b: `ch`/`safe` are the org's adopted reframe (challenge + safe-path), resolved
+        # ABOVE via the SHARED _apply_org_override the decorator uses, so the org brain
+        # reaches the MCP wedge too and the two keyless paths can't drift. Keyless: it reads
+        # the local .agentx/overrides.json (no gateway).
         # ...including a CONTEXT-SCOPED one. The agent_id dimension is the literal
         # "mcp_proxy" this surface logs its intercepts under -- there is no per-agent identity on
         # the keyless MCP door, so a scope written for a named agent correctly does NOT match
         # here, and `tool` is the dimension that carries org specificity on this path.
-        _mcp_args = params.get("arguments")
-        ch, safe = _apply_org_override(
-            decision.get("policy_id"), decision.get("challenge_text"),
-            decision.get("preferred_alternative"), policy_name=decision.get("policy_name"),
-            signature=_call_signature(
-                "mcp_proxy", tool_key,
-                _mcp_args.keys() if isinstance(_mcp_args, dict) else ()))
         coached = dict(decision, challenge_text=ch, preferred_alternative=safe)
         writer.send(_block_response(req_id, _coaching_text(coached, tripped, name)))
     else:
@@ -1738,7 +1813,14 @@ def _protection_report(session_stats, log):
                   % config_faults_n, file=log)
         protection = pulse.record_protection(session_stats)
         if protection:
-            print("[agentx-mcp] protection streak: %s." % pulse.format_protection_line(protection), file=log)
+            # "streak", not "protection streak", and the phrase names a watching session: a
+            # founder walk read "2 protected session(s)" after two runs in which the DROP
+            # TABLE reached the server. See pulse.format_protection_line.
+            print("[agentx-mcp] streak: %s."
+                  % pulse.format_protection_line(
+                      protection, posture=session_stats.get("_enforcement"),
+                      blocked=int(session_stats.get("critical_blocks", 0) or 0)),
+                  file=log)
         # P-112: what is NEW about this agent, and the reason to open the audit screen. The
         # MCP half of the decorator's session-end line -- main() suppresses the atexit
         # summary on this door, so a line wired only there reaches ZERO of these users. Same
@@ -1894,6 +1976,25 @@ def _point_stores_at_mcp_home():
         pass
 
 
+def _proxy_posture():
+    """The posture this whole wrapped server runs under, resolved once at startup.
+
+    🔴 THIS DOOR TELLS THE SHARED RESOLVER IT HAS NO GATEWAY LEG. The decorator's default is
+    read from the rung ("a key means a gateway, so enforce"); the proxy has no gateway at all,
+    so on this door a key in the host's environment is not a rung. Without `keyless_door=True`
+    a developer who exported AGENTX_API_KEY for their Python agents and launched Cursor from
+    that shell got every wrapped server ENFORCING, against every MCP surface's "out of the box
+    it blocks nothing", with the only line saying "enforcing" on stderr, which MCP hosts
+    swallow. Anything a person wrote down (AGENTX_POSTURE / AGENTX_ENFORCEMENT) still wins.
+
+    One function rather than an inline call so a test can drive the proxy's own answer and a
+    second test can check `main()` actually uses it; `main()` itself is only reachable as a
+    subprocess. Same resolver object as the decorator (`test_all_three_doors...` asserts the
+    identity), so the two doors still cannot disagree about anything a person set.
+    """
+    return _resolve_enforcement(None, keyless_door=True)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:]) if argv is None else list(argv)
 
@@ -2008,8 +2109,9 @@ def main(argv=None):
     # server" is one env line here too. In `audit` a caught tools/call is recorded
     # (WOULD_BLOCK) and FORWARDED to the real server instead of being answered with a
     # coaching error, so a team can run the shield non-blocking in staging first. Resolved
-    # once at startup (a long-lived process; no per-tool override on the proxy path).
-    session_stats["_enforcement"] = _resolve_enforcement(None)
+    # once at startup (a long-lived process; no per-tool override on the proxy path), through
+    # `_proxy_posture`, which tells the shared resolver this door has no gateway leg.
+    session_stats["_enforcement"] = _proxy_posture()
     # Point every store at the per-user MCP home BEFORE init_db creates one, or the proxy
     # leaves a .agentx.db in whatever directory the MCP host launched it from. The proxy owns
     # this whole process, so these are set globally rather than passed around. The decorator
@@ -2036,22 +2138,60 @@ def main(argv=None):
             pulse.on_session_end(session_stats)
     atexit.register(_session_end)
 
-    _posture = session_stats.get("_enforcement", "enforce")
+    # Resolved at session setup and always present, so this fallback is unreachable today.
+    # ⚠️ THE LITERAL MATCHES THIS DOOR'S DEFAULT AGAIN, AND ONLY BECAUSE OF `_proxy_posture`.
+    # For one day the default was resolved by rung here too (keyless watches, keyed enforces),
+    # and this "audit" would have been right for half of installs and wrong for the other
+    # half the moment the line became reachable. The proxy now tells the resolver it has no
+    # gateway leg, so with nothing set this door watches whatever the key says, and "audit"
+    # is the true fallback rather than a guess. If the routing core's absent-key reading
+    # (`session_stats.get("_enforcement") == "audit"` is False when the key is missing) ever
+    # matters, that is the other half of the same fact and is filed, not fixed here.
+    _posture = session_stats.get("_enforcement", "audit")
     if _posture == "audit":
-        # Loud, unmissable: audit records but does NOT block, so a wrapped-server operator
-        # must see at startup that the tools are being watched, not defended (twin of the
-        # decorator's _emit_audit_banner).
+        # 🔴 TWO BRANCHES, BECAUSE WATCHING IS NOW THE DEFAULT ON THIS DOOR TOO. Twin of the
+        # decorator's banner and split for the same reason: this used to fire only for an
+        # operator who had set the variable, so naming it and saying "NOT protected" were both
+        # statements about a choice they had made. It now fires on every wrapped server, and
+        # an alarm about the state we chose for them is the first thing they would read.
+        #
+        # ⚠️ THE ENV BRANCH KEEPS ITS ALARM. Someone who set the variable is running a server
+        # they believe is defended in a posture that defends nothing, and that is worth being
+        # loud about. Which spelling they used is read back, not assumed, because both work.
+        _set_name = next(
+            (n for n in ("AGENTX_POSTURE", "AGENTX_ENFORCEMENT")
+             if (os.environ.get(n) or "").strip().lower() == "audit"),
+            None,
+        )
         print("[agentx-mcp] "
               "============================================================", file=sys.stderr)
-        print("[agentx-mcp]  AUDIT MODE (AGENTX_ENFORCEMENT=audit): destructive tool calls are "
-              "RECORDED and still RUN.", file=sys.stderr)
-        print("[agentx-mcp]  Your server is NOT protected.", file=sys.stderr)
-        print("[agentx-mcp]  See what would have been stopped:  uvx agentx-mcp --insights", file=sys.stderr)
-        print("[agentx-mcp]  Start stopping them:  set AGENTX_ENFORCEMENT=enforce", file=sys.stderr)
+        if _set_name:
+            print("[agentx-mcp]  AUDIT MODE (%s=audit): destructive tool calls are "
+                  "RECORDED and still RUN." % _set_name, file=sys.stderr)
+            print("[agentx-mcp]  Your server is NOT protected.", file=sys.stderr)
+            print("[agentx-mcp]  See what would have been stopped:  uvx agentx-mcp --insights",
+                  file=sys.stderr)
+        else:
+            print("[agentx-mcp]  WATCHING. Every tool call this server makes is screened",
+                  file=sys.stderr)
+            print("[agentx-mcp]  and written down. Nothing is blocked, so adding AgentX",
+                  file=sys.stderr)
+            print("[agentx-mcp]  cannot break a server that already works.", file=sys.stderr)
+            print("[agentx-mcp]  See what it recorded:  uvx agentx-mcp --audit", file=sys.stderr)
+        # 🔴 JSON, NOT A SHELL ASSIGNMENT. This reader's posture lives in mcp.json, for a server
+        # process their client spawns, and there is no shell here to prefix. `set
+        # AGENTX_POSTURE=enforce` pasted into a JSON file is a syntax error. It is the same
+        # defect `cli._print_posture_command`'s MCP_ENTRY branch exists to prevent, sitting on
+        # the one screen EVERY MCP install sees at startup, with no gate over it.
+        from agentx_sdk.decorators import MCP_POSTURE_ENV_LINE
+        print("[agentx-mcp]  Start stopping them: in your mcp.json, beside this server's",
+              file=sys.stderr)
+        print('[agentx-mcp]  "command" and "args":  %s' % (MCP_POSTURE_ENV_LINE % "enforce"),
+              file=sys.stderr)
         print("[agentx-mcp] "
               "============================================================", file=sys.stderr)
     print("[agentx-mcp] AgentX shield active (%s), wrapping: %s"
-          % ("AUDIT: record-only, nothing blocked" if _posture == "audit" else "enforcing",
+          % ("WATCHING: recording, nothing blocked" if _posture == "audit" else "enforcing",
              " ".join(argv)), file=sys.stderr)
     return run_proxy(argv, client_in=client_in, client_out=client_out,
                      session_stats=session_stats, close_client_on_child_exit=True)

@@ -234,9 +234,11 @@ def _drive(run_proxy, stub_path, out, audit=False):
     # while the Python door said "blocks nothing", which is the drift the comment above warns
     # about ("a rung that means different things depending on how you wired us in") appearing
     # in the sentence that DEFINES the rung.
-    from .decorators import AUDIT_POSTURE_CLAUSE
+    from .decorators import AUDIT_POSTURE_CLAUSE, MCP_POSTURE_ENV_LINE
     if audit:
-        print(f" Now do it on your own server. Audit {AUDIT_POSTURE_CLAUSE}.", file=out)
+        # "A wrapped server", not "Audit": audit is the value, the record and the command,
+        # watching is what the server does. "Audit watches" made the value the actor.
+        print(f" Now do it on your own server. A wrapped server {AUDIT_POSTURE_CLAUSE}.", file=out)
     else:
         # 🔴 NOT AN AUDIT PITCH ON THE SCREEN THAT JUST BLOCKED. This paragraph and the config
         # under it printed on BOTH screens, so a reader who watched a DROP TABLE be stopped --
@@ -263,7 +265,7 @@ def _drive(run_proxy, stub_path, out, audit=False):
     # carries the whole point, so it goes rather than moves.
     print(" You get the same record whether blocking is on or off.", file=out)
     if audit:
-        print(" Audit only changes what gets stopped.", file=out)
+        print(" The posture only changes what gets stopped.", file=out)
     print("", file=out)
     print(" In mcp.json:", file=out)
     # `"command": "uvx"`, matching ui/utils/mcp.ts -- the config this project actually ships.
@@ -296,8 +298,23 @@ def _drive(run_proxy, stub_path, out, audit=False):
     # setting that turns blocking off. The ENV-FIRST-WITH-THE-COMMA rule above is unchanged
     # and is why this still works both ways: present, the comma separates two sibling keys;
     # absent, what remains is a complete block with nothing dangling.
-    if audit:
-        print("       \"env\": { \"AGENTX_ENFORCEMENT\": \"audit\" },", file=out)
+    # 🔴 WHICH SCREEN CARRIES THE ENV LINE SWAPPED WITH THE DEFAULT, AND THE RULE DID NOT.
+    # The rule is unchanged: the config we hand over reproduces the demo the reader just
+    # watched, and the OTHER posture is named below it as the option. What changed is which
+    # posture a plain config gives you. It used to be blocking, so the watch-only screen led
+    # with an env line and the blocking screen needed none. Now a plain config watches, so the
+    # watch-only reader needs no line at all and the BLOCKING reader is the one who does.
+    #
+    # ⚠️ AND THE ONE VALUE WE EVER PRINT IS `enforce`. The old line turned protection OFF,
+    # which is why the comment above worries about it becoming a copy-paste default. Nothing
+    # we hand over can do that any more: there is no config on either screen that switches
+    # blocking off, because switching it off is what happens when you paste nothing.
+    #
+    # Everything above about placement still holds and is why this still works both ways:
+    # env-key-first with the comma on the env line means taking both lines gives two sibling
+    # keys, and dropping the optional one leaves a complete block with nothing dangling.
+    if not audit:
+        print("       %s," % (MCP_POSTURE_ENV_LINE % "enforce"), file=out)
     # `"command": "uvx"`, matching ui/utils/mcp.ts -- the config this project actually ships.
     # The bare `"command": "agentx-mcp"` form only starts if agentx-mcp is on PATH, which a
     # reader who just ran `uvx agentx-mcp --demo` does NOT have: uvx is ephemeral. Handing
@@ -305,9 +322,12 @@ def _drive(run_proxy, stub_path, out, audit=False):
     # pass set out to remove. (Caught in review of #287.)
     print("       \"command\": \"uvx\",  \"args\": [\"agentx-mcp\", \"npx\", \"-y\", \"your-mcp-server\", \"...\"]", file=out)
     print("", file=out)
-    if audit:
+    if not audit:
+        # "keep watching", not "keep blocking". Scope is unchanged -- one agentx-mcp process
+        # wraps ONE server and `env` applies to its own block -- but what the untouched
+        # servers DO is the opposite of what it was, and this sentence asserts it.
         print(" The env line is optional. Add it per server block; the servers", file=out)
-        print(" you leave alone keep blocking.", file=out)
+        print(" you leave alone keep watching without blocking.", file=out)
     else:
         # The option, named AFTER the config that matches what they watched, in the clause
         # every other surface uses so the two doors cannot drift on what audit means.
@@ -316,13 +336,18 @@ def _drive(run_proxy, stub_path, out, audit=False):
         # block below was introduced by "Audit watches every call and blocks nothing:" --
         # the colon attached to the definition rather than to the thing being demonstrated.
         # The clause stays in ONE f-string so it cannot be half-edited out of single-sourcing.
-        print(f" Audit {AUDIT_POSTURE_CLAUSE}.", file=out)
-        print(" To switch ONE server to watch-only, add this line above its \"command\" line:",
+        # 🔴 THE OFFER INVERTED. This read "To switch ONE server to watch-only, add this
+        # line", which since watching became the default offers the reader a way to reach
+        # where they already are. What a reader of THIS screen -- the one that just watched a
+        # block -- cannot get by doing nothing is blocking, so that is what is on offer.
+        print(f" A wrapped server {AUDIT_POSTURE_CLAUSE}, and that is what the config above does.",
               file=out)
-        print("       \"env\": { \"AGENTX_ENFORCEMENT\": \"audit\" },", file=out)
+        print(" To switch ONE server to blocking, add this line above its \"command\" line:",
+              file=out)
+        print("       %s," % (MCP_POSTURE_ENV_LINE % "enforce"), file=out)
         # "Add it", matching the watch-only screen's wording: the two screens say the same
         # thing about scope and should not differ in how they say it.
-        print(" Add it per server block; the servers you leave alone keep blocking.", file=out)
+        print(" Add it per server block; the servers you leave alone keep watching.", file=out)
     # `uvx agentx-mcp --audit`, never `agentx audit`: under uvx the SDK's `agentx` script is
     # not on PATH, and it reads the cwd-relative ledger rather than the per-user MCP one.
     # Same reachability rule the --insights CTA already follows on this door.

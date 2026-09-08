@@ -23,13 +23,11 @@ DISCORD_URL = "https://discord.gg/TmQ3TURjwK"
 #                             report at a signup page, where there is nowhere to report
 #                             anything. Those now go to DISCORD_URL, which is where the
 #                             #bugs-and-feature-requests channel lives.
-#   3. outreach attribution -- the same short link is the cold-outreach CTA, and the
-#                             funnel reads a spike on it as "the founder shared something",
-#                             never as organic pull. Every CLI user who clicked was being
-#                             counted as founder outreach, so the one signal it exists to
-#                             carry was polluted by our own product.
+#   3. traffic attribution -- the same URL was also used outside the product, so a click
+#                             from a CLI user and a click from anywhere else were
+#                             indistinguishable. Separate constants keep the two apart.
 #
-# Same root shape as P-153: one thing serving two masters, correct for one of them and
+# Same root shape either way: one thing serving two masters, correct for one of them and
 # quietly wrong for the other.
 #
 # ⚠️ AND A SHORTENER IS THE WRONG DEFAULT ON THIS PRODUCT SPECIFICALLY. It hides its
