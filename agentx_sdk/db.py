@@ -15,7 +15,24 @@ from contextlib import contextmanager
 # default for MCP, where the host launches the proxy from an arbitrary directory, so the proxy
 # overrides this global at startup (see mcp_proxy._mcp_ledger_path). The default is deliberately
 # left alone so no existing decorator user's ledger moves.
-DB_PATH = ".agentx.db"
+#
+# 🔴 `AGENTX_LEDGER_PATH` MOVES IT. The TypeScript door has `AGENTX_TS_LEDGER_PATH` and the MCP
+# door has `AGENTX_MCP_LEDGER_PATH`; this one was added last, because until then the only way to
+# move the decorator's ledger was to reach in and assign this global -- which is exactly what
+# `mcp_proxy` does, and what every caller outside this package would have had to copy.
+#
+# It matters for a run whose cwd is not the project: CI, a container, a scheduled job. Without
+# it those write `.agentx.db` into whatever directory the runner happened to start in, and the
+# next run starts from an empty ledger with nothing saying so.
+#
+# ⚠️ READ AT IMPORT, NOT PER CALL, WHICH IS A REAL DIFFERENCE FROM THE OTHER TWO DOORS.
+# `mcp_proxy._ledger_path()` and the TS `ledgerPath()` both resolve their variable when called,
+# so setting it late still works there. Here the variable is consulted once, because this is a
+# module global that callers read directly (`path or DB_PATH`) and that the proxy REASSIGNS at
+# startup -- turning it into a function would change 41 call sites and break that override. So:
+# set it before the process starts. Setting it afterwards does nothing, and a test that wants a
+# different path should assign `db.DB_PATH` the way the root conftest already does.
+DB_PATH = os.environ.get("AGENTX_LEDGER_PATH") or ".agentx.db"
 
 # Concurrency: agents sharing one process each open their own short-lived
 # connection (no shared cursor), but concurrent WRITERS still serialize at the
@@ -1890,7 +1907,13 @@ def get_ledger_census(path=None):
               # so the same traffic was labelled ours on one screen and theirs on another.
               # Counted here rather than by a second query for the reason stated above: the
               # query that decides a sentence has to be the one the sentence is about.
-              "would_blocks_from_demo": 0, "inventory_from_demo": 0}
+              "would_blocks_from_demo": 0, "inventory_from_demo": 0,
+              # 🔴 AND OUR DEMO'S BLOCKS, WHICH THE TWO COUNTS ABOVE LEFT OUT. `agentx demo`
+              # writes one CHALLENGED row and recovers from it, and `agentx status` printed
+              # that as "Total intercepts: 1 / 1 of 1 recovered" under a header about what
+              # the reader's agent did, one command after `insights` had said it was ours
+              # (founder walk). Same pass, same rule.
+              "block_episodes_from_demo": 0, "recoveries_from_demo": 0}
     if not os.path.exists(path or DB_PATH):
         return census
     try:
@@ -1908,13 +1931,17 @@ def get_ledger_census(path=None):
                        SUM(CASE WHEN status = 'RECOVERED' THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status IS NOT ? THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status = ? AND {ours} THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN status IS ? AND {ours} THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN status IS ? AND {ours} THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status IN ('CHALLENGED', 'RECOVERED') AND {ours}
+                                THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status = 'RECOVERED' AND {ours} THEN 1 ELSE 0 END)
                   FROM event_log
             """.format(ours=_ours_sql), (WOULD_BLOCK_STATUS, INVENTORY_STATUS,
                   WOULD_BLOCK_STATUS, *_ours_params,
-                  INVENTORY_STATUS, *_ours_params))
+                  INVENTORY_STATUS, *_ours_params,
+                  *_ours_params, *_ours_params))
             (total, episodes, would, recovered, intercepted,
-             would_demo, inv_demo) = cursor.fetchone()
+             would_demo, inv_demo, episodes_demo, recovered_demo) = cursor.fetchone()
             census["total_rows"] = total or 0
             census["block_episodes"] = episodes or 0
             census["would_blocks"] = would or 0
@@ -1922,6 +1949,8 @@ def get_ledger_census(path=None):
             census["interceptions"] = intercepted or 0
             census["would_blocks_from_demo"] = would_demo or 0
             census["inventory_from_demo"] = inv_demo or 0
+            census["block_episodes_from_demo"] = episodes_demo or 0
+            census["recoveries_from_demo"] = recovered_demo or 0
     except Exception:
         # An unreadable ledger reports zeros, exactly like an empty one. Callers that must
         # tell those apart already use ledger_is_unreadable(); this function's contract is
@@ -2149,7 +2178,7 @@ def get_call_inventory(path=None, limit=25):
                     "arg_names": names, "classes": classes, "agents": agents,
                     "first_ts": first_ts, "last_ts": last_ts, "flagged": flagged,
                     # 🔴 THE PER-TOOL SPLIT, SO A ROW CAN BE RECONCILED WHERE IT IS READ. The
-                    # screen-level note says "21 of those came from AgentX's own demo code",
+                    # screen-level note says "21 of those came from AgentX's own demo or examples",
                     # which is a total across every tool -- so a reader looking at `run_sql 26`
                     # beside "run_sql ran 21 of your 39 calls" two lines above has nothing on
                     # screen that gets them from 26 to 21. Found by the founder on his own
@@ -2316,6 +2345,195 @@ def get_call_inventory(path=None, limit=25):
         return out
 
 
+# --- THE MCP TOOL ROSTER: what the wrapped server ADVERTISED, called or not ------------
+#
+# The denominator the call rows cannot supply. A tool the agent never called appears in no
+# row, so without this the audit screen can say what the agent did and never what it could
+# have done. On the MCP door the server hands the proxy its whole menu on every `tools/list`,
+# with the developer writing no code, so the denominator arrives for free and used to be
+# thrown away once drift detection had fingerprinted it.
+#
+# NAMES ONLY. The proxy also sees each tool's description and input schema; those are
+# attacker-controlled text and are never persisted (see `_inspect_list_line`). A tool NAME is
+# already what every `event_log` row stores for a called tool, so the roster adds no new kind
+# of data to the user's disk, only names the ledger would hold anyway had the agent called them.
+#
+# ONE ROW PER SERVER, holding the NEWEST advertised list, mirroring the TypeScript ledger's
+# roster row: the question the screen answers is "what could this agent have called", not
+# "every tool this server has ever advertised". A tool the server stops advertising drops out
+# on the next `tools/list`.
+#
+# Bookkeeping, not the user's history: created on write with IF NOT EXISTS, outside
+# `_plan_migration`, like `ledger_novelty`. Its absence costs the screen a line, never a record.
+_CREATE_MCP_ROSTER_SQL = """CREATE TABLE IF NOT EXISTS mcp_tool_roster (
+    server_key TEXT PRIMARY KEY,
+    tools      TEXT NOT NULL,
+    total      INTEGER NOT NULL,
+    ts         REAL NOT NULL
+)"""
+
+# The names kept per server. `total` carries the true count so the screen's denominator is
+# never understated by the cap; only the LIST is bounded, and a server advertising more than
+# this is a generated dispatcher, not an agent's toolbox.
+_ROSTER_MAX_NAMES = 500
+# A single advertised name longer than this is not a tool name. Skipped, not truncated: a
+# truncated name would never match its own `event_log` rows, so it would always read as
+# "never called".
+_ROSTER_MAX_NAME_LEN = 200
+
+# The policy name the proxy writes a drift/poison row under. Defined HERE because the roster
+# reader must exclude those rows from "called": they carry the drifted tool's name and the
+# proxy's agent id, but the agent did not call anything. The proxy imports it from here so
+# the writer and the reader cannot spell it two ways.
+MCP_DRIFT_POLICY_NAME = "MCP Tool Description Drift"
+
+# The agent id the MCP proxy writes every row under. Only its rows count against the roster:
+# the roster describes ITS server, and a Python-door tool that happens to share a name with
+# an advertised one was not called through that server.
+MCP_PROXY_AGENT_ID = "mcp_proxy"
+
+# A name carrying a C0/C1 control byte is not a tool name; it is a write primitive on the
+# audit screen. The server chooses these strings, and a tool only has to be ADVERTISED, never
+# called, to have its name printed under "never called", so an ESC sequence or a carriage
+# return in a name forges a roster line with no agent involvement at all. Same class and the
+# same answer as decorators._DETAIL_CONTROL_RE for a remote server's response body: drop the
+# whole class rather than enumerate escape sequences. Skipped, not cleaned: a cleaned name
+# would never match its own ledger rows.
+_ROSTER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def record_mcp_roster(server_key, names, path=None, only_if_present=False):
+    """Write the newest advertised tool list for one wrapped server. Best-effort, never raises.
+
+    NEVER CREATES THE STORE. The proxy calls this on every menu it sees, but writes only for
+    a server with a numerator: a call recorded this session, or a roster row an earlier
+    session's call earned (`only_if_present`, below). That is the TypeScript rule: a
+    denominator is only meaningful beside a numerator, and a process that lists the tools of
+    a server nobody calls should leave no record behind. The guard is kept here as well, so
+    no caller can create a ledger purely to note what a server advertised.
+
+    `only_if_present`: write only if this server ALREADY has a roster row. That is the
+    proxy's gate for a session that re-lists the menu and has not (yet) made a call: the
+    numerator exists from an earlier session, so the newest menu may replace the stale one,
+    while a server never called still gets no row.
+
+    Returns True when a row was written, so a caller can tell "wrote it" from "nowhere to
+    write it"; the proxy uses that to retry at the next opportunity rather than marking the
+    roster flushed.
+    """
+    try:
+        if not server_key or not isinstance(names, (list, tuple)):
+            return False
+        if not os.path.exists(path or DB_PATH):
+            return False
+        clean = []
+        seen = set()
+        for name in names:
+            if not isinstance(name, str) or not name or len(name) > _ROSTER_MAX_NAME_LEN:
+                continue
+            if _ROSTER_CONTROL_RE.search(name):
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            clean.append(name)
+        total = len(clean)
+        clean = sorted(clean)[:_ROSTER_MAX_NAMES]
+        with _connection(path) as conn:
+            if only_if_present:
+                # Asked BEFORE the CREATE, so a never-called server's no-call session leaves
+                # the ledger byte-for-byte as it was: no row, and no empty table either.
+                try:
+                    row = conn.execute("SELECT 1 FROM mcp_tool_roster WHERE server_key = ?",
+                                       (str(server_key),)).fetchone()
+                except sqlite3.OperationalError:
+                    row = None          # no table: no server has a row
+                if row is None:
+                    return False
+            conn.execute(_CREATE_MCP_ROSTER_SQL)
+            conn.execute(
+                "INSERT OR REPLACE INTO mcp_tool_roster (server_key, tools, total, ts) "
+                "VALUES (?, ?, ?, ?)",
+                (str(server_key), json.dumps(clean), total, time.time()))
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def get_mcp_roster(path=None):
+    """Every wrapped server's newest advertised list, against what the ledger says was called.
+    Never raises; returns a dict.
+
+    `servers` is empty on a ledger with no roster row, which is every ledger written before
+    this shipped. An absent roster means we do not know the total, and a screen printing
+    "0 never called" from that would be a claim, not a gap: the caller prints nothing.
+
+    🔴 COUNTS THE INTERSECTION, NOT THE LEDGER. `called` is the roster's names that have a
+    row, and `never_called` is the rest of the roster. A tool the ledger holds that the
+    newest roster does not name (the server stopped advertising it; a different server) is
+    not counted either way. Counting every distinct ledger tool against one server's roster
+    is what produced the TypeScript door's self-contradicting "2 wrapped. 4 called. 0 never
+    ran." before it was fixed there; same basis here from the start.
+
+    "Called" is any row the proxy wrote for that tool, whatever we said about it: a call we
+    stopped was still a call the agent made. The one exclusion is a drift/poison row, which
+    names a tool the server CHANGED, not one the agent called.
+    """
+    empty = {"readable": True, "servers": []}
+    if not os.path.exists(path or DB_PATH):
+        return empty
+    try:
+        with _connection(path) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("SELECT server_key, tools, total, ts FROM mcp_tool_roster")
+            except sqlite3.OperationalError as exc:
+                # No table: a ledger from before this shipped. That is "no roster", not
+                # "unreadable" -- the ledger itself opened fine. ONLY that case: the same
+                # exception class carries "database is locked" after the busy wait, and
+                # reading a locked file as "no roster" is the empty-versus-unreadable
+                # conflation the audit screen refuses everywhere else. Anything but a
+                # missing table falls through to the outer handler and reads as unreadable.
+                if "no such table" in str(exc).lower():
+                    return empty
+                raise
+            roster_rows = cursor.fetchall()
+            if not roster_rows:
+                return empty
+            cursor.execute(
+                "SELECT DISTINCT tool_name FROM event_log "
+                "WHERE agent_id IS ? AND tool_name IS NOT NULL "
+                "AND (policy_name IS NULL OR policy_name IS NOT ?)",
+                (MCP_PROXY_AGENT_ID, MCP_DRIFT_POLICY_NAME))
+            ran = {r[0] for r in cursor.fetchall()}
+        servers = []
+        for server_key, tools_json, total, ts in roster_rows:
+            try:
+                tools = [t for t in json.loads(tools_json or "[]") if isinstance(t, str)]
+            except Exception:
+                tools = []
+            called = [t for t in tools if t in ran]
+            never = [t for t in tools if t not in ran]
+            servers.append({
+                "server_key": server_key,
+                "tools": tools,
+                # The true advertised count. Equal to len(tools) unless the list was capped,
+                # in which case the names past the cap are neither called nor never-called
+                # here: they are simply not listed.
+                "total": int(total or len(tools)),
+                "called": called,
+                "never_called": never,
+                "ts": ts,
+            })
+        servers.sort(key=lambda s: s["ts"] or 0, reverse=True)
+        return {"readable": True, "servers": servers}
+    except Exception:
+        out = dict(empty)
+        out["readable"] = False
+        return out
+
+
 #: Every count a sentence about this ledger can rest on, and the ONLY place they are
 #: computed. Both audit views and both output shapes read these, so they cannot disagree.
 _LEDGER_TOTAL_KEYS = ("rows", "inventory", "flagged", "unclassified", "ours",
@@ -2405,6 +2623,64 @@ def get_ledger_totals(path=None):
         return out
 
 
+def is_rule_match(policy_id, status):
+    """True for a row that RAN and was the shape of an adopted rule. ONE definition for every
+    reader, so the audit screen, its --json and the summary cannot disagree about which rows
+    are matches.
+
+    Both halves are required. A gateway that enforces the same rule writes the SAME `rule-`
+    id onto the CHALLENGED / WOULD_BLOCK row it produces, so the prefix alone would mark a
+    call the gateway STOPPED as a match -- a review of this branch found the legend and
+    the --json field doing exactly that. The status is what says the call ran."""
+    return (status == INVENTORY_STATUS and bool(policy_id)
+            and str(policy_id).startswith("rule-"))
+
+
+def get_rule_match_summary(path=None):
+    """Which adopted rules the recorded calls were the shape of, per tool. Never raises.
+
+    ONE grouped query for the whole screen, regardless of tool count. `get_call_inventory`
+    already asks two questions per tool and its docstring measures the cost of that at
+    20,013 queries on the pathological ledger; a third per-tool question for this would move
+    the exact number that docstring is watching. Grouping here keeps this at one.
+
+    Reads ALLOWED rows only. A `rule-` id on a CHALLENGED or WOULD_BLOCK row would mean a
+    rule that BLOCKED, which only a gateway can do and only a gateway writes; those rows
+    belong to `agentx insights`, not to the inventory this summarises.
+
+    Returns {"total": int, "by_tool": {tool: [(rule_name, count), ...] count-DESC},
+             "by_rule": {rule_name: count}, "by_id": {rule_id: count}}.
+    `by_rule` is by NAME, for sentences that name what the ledger recorded. `by_id` is for
+    the YOUR RULES table, which walks the developer's file: a name is not a key there. Two
+    `adopt --rule` on one action without `--name` share a name, and a rule renamed in the
+    file keeps its history under the id; keyed by name, both rows showed one summed count
+    and the renamed rule showed 0 (scoped review of this branch).
+    """
+    empty = {"total": 0, "by_tool": {}, "by_rule": {}, "by_id": {}}
+    p = path or DB_PATH
+    if not os.path.exists(p):
+        return empty
+    try:
+        with _connection(p) as conn:
+            rows = conn.execute(
+                "SELECT tool_name, policy_id, policy_name, COUNT(*) FROM event_log "
+                "WHERE status IS ? AND policy_id LIKE 'rule-%' "
+                "GROUP BY tool_name, policy_id, policy_name "
+                "ORDER BY COUNT(*) DESC, policy_name ASC",
+                (INVENTORY_STATUS,)).fetchall()
+    except Exception:
+        return empty
+    by_tool, by_rule, by_id, total = {}, {}, {}, 0
+    for tool, rid, name, n in rows:
+        n = int(n or 0)
+        name = name or "(unnamed rule)"
+        by_tool.setdefault(tool or "(unnamed)", []).append((name, n))
+        by_rule[name] = by_rule.get(name, 0) + n
+        by_id[rid] = by_id.get(rid, 0) + n
+        total += n
+    return {"total": total, "by_tool": by_tool, "by_rule": by_rule, "by_id": by_id}
+
+
 def get_call_log(path=None, limit=50, offset=0):
     """P-92: what the agent did, ONE ROW PER CALL, newest first. Never raises.
 
@@ -2469,7 +2745,7 @@ def get_call_log(path=None, limit=50, offset=0):
             # likes. That makes "newest first" wrong exactly when calls are FASTEST, which
             # is the burst this view exists to make visible.
             sql = ("SELECT timestamp, tool_name, status, arg_names, amount, target_class, "
-                   "policy_name, trace_id, agent_id FROM event_log "
+                   "policy_name, trace_id, agent_id, policy_id FROM event_log "
                    "ORDER BY timestamp DESC, id DESC")
             # 🔴 OFFSET SURVIVES `limit=None`. The clause used to be appended only when a
             # limit was set, so `get_call_log(limit=None, offset=50)` silently returned the
@@ -2482,7 +2758,7 @@ def get_call_log(path=None, limit=50, offset=0):
 
             rows = []
             for (ts, tool, status, arg_names, amount, target_class,
-                 policy_name, trace_id, agent_id) in cursor.fetchall():
+                 policy_name, trace_id, agent_id, policy_id) in cursor.fetchall():
                 rows.append({
                     "ts": ts,
                     "tool": tool,
@@ -2491,6 +2767,10 @@ def get_call_log(path=None, limit=50, offset=0):
                     "amount": amount or 0.0,
                     "target_class": target_class,
                     "policy_name": policy_name,
+                    # on an ALLOWED row a `rule-` id here means "this call was the
+                    # shape of a rule the developer adopted". The prefix is the discriminator,
+                    # so readers do not have to know which statuses can carry a rule.
+                    "policy_id": policy_id,
                     "trace_id": trace_id,
                     "agent_id": agent_id,
                     # MARKED, never dropped -- the same call the grouped screen makes for
@@ -3673,8 +3953,21 @@ def _bump_audit_counters(tool_name, stats, in_audit):
 
 
 def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats_lock=None,
-                in_audit=False, description=None):
+                in_audit=False, description=None, matched_rule=None):
     """P-92: record ONE call that passed, in ANY posture. Best-effort, never raises.
+
+    `matched_rule`: the adopted rule this call is the shape of, as
+    `rules.match_adopted_rule` returns it, or None. When present the row carries the rule's
+    id and name in `policy_id` / `policy_name`, columns that are NULL on every other
+    `ALLOWED` row. The STATUS STAYS `ALLOWED`, and that is the design rather than an
+    omission: the call ran and nothing stopped it, so every reader that counts `ALLOWED`
+    rows -- the audit totals, the harvester, retention, the funnel -- goes on counting it.
+    What changes is that the row can now say which rule it hit. The `rule-` prefix on
+    `policy_id` is what tells a reader "annotation on a call that ran" from "the policy
+    that stopped it", the same prefix that already guards deletes in `rules.py`.
+
+    The rule's id and name are OUR strings (minted and stored by `adopt_rule`), so nothing
+    from the caller's payload reaches the row through this parameter.
 
     (Said "in audit posture" until P-112's enforce half. This is the writer that half turns
     on, so its own first line claiming otherwise is the worst place for that to go stale.)
@@ -3723,7 +4016,11 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
     # `in_audit` has already been resolved by the caller through _resolve_enforcement, so a
     # tool pinned to audit by its own decorator argument arrives here as True even when the
     # rest of the run is enforcing. That is the case this column exists to make visible.
-    log_intercept(trace_id, agent_id, tool_name, None, None, INVENTORY_STATUS,
+    rule_id = rule_name = None
+    if matched_rule:
+        rule_id = matched_rule.get("id")
+        rule_name = matched_rule.get("name") or rule_id
+    log_intercept(trace_id, agent_id, tool_name, rule_id, rule_name, INVENTORY_STATUS,
                   arg_names=names, amount=amount, target_class=target_class,
                   quantity=quantity, posture=("audit" if in_audit else "enforce"))
 

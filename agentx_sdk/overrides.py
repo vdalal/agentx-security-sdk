@@ -116,9 +116,42 @@ def _anchored_root(start=None):
     no project, and the honest answer is the working directory -- which is also the behaviour
     that predates the anchoring, so nothing moves for that user.
     """
+    explicit = explicit_project_dir()
+    if explicit:
+        return explicit
     start_abs = os.path.abspath(start or os.getcwd())
     found = _find_project_root(start_abs)
     return start_abs if _is_home_or_above(found) else found
+
+
+# The MCP door's project, by EXPLICIT ASK. An MCP host launches the proxy from a working
+# directory that is nobody's project (Claude Desktop from `/`, an IDE from wherever), so the
+# walk above cannot find one and the proxy keeps per-user stores. The developer can NAME the
+# project instead, in the host's own config file, which already lives in the project:
+#
+#     AGENTX_PROJECT_DIR   set by the developer in that config; hosts expand a workspace
+#                          variable into it (Claude Code `${CLAUDE_PROJECT_DIR}`, Cursor and
+#                          VS Code `${workspaceFolder}`); Claude Desktop takes an absolute path.
+#
+# ONE variable, and it is the developer's, not the host's. Claude Code also sets its own
+# `CLAUDE_PROJECT_DIR` in every process it spawns, including a human running `agentx audit`
+# from its shell inside a DIFFERENT checkout, where the walk from cwd is the right answer and
+# the host's variable is not. So this entry point never reads the host's variable; the MCP
+# proxy, the one door with no cwd worth walking from, adopts it at startup on purpose
+# (`mcp_proxy._adopt_host_project_dir`) and says so.
+#
+# Explicit beats the walk because a named project is a stronger claim than an inferred one.
+# A value that is not an existing directory is ignored rather than created: a typo must not
+# become a project.
+PROJECT_DIR_VAR = "AGENTX_PROJECT_DIR"
+
+
+def explicit_project_dir():
+    """The project the developer NAMED, or None. Absolute, existing directory."""
+    val = os.environ.get(PROJECT_DIR_VAR)
+    if val and os.path.isdir(val):
+        return os.path.abspath(val)
+    return None
 
 
 def _overrides_path(path=None):
@@ -293,10 +326,19 @@ def load_overrides(path=None, warn=False):
         return empty
     except (OSError, ValueError, json.JSONDecodeError) as e:
         if warn:
+            # The hint follows the error KIND. One sentence used to answer every failure
+            # with the JSON-syntax hint, so a path Windows refuses outright ([Errno 22]
+            # Invalid argument, from an AGENTX_OVERRIDES holding a literal placeholder on a
+            # founder walk) was answered with "check for a trailing comma". A file that
+            # cannot be opened has no commas to check.
+            if isinstance(e, (ValueError, json.JSONDecodeError)):
+                hint = "it is plain JSON; check for a trailing comma or an unclosed quote"
+            else:
+                hint = ("the file could not be opened at that path; if AGENTX_OVERRIDES is "
+                        "set, check that it names a real, writable location")
             print(f"⚠️  [AgentX] Could not read your override store at {p}: {e}\n"
                   f"    Your adopted org reframes are NOT being applied until this "
-                  f"is fixed (it's plain JSON — check for a trailing comma or an "
-                  f"unclosed quote).", file=sys.stderr)
+                  f"is fixed ({hint}).", file=sys.stderr)
         return {"version": _SCHEMA_VERSION, "overrides": {}, "scoped_overrides": []}
 
 
@@ -2083,7 +2125,8 @@ def _incidents_by_verdict_state(limit, labelled, db_path=None):
 
     ONE function, not two near-copies, because both review reads have the same bug and a
     rule with two entry points gets fixed at one of them. ``agentx review`` and
-    ``agentx review --labeled`` are the two members.
+    ``agentx review --undo`` are the two members. (The second was once ``--labeled``; that
+    flag is REMOVED, not aliased, so do not restore that spelling here.)
 
     🔴 THIS IS THE FIX FOR P-80's SECOND FACE. ``list_recent_incidents(200)`` then filtering
     in Python spends the window on rows that need no review, so 250 recently-labelled
@@ -2297,8 +2340,8 @@ def review_backlog_size(db_path=None):
 
 
 def labeled_items(db_path=None):
-    """Blocks that ALREADY carry a verdict — powers ``agentx review --labeled``, the
-    re-review path. ``reviewable_items`` only ever shows what's still PENDING; once
+    """Blocks that ALREADY carry a verdict — the re-review read behind
+    ``agentx review --undo``. ``reviewable_items`` only ever shows what's still PENDING; once
     labeled, an item vanishes from the normal walkthrough with no way back to see or
     change that decision. Same "verdict" item shape as ``reviewable_items``, plus the
     current ``label_verdict`` so it can be shown before it's (maybe) overwritten."""
@@ -2307,6 +2350,10 @@ def labeled_items(db_path=None):
 
 def labeled_items_with_truncation(db_path=None):
     """``(items, more_exist)`` — the other member of P-80's class, and it had the same bug.
+
+    🔴 THIS IS THE READ BEHIND ``agentx review --undo`` (cli.py, ``execute_review``). It is
+    the one production caller; the ``labeled_items`` wrapper above has tests only. Change the
+    shape here and the undo screen is what breaks.
 
     The Python-side filter spent the 200-row window on rows that had NO verdict, so an
     operator whose recent blocks are all pending saw an empty ``--labeled`` list over a
@@ -2427,9 +2474,25 @@ def _org_rules_path(path=None):
     if os.path.exists(current):
         return current
     legacy = os.path.join(root, DEFAULT_ORG_RULES_PATH)
-    if os.path.exists(legacy):
+    if os.path.exists(legacy) and _is_legacy_org_rules_file(legacy):
         return legacy
     return current
+
+
+def _is_legacy_org_rules_file(p):
+    """🔴 `.agentx/rules.json` NOW BELONGS TO ANOTHER FEATURE. Since the adopted detection
+    rules moved out of `policies.db`, that name is THEIR file (`{"version": 1, "rules":
+    [...]}`, see `rules.py`), and every install that adopted a rule has one. Reading it as a
+    legacy import file made `agentx import check` report "unknown key 'rules'" and exit 1 on
+    a project that never wrote an import file at all. A legacy org file is recognised by its
+    own keys; anything else is not ours to read here. Unreadable counts as not legacy: the
+    caller then reports on `import.json`, the name we want people to create."""
+    try:
+        with open(p, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(doc, dict) and bool(set(doc) & set(_ORG_RULES_KEYS))
 
 
 def load_org_rules(rules_path=None):

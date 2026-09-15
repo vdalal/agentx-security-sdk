@@ -108,7 +108,8 @@ try:
                                WOULD_BLOCK_STATUS,
                                read_novelty, advance_watermark, format_novelty_item, top_novelty,
                                current_call_shape, _call_shape,
-                               WATERMARK_SESSION)
+                               WATERMARK_SESSION,
+                               record_mcp_roster, MCP_DRIFT_POLICY_NAME)
 finally:
     sys.stdout = _real_stdout
 
@@ -348,6 +349,153 @@ def _call_ceiling():
         return 0
 
 
+def _notify_enabled():
+    """Send what we found as an MCP log notification, so a HUMAN can see it. OPT-IN.
+
+    🔴 WATCH POSTURE IS STRUCTURALLY SILENT, AND THAT IS THE RETENTION PROBLEM. Watching
+    forwards the call untouched, so unlike a block there is nothing in-band to say. Everything
+    we print at session end -- what is new for this agent, the protection report, the streak --
+    goes to stderr, and the hosts route stderr to a log file almost nobody opens. The features
+    built to bring somebody back are real, and on this door they are invisible.
+
+    ⚠️ THE TOOL RESULT IS NOT AN OPTION AND THIS IS NOT IT. Appending our text to a server's
+    successful response is injecting into the model's context and altering a result the agent
+    may parse -- the exact thing this product exists to stop. A log notification is a SEPARATE
+    JSON-RPC frame: it touches no result, and the model never sees it.
+
+    🔴 OFF BY DEFAULT UNTIL A REAL HOST HAS BEEN WATCHED. Whether Claude Desktop or Cursor
+    render these, and at what level, is UNKNOWN and cannot be settled by reading our own code.
+    Shipping it on by default would risk two silent outcomes at once: hosts that drop it (we
+    would conclude the idea failed when only the plumbing did) and hosts that mis-handle a
+    capability we newly claim. Arm it, watch a real client, then decide.
+    """
+    return os.environ.get("AGENTX_MCP_NOTIFY", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _with_logging_capability(line, session_stats, log=None):
+    """Return the `initialize` result with `capabilities.logging` added, or None to relay as is.
+
+    None means "not this line, or not safe to touch" and the caller relays the original bytes
+    untouched. Returning None on every doubt is the whole design: the cost of missing the
+    declaration is one notification a client may ignore; the cost of mangling `initialize` is
+    a session that never starts.
+
+    Clears `_init_id` once matched, so exactly one line can ever be rewritten per session.
+    """
+    try:
+        msg = json.loads(line)
+    except Exception:
+        return None                      # not JSON we understand
+    if not isinstance(msg, dict) or msg.get("id") != session_stats.get("_init_id"):
+        return None
+    # It IS the initialize response, so this session's one chance is spent either way.
+    session_stats["_init_id"] = None
+    result = msg.get("result")
+    if not isinstance(result, dict):
+        return None                      # an error response, or a shape we did not expect
+    caps = result.get("capabilities")
+    if caps is None:
+        caps = {}
+        result["capabilities"] = caps
+    if not isinstance(caps, dict):
+        return None                      # a server doing something we should not second-guess
+    if "logging" in caps:
+        # 🔴 NOTHING TO REWRITE IS NOT NOTHING TO SEND. This returns None so the relay passes
+        # the server's own bytes through untouched, which is right. But the caller read that
+        # None as "no notification either", so a server that declares `logging` ITSELF got
+        # zero notices -- and those are the servers whose clients are MOST likely to render
+        # one. The flag separates the two questions: rewrite (no) and notify (yes).
+        # Deliberately NOT set on the other None paths above and below: an error response or
+        # a shape we did not expect is not a handshake worth speaking into, and a failed
+        # re-serialize means we never declared the capability at all.
+        session_stats["_logging_already_declared"] = True
+        return None                      # already declared: relay the server's own bytes
+    caps["logging"] = {}
+    try:
+        return json.dumps(msg) + "\n"
+    except Exception:
+        if log is not None:
+            print("[agentx-mcp] (could not re-serialize initialize; relayed unchanged)", file=log)
+        return None
+
+
+def _notify_novelty_now(writer, log=None):
+    """Send what is new for this agent, at session START, while the client is connected.
+
+    🔴 START, NOT END, AND THAT IS FORCED. The session-end report runs from `atexit`, which is
+    reached because the CLIENT closed the stream -- so at that point there is nobody to notify.
+    Here the relay has just seen the `initialize` response come back, which means the client is
+    provably alive.
+
+    It also happens to be the better moment. What is new is accumulated from PREVIOUS sessions,
+    so this is precisely the "here is why you came back" line, delivered as the client starts
+    rather than as it dies.
+
+    🔴 READS, NEVER ADVANCES. `read_novelty` is a pure read; the session-end path still owns the
+    advance. If this advanced too, the stderr line a terminal user reads would go silent and
+    every test asserting it would be measuring a screen nobody gets. So the same novelty is
+    announced once here and printed once there, and consumed exactly once, at the end.
+
+    Never raises: a notice must not take down the session it is annotating.
+    """
+    try:
+        # ⚠️ NO AUTOMATION GATE HERE, DELIBERATELY, AND IT IS NOT A COPY-PASTE MISS.
+        # The session-end novelty print is excluded from automation because it ADVANCES the
+        # watermark, so a CI run would consume the operator's novelty. This path is a pure
+        # read and consumes nothing, so that reason does not reach it.
+        #
+        # The reason that decides it: reaching this line already required someone to set
+        # AGENTX_MCP_NOTIFY themselves. An explicit decision beats a heuristic about who is
+        # running. Keeping the gate would have made this untestable on the one machine most
+        # likely to test it -- the operator's, which carries the sticky ~/.agentx/internal
+        # marker and reads as automation in every directory forever.
+        #
+        # 🔴 IF THIS EVER BECOMES DEFAULT-ON, THE GATE COMES BACK. Then arming is no longer a
+        # decision anyone made, and a CI harness would notify for nobody.
+        current = current_call_shape()
+        novelty = read_novelty(WATERMARK_SESSION, current=current)
+        items = top_novelty(novelty["items"], 2)
+        lines = []
+        for item in items:
+            text = format_novelty_item(item)
+            if text:
+                prefix = ("%s: " % item["tool"]) if item["tool"] else ""
+                lines.append("%s%s" % (prefix, text))
+        if not lines:
+            return False
+        # One sentence, then the command. The items already read as full clauses
+        # ("read_file: first call to your filesystem"), so joining them under another colon
+        # gave "New for your agent: read_file: first call ..." and two colons in six words.
+        body = "AgentX watched your agent do something new. " + ". ".join(lines) + "."
+        hidden = len(novelty["items"]) - len(items)
+        if hidden > 0:
+            body += " And %d more." % hidden
+        body += " See them: uvx agentx-mcp --audit"
+        _send_log_notification(writer, body, log=log)
+        return True
+    except Exception:
+        return False
+
+
+def _send_log_notification(writer, data, level="info", log=None):
+    """Emit one `notifications/message` on the client channel. Never raises.
+
+    A notification carries NO id: it is fire-and-forget and the client must not answer it, so
+    it can never collide with a request/response pair we are relaying. `_ClientWriter` holds
+    the same lock every other producer uses, so this cannot interleave with a relayed line.
+    """
+    try:
+        writer.send({
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"level": level, "logger": "agentx", "data": data},
+        })
+    except Exception:
+        # A notice we could not deliver must never take down the session it was annotating.
+        if log is not None:
+            print("[agentx-mcp] (could not send log notification)", file=log)
+
+
 # The structural-signature vocab (_ACTION_KEYWORDS / _NARROWING_TOKENS / _target_action /
 # _scope / _abstract_call) MOVED to decorators.py and is imported at the top of this module.
 # It grew a second consumer — the decorator's two block paths, for context-scoped overrides —
@@ -445,6 +593,137 @@ def _user_store_dir():
     return os.path.join(home, ".agentx")
 
 
+# =====================================================================
+# WHICH PROJECT THIS MCP PROCESS SERVES, AND HOW IT KNOWS
+# =====================================================================
+# Per-user (`_user_store_dir`) is the right default for a process launched from nobody's
+# directory, and it is also why the MCP door could not have rules: a rule belongs to a
+# project, and the proxy could not tell which. The developer can NAME the project instead,
+# in the host's own config, which already lives in the project (founder-ratified: the
+# explicit ask first; `roots/list` deferred). The name resolves ONCE, at startup, and the
+# answer is PRINTED with its source, because a store chosen silently is how this door
+# produced a trail of ledgers the first time.
+#
+# Two roles, two rules, because they have different cwds:
+#   proxy   explicit only. `AGENTX_PROJECT_DIR`, or Claude Code's own `CLAUDE_PROJECT_DIR`
+#           adopted on this door alone (the SDK's single entry point never reads the host's
+#           variable, see overrides.explicit_project_dir). The host's cwd is never walked.
+#   reader  (`--audit` / `--review` / `--insights`, run by a human in a terminal) explicit
+#           first; else the project walked up from cwd, IF it already holds an MCP ledger --
+#           a human standing in their project expects to read what the proxy wrote there;
+#           else per-user. When both a project store and the per-user one exist, both are
+#           named, so nothing is read over silently.
+_MCP_PROJECT = None          # absolute project dir, or None for per-user
+_MCP_PROJECT_SOURCE = None   # "AGENTX_PROJECT_DIR" | "CLAUDE_PROJECT_DIR" | "your directory"
+# `AGENTX_PROJECT_DIR` was SET and is not a directory (an unexpanded `${workspaceFolder}` on a
+# host that does not expand it, a typo). The developer named a project; "this host named no
+# project" would say the opposite and hide the reason, so the value is kept for the origin
+# line (scoped review, finding 7). Cleared whenever the resolver runs.
+_MCP_PROJECT_UNUSABLE = None
+
+
+def _resolve_mcp_project(role):
+    """Decide the store root for this process and remember how. Never raises."""
+    global _MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE
+    _MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE = None, None, None
+    try:
+        from .overrides import explicit_project_dir, PROJECT_DIR_VAR, _anchored_root
+        adopted = None
+        named = os.environ.get(PROJECT_DIR_VAR)
+        if named and not os.path.isdir(named):
+            _MCP_PROJECT_UNUSABLE = named
+        # A set-but-unusable value must not also block Claude Code's own variable: the
+        # developer's typo would otherwise cost them the fallback that was working.
+        if role == "proxy" and not explicit_project_dir():
+            host = os.environ.get("CLAUDE_PROJECT_DIR")
+            if host and os.path.isdir(host):
+                # Adopt it into the SDK's own variable so EVERY store resolver follows
+                # (`_anchored_root` reads that one and nothing else).
+                os.environ[PROJECT_DIR_VAR] = host
+                adopted = "CLAUDE_PROJECT_DIR"
+        explicit = explicit_project_dir()
+        if explicit:
+            _MCP_PROJECT, _MCP_PROJECT_SOURCE = explicit, (adopted or PROJECT_DIR_VAR)
+            return
+        if role == "reader":
+            root = _anchored_root()
+            if os.path.exists(os.path.join(root, ".agentx", "mcp-ledger.db")):
+                # Same adoption, so the rules file and the overrides resolve to this root
+                # too, not to whatever the cwd walk would say from a subdirectory later.
+                os.environ[PROJECT_DIR_VAR] = root
+                _MCP_PROJECT, _MCP_PROJECT_SOURCE = root, "your directory"
+    except Exception:
+        _MCP_PROJECT, _MCP_PROJECT_SOURCE = None, None
+
+
+def _mcp_store_dir():
+    """The directory every MCP store lives under: `<project>/.agentx` when a project was
+    named, else the per-user home. The four path functions below all derive from this, so
+    the proxy and the reader cannot disagree about it once they agree on the project."""
+    if _MCP_PROJECT:
+        return os.path.join(_MCP_PROJECT, ".agentx")
+    return _user_store_dir()
+
+
+def _store_origin_lines():
+    """The line(s) that say where this process's stores are and how that was decided. Printed
+    at proxy startup and at the top of every reader screen. Absence never carries the
+    decision: per-user says so, and says how to name a project."""
+    if _MCP_PROJECT:
+        how = ("found from your directory" if _MCP_PROJECT_SOURCE == "your directory"
+               else "named by %s" % _MCP_PROJECT_SOURCE)
+        if _MCP_PROJECT_UNUSABLE is not None:
+            # The fallback worked, and the value the developer configured did not: say
+            # both, or the line reads as their choice when it was their typo's.
+            how += ("; AGENTX_PROJECT_DIR is set to %r, which is not a directory, and was "
+                    "ignored" % _MCP_PROJECT_UNUSABLE)
+        lines = ["project store: %s  (%s)" % (_mcp_store_dir(), how)]
+        legacy = os.path.join(_user_store_dir(), "mcp-ledger.db")
+        if os.path.exists(legacy):
+            lines.append("also on this machine: the per-user store %s, from before a project"
+                         " was named" % _user_store_dir())
+        return lines
+    if _MCP_PROJECT_UNUSABLE is not None:
+        return ["per-user store: %s  (AGENTX_PROJECT_DIR is set to %r, which is not a "
+                "directory, so no project was named; fix the value in the server's env in "
+                "your MCP config)" % (_user_store_dir(), _MCP_PROJECT_UNUSABLE)]
+    return ["per-user store: %s  (this host named no project; to keep stores per project,"
+            " set AGENTX_PROJECT_DIR in the server's env in your MCP config)" % _user_store_dir()]
+
+
+def _match_adopted_rule_mcp(tool_name, arguments, session_stats):
+    """The adopted rule this passing call is the shape of, on the MCP door, or None.
+
+    The decorator's `_match_adopted_rule_keyless` ported to this door, with one gate of its
+    own: it runs ONLY when a project was named. Per-user, there is no project and so no rules
+    file this process is entitled to read -- the walk from the host's launch directory could
+    land on any repo on the machine -- so per-user matches nothing, and the origin line at
+    startup says so. This door has no gateway leg, so the decorator's gateway_reached gate
+    does not apply. RECORDS, NEVER BLOCKS, in every posture, for the reason stated on the
+    decorator: a match is about shape, not meaning. Narrates ONCE PER RULE per session, on
+    stderr (stdout is the protocol channel). Never raises.
+    """
+    try:
+        if not _MCP_PROJECT:
+            return None
+        from .rules import match_adopted_rule
+        rule = match_adopted_rule(tool_name, arguments)
+        if not rule:
+            return None
+        session_stats["rule_matches_seen"] = session_stats.get("rule_matches_seen", 0) + 1
+        session_stats["rule_matches"] = session_stats.get("rule_matches", 0) + 1
+        narrated = session_stats.setdefault("rule_matches_narrated", set())
+        if rule["id"] not in narrated:
+            narrated.add(rule["id"])
+            print("[agentx-mcp] '%s' matched your rule '%s'. Recorded and let run: the proxy "
+                  "matches the shape of a rule, and only a gateway judges the meaning. See "
+                  "every match:  uvx agentx-mcp --audit" % (tool_name, rule["name"]),
+                  file=sys.stderr)
+        return rule
+    except Exception:
+        return None
+
+
 def _mcp_ledger_path():
     """Where the MCP proxy's flight-recorder ledger lives.
 
@@ -462,7 +741,7 @@ def _mcp_ledger_path():
     explicit = os.environ.get("AGENTX_MCP_LEDGER_PATH")
     if explicit:
         return explicit
-    return os.path.join(_user_store_dir(), "mcp-ledger.db")
+    return os.path.join(_mcp_store_dir(), "mcp-ledger.db")
 
 
 def _mcp_overrides_path():
@@ -504,7 +783,7 @@ def _mcp_overrides_path():
     explicit = os.environ.get("AGENTX_MCP_OVERRIDES_PATH")
     if explicit:
         return explicit
-    return os.path.join(_user_store_dir(), "overrides.json")
+    return os.path.join(_mcp_store_dir(), "overrides.json")
 
 
 def _harvest_path():
@@ -523,7 +802,7 @@ def _harvest_path():
     explicit = os.environ.get("AGENTX_MCP_HARVEST_PATH")
     if explicit:
         return explicit
-    return os.path.join(_user_store_dir(), "mcp_harvest.jsonl")
+    return os.path.join(_mcp_store_dir(), "mcp_harvest.jsonl")
 
 
 def _legacy_project_harvest():
@@ -842,7 +1121,7 @@ def _pins_path():
     explicit = os.environ.get("AGENTX_MCP_PINS_PATH")
     if explicit:
         return explicit
-    return os.path.join(_user_store_dir(), "mcp_tool_pins.json")
+    return os.path.join(_mcp_store_dir(), "mcp_tool_pins.json")
 
 
 def _server_key(child_cmd):
@@ -1000,7 +1279,7 @@ def _report_pin_events(events, mode, drifted, session_stats, log):
                     trace = "%s-drift-%s" % (session_stats.get("_trace_id") or "mcp-session",
                                              uuid.uuid4().hex[:8])
                     log_intercept(trace, "mcp_proxy", name, None,
-                                  "MCP Tool Description Drift", "CHALLENGED",
+                                  MCP_DRIFT_POLICY_NAME, "CHALLENGED",
                                   posture="enforce")
                 except Exception:
                     pass
@@ -1051,11 +1330,69 @@ def _inspect_list_line(line, pins, pending_list_ids, server_key, mode, drifted, 
                     descs[name] = desc
         except Exception:
             pass
+        # THE ROSTER: the NAMES on this menu, kept for the audit screen's denominator
+        # ("23 tools advertised, 4 called"). Names only, per the rule three comments up; the
+        # newest menu replaces the last, so a tool the server stops advertising drops out.
+        # Written when this server has a numerator: a call recorded this session, or a
+        # roster row from an earlier one (see _flush_mcp_roster).
+        try:
+            names = [t.get("name") for t in tools
+                     if isinstance(t, dict) and isinstance(t.get("name"), str) and t.get("name")]
+            session_stats.setdefault("_advertised", {})[server_key] = names
+            session_stats.setdefault("_roster_pending", set()).add(server_key)
+            _flush_mcp_roster(session_stats)
+        except Exception:
+            pass
         events = pins.inspect(server_key, tools)
         if events:
             _report_pin_events(events, mode, drifted, session_stats, log)
     except Exception:
         return
+
+
+def _flush_mcp_roster(session_stats):
+    """Write every pending advertised list to the ledger, for each server that has a
+    numerator. Never raises.
+
+    ⚠️ A DENOMINATOR ONLY BESIDE A NUMERATOR, the TypeScript door's rule ported: a server the
+    agent has never called gets no roster row, so a host that starts the proxy, lists the
+    tools of a server nobody uses and calls nothing leaves the ledger exactly as it was. The
+    numerator is either a call recorded THIS session (`_ledger_seq` counts the rows this
+    session wrote: passing, would-block and blocked calls alike, so it is the numerator's own
+    counter rather than a second one kept beside it) or a roster row from an EARLIER session,
+    which a call back then earned. In the second case a re-listed menu replaces the stale one
+    at once, so a tool the server stopped advertising drops out on the next list, as the
+    CHANGELOG says, not on the next list that happens to share a session with a call.
+
+    Called from `_inspect_list_line` (a menu that arrives after the first call is written at
+    once) and from each ledger-write site (a menu that arrived before the first call is
+    written when that call is). A server stays pending until its write succeeds, so a menu
+    seen before the store existed is not lost.
+
+    `_roster_no_row` remembers, for this session, the servers the presence check found no
+    row for. Without it a never-called server re-listed on every `list_changed` notification
+    would run one SELECT on the relay thread per notification, new I/O on a byte pump that
+    had none. The set is consulted only while no call has been recorded; the first call
+    writes regardless.
+    """
+    try:
+        if not session_stats.get("_ledger"):
+            return
+        pending = session_stats.get("_roster_pending")
+        if not pending:
+            return
+        advertised = session_stats.get("_advertised") or {}
+        no_call_yet = not session_stats.get("_ledger_seq", 0)
+        no_row = session_stats.setdefault("_roster_no_row", set())
+        for key in list(pending):
+            if no_call_yet and key in no_row:
+                continue
+            if record_mcp_roster(key, advertised.get(key) or [], only_if_present=no_call_yet):
+                pending.discard(key)
+            elif no_call_yet:
+                no_row.add(key)
+    except Exception:
+        pass
 
 
 class _ClientWriter:
@@ -1428,9 +1765,13 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 record_call(inv_trace, "mcp_proxy", tool_key, params.get("arguments"),
                             stats=session_stats,
                             in_audit=session_stats.get("_enforcement") == "audit",
-                            description=(session_stats.get("_tool_desc") or {}).get(tool_key))
+                            description=(session_stats.get("_tool_desc") or {}).get(tool_key),
+                            matched_rule=_match_adopted_rule_mcp(
+                                tool_key, params.get("arguments"), session_stats))
             except Exception:
                 pass
+            # The numerator exists now; a menu seen before this call can be written.
+            _flush_mcp_roster(session_stats)
         return "forward"
 
     # AUDIT posture: this call matched a policy, but AGENTX_ENFORCEMENT=audit — record the
@@ -1471,6 +1812,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                               quantity=quantity, posture="audit")
             except Exception:
                 pass
+            _flush_mcp_roster(session_stats)
         try:
             # `agentx-mcp --insights`, never `agentx insights`: under uvx the SDK's `agentx`
             # script is not on PATH, so the bare form sent this reader to a command not found.
@@ -1567,6 +1909,8 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                                             if req_id is not None else None))
         except Exception:
             pass
+        # A stopped call is still a call the agent made: the roster's numerator exists.
+        _flush_mcp_roster(session_stats)
 
     if req_id is not None:
         if harvest is not None:
@@ -1624,6 +1968,32 @@ def _route_line(line, child_in, writer, session_stats, streaks, max_turns, log, 
     except Exception:
         pass
 
+    # Same id-correlation trick for `initialize`, and only when notifications are armed. The
+    # relay needs to find that ONE response so it can add the `logging` capability; without
+    # the declaration a strict client is entitled to drop our notification, and we would read
+    # that as "hosts do not render these" when the truth is "we never said we send them".
+    try:
+        if session_stats.get("_notify") and isinstance(msg, dict) \
+                and msg.get("method") == "initialize" and msg.get("id") is not None:
+            session_stats["_init_id"] = msg.get("id")
+    except Exception:
+        pass
+
+    # 🔴 ANSWER `logging/setLevel` OURSELVES RATHER THAN FORWARDING IT. We are the one claiming
+    # the logging capability, not the wrapped server, so a client that takes us up on it must
+    # not have its request handed to a server that never advertised it and may error on an
+    # unknown method. We accept every level and keep sending at `info`: the alternative is
+    # honouring a level for a channel that carries one notice per session, which is precision
+    # nobody asked for and another thing to get wrong.
+    try:
+        if session_stats.get("_notify") and isinstance(msg, dict) \
+                and msg.get("method") == "logging/setLevel":
+            if msg.get("id") is not None:
+                writer.send({"jsonrpc": "2.0", "id": msg.get("id"), "result": {}})
+            return
+    except Exception:
+        pass
+
     # JSON-RPC batch: removed in MCP 2025-06-18, but a legacy client may still send an
     # array. Screen each member and forward only the ones we did not block, so a
     # dangerous tools/call buried in a batch can't slip through unscreened.
@@ -1677,6 +2047,11 @@ def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
     if ceiling:
         session_stats["_call_ceiling"] = ceiling
 
+    # Armed ONCE per session and read from session_stats everywhere else, so the routing core
+    # and the relay keep their signatures (same treatment as _pin_mode and _call_ceiling).
+    if _notify_enabled():
+        session_stats["_notify"] = True
+
     def _default_popen(cmd):
         # errors="replace": a stray non-UTF-8 byte from the server must not raise in the
         # relay's `for line in child.stdout` and tear the whole session down.
@@ -1710,6 +2085,30 @@ def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
                 if pins is not None:
                     _inspect_list_line(line, pins, pending_list_ids, server_key,
                                        pin_mode, drifted, session_stats, log)
+                # 🔴 THE ONLY LINE THIS PROXY EVER REWRITES, AND ONLY WHEN ARMED. Everywhere
+                # else the relay is a byte-identical pump, deliberately: a proxy that edits a
+                # server's answers is a proxy that can corrupt them. The exception is the
+                # `initialize` RESULT, where we add the `logging` capability so a client will
+                # accept the one notification we send. It is protocol metadata, not a tool
+                # result and not model context. On any doubt -- not armed, not the right id,
+                # unparseable, unexpected shape -- fall through to the verbatim relay.
+                if session_stats.get("_notify") and session_stats.get("_init_id") is not None:
+                    patched = _with_logging_capability(line, session_stats, log)
+                    if patched is not None:
+                        writer.relay(patched)
+                        # The client has its handshake and is provably listening, so this is
+                        # the one moment in the session when a notice can reach it. Sent AFTER
+                        # the initialize result, never before: a frame arriving mid-handshake
+                        # is a good way to confuse a client for no benefit.
+                        _notify_novelty_now(writer, log)
+                        continue
+                    # The server declared `logging` itself, so there was nothing to rewrite.
+                    # Same moment, same guarantee that the client is listening, and a client
+                    # whose server advertises logging is the likeliest of all to render this.
+                    if session_stats.pop("_logging_already_declared", False):
+                        writer.relay(line)
+                        _notify_novelty_now(writer, log)
+                        continue
                 writer.relay(line)
         except Exception:
             pass
@@ -1851,6 +2250,7 @@ def _protection_report(session_stats, log):
             _items = top_novelty(_novelty["items"], 2)
             if _items:
                 print("[agentx-mcp] new for your agent:", file=log)
+                _lines = []
                 for _item in _items:
                     _line = format_novelty_item(_item)
                     if _line:
@@ -1858,10 +2258,18 @@ def _protection_report(session_stats, log):
                         # prefix goes with them rather than printing a bare colon.
                         _pre = ("%s: " % _item["tool"]) if _item["tool"] else ""
                         print("[agentx-mcp]   -> %s%s" % (_pre, _line), file=log)
+                        _lines.append("%s%s" % (_pre, _line))
                 _hidden = len(_novelty["items"]) - len(_items)
                 if _hidden > 0:
                     print("[agentx-mcp]   -> ...and %d more." % _hidden, file=log)
                 print("[agentx-mcp]   -> see them:  uvx agentx-mcp --audit", file=log)
+                # ⚠️ NO NOTIFICATION FROM HERE, AND THE REASON IS WORTH KEEPING. This function
+                # runs from `atexit`, i.e. process exit, which is reached BECAUSE the client
+                # closed the stream. The client is already gone, so a `notifications/message`
+                # sent here goes into a dead pipe -- it would ship, do nothing, and read as
+                # "hosts do not render these" when the truth is "nobody was listening".
+                # The notification is sent at session START instead, from the relay, where the
+                # client is provably connected. See `_notify_novelty_now`.
                 advance_watermark(WATERMARK_SESSION, current=_current)
         # Offline staleness notice — the MCP half of the same reach problem. An MCP user
         # never sees the decorator's atexit summary (main() suppresses it), so a notice
@@ -1891,6 +2299,7 @@ def _reader_globals(fn, argv):
     same leak class execute_demo's finally block had just been fixed for; I fixed it there and
     reintroduced it here in the same PR. (Fourth review of #287.)
     """
+    global _MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE
     from agentx_sdk import cli, db as _db
     saved_entry = cli.MCP_ENTRY
     saved_db = os.environ.get("AGENTX_INCIDENT_DB")
@@ -1901,9 +2310,23 @@ def _reader_globals(fn, argv):
     # this restore put back two -- caught immediately by test_decorator_ledger_default_is_
     # untouched, which is the existing suite doing what my own new test did not.
     saved_path = _db.DB_PATH
+    # The project decision joined the list with the per-project stores: the reader may ADOPT
+    # the walked project into AGENTX_PROJECT_DIR so every resolver agrees, and the next
+    # in-process caller must not inherit that.
+    from agentx_sdk.overrides import PROJECT_DIR_VAR
+    saved_project = os.environ.get(PROJECT_DIR_VAR)
+    saved_globals = (_MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE)
     try:
         cli.MCP_ENTRY = True          # render CTAs this reader can actually run
+        _resolve_mcp_project("reader")
         _point_stores_at_mcp_home()
+        # 🔴 STDERR, like the proxy's copy of this line. `--audit --json` puts the document
+        # on stdout and promises it is alone there; the first cut printed this to stdout
+        # ahead of the JSON and every parser downstream of `uvx agentx-mcp --audit --json`
+        # failed on the first byte. Found by the scoped review, not by the walk, which
+        # read both streams as one.
+        for _line in _store_origin_lines():
+            print("[agentx-mcp] %s" % _line, file=sys.stderr)
         # 🔴 MIGRATE AFTER THE REPOINT, NEVER BEFORE. These reader subcommands are
         # dispatched straight at cli.execute_*, so they never reach cli.main() and main's migration
         # hook does not cover them. Doing it here, once _point_stores_at_mcp_home has moved
@@ -1917,8 +2340,10 @@ def _reader_globals(fn, argv):
     finally:
         cli.MCP_ENTRY = saved_entry
         _db.DB_PATH = saved_path
+        _MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE = saved_globals
         for _var, _saved in (("AGENTX_INCIDENT_DB", saved_db),
-                             ("AGENTX_OVERRIDES", saved_overrides)):
+                             ("AGENTX_OVERRIDES", saved_overrides),
+                             (PROJECT_DIR_VAR, saved_project)):
             if _saved is None:
                 os.environ.pop(_var, None)
             else:
@@ -2065,7 +2490,7 @@ def main(argv=None):
     # real wrap uses.
     if len(argv) == 1 and argv[0] in ("demo", "review", "insights", "audit"):
         sys.stderr.write(
-            "[agentx-mcp] unknown command '%s' -- did you mean '--%s'?\n"
+            "[agentx-mcp] unknown command '%s'. Did you mean '--%s'?\n"
             "  uvx agentx-mcp --%s\n" % (argv[0], argv[0], argv[0])
         )
         return 2
@@ -2112,6 +2537,10 @@ def main(argv=None):
     # once at startup (a long-lived process; no per-tool override on the proxy path), through
     # `_proxy_posture`, which tells the shared resolver this door has no gateway leg.
     session_stats["_enforcement"] = _proxy_posture()
+    # The same value under the key the pulse reads (`pulse._posture`), so the funnel
+    # can tell a watching proxy from a blocking one without a catch having happened. One
+    # resolver, one stamp per door; the decorator door stamps its own at session end.
+    session_stats["posture"] = session_stats["_enforcement"]
     # Point every store at the per-user MCP home BEFORE init_db creates one, or the proxy
     # leaves a .agentx.db in whatever directory the MCP host launched it from. The proxy owns
     # this whole process, so these are set globally rather than passed around. The decorator
@@ -2123,7 +2552,13 @@ def main(argv=None):
     # auto-coach wrote them through the cwd-derived default while `--review` read the per-user
     # one. Two call sites computing "the same" answer separately is the bug, so there is now
     # one function and both callers use it.
+    #
+    # The project is decided FIRST, once, and printed with its source. Everything below
+    # derives its paths from that decision.
+    _resolve_mcp_project("proxy")
     _point_stores_at_mcp_home()
+    for _line in _store_origin_lines():
+        print("[agentx-mcp] %s" % _line, file=sys.stderr)
     try:
         init_db()
     except Exception:
@@ -2172,11 +2607,12 @@ def main(argv=None):
             print("[agentx-mcp]  See what would have been stopped:  uvx agentx-mcp --insights",
                   file=sys.stderr)
         else:
-            print("[agentx-mcp]  WATCHING. Every tool call this server makes is screened",
-                  file=sys.stderr)
-            print("[agentx-mcp]  and written down. Nothing is blocked, so adding AgentX",
-                  file=sys.stderr)
-            print("[agentx-mcp]  cannot break a server that already works.", file=sys.stderr)
+            # Founder copy pass: one line for the state, present tense. This used
+            # to run three lines and end "so adding AgentX cannot break a server that already
+            # works", a reassurance the audit screen then repeated; a banner printed on every
+            # start is read many times and earns no editorial.
+            print("[agentx-mcp]  WATCHING: every tool call is screened and recorded; nothing "
+                  "is blocked.", file=sys.stderr)
             print("[agentx-mcp]  See what it recorded:  uvx agentx-mcp --audit", file=sys.stderr)
         # 🔴 JSON, NOT A SHELL ASSIGNMENT. This reader's posture lives in mcp.json, for a server
         # process their client spawns, and there is no shell here to prefix. `set
@@ -2184,15 +2620,23 @@ def main(argv=None):
         # defect `cli._print_posture_command`'s MCP_ENTRY branch exists to prevent, sitting on
         # the one screen EVERY MCP install sees at startup, with no gate over it.
         from agentx_sdk.decorators import MCP_POSTURE_ENV_LINE
-        print("[agentx-mcp]  Start stopping them: in your mcp.json, beside this server's",
-              file=sys.stderr)
-        print('[agentx-mcp]  "command" and "args":  %s' % (MCP_POSTURE_ENV_LINE % "enforce"),
-              file=sys.stderr)
+        print("[agentx-mcp]  To block calls, not just record them, add this to the server's "
+              "entry in mcp.json:", file=sys.stderr)
+        print("[agentx-mcp]    %s" % (MCP_POSTURE_ENV_LINE % "enforce"), file=sys.stderr)
         print("[agentx-mcp] "
               "============================================================", file=sys.stderr)
+    # "WATCHING" alone under the default banner: it has just said what watching means, and
+    # a label that repeated it made the same fact land twice in five lines (founder copy
+    # pass). Under the env-set banner, which says AUDIT MODE in the reader's own words, the
+    # label quotes that setting so the two lines name one state.
+    if _posture != "audit":
+        _label = "enforcing"
+    elif _set_name:
+        _label = "WATCHING, set by %s=audit" % _set_name
+    else:
+        _label = "WATCHING"
     print("[agentx-mcp] AgentX shield active (%s), wrapping: %s"
-          % ("WATCHING: recording, nothing blocked" if _posture == "audit" else "enforcing",
-             " ".join(argv)), file=sys.stderr)
+          % (_label, " ".join(argv)), file=sys.stderr)
     return run_proxy(argv, client_in=client_in, client_out=client_out,
                      session_stats=session_stats, close_client_on_child_exit=True)
 

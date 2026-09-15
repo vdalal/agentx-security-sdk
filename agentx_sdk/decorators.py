@@ -502,7 +502,7 @@ def _warn_policy_load_audit_once(error):
     _POLICY_DEGRADED_WARNED = True
     logger.warning(
         "[AgentX] AUDIT: your policy file is malformed. Audit does not refuse, so this call "
-        "was screened by the BUILT-IN floor only and your own rules were NOT applied -- the "
+        "was screened by the BUILT-IN floor only and your own rules were NOT applied, so the "
         "findings under-report what your policies would catch. "
         "Fix it with: agentx policies --check  (%s)", error)
 
@@ -623,11 +623,20 @@ def _emit_audit_banner(via_override=False):
     # false claim about the other tools that the gate below exists to prevent, arriving through
     # the spelling nobody updated here. Same class as the conftest fixture that had to close
     # both doors (`sdk_tests/conftest.py`, `_AMBIENT_POSTURE_VARS`).
+    # 🔴 ASK THE RESOLVER WHETHER THE SHELL IS IN AUDIT, NEVER THE ENVIRONMENT. This
+    # scanned the two spellings for the WORD "audit", so with AGENTX_POSTURE=enforce and
+    # AGENTX_ENFORCEMENT=audit set together it found the word, skipped the per-tool branch and
+    # printed "AgentX is in AUDIT mode" about a shell that `_resolve_enforcement` says is
+    # ENFORCING (stricter wins, its own conflict rule). A banner is a claim about the posture,
+    # and the posture is decided in exactly one function. The env name is still read, but only
+    # to say WHICH spelling the reader typed, and only once the resolver has said the shell is
+    # audit -- when it is, every spelling that is set reads audit, so the first set one is it.
+    _shell_audit = _resolve_enforcement() == "audit"
     _env_name = next(
         (n for n in ("AGENTX_POSTURE", "AGENTX_ENFORCEMENT")
-         if (os.environ.get(n) or "").strip().lower() == "audit"),
+         if (os.environ.get(n) or "").strip()),
         None,
-    )
+    ) if _shell_audit else None
     _env_audit = _env_name is not None
     if via_override and not _env_audit:
         _print_banner(
@@ -1142,7 +1151,16 @@ def _resolve_fail_mode():
     return "open"
 
 
-_HITL_DEFAULT_SECONDS = 120
+# Ten minutes, up from two. Two minutes suits a demo where someone is already watching the
+# terminal, and is short for the case the feature exists for: a person who has to notice the
+# item on the dashboard (which refreshes every 60 s), open it, read it and decide. The cost,
+# stated: an unattended agent in enforce posture that hits an escalation stalls up to ten
+# minutes before failing safe, where it stalled two. And on an ASYNC host the wait holds one
+# worker of the dedicated decision pool (16 workers, see the executor comment below) for the
+# whole time, so sixteen simultaneous escalations queue every other protected call, allowed
+# ones included, for up to ten minutes. AGENTX_HITL_TIMEOUT_SECONDS=120 restores the shorter
+# wait.
+_HITL_DEFAULT_SECONDS = 600
 
 
 def _hitl_timeout_seconds():
@@ -1153,10 +1171,9 @@ def _hitl_timeout_seconds():
     returns ESCALATED, so anything written inline there is code no test in this suite can
     drive. Pulled out, the budget can be driven directly in both polarities.
 
-    🔴 THE DEFAULT IS SHORT AND THAT IS A PRODUCT DECISION, NOT A LIMIT. Two minutes suits a
-    demo, where the person is already watching the terminal. It is short for the case this
-    feature is actually for: an analyst who has to notice, open the dashboard, read the
-    incident and decide. Anyone in that position sets this variable, which is why it exists.
+    🔴 THE DEFAULT IS A PRODUCT DECISION, NOT A LIMIT. See the note above the constant for
+    why it is ten minutes. Anyone who wants a different wait sets this variable, which is why
+    it exists.
 
     ⚠️ FALLS BACK RATHER THAN RAISING. A typo in a timeout must not be the thing that takes
     down the escalation path itself: refusing to run would turn a bad env var into an outage
@@ -1619,6 +1636,19 @@ _session_stats = {
     # asserts the result equals `_ALLOWED_SESSION_KEYS` EXACTLY (not a subset). So this counter
     # cannot reach the wire by accident, and adding it deliberately reddens that test first.
     "would_blocks_seen": 0,            # <-- every would-block this session, OURS INCLUDED.
+    # A call that ran AND is the shape an adopted rule names. Same two-counter split
+    # as the pair above, for the same two readers: `rule_matches` rides the pulse and excludes
+    # our own demo; `rule_matches_seen` is what the summary prints and takes no view on who
+    # owns the agent. NOT a would-block and never folded into one: a rule match is an
+    # annotation on a call we let run, in every posture, because the SDK can only see a
+    # rule's symbolic half (see rules.match_adopted_rule).
+    "rule_matches": 0,
+    "rule_matches_seen": 0,
+    # The posture this session ran under, stamped from the resolver at session end for the
+    # pulse. DECLARED here, because the stamp used to create the key lazily and the
+    # whole-declaration snapshot test caught the live dict carrying a key nothing declared.
+    "posture": None,
+    "rule_matches_narrated": set(),    # <-- rule ids narrated this session; one line per rule, not per call.
     # 🔴 P-92, AND THE REASON IT IS SEPARATE FROM would_blocks ABOVE. `would_blocks` can only
     # count an install whose agent tripped one of our floors, so the population it CANNOT see
     # is the one this whole change is for: someone who wired us in, ran their agent, and did
@@ -1983,7 +2013,7 @@ def _func_display_name(fn):
 # A DEDICATED, bounded thread pool for running the (blocking) decision core off the
 # event loop in the async path (review #115 finding 2). Kept SEPARATE from asyncio's
 # default executor so AgentX's blocking work — the gateway round-trip, and especially
-# the up-to-120s HITL poll — can never starve the host app's own run_in_executor /
+# the bounded HITL poll (_HITL_DEFAULT_SECONDS) — can never starve the host app's own run_in_executor /
 # asyncio.to_thread (DB drivers, file I/O). Sized by AGENTX_ASYNC_MAX_WORKERS
 # (default 16); a swarm larger than the pool serializes AgentX decisions but never
 # blocks the host app. Lazily created so a purely-sync install never spins threads.
@@ -2479,6 +2509,11 @@ def _print_agentx_summary():
     # streak and emit the anonymous activation pulse — so the demo still counts as an
     # activated install and still extends the streak.
     global _protection_recorded
+    # The posture this session ran under, for the pulse, stamped from the ONE resolver
+    # on the way out. Stamped HERE, at session end, rather than at import: the value is a
+    # snapshot and this is the moment it is read. Both exits of this function stamp it, so
+    # a quiet summary and a printed one report the same install the same way.
+    _session_stats["posture"] = _resolve_enforcement()
     if _atexit_summary_quiet:
         if not _protection_recorded:
             _protection_recorded = True
@@ -2627,6 +2662,13 @@ def _print_agentx_summary():
     if _session_stats.get("would_blocks_seen", 0) > 0:
         print(f" 🔍 Audit Catches:         {_session_stats['would_blocks_seen']:<3} |  "
               f"recorded, not blocked")
+    # Conditional for the same reason as the line above, and its own label for the
+    # same reason too: a rule match is neither an intercept nor an audit catch. It is a call
+    # that ran and happens to be the shape a rule the reader wrote names. `_seen`, not the
+    # pulse counter, so our own demo traffic still shows on the screen it was run to fill.
+    if _session_stats.get("rule_matches_seen", 0) > 0:
+        print(f" 🧩 Your Rules Matched:    {_session_stats['rule_matches_seen']:<3} |  "
+              f"recorded, not blocked; only a gateway judges the meaning")
 
     # --- FIXED: Display the Human Override metrics cleanly inside the table block layout ---
     # 🔴 THE SECOND HALF OF THIS LINE WAS THE SESSION NUMBER PRINTED TWICE. It read
@@ -2862,9 +2904,18 @@ def _print_agentx_summary():
         print("    label a block, or adopt a safe-path it learned:")
         print("    ▶ agentx review")
     elif len(_session_stats["recovered_traces"]) > 0:
+        # This line promised "AgentX may have learned reusable safe-paths" and
+        # sent the reader to `agentx review` to adopt them. Learned safe-paths are harvested
+        # from the gateway's incident store, which a keyless run never writes, so on the free
+        # door the promise was empty -- and `review` was NOT empty: it showed rule proposals
+        # built from ALLOWED calls, unrelated to the recovery that fired this line, with no
+        # way for the reader to tell. A mis-attribution, not a dead CTA. The self-correction
+        # itself is real and stays; the "so we learned something, go adopt it" clause goes.
+        # Where a gateway DID write the store, `review` still lists what it learned, so the
+        # command stays too, offered for what it shows rather than for what this line guesses.
         print("─"*60)
-        print(" 💡 Your agents self-corrected this session — AgentX may have learned")
-        print("    reusable safe-paths. Review & adopt what it learned:  agentx review")
+        print(" 💡 Your agent self-corrected this session after a block: it found another")
+        print("    way to the goal. What it did, and anything there is to adopt:  agentx review")
     elif _session_stats["total_calls"] > 0 and _sum_counters(_TRIPPED_COUNTERS) == 0:
         # 🔴 THE MAJORITY CASE HAD NO BRANCH AT ALL. The ladder above ends here, and
         # both of its arms need something to have been CAUGHT -- so a developer whose agent
@@ -5767,6 +5818,31 @@ def _audit_scope_phrase():
     return "Nothing is blocking"
 
 
+def _would_block_narration(head, body):
+    """The 🔍 line a user reads on every would-block, in ONE shape for its three sites.
+
+    🔴 IT WAS ONE 170-COLUMN LINE, IN THE OLD WORD, IN THREE SPELLINGS. The default read
+    "[AgentX AUDIT] Would have blocked '<tool>' on policy '<name>'. Nothing is blocking, so
+    the call was allowed through and recorded. Review what audit caught with: agentx
+    insights"; the release backstop said "Would have stopped '<tool>' (<name>) ... control
+    returned to your code unchanged. Recorded: agentx insights"; the scrub site a third.
+    On the founder's demo read it wrapped mid-word in his terminal three lines above
+    "Watching blocks nothing", and "what audit caught" there reads as a second thing
+    beside watching. Two lines inside the 75 fence, the [AgentX SDK] tag every other
+    decorator line carries, the head each site owns (one line, whatever the tool is
+    called), the body under it with `_audit_scope_phrase` once, and the command with a
+    plain "See it", held together through the wrap.
+    """
+    import textwrap
+    kw = dict(width=75, break_long_words=False, break_on_hyphens=False)
+    # The head is one line whatever the tool is called (a tool name does not wrap well);
+    # the body wraps under it, and the command is held together through the wrap.
+    first = "🔍 [AgentX SDK] %s" % head
+    second = textwrap.fill("%s. See it:  agentx\u2060insights" % body,
+                           initial_indent="   ", subsequent_indent="   ", **kw)
+    return first + "\n" + second.replace("agentx\u2060insights", "agentx insights")
+
+
 def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, category,
                         narration=None, arguments=None):
     """The RECORD half of the audit route, split out so EVERY audit path writes the same
@@ -5828,10 +5904,9 @@ def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, c
     # caller's `except Exception` (the Layer-0 shield's) would swallow it and fall through
     # to the gateway path, double-counting this one call. The record above already stood.
     try:
-        print(narration or (
-            f"🔍 [AgentX AUDIT] Would have blocked '{tool_name}' on policy '{policy_name}'. "
-            f"{_audit_scope_phrase()}, so the call was allowed through and recorded. "
-            f"Review what audit caught with: agentx insights"))
+        print(narration or _would_block_narration(
+            f"Would have stopped '{tool_name}':",
+            f"{policy_name}. {_audit_scope_phrase()}, so it ran and was recorded"))
     except Exception:
         pass
 
@@ -5929,6 +6004,56 @@ def _inventory_due(outcome):
             and not outcome.recorded)
 
 
+def _match_adopted_rule_keyless(agent_id, tool_name, arguments):
+    """The adopted rule this passing call is the shape of, when the SDK is the only
+    thing that could know. Returns the rule dict for `record_call`, or None. Never raises.
+
+    KEYLESS ONLY, gated on the session never having reached a gateway. A gateway arms the
+    same rule with BOTH halves -- the symbolic half this matcher has, and the meaning half it
+    does not -- and speaks first on every call it sees. If it let this call through, it judged
+    the rule's meaning and found the call clean; annotating "matched your rule" on the same
+    row would set the SDK's shape-only reading against the gateway's meaning-based verdict,
+    on the tier that pays for the difference. So once a gateway has answered this session,
+    the SDK stays out of rule matching entirely.
+
+    RECORDS, NEVER BLOCKS, in every posture. The match is a statement about SHAPE ("a call to
+    the tool your rule names, carrying the indicators it lists"), not about meaning, and the
+    gap between the two is exactly the false positive the shipped floor has already paid for
+    before. So a match here changes a status label and a count on the audit screen, and
+    nothing about whether the tool ran. Founder-ratified direction.
+
+    Two counters, same split as the would-block pair beside `_record_would_block`, and the
+    adjacency rule stated there applies: `rule_matches` is the pulse's (excludes our demo),
+    `rule_matches_seen` is the screen's. The narration prints ONCE PER RULE per session, not
+    per call: a rule on a tool called five hundred times in a loop is five hundred matches
+    and one sentence.
+    """
+    try:
+        if _session_stats.get("gateway_reached"):
+            return None
+        from .rules import match_adopted_rule
+        rule = match_adopted_rule(tool_name, arguments)
+        if not rule:
+            return None
+        _incr("rule_matches_seen")
+        if not _is_demo_agent(agent_id):
+            _incr("rule_matches")
+        with _stats_lock:
+            narrated = _session_stats.setdefault("rule_matches_narrated", set())
+            first_time = rule["id"] not in narrated
+            narrated.add(rule["id"])
+        if first_time:
+            try:
+                print(f"🧩 [AgentX RULE] '{tool_name}' matched your rule '{rule['name']}'. "
+                      f"Recorded and let run: the SDK matches the shape of a rule, and only "
+                      f"a gateway judges the meaning. See every match:  agentx audit")
+            except Exception:
+                pass
+        return rule
+    except Exception:
+        return None
+
+
 def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, description=None):
     """P-92: record ONE call we had NO opinion about. Best-effort; never raises.
 
@@ -5955,7 +6080,8 @@ def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, descri
         # rather than "ran a protected tool at all". See db._bump_audit_counters.
         record_call(trace_id, agent_id, tool_name, arguments,
                     stats=_session_stats, stats_lock=_stats_lock,
-                    in_audit=in_audit, description=description)
+                    in_audit=in_audit, description=description,
+                    matched_rule=_match_adopted_rule_keyless(agent_id, tool_name, arguments))
     except Exception:
         # Deliberately silent, unlike the would-block narration. This runs on EVERY passing
         # call, so a per-call complaint would turn one broken ledger into thousands of lines
@@ -6080,9 +6206,10 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
         _record_would_block(
             trace_id, agent_id, tool_name, "local-dlp", "Local DLP (PII scrub)",
             "PII_EXFILTRATION",
-            narration=(f"🔍 [AgentX AUDIT] Would have scrubbed {outcome.scrub_targets} from "
-                       f"'{tool_name}' output. {_audit_scope_phrase()}, so the result was "
-                       f"returned UNCHANGED. Recorded: agentx insights"),
+            narration=_would_block_narration(
+                f"Would have scrubbed {outcome.scrub_targets} from '{tool_name}' output:",
+                f"{_audit_scope_phrase()}, so the result was returned unchanged and "
+                "recorded"),
             arguments=arguments)
         # recorded=True on every path that just wrote a would-block row, including the two
         # that return straight to the caller and cannot re-enter the clean branch today.
@@ -6154,9 +6281,10 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
         # so it does not know the KIND of action. _note_block_category drops a None, which
         # is the honest outcome — better an absent category than a guessed one.
         None,
-        narration=(f"🔍 [AgentX AUDIT] Would have stopped '{tool_name}' ({policy_name}). "
-                   f"{_audit_scope_phrase()}, so the call ran and control returned to your "
-                   f"code unchanged. Recorded: agentx insights"),
+        narration=_would_block_narration(
+            f"Would have stopped '{tool_name}':",
+            f"{policy_name}. {_audit_scope_phrase()}, so it ran and control returned to "
+            "your code unchanged"),
         arguments=arguments)
     return _ExecuteTool(recorded=True)
 
@@ -6603,8 +6731,12 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # merely not-false on both paths when the exact one is already in hand.
             _strikes = _session_stats['consecutive_strikes'].get(func_name, 0)
             _strike_word = "flagged" if enforcement_level == "audit" else "blocked"
+            # "once already" / "3 times in a row already", not "1x in a row already"
+            # (founder demo read).
+            _strike_phrase = ("once already" if _strikes == 1
+                              else f"{_strikes} times in a row already")
             print(f"\n🛡️ [AgentX SDK] Checking '{func_name}'..."
-                 + (f" ({_strike_word} {_strikes}x in a row already)" if _strikes else ""))
+                 + (f" ({_strike_word} {_strike_phrase})" if _strikes else ""))
 
             # =====================================================================
             # 🪶 LAYER 0: OUT-OF-PROMPT LOCAL KEYWORD / INTENT PRE-FILTER
@@ -7306,7 +7438,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # AUDIT posture: an escalation is a verdict about ONE action, so
                 # audit releases it like any other. Handled HERE rather than left to
                 # `_audit_release` because everything below it is the side effect: this path
-                # SUSPENDS the caller for up to 120s polling a human, and a gate on the
+                # SUSPENDS the caller for up to _HITL_DEFAULT_SECONDS polling a human, and a gate on the
                 # return value cannot un-wait that. Watch-only has to mean the developer's
                 # call does not pause, not merely that it eventually proceeds.
                 #
@@ -7442,7 +7574,24 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     print(f"⚠️ [AgentX SDK] No human decision within {max_poll_seconds}s. "
                           f"The action was NOT executed.")
                     print("   Set AGENTX_HITL_TIMEOUT_SECONDS to give a person longer.")
-                    return "AgentX Error: Timeout waiting for SOC approval. Aborting action."
+                    # The SAME shape as DENIED and DISMISSED above. This was a bare string
+                    # ("AgentX Error: Timeout waiting for SOC approval. Aborting action.")
+                    # while the other two terminal outcomes of the same wait handed the model
+                    # `{error, instruction}` telling it what to do next -- so the one outcome
+                    # where the agent had done nothing wrong was the one that left it guessing.
+                    # Found while routing an agent's own cleanup through this wait.
+                    # 🔴 THE STATE IT NAMES MUST BE THE STATE THAT EXISTS. The first version
+                    # said "report that it is waiting on a human", but `_expire_escalation`
+                    # above has just closed the item, so nobody is waiting on anything and no
+                    # queue holds it. Same instruction as a denial, because it is the same state.
+                    return json.dumps({
+                        "error": "AgentX Human Escalation Timed Out",
+                        "instruction": (
+                            f"No person decided within {max_poll_seconds}s, so this action was "
+                            "NOT run and the request has expired. Do not retry it. Find an "
+                            "alternative path or fail the task, and say the action needs a "
+                            "person to run it."),
+                    })
 
             # 3. Check for the "Success" path
             elif isinstance(eval_res, dict) and eval_res.get("status") in ["success", "ALLOWED"]:
@@ -7601,7 +7750,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # body below — restoring parity with the sync path (also #115 finding 5).
                 if not trace_id_var.get():
                     start_secure_session()
-                # Run the BLOCKING decision core (gateway call + up-to-120s HITL poll)
+                # Run the BLOCKING decision core (gateway call + bounded HITL poll (_HITL_DEFAULT_SECONDS))
                 # on a DEDICATED bounded pool, NOT asyncio's default executor, so it
                 # can never starve the host app's own run_in_executor / to_thread
                 # (#115 finding 2). copy_context() carries the trace into the worker.

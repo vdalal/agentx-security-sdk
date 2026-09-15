@@ -63,11 +63,23 @@ _TIMEOUT = 1.0                     # seconds — best-effort; bounds the atexit 
 # splits had_block/first_block_ever (booleans) out from the count keys.
 _ALLOWED_KEYS = {"install_id", "sdk_version", "python", "os", "first_seen", "ts",
                  "mode", "gateway_present", "reasoning_enabled", "contributed",
-                 "block_category", "integration", "session", "ran_audit_report"}
+                 "block_category", "integration", "session", "ran_audit_report",
+                 # `posture`: which way this install runs, "audit" or
+                 # "enforce", a closed two-value vocab. Until this the funnel could tell a
+                 # watching install from a blocking one ONLY when something was caught
+                 # (would_blocks vs intercepts); an install whose agent behaved looked the
+                 # same either way, and since watching is the default that was most of them.
+                 # `rules_adopted`: how many detection rules this install has adopted, a
+                 # count of rows in its policy store. Names stay on disk.
+                 "posture", "rules_adopted"}
 _ALLOWED_SESSION_KEYS = {
     "tools_monitored", "intercepts", "critical_blocks",
     "human_escalations", "self_corrections", "would_blocks",
     "had_block", "first_block_ever", "shield_failopens",
+    # Calls this session that were the shape of an adopted rule. A count; NOT a
+    # would-block (a rule match is recorded in every posture and never blocks) and never
+    # folded into one. Excludes our own demo, like would_blocks.
+    "rule_matches",
     # P-107. `had_block` and `first_block_ever` cannot tell OUR canned demo from the
     # developer's own agent -- `agentx demo` wraps a tool, gets blocked and self-corrects,
     # so it moves every counter a real install moves. This is the one signal that answers
@@ -811,6 +823,34 @@ def _integration(session_stats):
     return v if v in _INTEGRATION_VOCAB else "decorator"
 
 
+_POSTURE_VOCAB = frozenset({"audit", "enforce"})
+
+
+def _posture(session_stats):
+    """The posture the door resolved for this session, or None. Off-vocab -> None, so a
+    stray value can never ride the wire as text. Each door stamps `session_stats["posture"]`
+    from the ONE resolver (`decorators._resolve_enforcement`) right before ending the session;
+    this reads it and takes no view of its own on how a posture is decided."""
+    v = session_stats.get("posture")
+    return v if isinstance(v, str) and v in _POSTURE_VOCAB else None
+
+
+def _rules_adopted():
+    """How many rules this install has adopted, or None if the store could not be read.
+
+    None, not 0, on a failed read: a zero has to mean "none adopted", and a store we could
+    not open would otherwise report exactly that. A count only -- the rule names, and the
+    tool names inside them, stay on the developer's disk."""
+    try:
+        # NOT `adopted_rule_count`, which reads a damaged file as 0 -- the exact zero this
+        # function's contract says must never ride the wire. The `_or_none` twin exists for
+        # this caller: a rules file that exists and cannot be read comes back None.
+        from .rules import adopted_rule_count_or_none
+        return adopted_rule_count_or_none()
+    except Exception:
+        return None
+
+
 def build_payload(session_stats, state, first_block_ever=None):
     """Assemble the abstract pulse. WHITELIST ONLY — reads counters, never content.
 
@@ -859,6 +899,13 @@ def build_payload(session_stats, state, first_block_ever=None):
         # closed-vocab, no identity. A pre-integration-field SDK omits it, so the
         # receiver maps absent -> NULL = "pre-signal".
         "integration": _integration(session_stats),
+        # Watching or blocking, for every install and not only the ones with a
+        # catch. Closed vocab, validated above; the door stamps it from the one resolver.
+        "posture": _posture(session_stats),
+        # Adopted-rule count from the policy store. Cross-process like `contributed`
+        # (adoption happens in the CLI), but read from the store rather than persisted state
+        # because the store IS the fact. None = could not read, never 0 for that.
+        "rules_adopted": _rules_adopted(),
         "session": {
             "tools_monitored": int(session_stats.get("total_calls", 0)),
             "intercepts": int(session_stats.get("intercepts", 0)),
@@ -901,6 +948,9 @@ def build_payload(session_stats, state, first_block_ever=None):
             # Both are counts; the NAMES stay on the user's disk.
             "audit_calls": int(session_stats.get("audit_calls", 0)),
             "audit_tools": int(session_stats.get("audit_tools", 0)),
+            # Calls that were the shape of an adopted rule. Its own count, never a
+            # would-block: recorded in every posture, blocks nothing, excludes our demo.
+            "rule_matches": int(session_stats.get("rule_matches", 0)),
         },
         # CROSS-PROCESS, so it rides top-level off the persisted state rather than the
         # session: the agent run that records the inventory and the `agentx audit` that reads

@@ -9,14 +9,14 @@ loop on the CLI:
   * HARVEST — ``harvest_rule_candidates()`` projects the *reusable*
               ``rule_suggestion`` rows from the local incident store into ranked
               structural-rule candidates.
-  * ADOPT   — ``adopt_rule()`` writes the chosen candidate as a structural policy
-              into the local policy store (``.agentx/policies.db``). The gateway
-              already loads + evaluates that store at boot (symbolic
-              ``target_action`` + neural ``semantic_description``), and boot
-              reconciliation never overwrites non-baseline rows — so the rule goes
-              live on the gateway's next start with ZERO gateway change, the same
-              elegance as the SDK-swap for reframes. The manual adopt step is the
-              anti-poisoning gate: an agent-derived rule never arms itself.
+  * ADOPT   — ``adopt_rule()`` writes the chosen candidate into the project's
+              committable rules file (``.agentx/rules.json``, see the block above
+              ``_rules_file_path``). The keyless SDK matches it on its symbolic half
+              from the next call; a gateway that reads the file arms both halves
+              (symbolic ``target_action`` + neural ``semantic_description``) on its
+              next policy refresh, and at boot. The manual adopt step is the
+              anti-poisoning gate: an
+              agent-derived rule never arms itself.
 
               🔴 AND IT HAS TO HOLD OFF A TERMINAL TOO, WHICH TAKES AN EXPLICIT GATE.
               A confirm that auto-proceeds when stdin is not a tty makes the ABSENCE of
@@ -37,6 +37,7 @@ module load (the 0.3.1 import-safety lesson).
 import json
 import os
 import sqlite3
+import sys
 import uuid
 
 # Reuse the project-root anchor + incident-store resolver + timestamp so the CLI
@@ -356,6 +357,9 @@ def harvest_rule_candidates_from_calls(db_path=None, limit=5):
             "evidence": evidence,
             "indicators": [],
             "policy_violated": None,
+            # The shape the sentence above was built from, kept as data so `rule_name` can
+            # name the rule from the same facts instead of re-parsing the sentence.
+            "arg_names": names,
             "count": int(count or 0),
         })
         if len(candidates) >= int(limit):
@@ -363,152 +367,542 @@ def harvest_rule_candidates_from_calls(db_path=None, limit=5):
     return candidates
 
 
-def _existing_rule_actions(path=None):
-    """`target_action` values the developer ADOPTED, so we never propose a rule for something
-    they have already ruled on. Never raises; an unreadable or absent store suppresses nothing.
+# =====================================================================
+# THE RULES FILE: `.agentx/rules.json`
+# =====================================================================
+# Adopted rules used to live as rows in `policies.db`, beside the shipped baseline, for one
+# reason: the gateway already loaded that store at boot, so a rule written there armed with no
+# gateway change. That convenience had a cost nobody chose on its merits. A rule is
+# configuration the developer authored, and everything else they author is committable text
+# (`overrides.json`, the verdicts file); rules were the one thing in a binary, so they could not
+# be shared through the repo, reviewed in a pull request, or reach a CI machine at all. The
+# founder's question on the walk was why user rules live in a database. They do not any more.
+#
+# The file is the SOURCE OF TRUTH, not an export. There is no second copy to drift.
+#
+# Shape (one object per rule, sorted by id, two-space indent, trailing newline, so an adopt
+# that changes nothing is a no-op diff):
+#
+#   {"version": 1, "rules": [{"id": "rule-…", "name": …, "target_action": …, "indicators": [],
+#                             "semantic_description": …, "coaching": …, "active": true,
+#                             "adopted_at": "…"}]}
+#
+# `active` is a POSITIVE field. A rule the developer switched off is present with `active:
+# false`; a rule absent from the file does not exist. Absence never carries a decision -- a
+# switched-off rule and a truncated file must not be the same bytes.
+#
+# Ids keep the `rule-` prefix. The ledger row for a matched call carries the rule's id, and
+# every reader of that row (`db.is_rule_match`, the audit screens, the dashboard) keys on the
+# prefix, so a rule carried over from the database keeps its id and its history.
+#
+# NOT `.agentx/import.json`: that file is consumed once by `agentx import` (coaching and
+# verdicts); this one is read on every call and at every gateway boot. Three concerns, three
+# files, the way verdicts left `overrides.json` so sharing coaching does not share judgments.
+#
+# A file an agent can write is a file an agent can poison. The `adopt` prompt keeps its human
+# `y`, and the repository's own review is the gate on the file -- which is also the point: a
+# rule change shows up in a pull request like any other configuration change.
+DEFAULT_RULES_FILE = os.path.join(".agentx", "rules.json")
+_RULES_FILE_VERSION = 1
 
-    🔴 `WHERE id LIKE 'rule-%'`, AND THE FILTER IS THE WHOLE CORRECTNESS OF IT. The policy
-    store also holds the SHIPPED BASELINE rows, so a plain `SELECT target_action FROM policies`
-    returns every built-in rule on any install that has booted the gateway or run `agentx
-    pull`. Two things then go wrong at once: this suppresses proposals for tools the developer
-    never ruled on, and the status screen counting these tells them they adopted rules they
-    never adopted. `adopt_rule` mints `rule-<uuid>` ids precisely so an adopted row is
-    distinguishable from a shipped one; nothing else in the table carries that prefix.
+
+def _rules_file_path(path=None):
+    """Where the adopted rules live. Explicit arg, else ``AGENTX_RULES_FILE``, else the sibling of
+    an explicit ``AGENTX_POLICY_DB``, else ``<project>/.agentx/rules.json``.
+
+    The sibling rule is what keeps every existing test's isolation intact: the suites pin
+    ``AGENTX_POLICY_DB`` to a temp directory, and the rules file lands beside it rather than in
+    the developer's real project. It is also the right answer for a human who moved the policy
+    store deliberately: their rules go where their store went.
     """
+    if path:
+        # A caller handing this the DATABASE path is a bug from before the move, and writing
+        # JSON into a file named policies.db is the quiet kind. Found by a test fixture that
+        # did exactly that; refused here so the next one is loud.
+        if str(path).lower().endswith(".db"):
+            raise ValueError("%s is the policy store; the rules file is rules.json beside it"
+                             % path)
+        return path
+    env = os.environ.get("AGENTX_RULES_FILE")
+    if env:
+        return env
+    db_env = os.environ.get("AGENTX_POLICY_DB")
+    if db_env:
+        return os.path.join(os.path.dirname(os.path.abspath(db_env)), "rules.json")
+    return os.path.join(_anchored_root(), DEFAULT_RULES_FILE)
+
+
+def _read_rules_file(p):
+    """The rules in the file, as stored. Raises on a file that exists and cannot be read as this
+    file's shape; returns [] for a file that does not exist. The distinction is deliberate: an
+    absent file means none adopted, a damaged file must never read as none adopted."""
+    if not os.path.exists(p):
+        return []
+    with open(p, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    if isinstance(doc, dict) and not isinstance(doc.get("rules"), list) \
+            and ({"reframes", "verdicts"} & set(doc)):
+        # The org-brain seed under its old name. Every reader that lists rules would warn on
+        # every command without saying what to do; this says it once, where the reader looks.
+        raise ValueError("%s is an org import file from an earlier version (coaching/verdicts); "
+                         "move it to .agentx/import.json, which `agentx import` reads, and this "
+                         "name is free for your adopted rules" % p)
+    if not isinstance(doc, dict) or not isinstance(doc.get("rules"), list):
+        raise ValueError("%s is not a rules file (expected {\"version\", \"rules\": [...]})" % p)
+    out = []
+    for r in doc["rules"]:
+        if not isinstance(r, dict) or not str(r.get("id") or "").startswith("rule-"):
+            raise ValueError("%s holds a rule without a 'rule-' id" % p)
+        out.append(r)
+    return out
+
+
+def _write_rules_file(p, rules):
+    """Write the whole file, deterministically, via a temp file and rename so a crash mid-write
+    leaves the old file rather than half of the new one."""
+    parent = os.path.dirname(p)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    doc = {"version": _RULES_FILE_VERSION,
+           "rules": sorted(rules, key=lambda r: str(r.get("id")))}
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(doc, fh, indent=2, ensure_ascii=False, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, p)
+
+
+def _policy_db_rule_rows(db_path=None):
+    """The adopted rules still sitting as `rule-` rows in `policies.db`, in the FILE's shape,
+    READ ONLY. `[]` when there is no store or no such rows; `None` when the store exists and
+    could not be read, so a caller counting them never turns "could not look" into 0.
+
+    Three readers, one query: the one-time move below, the pulse counter (which must count
+    without writing), and the hot-path matcher on an install that has not moved yet (which
+    must match without writing). The first cut had only the move, and both other readers
+    reached for it -- so the anonymous pulse migrated the developer's configuration at
+    process exit, and an upgraded agent whose rules were still in the store matched nothing
+    until some command happened to run. Found by the scoped review of this branch.
+    """
+    # 🔴 "NO SUCH TABLE" AND "NO SUCH COLUMN" ARE 0, NOT None. A store with no `policies`
+    # table (a 0-byte file, a bare connect) or with a table narrower than the one `adopt` wrote
+    # into cannot hold an adopted rule, so there is nothing to move and nothing to count.
+    # Reading those as "could not read" made the writer refuse forever ("run the command
+    # again", against a store no command would ever change), which the founder's suite run
+    # hit on a test fixture with a four-column table. Locked, or not a database at all, is
+    # still None: those stores may well hold rules we cannot see right now.
+    needed = ("id", "created_at", "name", "semantic_description", "target_action",
+              "blocked_intents", "socratic_prompt", "is_active")
     try:
-        p = _policy_db_path(path)
-        if not os.path.exists(p):
-            return set()
-        conn = sqlite3.connect(p)
+        dbp = _policy_db_path(db_path)
+        if not os.path.exists(dbp):
+            return []
+        conn = sqlite3.connect(dbp)
         try:
-            return {row[0] for row in conn.execute(
-                "SELECT target_action FROM policies WHERE id LIKE 'rule-%'") if row and row[0]}
+            have = {r[1] for r in conn.execute("PRAGMA table_info(policies)").fetchall()}
+            if not have or not set(needed) <= have:
+                return []
+            rows = conn.execute(
+                "SELECT %s FROM policies WHERE id LIKE 'rule-%%' ORDER BY id"
+                % ", ".join(needed)).fetchall()
         finally:
             conn.close()
-    except sqlite3.Error:
+    except Exception:
+        return None
+    out = []
+    for rid, created, name, desc, action, intents, socratic, active in rows:
+        try:
+            indicators = [str(i) for i in (json.loads(intents) if intents else []) if i]
+        except (TypeError, ValueError):
+            indicators = []
+        out.append({
+            "id": rid, "name": name or rid, "target_action": action,
+            "indicators": indicators, "semantic_description": desc or "",
+            "coaching": socratic or "",
+            "active": bool(active) if active is not None else True,
+            "adopted_at": created or _now_iso(),
+        })
+    return out
+
+
+def _carry_rules_from_policy_db(p, db_path=None):
+    """ONE-TIME MOVE of adopted rows out of `policies.db` into the file. Returns how many moved,
+    or None when there were rows to move and the move FAILED: a writer must tell those apart,
+    because "nothing to move" licenses writing a fresh file and "the move failed" does not.
+
+    Runs only when the file does not exist yet, so an install that has already moved is never
+    touched again. A MOVE, not a copy: two stores holding one rule is the exact class of defect
+    where a deliberate act and a stale copy become the same bytes. The rows are deleted from the
+    database only after the file is on disk. Prints what it did, because a silent migration of
+    the developer's own configuration is the kind of thing that costs an afternoon.
+
+    🔴 A MOVE THAT HALF-HAPPENS IS UNDONE, NOT LEFT. If the delete fails after the file is
+    written (a local gateway holding the store open, say), the file just written is removed
+    again and the failure is said out loud: both stores are then exactly as they were, and the
+    next command retries. The first cut swallowed that failure with the file in place, so the
+    rows stayed in the store forever (the carry never runs once the file exists) and a
+    local-mode gateway kept arming them from the store after `agentx review --undo` had
+    removed them from the file. Found by the scoped review of this branch.
+
+    Never raises. A store that exists and cannot be READ is a failed move too (None), not
+    "nothing to move": the writer above would otherwise create the file over rows it never
+    saw, and the rows would be stranded behind it (third instance of the class, found by the
+    review of the second). No store at all, or no `rule-` rows, is 0.
+    """
+    try:
+        dbp = _policy_db_path(db_path)
+        carried = _policy_db_rule_rows(db_path)
+        if carried is None:
+            print("⚠️ could not read %s to move your adopted rules out of it; nothing changed, "
+                  "the next command retries. If a local gateway is running, stop it first."
+                  % dbp, file=sys.stderr)
+            return None
+        if not carried:
+            return 0
+        _write_rules_file(p, carried)
+        try:
+            conn = sqlite3.connect(dbp)
+            try:
+                conn.execute("DELETE FROM policies WHERE id LIKE 'rule-%'")
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as err:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            print("⚠️ could not move %d adopted rule%s out of %s (%s). Nothing changed; the "
+                  "next command retries. If a local gateway is running, stop it first."
+                  % (len(carried), "" if len(carried) == 1 else "s", dbp, err), file=sys.stderr)
+            return None
+        print("📦 moved %d adopted rule%s from %s to %s; commit that file to share them"
+              % (len(carried), "" if len(carried) == 1 else "s", dbp, p))
+        return len(carried)
+    except Exception:
+        return None
+
+
+def _store_beside(rules_path, explicit):
+    """The policy store a rules file stands in for: beside an EXPLICIT rules path, else the
+    resolved default. One answer for the move, the writer and the hot-path fallback, so a
+    caller naming a scratch file never reads (or, worse, moves rows out of) the machine's
+    default store. Two of the three had it wrong in turn; the third copy is the rule."""
+    if explicit:
+        return os.path.join(os.path.dirname(os.path.abspath(rules_path)), "policies.db")
+    return None      # `_policy_db_path(None)`: env or the project default
+
+
+def _load_rules(path=None):
+    """Every rule in the file, active or not, after the one-time carry. Never raises: a damaged
+    file is reported once on stderr and read as [] for THIS call, so a screen still renders --
+    but the count functions below say None for it rather than 0, because a zero from a file we
+    could not read is a claim we cannot make."""
+    p = _rules_file_path(path)
+    if not os.path.exists(p):
+        _carry_rules_from_policy_db(p, db_path=_store_beside(p, path))
+    try:
+        return _read_rules_file(p)
+    except Exception as err:
+        print("⚠️ could not read %s (%s); treating it as empty for this command" % (p, err),
+              file=sys.stderr)
+        return []
+
+
+def _load_rules_for_writing(path=None):
+    """`_load_rules` for a WRITER. A reader can treat a file it cannot parse as empty for one
+    screen; a writer that did the same would then replace that file with its own, and the
+    developer's file is gone. So this raises instead, naming the file.
+
+    🔴 THE FILE NAME IS SHARED WITH AN EARLIER FEATURE. `.agentx/rules.json` was the org-brain
+    seed file (reframes and verdicts) before it was renamed to `import.json`, and
+    `overrides._org_rules_path` still reads a legacy one. A project that kept that file would
+    have had it read as "damaged" here and overwritten by the first `adopt`. The reverse
+    direction is guarded in `_org_rules_path`: it does not take a detection-rules document as
+    a legacy import file.
+    """
+    p = _rules_file_path(path)
+    if not os.path.exists(p):
+        # 🔴 A FAILED MOVE IS NOT AN EMPTY FILE. The carry says None when rows were there and
+        # could not be moved; reading the (absent) file as [] here would write a fresh file
+        # holding only the new rule, and the old rows would be stranded in the store behind
+        # it, forever, which is the half-done state the carry just refused to leave. Round two
+        # of the scoped review found this inside round one's fix.
+        if _carry_rules_from_policy_db(p, db_path=_store_beside(p, path)) is None:
+            raise ValueError("not writing %s: your earlier rules are still in the policy store "
+                             "and could not be moved into the file just now (see the line "
+                             "above). Nothing changed; run the command again." % p)
+    try:
+        return _read_rules_file(p)
+    except Exception as err:
+        raise ValueError("not writing %s: it exists and is not an adopted-rules file. %s"
+                         % (p, err))
+
+
+def _existing_rule_actions(path=None):
+    """`target_action` values the developer ADOPTED, so we never propose a rule for something
+    they have already ruled on. Never raises; an unreadable or absent file suppresses nothing.
+    Switched-off rules count: the developer ruled on that tool, whichever way the switch sits."""
+    try:
+        return {r.get("target_action") for r in _load_rules(path) if r.get("target_action")}
+    except Exception:
         return set()
 
 
 def adopted_rules(path=None):
     """The detection rules the developer ADOPTED, for the undo pass. Never raises.
 
-    Same `rule-%` filter as `_existing_rule_actions`, and for the same reason: the policy store
-    also holds the SHIPPED BASELINE, and nothing but an adopted row carries that prefix. Here
-    the filter is not just correctness, it is the safety boundary -- this list is what a delete
-    is offered against.
-    """
+    Only `rule-` ids ever enter the file (`_read_rules_file` refuses anything else), so this list
+    is the safety boundary a delete is offered against, as it was when the rows sat beside the
+    shipped baseline in the database."""
     try:
-        p = _policy_db_path(path)
-        if not os.path.exists(p):
-            return []
-        conn = sqlite3.connect(p)
-        try:
-            rows = conn.execute(
-                "SELECT id, target_action, semantic_description FROM policies "
-                "WHERE id LIKE 'rule-%' ORDER BY target_action, id").fetchall()
-        finally:
-            conn.close()
-    except sqlite3.Error:
+        return [{"id": r["id"], "name": r.get("name") or r["id"],
+                 "target_action": r.get("target_action"),
+                 "semantic_description": r.get("semantic_description"),
+                 "active": bool(r.get("active", True))}
+                for r in sorted(_load_rules(path),
+                                key=lambda r: (str(r.get("target_action")), str(r["id"])))]
+    except Exception:
         return []
-    return [{"id": r[0], "target_action": r[1], "semantic_description": r[2]} for r in rows]
 
 
 def remove_rule(rule_id, path=None):
-    """Un-adopt ONE rule by id. Returns True if a row was actually deleted.
+    """Un-adopt ONE rule by id. Returns True if a rule was actually removed.
 
-    🔴 THE PREFIX IS CHECKED TWICE, IN PYTHON AND IN THE SQL, AND THAT IS NOT BELT-AND-BRACES
-    FOR ITS OWN SAKE. This is the only DELETE against the policy store that a keystroke can
-    reach. The shipped baseline lives in the same table, so an id that slipped through would
-    remove a policy we ship and the developer would have no idea which. A caller passing
-    anything without the adopted-row prefix is a bug, so it raises rather than silently
-    matching nothing.
-    """
+    The prefix is still checked, and it still raises on a bad caller rather than silently
+    matching nothing: this is the only keystroke-reachable delete of the developer's own
+    configuration, and a caller handing it something that is not an adopted-rule id is a bug."""
     if not rule_id or not str(rule_id).startswith("rule-"):
         raise ValueError("remove_rule only removes ADOPTED rules (id must start with 'rule-')")
     try:
-        p = _policy_db_path(path)
-        if not os.path.exists(p):
+        p = _rules_file_path(path)
+        rules = _load_rules(path)
+        kept = [r for r in rules if r.get("id") != rule_id]
+        if len(kept) == len(rules):
             return False
-        conn = sqlite3.connect(p)
-        try:
-            cur = conn.execute(
-                "DELETE FROM policies WHERE id IS ? AND id LIKE 'rule-%'", (rule_id,))
-            conn.commit()
-            return (cur.rowcount or 0) > 0
-        finally:
-            conn.close()
-    except sqlite3.Error:
+        _write_rules_file(p, kept)
+        return True
+    except Exception:
         return False
 
 
-def adopted_rule_count(path=None):
-    """How many rules the developer adopted. A COUNT of rows, not of distinct actions.
+_MATCH_CACHE = {}   # path -> ((mtime_ns, size), rules)
 
-    Separate from `_existing_rule_actions` on purpose: that one answers "which tools have
-    already been ruled on", where collapsing duplicates is correct. A screen saying "2 rules
-    you adopted" is counting ROWS, and two adopted rules on one action would render as "1"
-    if it reused the set.
+
+def _armed_adopted_rules(path=None):
+    """The ACTIVE adopted rules, loaded once per change to the file. Never raises.
+
+    Called on the hot path (every recorded call), so it cannot parse JSON each time. The cache
+    key is the file's (mtime, size): an adopt, an undo or a hand edit changes at least one of
+    them, and an unchanged file is not reopened. `_rules_file_path()` still walks up from cwd to
+    find the project root on every call -- known, not measured, left open.
+
+    🔴 AN ABSENT FILE READS THE STORE, READ ONLY, AND NEVER MIGRATES. An install upgrading to
+    the file still has its rules as rows in `policies.db` until some command lists them; the
+    first cut matched nothing in that window, so the calls that were matched and recorded the
+    day before the upgrade silently stopped being, with nothing saying why. The rows are read
+    here the way the file is (cached on the store's own mtime and size), and the move itself
+    still waits for a command: the hot path must not write the developer's configuration.
+
+    `active` is honoured here for the same reason the gateway honours it at boot: a rule
+    somebody switched off must not go on matching quietly in the SDK.
     """
     try:
-        p = _policy_db_path(path)
-        if not os.path.exists(p):
-            return 0
-        conn = sqlite3.connect(p)
+        p = _rules_file_path(path)
+        source, reader = p, _read_rules_file
         try:
-            return conn.execute(
-                "SELECT COUNT(*) FROM policies WHERE id LIKE 'rule-%'").fetchone()[0] or 0
-        finally:
-            conn.close()
-    except sqlite3.Error:
+            st = os.stat(p)
+        except OSError:
+            _MATCH_CACHE.pop(p, None)
+            # The store BESIDE the rules file it stands in for, so an explicit `path` never
+            # reads the machine's default store by accident (round two of the scoped review).
+            source = _policy_db_path(_store_beside(p, path))
+            reader = (lambda dbp: _policy_db_rule_rows(dbp) or [])
+            try:
+                st = os.stat(source)
+            except OSError:
+                _MATCH_CACHE.pop(source, None)
+                return []
+        key = (st.st_mtime_ns, st.st_size)
+        cached = _MATCH_CACHE.get(source)
+        if cached and cached[0] == key:
+            return cached[1]
+        rules = []
+        for r in reader(source):
+            if not r.get("active", True):
+                continue
+            rules.append({"id": r["id"], "name": r.get("name") or r["id"],
+                          "target_action": r.get("target_action"),
+                          "indicators": [str(i) for i in (r.get("indicators") or []) if i]})
+        rules.sort(key=lambda r: (str(r["target_action"]), r["id"]))
+        _MATCH_CACHE[source] = (key, rules)
+        return rules
+    except Exception:
+        return []
+
+
+def _call_text(arguments):
+    """One lowercase string of the call's argument VALUES, for indicator matching.
+
+    Built in memory and dropped; nothing derived from it is written anywhere. The ledger row
+    that records the match carries only the rule's own id and name, which are our strings.
+    """
+    if not arguments:
+        return ""
+    # Leaf VALUES, joined raw. Not json.dumps: that escapes backslashes, quotes and every
+    # non-ASCII character, so an indicator like a Windows path or a name with an accent could
+    # never match -- a silent false negative on the one half this matcher claims to do
+    # exactly. Keys are left out on purpose: an indicator equal to an argument NAME would
+    # otherwise match every call to the tool.
+    out = []
+    stack = [arguments]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, dict):
+            stack.extend(v.values())
+        elif isinstance(v, (list, tuple, set, frozenset)):
+            stack.extend(v)
+        elif v is not None:
+            try:
+                out.append(str(v))
+            except Exception:
+                continue
+    return "\n".join(out).lower()
+
+
+def match_adopted_rule(tool_name, arguments=None, path=None):
+    """The adopted rule this call hits on its SYMBOLIC half, or None.
+
+    This is the keyless SDK's whole knowledge of a user rule, and it is deliberately narrow:
+
+      * `target_action` must equal the tool name. That is the rule as the keyless proposer
+        writes it ("Calls to 'refund_payment'"), so on those rules a tool-name match IS the
+        rule, not an approximation of it.
+      * every `indicator` the rule carries must appear in the call's argument text. Indicators
+        are the exact-match IOC half a judge-derived rule ships with; a rule with none matches
+        on the tool name alone.
+
+    What it does NOT do: read `semantic_description`. The meaning half of a rule is an
+    embedding compared by meaning, the SDK has no model and, keyless, no network to reach one,
+    so that half stays on the gateway. A match here says "this call is the shape your rule
+    names", never "this call is what your rule means" -- which is why the caller RECORDS it
+    and never blocks on it.
+
+    Never raises: a match is an annotation on a call that already ran.
+    """
+    if not tool_name:
+        return None
+    try:
+        candidates = [r for r in _armed_adopted_rules(path) if r["target_action"] == tool_name]
+        if not candidates:
+            return None
+        text = None
+        for rule in candidates:
+            if rule["indicators"]:
+                if text is None:
+                    text = _call_text(arguments)
+                if not all(ind.lower() in text for ind in rule["indicators"]):
+                    continue
+            return rule
+        return None
+    except Exception:
+        return None
+
+
+def adopted_rule_count(path=None):
+    """How many rules the developer adopted, active or not. A COUNT of entries, not of distinct
+    actions: two adopted rules on one action are two rules on every screen that says "2 rules
+    you adopted"."""
+    try:
+        return len(_load_rules(path))
+    except Exception:
         return 0
 
 
-def adopt_rule(candidate, *, challenge=None, path=None):
-    """Write a structural-rule candidate into the local policy store as an ACTIVE
-    policy — the human gate. Returns the stored ``{id, name, ...}`` dict.
+def adopted_rule_count_or_none(path=None):
+    """The count for the WIRE: None when the file exists and cannot be read, so a zero on the
+    pulse always means "none adopted" and never "we could not look". `adopted_rule_count` above
+    swallows that case as 0, which is right for a screen and wrong for a counter.
 
-    The gateway evaluates it on its next boot (symbolic ``target_action`` + neural
-    ``semantic_description``; ``indicators`` are the exact-match IOC subtype). A
-    fresh ``rule-<uuid>`` id keeps it out of the way of baseline reconciliation.
+    🔴 READS, NEVER WRITES. The pulse calls this at process exit inside the developer's agent
+    and inside the MCP proxy; the first cut ran the one-time move from here, so telemetry
+    migrated the developer's configuration (and, per-user on the MCP door, whichever repo the
+    host launched from). An install that has not moved yet is counted from its store, read
+    only; the move waits for a command that lists rules.
+    """
+    try:
+        p = _rules_file_path(path)
+        if not os.path.exists(p):
+            rows = _policy_db_rule_rows(_store_beside(p, path))
+            return None if rows is None else len(rows)
+        return len(_read_rules_file(p))
+    except Exception:
+        return None
+
+
+def rule_name(candidate, override=None):
+    """The name a rule is listed under, decided in ONE place.
+
+    In order: the name the developer typed (``adopt N --name``, ``adopt --rule --name``); the
+    policy name a judge-derived candidate already carries (``policy_violated``); otherwise the
+    tool and the argument names the proposal was built from -- ``refund_payment with amount``,
+    or just ``refund_payment`` when the call carries no named arguments.
+
+    🔴 NOTHING INVENTED. This used to fall through to ``"<effect> via <tool>"``, which for every
+    keyless-proposed rule is ``OTHER via <tool>``: a category the developer never chose, printed
+    as if they had named it. It went unseen for as long as the screens led with the tool name;
+    the YOUR RULES table leads with the name, so the founder read it and asked where it came
+    from. Every word here now comes from the developer or from their own call.
+    """
+    typed = str(override or "").strip()
+    if typed:
+        return typed
+    given = str(candidate.get("policy_violated") or "").strip()
+    if given:
+        return given
+    action = str(candidate.get("target_action") or "action").strip()
+    names = [str(n).strip() for n in (candidate.get("arg_names") or []) if str(n).strip()]
+    if names:
+        return "%s with %s" % (action, ", ".join(names))
+    return action
+
+
+def adopt_rule(candidate, *, challenge=None, name=None, path=None):
+    """Write a structural-rule candidate into `.agentx/rules.json` as an ACTIVE rule — the human
+    gate. Returns the stored ``{id, name, ...}`` dict.
+
+    ``name`` is the developer's own name for the rule; see ``rule_name`` for what is used when
+    there is none.
+
+    The keyless SDK matches it on its shape from the next call; a gateway that reads the file
+    arms both halves on its next policy refresh (symbolic ``target_action`` + neural
+    ``semantic_description``; ``indicators`` are the exact-match IOC subtype).
     """
     if not candidate or not str(candidate.get("semantic_description") or "").strip():
         raise ValueError("a rule candidate with a semantic_description is required")
 
-    p = _policy_db_path(path)
-    parent = os.path.dirname(p)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
+    p = _rules_file_path(path)
+    rules = _load_rules_for_writing(path)   # raises rather than replace a file it cannot read
 
     rule_id = "rule-" + uuid.uuid4().hex[:12]
     effect = candidate.get("effect_category") or "OTHER"
     action = candidate.get("target_action") or "action"
-    name = candidate.get("policy_violated") or f"{effect} via {action}"
+    name = rule_name(candidate, override=name)
     desc = str(candidate["semantic_description"]).strip()
     indicators = [i for i in (candidate.get("indicators") or []) if i]
+    # What the agent is told on a match. It used to say "a dangerous pattern your own
+    # incidents taught AgentX", which was false for the common case: a rule adopted from the
+    # audit screen comes from ALLOWED calls, no incident ever happened, and "dangerous" was our
+    # word for a rule the developer named "Refunds need a ticket". A founder read it in his
+    # rules.json. The person who adopted the rule is the authority; the text says so.
     socratic = challenge or (
-        f"Policy Violation: {name}. This action matches a dangerous pattern your "
-        f"own incidents taught AgentX ({desc}). Reach the goal a safe way instead, "
-        f"or request human approval."
+        f"Policy Violation: {name}. This call matches a rule you adopted ({desc}). "
+        f"Reach the goal a safe way instead, or request human approval."
     )
-
-    conn = sqlite3.connect(p)
-    try:
-        conn.execute(_CREATE_POLICIES_SQL)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO policies (
-                id, created_at, name, semantic_description, target_action,
-                blocked_intents, pii_targets, socratic_prompt, is_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                rule_id, _now_iso(), name, desc, action,
-                json.dumps(indicators), None, socratic, 1,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    stored = {"id": rule_id, "name": name, "target_action": action, "indicators": indicators,
+              "semantic_description": desc, "coaching": socratic, "active": True,
+              "adopted_at": _now_iso()}
+    _write_rules_file(p, rules + [stored])
 
     return {"id": rule_id, "name": name, "target_action": action,
             "effect_category": effect, "semantic_description": desc,

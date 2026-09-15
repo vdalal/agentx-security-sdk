@@ -6,7 +6,7 @@
 
 LLM agents are powerful and brittle. Given the wrong prompt they will drop a production table, read a secret, or POST your data to an attacker's URL. A traditional guardrail answers with a hard `403` that kills the run and burns the tokens you already spent.
 
-AgentX is different, and it protects you with zero keys. The hero is a deterministic **Shield** that runs in-process, screening every call against a floor that needs no LLM and no network: `DROP TABLE`, SSRF, secret reads, destructive shell and cloud teardown. Out of the box it watches and records what it finds and blocks nothing, so adding it cannot break an agent that already works. Set `AGENTX_POSTURE=enforce`, or pin a single tool with `posture="enforce"`, and the same floor stops those calls before they run and hands your agent coaching to self-correct on. It escalates the consequential-but-legitimate ones (large transfers, external publishes, runaway spend, bulk deletes) for a human to approve. No API key, no signup, no LLM round-trip.
+AgentX is different, and it protects you with zero keys. The hero is a deterministic **Shield** that runs in-process, screening every call against a floor that needs no LLM and no network: `DROP TABLE`, SSRF, secret reads, destructive shell and cloud teardown. Out of the box it watches and records what it finds and blocks nothing. Set `AGENTX_POSTURE=enforce`, or pin a single tool with `posture="enforce"`, and the same floor stops those calls before they run and hands your agent coaching to self-correct on. It escalates the consequential-but-legitimate ones (large transfers, external publishes, runaway spend, bulk deletes) for a human to approve. No API key, no signup, no LLM round-trip.
 
 This repository is the MIT-licensed SDK: the keyless Shield, which you can read, audit, and run yourself with no AgentX account.
 
@@ -102,6 +102,20 @@ No Python in your stack? Run it on demand with [`uvx`](https://docs.astral.sh/uv
 ```
 
 (`pipx run agentx-mcp <real server command>` works the same way.) A blocked call comes back to the agent as a coaching tool error it can self-correct on, so the run keeps going and the dangerous call never reaches the server.
+
+## Read what your agent did
+
+Every wrapped call is written down locally, whether blocking is on or off. From the folder your agent ran in:
+
+```bash
+agentx audit             # grouped by tool: which tools ran, how often, what each touched
+agentx audit --calls     # one row per call, newest first
+agentx audit --json      # the same data for a program
+```
+
+In CI, two flags turn the screen into a verdict: `agentx audit --require-calls` exits 2 when the record holds no calls, so a job where the agent never ran cannot pass as a clean audit; `--fail-on-rule-match` exits 3 when a recorded call matched a rule you adopted.
+
+Your own rules come from your own record: `agentx review` walks what got caught and lets you adopt a rule from it, into `.agentx/rules.json`, a file you can commit and review in a pull request. A call that matches one is marked on the audit screen and named under it. It is recorded, never blocked, in any posture.
 
 ## Runnable examples
 

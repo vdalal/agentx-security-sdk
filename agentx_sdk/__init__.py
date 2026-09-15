@@ -1,4 +1,4 @@
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 # 🔴 0.5.0, NOT 0.4.32, BECAUSE THE DEFAULT POSTURE FLIPPED. A keyless install that upgrades
 # across this line goes from blocking every catch to recording it and letting the call run.
 # No API changed, so a patch number would have been "honest" and would have told an
@@ -8,7 +8,7 @@ __version__ = "0.5.0"
 # (pulse.staleness_notice): an old install nags ITSELF to upgrade with no network
 # call, because pip cannot declare a minimum version of the leaf package and so
 # nothing else can reach a pinned install. MUST move with __version__.
-__released__ = "2026-09-06"
+__released__ = "2026-09-11"
 
 # The rule "never ship SDK source under a version that is ALREADY published" still
 # stands; what is gone is the hand-maintained `__published__` constant that used to
