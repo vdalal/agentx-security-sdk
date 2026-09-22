@@ -35,7 +35,9 @@ Tenant-private (the org brain). Pure standard library so it is import-safe at SD
 module load (the 0.3.1 import-safety lesson).
 """
 import json
+import numbers
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -190,15 +192,18 @@ def harvest_rule_candidates(db_path=None):
     )
 
 
-def _seen_clause(count, total_calls, distinct_tools):
+def _seen_clause(count, total_calls):
     """How thin the evidence is, for a candidate with no magnitude to speak for it.
 
     🔴 THE COMPARISON HAS TO EXIST BEFORE WE IMPLY ONE. "seen once, out of 129 calls" invites
     the reader to weigh this tool against the rest of the ledger, which is a real signal. In a
     ledger holding ONE tool there is nothing to weigh it against, and "out of 1 calls" would be
     a comparison dressed up out of nothing -- the same defect as the sentence that once called
-    a tool "Infrequent" after 120 calls, one level up. So that case says what is actually true:
-    it is the only tool we have seen.
+    a tool "Infrequent" after 120 calls, one level up. That case used to be a second wording
+    here ("seen once in a call that ran, and the only tool here"); it is now the GATE
+    (`_row_supports_a_rule`): a candidate with no magnitude and nothing to compare against is
+    not proposed, and the screen says which tool was withheld and why. So this clause is only
+    ever rendered where the comparison exists.
 
     🔴 AND THE DENOMINATOR NAMES ITS POPULATION, BECAUSE A BLOCK COUNT SITS ABOVE IT. The
     caller's query is `WHERE status = INVENTORY_STATUS` ("ALLOWED"), so this total counts the
@@ -211,9 +216,110 @@ def _seen_clause(count, total_calls, distinct_tools):
     defect as the run_query row that read 122 under a sentence saying 120.
     """
     times = "once" if count == 1 else "%d times" % count
-    if distinct_tools <= 1:
-        return "seen %s, and the only tool here" % times
     return "seen %s, out of %s allowed calls" % (times, f"{total_calls:,}")
+
+
+def _allowed_call_rows(db_path=None):
+    """The ONE read behind every call-derived proposal: the developer's ALLOWED calls grouped
+    by tool, plus the two ledger-wide facts each line's evidence clause needs.
+
+    Returns ``(rows, total_calls, distinct_tools)``; ``rows`` is ``[]`` on a missing ledger,
+    an older schema, or no traffic. One function, two readers (the harvester below and
+    ``withheld_rule_proposals``), so the reason a proposal is withheld can never be computed
+    from a different reading of the ledger than the proposals themselves.
+    """
+    from . import db as _db
+
+    path = db_path or _db.DB_PATH
+    if not os.path.exists(path):
+        return [], 0, 0
+
+    # 🔴 OUR OWN TRAFFIC IS NOT THEIR AGENT. `agentx demo --audit` writes a full inventory on
+    # purpose, so without this the very first thing we would propose is a rule derived from
+    # our own demo. Reuses the shared fragment rather than hand-rolling the filter, which is
+    # the drift this helper was extracted to prevent.
+    excluded = [a for a in _db.OUR_AGENT_IDS if a]
+    frag, frag_params = _db._exclude_agents_fragment(excluded)
+
+    # ONE grouped pass. The per-tool pattern this deliberately avoids was measured at 20,013
+    # queries on a wide ledger; the fix named there is to fold into the group, not add to it.
+    sql = (
+        "SELECT tool_name, MAX(quantity), COUNT(*), "
+        "GROUP_CONCAT(DISTINCT arg_names), GROUP_CONCAT(DISTINCT target_class) "
+        "FROM event_log "
+        "WHERE status = ? AND tool_name IS NOT NULL AND tool_name != ''" + frag +
+        " GROUP BY tool_name "
+        # 🔴 NO LIMIT IN THE QUERY. It used to take the top 5 and THEN drop the tools already
+        # ruled on, so a developer who adopted rules for their five biggest tools got an empty
+        # list forever while tools 6..N sat there as perfectly good candidates. Truncation
+        # after filtering, never before.
+        "ORDER BY MAX(quantity) DESC, COUNT(*) ASC, tool_name ASC")
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            rows = conn.execute(
+                sql, tuple([_db.INVENTORY_STATUS] + list(frag_params))).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # A pre-quantity ledger has no such column. An older schema yields nothing rather
+        # than raising, exactly as the incident-store harvester does.
+        return [], 0, 0
+
+    # 🔴 THE LEDGER'S OWN SHAPE, READ ONCE, SO EVERY LINE CAN CARRY ITS REASON. Computed over
+    # ALL rows before the per-tool loop, and before the `existing` filter and the `limit` break,
+    # so "out of 129 calls" is not "out of the calls we happened to still be proposing".
+    #
+    # ⚠️ IT IS THE DEVELOPER'S OWN CALLS, NOT THE LEDGER'S. The query above already excludes our
+    # demo agents, so this total is the same population the audit screen's "ran 21 of YOUR 39
+    # calls" line counts -- and deliberately NOT the "60 calls across 8 tools" header, which is
+    # ledger-wide. An earlier version of this comment claimed it matched the header; it does
+    # not, and on a ledger holding demo traffic the two differ by exactly our rows.
+    total_calls = sum(int(c or 0) for _, _, c, _, _ in rows)
+    distinct_tools = len(rows)
+    return rows, total_calls, distinct_tools
+
+
+def _row_supports_a_rule(quantity, distinct_tools):
+    """Whether a tool's row carries anything a rule could key on.
+
+    🔴 THE RULE IS `_seen_clause`'s, MOVED FROM THE WORDING TO THE GATE. That clause already
+    says a comparison has to exist before the screen implies one: "seen once, out of 129
+    calls" weighs a tool against the rest of the ledger, "seen once, and the only tool here"
+    weighs it against nothing. A proposal built on nothing but the second reads "your agent
+    called a tool" and asks the developer to adopt a rule about it (the founder's #413 walk:
+    one `SELECT 1` proposed a rule to watch `run_sql`). So a row supports a proposal when it
+    carries a THRESHOLD (a recorded magnitude is a property of the rule) or when rarity has
+    something to be measured against (another tool in the ledger).
+
+    ⚠️ NOT A MINIMUM SIGHTING COUNT, and not the target class either. A count floor drops
+    the rare call, which is usually the dangerous one, and drops it silently. The class
+    (DB, HTTP, FS) is on every tool of that kind and narrows nothing: a rule keyed on it
+    still says "any call to this tool". What is withheld here is SAID by the screen, through
+    ``withheld_rule_proposals``, so the omission is never the silent kind.
+    """
+    return bool(quantity) or int(distinct_tools or 0) > 1
+
+
+def withheld_rule_proposals(db_path=None):
+    """The tools the harvester chose NOT to propose a rule for, with the count of their calls,
+    so the screen can say so in the proposal's place.
+
+    Same read as the harvester, same exclusions (our demo, tools already ruled on), the
+    complement of ``_row_supports_a_rule``. Empty whenever the harvester had something to
+    key on, which on any ledger with two tools of the developer's own is always.
+    """
+    rows, _total, distinct_tools = _allowed_call_rows(db_path)
+    if not rows:
+        return []
+    existing = _existing_rule_actions(path=None)
+    withheld = []
+    for tool_name, quantity, count, _names, _classes in rows:
+        if not tool_name or tool_name in existing:
+            continue
+        if not _row_supports_a_rule(quantity, distinct_tools):
+            withheld.append({"target_action": tool_name, "count": int(count or 0)})
+    return withheld
 
 
 def harvest_rule_candidates_from_calls(db_path=None, limit=5):
@@ -249,58 +355,19 @@ def harvest_rule_candidates_from_calls(db_path=None, limit=5):
     """
     from . import db as _db
 
-    path = db_path or _db.DB_PATH
-    if not os.path.exists(path):
+    rows, total_calls, distinct_tools = _allowed_call_rows(db_path)
+    if not rows:
         return []
-
-    # 🔴 OUR OWN TRAFFIC IS NOT THEIR AGENT. `agentx demo --audit` writes a full inventory on
-    # purpose, so without this the very first thing we would propose is a rule derived from
-    # our own demo. Reuses the shared fragment rather than hand-rolling the filter, which is
-    # the drift this helper was extracted to prevent.
-    excluded = [a for a in _db.OUR_AGENT_IDS if a]
-    frag, frag_params = _db._exclude_agents_fragment(excluded)
-
-    # ONE grouped pass. The per-tool pattern this deliberately avoids was measured at 20,013
-    # queries on a wide ledger; the fix named there is to fold into the group, not add to it.
-    sql = (
-        "SELECT tool_name, MAX(quantity), COUNT(*), "
-        "GROUP_CONCAT(DISTINCT arg_names), GROUP_CONCAT(DISTINCT target_class) "
-        "FROM event_log "
-        "WHERE status = ? AND tool_name IS NOT NULL AND tool_name != ''" + frag +
-        " GROUP BY tool_name "
-        # 🔴 NO LIMIT IN THE QUERY. It used to take the top 5 and THEN drop the tools already
-        # ruled on, so a developer who adopted rules for their five biggest tools got an empty
-        # list forever while tools 6..N sat there as perfectly good candidates. Truncation
-        # after filtering, never before.
-        "ORDER BY MAX(quantity) DESC, COUNT(*) ASC, tool_name ASC")
-    try:
-        conn = sqlite3.connect(path)
-        try:
-            rows = conn.execute(
-                sql, tuple([_db.INVENTORY_STATUS] + list(frag_params))).fetchall()
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        # A pre-quantity ledger has no such column. An older schema yields nothing rather
-        # than raising, exactly as the incident-store harvester does.
-        return []
-
-    # 🔴 THE LEDGER'S OWN SHAPE, READ ONCE, SO EVERY LINE CAN CARRY ITS REASON. Computed over
-    # ALL rows before the per-tool loop, and before the `existing` filter and the `limit` break,
-    # so "out of 129 calls" is not "out of the calls we happened to still be proposing".
-    #
-    # ⚠️ IT IS THE DEVELOPER'S OWN CALLS, NOT THE LEDGER'S. The query above already excludes our
-    # demo agents, so this total is the same population the audit screen's "ran 21 of YOUR 39
-    # calls" line counts -- and deliberately NOT the "60 calls across 8 tools" header, which is
-    # ledger-wide. An earlier version of this comment claimed it matched the header; it does
-    # not, and on a ledger holding demo traffic the two differ by exactly our rows.
-    total_calls = sum(int(c or 0) for _, _, c, _, _ in rows)
-    distinct_tools = len(rows)
 
     existing = _existing_rule_actions(path=None)
     candidates = []
     for tool_name, quantity, count, arg_names, classes in rows:
         if not tool_name or tool_name in existing:
+            continue
+        # 🔴 ONLY WHEN THE ROW SUPPORTS A RULE. The reason is `_row_supports_a_rule`'s; the
+        # withheld tool is named on the screen by `withheld_rule_proposals`, never dropped in
+        # silence.
+        if not _row_supports_a_rule(quantity, distinct_tools):
             continue
         names = sorted({n for n in (arg_names or "").split(",") if n})
         klass = sorted({c for c in (classes or "").split(",") if c and c != _db._CLASS_OTHER})
@@ -345,7 +412,7 @@ def harvest_rule_candidates_from_calls(db_path=None, limit=5):
         if quantity:
             desc += " (largest recorded size >= %d)" % int(quantity)
         else:
-            evidence = _seen_clause(count, total_calls, distinct_tools)
+            evidence = _seen_clause(count, total_calls)
         candidates.append({
             "target_action": tool_name,
             "effect_category": effect,
@@ -453,6 +520,29 @@ def _read_rules_file(p):
     for r in doc["rules"]:
         if not isinstance(r, dict) or not str(r.get("id") or "").startswith("rule-"):
             raise ValueError("%s holds a rule without a 'rule-' id" % p)
+        # A threshold that cannot be read is refused with the file, not matched around: a
+        # rule that says "only when amount >= 1000" and is matched on every call because
+        # the clause was mistyped is the one outcome the clause exists to prevent.
+        #
+        # 🔴 THE CANONICAL FORM IS KEPT, NOT JUST CHECKED. The first cut validated the clause
+        # and then handed the RAW text on, so a hand-typed `"value": "1000"` passed here (a
+        # numeric string reads as a number) and reached the comparison as a string: the SDK
+        # raised, swallowed it, and answered "no rule" on every call while the gateway,
+        # which keeps the normalised clause, enforced. The screens crashed formatting the same
+        # string. One reader, one form: what every later reader sees is what the gateway
+        # sees. A `null` is the same as no clause on both surfaces. The next rewrite of the
+        # file (an adopt, an undo) writes the canonical form back, which tidies the typed
+        # value into what both readers use, not into something else. Found by a review of
+        # this branch; a test had asserted both readers ACCEPT the string and never drove it.
+        r = dict(r)
+        if r.get("only_when") is None:
+            r.pop("only_when", None)
+        else:
+            try:
+                r["only_when"] = _normalize_only_when(r["only_when"])
+            except ValueError as err:
+                raise ValueError("%s: rule %s has an only_when clause that cannot be read (%s)"
+                                 % (p, r.get("id"), err))
         out.append(r)
     return out
 
@@ -659,6 +749,7 @@ def adopted_rules(path=None):
         return [{"id": r["id"], "name": r.get("name") or r["id"],
                  "target_action": r.get("target_action"),
                  "semantic_description": r.get("semantic_description"),
+                 "only_when": r.get("only_when") or None,
                  "active": bool(r.get("active", True))}
                 for r in sorted(_load_rules(path),
                                 key=lambda r: (str(r.get("target_action")), str(r["id"])))]
@@ -731,9 +822,13 @@ def _armed_adopted_rules(path=None):
         for r in reader(source):
             if not r.get("active", True):
                 continue
+            # `only_when` rides along or the matcher cannot see it. The file reader already
+            # refused a clause it could not read, so a present clause is a valid one; the
+            # store fallback never carries one (rules predate the field there).
             rules.append({"id": r["id"], "name": r.get("name") or r["id"],
                           "target_action": r.get("target_action"),
-                          "indicators": [str(i) for i in (r.get("indicators") or []) if i]})
+                          "indicators": [str(i) for i in (r.get("indicators") or []) if i],
+                          "only_when": r.get("only_when") or None})
         rules.sort(key=lambda r: (str(r["target_action"]), r["id"]))
         _MATCH_CACHE[source] = (key, rules)
         return rules
@@ -770,6 +865,250 @@ def _call_text(arguments):
     return "\n".join(out).lower()
 
 
+# ---------------------------------------------------------------------------------------
+# A THRESHOLD ON A RULE: "only when amount >= 1000".
+#
+# A rule matches the SHAPE of a call (the tool, the indicators). A threshold narrows that to
+# the calls where one named argument crosses a number, so "refunds need a ticket" can mean
+# "refunds of 1,000 or more need a ticket" and small ones pass without a match. The clause is
+# a named argument, an operator and a number, stored as typed:
+#
+#   {"argument": "amount", "op": ">=", "value": 1000}
+#
+# The argument is read from the call by its exact name at the top level, or by a dotted path
+# the developer typed (`payment.amount`). Nothing is searched for: guessing which nested
+# number is "the amount" is how a rule fires on the wrong one.
+#
+# Money is one instance, not a special case: "recipients >= 50" on a mail tool and
+# "percent > 30" on a discount tool are the same clause.
+#
+# When the number cannot be read (the argument is absent, or its value is not a number) the
+# rule does NOT match, and the caller records that the comparison could not be made. A
+# threshold rule that fired whenever it could not read the number would fire on every call,
+# which is the opposite of "only the big ones"; silence would hide that half the calls were
+# never compared. So: no match, and a count the developer can see.
+#
+# The GATEWAY applies the same clause to the same call (its `only_when` gate in the policy
+# loop). KEEP IN SYNC: `_ONLY_WHEN_OPERATORS`, `_only_when_argument_ok`, `_normalize_only_when`,
+# `_coerce_only_when_number`, `_only_when_value`, `_only_when_holds` and
+# `_only_when_unreadable_reason` are byte-identical there, asserted by AST and by one corpus
+# driven through both surfaces on the gateway's own test suite.
+_ONLY_WHEN_OPERATORS = (">=", "<=", ">", "<")     # two-character forms first, for the parser
+_ONLY_WHEN_ARGUMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_ONLY_WHEN_ABSENT = object()                      # "no such argument", as distinct from "not a number"
+# The first gateway build whose rules-file loader reads `only_when`. Every build before it
+# copies the keys it knows and drops the rest, so it reads a threshold rule as a plain rule
+# and matches EVERY call to the tool. Nothing on that side can be fixed after the fact; the
+# adopt screen says this number beside the clause, once, where the number is typed. KEEP IN
+# SYNC with the gateway's version constant at the build that added the loader field; the
+# gateway's own test suite asserts this is not ahead of that build.
+ONLY_WHEN_GATEWAY_MIN = "2026.09.16.1"
+
+
+def parse_only_when(text):
+    """`"amount >= 1000"` -> `{"argument": "amount", "op": ">=", "value": 1000}`.
+
+    Raises ValueError with a sentence a person can act on. Accepts the four comparison
+    operators, an argument name or dotted path, and a number with optional thousands
+    separators (`1,000`, `1_000`) and a decimal part. Whitespace around the operator is
+    optional. Nothing else: no `==`, no two clauses, no arithmetic.
+    """
+    s = str(text or "").strip()
+    if not s:
+        raise ValueError("an only-when clause looks like: amount >= 1000")
+    for op in _ONLY_WHEN_OPERATORS:
+        if op in s:
+            left, right = s.split(op, 1)
+            break
+    else:
+        raise ValueError("no comparison in %r; use one of >=, >, <, <= (for example: amount >= 1000)"
+                         % s)
+    argument = left.strip()
+    if not _only_when_argument_ok(argument):
+        raise ValueError("%r is not an argument name; use the name your tool takes, or a dotted "
+                         "path into it (payment.amount)" % argument)
+    value = _coerce_only_when_number(right.strip())
+    if value is None:
+        raise ValueError("%r is not a number; the right-hand side is a plain number like 1000 "
+                         "or 0.5" % right.strip())
+    return {"argument": argument, "op": op, "value": value}
+
+
+def _only_when_argument_ok(argument):
+    """An argument name, or a dotted path of names."""
+    return bool(_ONLY_WHEN_ARGUMENT_RE.match(str(argument)))
+
+
+def _normalize_only_when(raw):
+    """A stored clause, validated and in canonical form; raises ValueError on anything else.
+    The reader's twin of `parse_only_when`, for a file a hand may have edited. Builds the
+    canonical dict directly rather than re-parsing through text, so an integer threshold
+    stays the integer it was (a float round trip lost precision past 1e15, and the gateway's
+    copy never round-tripped: two readers, two thresholds)."""
+    if not isinstance(raw, dict):
+        raise ValueError("only_when: expected an object with argument, op and value")
+    argument, op = raw.get("argument"), raw.get("op")
+    if not isinstance(argument, str) or not _only_when_argument_ok(argument.strip()):
+        raise ValueError("only_when: %r is not an argument name or dotted path" % (argument,))
+    if op not in _ONLY_WHEN_OPERATORS:
+        raise ValueError("only_when: op must be one of >=, >, <, <=")
+    value = _coerce_only_when_number(raw.get("value"))
+    if value is None:
+        raise ValueError("only_when: value is not a number")
+    return {"argument": argument.strip(), "op": op, "value": value}
+
+
+def _finite_magnitude(num):
+    """THE ONE RULE for a number read from a call: a finite number, or None. NaN is None;
+    an infinity (what `float("1e400")` or `float("1" * 400)` returns, without raising) is
+    the largest float of that sign, so a magnitude past the float range still compares as
+    the enormous number it is and nothing downstream is handed an infinity to divide,
+    round or convert. Three review rounds on one branch each found one more carrier of the
+    same class (an int that raises, a string that returns inf, a ratio that overflows);
+    the rule replaces the fourth patch. On this surface the threshold reader is the one
+    reader of a call's magnitude and applies it. The gateway's byte-identical copy keeps
+    the list of ITS readers in its own docstring, the one place that list is maintained;
+    a reader added after that list is not covered until it is on it (a review of this
+    branch found two that did not, after an earlier version of this sentence said "every
+    reader", and a later one found this copy's list one reader behind)."""
+    if num != num:
+        return None
+    if num == float("inf"):
+        return 1e308
+    if num == float("-inf"):
+        return -1e308
+    return num
+
+
+def _coerce_only_when_number(value):
+    """The number a call value IS, or None when it is not one.
+
+    ints, floats, Decimals and Fractions are numbers (a Python money tool passes
+    `Decimal("1500")`, which is not a `numbers.Real`, so the check is `numbers.Number` minus
+    complex); a bool is NOT (it subclasses int, and `approved=True` compared against 1000 is
+    nonsense, not a small amount). A string is a number when it reads as one after thousands
+    separators are dropped (`"1,000.50"`, `"1_000"`); anything else, including a list, a dict
+    or None, is not. Integral values come back as int so the screen prints 1,000 rather than
+    1,000.0. A value past the float range is the largest float (`_finite_magnitude`)."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        num = value
+    elif isinstance(value, str):
+        s = value.strip().replace(",", "").replace("_", "")
+        if not s:
+            return None
+        try:
+            num = float(s)
+        except ValueError:
+            return None
+    elif isinstance(value, numbers.Number) and not isinstance(value, complex):
+        try:
+            num = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    num = _finite_magnitude(num)
+    if num is None:
+        return None
+    # Magnitude FIRST: `float(10**400)` raises OverflowError, and a JSON body can carry an
+    # int that size. Checked after the float conversion, that raise reached the gateway's
+    # policy loop as a 500, which the SDK reads as "unreachable" and fails OPEN on for every
+    # policy, not only this rule (a scoped review of this branch). A huge int is a number;
+    # it comes back as the int it is and compares correctly.
+    return int(num) if abs(num) < 1e15 and float(num).is_integer() else num
+
+
+def _only_when_value(arguments, argument_path):
+    """The call's value at `argument_path` (a top-level name or a dotted path through dicts),
+    or `_ONLY_WHEN_ABSENT` when there is nothing there. Reads in memory and writes nothing."""
+    node = arguments
+    for part in str(argument_path).split("."):
+        if not isinstance(node, dict) or part not in node:
+            return _ONLY_WHEN_ABSENT
+        node = node[part]
+    return node
+
+
+def _only_when_unreadable_reason(only_when, arguments):
+    """Why the clause could not be compared on this call, for a sentence a person reads:
+    "carried no 'amount'" (the argument is not there) or "has an 'amount' that is not a
+    number" (it is there and cannot be read). The first cut said "carried no 'amount'" for
+    both, which is false for a present value such as a list or "$1,500". None when it could
+    be compared."""
+    value = _only_when_value(arguments, only_when["argument"])
+    if value is _ONLY_WHEN_ABSENT:
+        return "carried no '%s'" % only_when["argument"]
+    if _coerce_only_when_number(value) is None:
+        return "has an '%s' that is not a number" % only_when["argument"]
+    return None
+
+
+def _only_when_holds(only_when, arguments):
+    """True / False when the clause could be compared, None when it could not."""
+    number = _coerce_only_when_number(_only_when_value(arguments, only_when["argument"]))
+    if number is None:
+        return None
+    op, threshold = only_when["op"], only_when["value"]
+    if op == ">=":
+        return number >= threshold
+    if op == ">":
+        return number > threshold
+    if op == "<=":
+        return number <= threshold
+    return number < threshold
+
+
+def only_when_clause(rule):
+    """The clause as a screen prints it: `only when amount >= 1,000`, or "" for a rule
+    without one. One function, so every screen spells it the same way."""
+    ow = (rule or {}).get("only_when")
+    if not ow:
+        return ""
+    value = ow.get("value")
+    shown = format(value, ",") if isinstance(value, int) else format(value, ",.10g")
+    return "only when %s %s %s" % (ow.get("argument"), ow.get("op"), shown)
+
+
+def evaluate_adopted_rule(tool_name, arguments=None, path=None):
+    """`(rule, "matched")`, `(rule, "uncompared")` or `(None, None)` for this call.
+
+    The tri-state behind `match_adopted_rule`. "uncompared" is a rule whose shape the call
+    has but whose threshold could not be compared (no such argument, or not a number): not a
+    match, and not nothing either, so the caller can record it and a screen can count it.
+    One tool name can carry several rules; the first that MATCHES wins, and "uncompared" is
+    reported only when no rule matched.
+
+    Never raises: a match is an annotation on a call that already ran.
+    """
+    if not tool_name:
+        return (None, None)
+    try:
+        candidates = [r for r in _armed_adopted_rules(path) if r["target_action"] == tool_name]
+        if not candidates:
+            return (None, None)
+        text = None
+        uncompared = None
+        for rule in candidates:
+            if rule["indicators"]:
+                if text is None:
+                    text = _call_text(arguments)
+                if not all(ind.lower() in text for ind in rule["indicators"]):
+                    continue
+            if rule.get("only_when"):
+                held = _only_when_holds(rule["only_when"], arguments)
+                if held is None:
+                    uncompared = uncompared or rule
+                    continue
+                if not held:
+                    continue
+            return (rule, "matched")
+        return (uncompared, "uncompared") if uncompared else (None, None)
+    except Exception:
+        return (None, None)
+
+
 def match_adopted_rule(tool_name, arguments=None, path=None):
     """The adopted rule this call hits on its SYMBOLIC half, or None.
 
@@ -781,6 +1120,9 @@ def match_adopted_rule(tool_name, arguments=None, path=None):
       * every `indicator` the rule carries must appear in the call's argument text. Indicators
         are the exact-match IOC half a judge-derived rule ships with; a rule with none matches
         on the tool name alone.
+      * a rule with an `only_when` clause matches only when the named argument crosses the
+        number (see the block above `parse_only_when`). A call whose number could not be read
+        is NOT a match here; `evaluate_adopted_rule` is the form that also reports it.
 
     What it does NOT do: read `semantic_description`. The meaning half of a rule is an
     embedding compared by meaning, the SDK has no model and, keyless, no network to reach one,
@@ -790,23 +1132,8 @@ def match_adopted_rule(tool_name, arguments=None, path=None):
 
     Never raises: a match is an annotation on a call that already ran.
     """
-    if not tool_name:
-        return None
-    try:
-        candidates = [r for r in _armed_adopted_rules(path) if r["target_action"] == tool_name]
-        if not candidates:
-            return None
-        text = None
-        for rule in candidates:
-            if rule["indicators"]:
-                if text is None:
-                    text = _call_text(arguments)
-                if not all(ind.lower() in text for ind in rule["indicators"]):
-                    continue
-            return rule
-        return None
-    except Exception:
-        return None
+    rule, status = evaluate_adopted_rule(tool_name, arguments, path)
+    return rule if status == "matched" else None
 
 
 def adopted_rule_count(path=None):
@@ -867,12 +1194,14 @@ def rule_name(candidate, override=None):
     return action
 
 
-def adopt_rule(candidate, *, challenge=None, name=None, path=None):
+def adopt_rule(candidate, *, challenge=None, name=None, path=None, only_when=None):
     """Write a structural-rule candidate into `.agentx/rules.json` as an ACTIVE rule — the human
     gate. Returns the stored ``{id, name, ...}`` dict.
 
     ``name`` is the developer's own name for the rule; see ``rule_name`` for what is used when
-    there is none.
+    there is none. ``only_when`` is a threshold clause, either the text a person typed
+    (``"amount >= 1000"``) or the dict ``parse_only_when`` returns; see the block above
+    ``parse_only_when``. A clause that cannot be read raises before anything is written.
 
     The keyless SDK matches it on its shape from the next call; a gateway that reads the file
     arms both halves on its next policy refresh (symbolic ``target_action`` + neural
@@ -880,6 +1209,10 @@ def adopt_rule(candidate, *, challenge=None, name=None, path=None):
     """
     if not candidate or not str(candidate.get("semantic_description") or "").strip():
         raise ValueError("a rule candidate with a semantic_description is required")
+    clause = None
+    if only_when is not None and only_when != "":
+        clause = (parse_only_when(only_when) if isinstance(only_when, str)
+                  else _normalize_only_when(only_when))
 
     p = _rules_file_path(path)
     rules = _load_rules_for_writing(path)   # raises rather than replace a file it cannot read
@@ -902,8 +1235,13 @@ def adopt_rule(candidate, *, challenge=None, name=None, path=None):
     stored = {"id": rule_id, "name": name, "target_action": action, "indicators": indicators,
               "semantic_description": desc, "coaching": socratic, "active": True,
               "adopted_at": _now_iso()}
+    if clause:
+        # Written only when there is one: a rule without a threshold stays byte-identical to
+        # what every earlier build wrote, and an older gateway reads it exactly as before.
+        stored["only_when"] = clause
     _write_rules_file(p, rules + [stored])
 
     return {"id": rule_id, "name": name, "target_action": action,
             "effect_category": effect, "semantic_description": desc,
-            "indicators": indicators, "socratic_prompt": socratic, "path": p}
+            "indicators": indicators, "socratic_prompt": socratic, "path": p,
+            "only_when": clause}

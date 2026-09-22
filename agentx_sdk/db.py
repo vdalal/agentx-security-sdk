@@ -7,6 +7,7 @@ import time
 import os
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 # Hidden file in the directory where the developer runs their agent.
 #
@@ -508,7 +509,91 @@ _EVENT_LOG_COLUMNS = [
     # the same reason `quantity` was: a fresh ledger takes its column order from CREATE and an
     # existing one from ALTER TABLE ADD COLUMN, which can only append.
     ("posture",         "TEXT"),
+    # --- A RULE WHOSE THRESHOLD COULD NOT BE COMPARED ON THIS CALL ---------------------------
+    #
+    # An adopted rule with an `only_when` clause ("only when amount >= 1000") matches a call
+    # only when the named argument crosses the number. When the call has the rule's SHAPE but
+    # the number cannot be read (no such argument, or not a number), the rule does not match,
+    # and that fact needs a home or the developer reads "4 matched" as "every refund was
+    # checked". This column carries the rule's id on such a row. `policy_id` stays EMPTY on
+    # it, so every reader that counts `policy_id LIKE 'rule-%'` as a match (the audit screens,
+    # `is_rule_match`, the dashboard) sees exactly what it saw before this column existed.
+    # Our own string (a `rule-` id), never caller text. Appended at the END, same reason.
+    ("rule_uncompared", "TEXT"),
+    # --- HOW MANY ROWS THIS WRITE COULD TOUCH --------------------------------------------
+    #
+    # One of `ALL` / `AT_MOST` / `UNKNOWN`, or NULL on the calls that are not a row write --
+    # which is most of them. See `decorators.row_cap_class`.
+    #
+    # 🔴 WHY A THIRD VALUE EXISTS, BECAUSE A TWO-VALUED COLUMN HERE WOULD LIE. A delete
+    # either names nothing to spare, carries a cap the statement itself proves, or is
+    # unsized -- and the unsized one is the whole reason for the column. A real agent ran
+    # `DELETE FROM audit_log WHERE created < date('now','-30 days')` against a 120,000-row
+    # table, every row matched, the table emptied, and nothing was written anywhere because
+    # a WHERE was read as proof of safety. `UNKNOWN` is that row.
+    #
+    # ⚠️ NOT A VERDICT, AND MUST NOT BE READ AS ONE. `ALL` is not "we blocked it" and
+    # `UNKNOWN` is not "we allowed something bad": the column says what the STATEMENT could
+    # be shown to bound, never what we did about it. What we did is `status`.
+    #
+    # Same privacy rule as `posture`: a bounded label from a fixed set of three, derived
+    # from the payload and incapable of carrying anything out of it. The cap NUMBER is
+    # deliberately NOT stored -- `amount` and `quantity` put values through
+    # `_magnitude_bucket` before they land here, and a raw `LIMIT 1000` would be the first
+    # unbucketed figure in the table. Appended at the END, same reason as the three above.
+    ("row_cap",         "TEXT"),
+    # --- WHAT KIND OF THING THIS CALL DID ---------------------------------------------------
+    #
+    # One of `READ_ONLY` / `BOUNDED` / `DESTRUCTIVE` / `UNKNOWN` on every inventory row; NULL
+    # only on a row written before the column existed. See `decorators.reversibility_class`
+    # for what each word is allowed to mean, and for why the fourth exists.
+    #
+    # 🔴 NEVER NULL ON A NEW ROW, DELIBERATELY. A call with no statement to read gets
+    # `UNKNOWN` written, not nothing: NULL already means "older ledger", and one value
+    # standing for two states is an omission no reader can tell apart from an accident.
+    #
+    # ⚠️ NOT A VERDICT AND NOT A PROMISE. `DESTRUCTIVE` is not "we blocked it" (what we did
+    # is `status`), and `BOUNDED` is not "we kept a copy" (nothing here keeps one). The
+    # column says what the STATEMENT established about itself. Same privacy rule as
+    # `row_cap`: a label from a fixed set of four, incapable of carrying anything out of the
+    # payload. Appended at the END, same reason as every column above it.
+    ("reversibility",   "TEXT"),
+    # --- THE PERSON'S ANSWER: WAS THIS BLOCK RIGHT? ---------------------------------------
+    #
+    # `agentx review` used to read only the gateway's incident store, so a block on the free
+    # door ("📝 Recorded locally (no key needed)") and every `ran, flagged` call under audit
+    # posture had nowhere to be answered. These three mirror the incident store's verdict
+    # columns (`overrides._LABEL_COLUMNS`) so the same review walk can label a ledger row.
+    # Only the VERDICT axis: safe-path is reconciled from a later block on the same trace, and
+    # this ledger records recovery by rewriting the row's status in place (CHALLENGED ->
+    # RECOVERED), so there is nothing to reconcile; harm has no writer anywhere by design.
+    #
+    # Our own words from a closed set (`overrides._VERDICT_VOCAB` / `_VERDICT_SOURCE_VOCAB`),
+    # never caller text, so the privacy rule above holds. NULL means "not answered", the
+    # same reading on a fresh and an upgraded ledger. Appended at the END, same reason as
+    # every column above.
+    ("label_verdict",        "TEXT"),
+    ("label_verdict_source", "TEXT"),
+    ("outcome_at",           "TEXT"),
 ]
+
+# The statuses a ledger row can carry that a person can be asked about: we had an opinion,
+# and either stopped the call (CHALLENGED) or let it run and said so (WOULD_BLOCK). NOT
+# RECOVERED: that row was a CHALLENGED one the agent then got past another way, and the
+# incident store's twin (COMPLIED) is not asked about either; NOT ALLOWED: no opinion to
+# judge. One set, read by every function below that asks "does this row await a verdict".
+REVIEWABLE_LEDGER_STATUSES = ("CHALLENGED", WOULD_BLOCK_STATUS)
+_LEDGER_LABEL_COLUMNS = ("label_verdict", "label_verdict_source", "outcome_at")
+
+# The four values the `reversibility` column may hold. Defined HERE, beside the column,
+# because `decorators` imports this module and not the other way round; `decorators`
+# re-exports them and owns the classifier that produces them.
+REVERSIBILITY_READ_ONLY = "READ_ONLY"
+REVERSIBILITY_BOUNDED = "BOUNDED"
+REVERSIBILITY_DESTRUCTIVE = "DESTRUCTIVE"
+REVERSIBILITY_UNKNOWN = "UNKNOWN"
+_REVERSIBILITY_LABELS = (REVERSIBILITY_READ_ONLY, REVERSIBILITY_BOUNDED,
+                         REVERSIBILITY_DESTRUCTIVE, REVERSIBILITY_UNKNOWN)
 
 _CREATE_EVENT_LOG_SQL = "CREATE TABLE IF NOT EXISTS event_log (\n    %s\n)" % ",\n    ".join(
     "%s %s" % (name, ddl) for name, ddl in _EVENT_LOG_COLUMNS)
@@ -1238,6 +1323,68 @@ def _magnitude_bucket(value):
     return bucket
 
 
+def _exact_magnitude(value):
+    """The magnitude of a numeric argument as the developer passed it, or None.
+
+    The unbucketed half of `_magnitude_bucket`, with the same refusals: a bool is not a
+    number, a string is never coerced (parsing one is how a value sneaks into a numeric
+    column), NaN and inf carry no magnitude. Sign is not magnitude. The ledger never stores
+    this -- it buckets. The narrowing test (decorators._numeric_narrowing) compares it in
+    session memory and writes only the verdict, so the "shape, never values" rule holds
+    on disk while `count=50 -> count=20` still reads as a narrowing.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        size = abs(float(value))
+    except Exception:
+        return None
+    if not (size == size) or size == float("inf"):
+        return None
+    return size
+
+
+def _labelled_amount(arguments):
+    """The largest amount this call moves, by the currency rule above: an `amount` / `<prefix>_amount`
+    key, not a range bound, with a real `currency` value somewhere in the same call. Exact
+    magnitude; the ledger recorder buckets it. None when the rule claims nothing.
+
+    max() among the qualifying arguments, not first-wins: two amount keys are two readings
+    of one call and the larger consequence is the one worth showing. Iterates the
+    arguments rather than building a normalised dict, so colliding keys cannot collapse.
+    """
+    args = arguments if isinstance(arguments, dict) else {}
+    has_currency = any(
+        _is_currency_key(_normalise_key(k)) and _is_real_currency_value(v)
+        for k, v in args.items())
+    if not has_currency:
+        return None
+    best = None
+    for key, value in args.items():
+        norm = _normalise_key(key)
+        if not _is_amount_key(norm) or _amount_prefix(norm) in _RANGE_BOUND_PREFIXES:
+            continue
+        size = _exact_magnitude(value)
+        if size is not None and (best is None or size > best):
+            best = size
+    return best
+
+
+def _labelled_quantity(arguments):
+    """The largest counted quantity this call acts on: a `count` / `<prefix>_count` key.
+    Exact magnitude, same MAX-not-first rule as `_labelled_amount`. None when no count key
+    carries a number."""
+    args = arguments if isinstance(arguments, dict) else {}
+    best = None
+    for key, value in args.items():
+        if not _is_count_key(_normalise_key(key)):
+            continue
+        size = _exact_magnitude(value)
+        if size is not None and (best is None or size > best):
+            best = size
+    return best
+
+
 def _name_tokens(raw):
     """Split identifier-ish text into whole lowercase tokens. Pure.
 
@@ -1381,33 +1528,18 @@ def _call_shape(tool_name, arguments, description=None):
     #
     # The gateway has neither, because it iterates `action_args.items()` and takes a max. So
     # the shortcut was also a divergence from the rule this file claims to have ported.
-    amount = 0.0
+    # The two readers live in _labelled_amount / _labelled_quantity so the narrowing test
+    # (decorators._numeric_narrowing) asks the SAME rule for the same numbers. Bucketing the
+    # max is the max of the buckets: the floor is monotonic.
     try:
-        args = arguments or {}
-        has_currency = any(
-            _is_currency_key(_normalise_key(k)) and _is_real_currency_value(v)
-            for k, v in args.items())
-        if has_currency:
-            for key, value in args.items():
-                norm = _normalise_key(key)
-                if not _is_amount_key(norm) or _amount_prefix(norm) in _RANGE_BOUND_PREFIXES:
-                    continue
-                bucket = _magnitude_bucket(value)
-                if bucket > amount:
-                    amount = bucket
+        amount = _magnitude_bucket(_labelled_amount(arguments))
     except Exception:
         amount = 0.0
 
     # Same MAX-not-first rule as the amount block above, and for the same reason: taking
     # the first non-zero would let a small labelled count silence a large one in the same call.
-    quantity = 0.0
     try:
-        for key, value in (arguments or {}).items():
-            if not _is_count_key(_normalise_key(key)):
-                continue
-            bucket = _magnitude_bucket(value)
-            if bucket > quantity:
-                quantity = bucket
+        quantity = _magnitude_bucket(_labelled_quantity(arguments))
     except Exception:
         quantity = 0.0
 
@@ -2094,7 +2226,7 @@ def get_call_inventory(path=None, limit=25):
              "distinct_tools": 0, "readable": True, "flagged_total": 0,
              "would_block_total": 0, "unclassified_total": 0, "flagged_from_demo": 0,
              "inventory_from_demo": 0, "viewable_total": 0, "would_block_from_demo": 0,
-             "totals": dict(dict.fromkeys(_LEDGER_TOTAL_KEYS, 0), window_start=None)}
+             "stopped_from_demo": 0, "totals": _empty_totals()}
     if not os.path.exists(path or DB_PATH):
         return empty
     try:
@@ -2297,6 +2429,19 @@ def get_call_inventory(path=None, limit=25):
                 (WOULD_BLOCK_STATUS, *_ours_params))
             would_block_from_demo = cursor.fetchone()[0] or 0
 
+            # 🔴 THE FOURTH SPLIT, FOR THE SENTENCE THAT SAYS WHO TURNED BLOCKING ON. The audit
+            # screen derived "our stopped rows" as `flagged_from_demo - would_block_from_demo`,
+            # and `flagged_from_demo` is `status IS NOT 'ALLOWED'`, which SQLite answers TRUE
+            # for a NULL status -- so a legacy status-less row of ours counted as a stopped
+            # one, and on an old ledger the screen could credit the reader's own block to the
+            # demo (scoped review of the branch that added the sentence). Counted over the two
+            # statuses the sentence is about, the same population `viewable_total` minus the
+            # audited rows names on the reader's side.
+            cursor.execute(
+                "SELECT COUNT(*) FROM event_log WHERE status IN ('CHALLENGED', 'RECOVERED') "
+                "AND " + _ours_sql, tuple(_ours_params))
+            stopped_from_demo = cursor.fetchone()[0] or 0
+
             # Rows with NO status at all (legacy, pre-P-57 migration). They are counted in
             # flagged_total because a row we cannot classify is still a row -- but every
             # `agentx insights` reader filters on CHALLENGED / RECOVERED / WOULD_BLOCK, so
@@ -2326,6 +2471,7 @@ def get_call_inventory(path=None, limit=25):
                 "flagged_total": flagged_total,
                 "would_block_total": would_block_total,
                 "would_block_from_demo": would_block_from_demo,
+                "stopped_from_demo": stopped_from_demo,
                 "unclassified_total": unclassified_total,
                 "viewable_total": viewable_total,
                 "flagged_from_demo": flagged_from_demo,
@@ -2537,7 +2683,33 @@ def get_mcp_roster(path=None):
 #: Every count a sentence about this ledger can rest on, and the ONLY place they are
 #: computed. Both audit views and both output shapes read these, so they cannot disagree.
 _LEDGER_TOTAL_KEYS = ("rows", "inventory", "flagged", "unclassified", "ours",
-                      "distinct_tools", "window_start")
+                      "distinct_tools", "window_start", "unsized_writes")
+
+
+def _empty_totals():
+    """The zeroed totals, built in ONE place so every empty path has the same SHAPE.
+
+    🔴 A KEY THAT APPEARS ONLY SOMETIMES IS A CONTRACT THAT CANNOT BE READ. Three sites
+    build this dict, and `unsized_readable` is not a count, so `dict.fromkeys(..., 0)` can
+    neither carry it nor fake it: zeroing it would put an int where every other reader sees
+    a bool, and omitting it meant a real read returned the flag while a missing file did
+    not. The `--json` document then had a key whose PRESENCE depended on whether the ledger
+    existed, which is exactly the "empty versus unreadable" confusion that payload is built
+    to refuse.
+
+    False, not True: a ledger nobody could open has not told us there are no unsized
+    writes. Same rule as the zero it sits beside.
+    """
+    out = dict.fromkeys(_LEDGER_TOTAL_KEYS, 0)
+    out["window_start"] = None
+    out["unsized_readable"] = False
+    # The four-label split of the inventory. A dict rather than four keys, so the
+    # `--json` document carries the label set as one object, and `False` for the same
+    # reason `unsized_readable` is: an unopened ledger has not said the split is all zero.
+    out["reversibility"] = dict.fromkeys(_REVERSIBILITY_LABELS, 0)
+    out["reversibility_readable"] = False
+    out["reversibility_unlabelled"] = 0
+    return out
 
 
 def _ledger_totals(cursor):
@@ -2595,9 +2767,78 @@ def _ledger_totals(cursor):
     cursor.execute("SELECT COUNT(*) FROM event_log WHERE " + ours_sql, tuple(ours_params))
     ours = cursor.fetchone()[0] or 0
 
+    # Writes this ledger could not SIZE: the statement had a real WHERE, so it was never a
+    # whole-table write, and nothing in it proved a cap either. See the `row_cap` column.
+    #
+    # 🔴 SCOPED TO INVENTORY ROWS AND TO THE READER'S OWN AGENTS, IN THE QUERY, NOT BY
+    # ACCIDENT. The screen prints this directly under "N calls that tripped nothing", so it
+    # has to count that population and no other. Unscoped it counted every row in the file
+    # and was RIGHT ONLY BECAUSE the would-block writers happen not to pass `row_cap` today
+    # -- an accident of who writes the column, which the first labelled block would have
+    # turned into a sentence counting blocked calls under a header about calls that tripped
+    # nothing. That is the split this screen has already been fixed for twice. The demo
+    # exclusion is the same rule every other count here obeys: `agentx demo --audit` writes
+    # real ALLOWED rows, and attributing them to the reader's agent is the one thing this
+    # screen's footnotes exist to prevent.
+    #
+    # 🔴 ITS OWN try, AND A ZERO THAT MEANS "THE COLUMN IS NOT THERE" IS NOT A FINDING. On a
+    # ledger the migration has not reached this SELECT raises "no such column" -- and this
+    # function's other counts are all still perfectly readable, so taking the whole set down
+    # with it would turn one missing column into an unreadable ledger. It reports 0, which
+    # is indistinguishable from "no unsized writes", so `unsized_readable` says which of the
+    # two it is and every screen must branch on it rather than print the zero.
+    _theirs_sql, _theirs_params = _our_agents_clause(negate=True)
+    try:
+        cursor.execute(
+            "SELECT COUNT(*) FROM event_log WHERE row_cap IS 'UNKNOWN' AND status IS ? "
+            "AND " + _theirs_sql,
+            tuple([INVENTORY_STATUS] + _theirs_params))
+        unsized = cursor.fetchone()[0] or 0
+        unsized_readable = True
+    except sqlite3.Error:
+        unsized, unsized_readable = 0, False
+
+    # The inventory split four ways by what each call established about itself.
+    # Same population as `unsized` (inventory rows, the reader's own agents) and for the
+    # same reason: it prints directly under "N calls that tripped nothing".
+    #
+    # 🔴 A NULL HERE IS AN OLDER ROW, NOT A FIFTH LABEL. `record_call` writes UNKNOWN when
+    # it has nothing to say, so on a current ledger every inventory row carries one of the
+    # four. A row with NULL was written before the column existed and is left out of the
+    # split; `reversibility_readable` says whether the column was there at all.
+    #
+    # Its own try, same as `unsized`: on a ledger the migration has not reached the SELECT
+    # raises, and four zeroes would read as "nothing classified" rather than "no column".
+    try:
+        cursor.execute(
+            "SELECT reversibility, COUNT(*) FROM event_log WHERE status IS ? AND "
+            + _theirs_sql + " GROUP BY reversibility",
+            tuple([INVENTORY_STATUS] + _theirs_params))
+        split = dict.fromkeys(_REVERSIBILITY_LABELS, 0)
+        # 🔴 THE FIFTH TERM, SO THE SCREEN'S SENTENCE SUMS TO THE COUNT IT SITS UNDER. The
+        # header counts every inventory row; the four labels above cover the reader's own
+        # rows that carry one. A row written before the column existed carries NULL, and
+        # on an upgraded ledger that is hundreds of rows -- left out silently, "1,003
+        # calls ... Of those: 1 read-only, 2 could not tell" is the sum that does not add
+        # up, which a review caught on a mixed ledger. With the demo count the screen
+        # already holds, `labels + unlabelled + demo == inventory`, and a test pins it.
+        unlabelled = 0
+        for label, n in cursor.fetchall():
+            if label in split:
+                split[label] = n or 0
+            elif label is None:
+                unlabelled = n or 0
+        split_readable = True
+    except sqlite3.Error:
+        split, split_readable = dict.fromkeys(_REVERSIBILITY_LABELS, 0), False
+        unlabelled = 0
+
     return {"rows": rows or 0, "inventory": inventory, "flagged": flagged,
             "unclassified": unclassified, "ours": ours,
-            "distinct_tools": distinct_tools or 0, "window_start": window_start}
+            "distinct_tools": distinct_tools or 0, "window_start": window_start,
+            "unsized_writes": unsized, "unsized_readable": unsized_readable,
+            "reversibility": split, "reversibility_readable": split_readable,
+            "reversibility_unlabelled": unlabelled}
 
 
 def get_ledger_totals(path=None):
@@ -2607,8 +2848,7 @@ def get_ledger_totals(path=None):
     zeroes from an unreadable ledger describe a file nobody managed to open, which is not
     the same statement as an idle agent.
     """
-    empty = dict.fromkeys(_LEDGER_TOTAL_KEYS, 0)
-    empty["window_start"] = None
+    empty = _empty_totals()
     empty["readable"] = True
     if not os.path.exists(path or DB_PATH):
         return empty
@@ -2649,17 +2889,23 @@ def get_rule_match_summary(path=None):
     belong to `agentx insights`, not to the inventory this summarises.
 
     Returns {"total": int, "by_tool": {tool: [(rule_name, count), ...] count-DESC},
-             "by_rule": {rule_name: count}, "by_id": {rule_id: count}}.
+             "by_rule": {rule_name: count}, "by_id": {rule_id: count},
+             "uncompared_by_id": {rule_id: count}}.
     `by_rule` is by NAME, for sentences that name what the ledger recorded. `by_id` is for
     the YOUR RULES table, which walks the developer's file: a name is not a key there. Two
     `adopt --rule` on one action without `--name` share a name, and a rule renamed in the
     file keeps its history under the id; keyed by name, both rows showed one summed count
     and the renamed rule showed 0 (scoped review of this branch).
+    `uncompared_by_id` counts the rows whose `rule_uncompared` names the rule: calls with
+    the rule's shape whose `only_when` number could not be read. Never in any match count.
+    A ledger without that column (older than the field) reads it as {} rather than failing
+    the whole summary.
     """
-    empty = {"total": 0, "by_tool": {}, "by_rule": {}, "by_id": {}}
+    empty = {"total": 0, "by_tool": {}, "by_rule": {}, "by_id": {}, "uncompared_by_id": {}}
     p = path or DB_PATH
     if not os.path.exists(p):
         return empty
+    uncompared_by_id = {}
     try:
         with _connection(p) as conn:
             rows = conn.execute(
@@ -2668,6 +2914,14 @@ def get_rule_match_summary(path=None):
                 "GROUP BY tool_name, policy_id, policy_name "
                 "ORDER BY COUNT(*) DESC, policy_name ASC",
                 (INVENTORY_STATUS,)).fetchall()
+            try:
+                for rid, n in conn.execute(
+                        "SELECT rule_uncompared, COUNT(*) FROM event_log "
+                        "WHERE status IS ? AND rule_uncompared LIKE 'rule-%' "
+                        "GROUP BY rule_uncompared", (INVENTORY_STATUS,)).fetchall():
+                    uncompared_by_id[rid] = int(n or 0)
+            except sqlite3.OperationalError:
+                uncompared_by_id = {}      # a ledger from before the column: nothing to count
     except Exception:
         return empty
     by_tool, by_rule, by_id, total = {}, {}, {}, 0
@@ -2678,7 +2932,8 @@ def get_rule_match_summary(path=None):
         by_rule[name] = by_rule.get(name, 0) + n
         by_id[rid] = by_id.get(rid, 0) + n
         total += n
-    return {"total": total, "by_tool": by_tool, "by_rule": by_rule, "by_id": by_id}
+    return {"total": total, "by_tool": by_tool, "by_rule": by_rule, "by_id": by_id,
+            "uncompared_by_id": uncompared_by_id}
 
 
 def get_call_log(path=None, limit=50, offset=0):
@@ -2710,7 +2965,7 @@ def get_call_log(path=None, limit=50, offset=0):
     # Every key the success path returns, so a caller never has to branch on which of the
     # three exits it got. The missing-file and unreadable exits differ ONLY in `readable`.
     empty = {"readable": True, "rows": [], "shown": 0, "covers_all": True,
-             "totals": dict(dict.fromkeys(_LEDGER_TOTAL_KEYS, 0), window_start=None),
+             "totals": _empty_totals(),
              "window_start": None}
     if not os.path.exists(path or DB_PATH):
         return empty
@@ -3953,7 +4208,8 @@ def _bump_audit_counters(tool_name, stats, in_audit):
 
 
 def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats_lock=None,
-                in_audit=False, description=None, matched_rule=None):
+                in_audit=False, description=None, matched_rule=None, uncompared_rule=None,
+                row_cap=None, reversibility=None):
     """P-92: record ONE call that passed, in ANY posture. Best-effort, never raises.
 
     `matched_rule`: the adopted rule this call is the shape of, as
@@ -3965,6 +4221,12 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
     What changes is that the row can now say which rule it hit. The `rule-` prefix on
     `policy_id` is what tells a reader "annotation on a call that ran" from "the policy
     that stopped it", the same prefix that already guards deletes in `rules.py`.
+
+    `uncompared_rule`: the adopted rule whose SHAPE this call had but whose `only_when`
+    threshold could not be compared (the argument was absent or not a number), as
+    `rules.evaluate_adopted_rule` reports it. Its id lands in `rule_uncompared` and nothing
+    else on the row changes: `policy_id` stays NULL, so no reader counts it as a match. A
+    call is never both; the matcher reports "uncompared" only when no rule matched.
 
     The rule's id and name are OUR strings (minted and stored by `adopt_rule`), so nothing
     from the caller's payload reaches the row through this parameter.
@@ -4020,14 +4282,29 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
     if matched_rule:
         rule_id = matched_rule.get("id")
         rule_name = matched_rule.get("name") or rule_id
+    uncompared_id = (uncompared_rule or {}).get("id") if not matched_rule else None
+    # `row_cap` arrives ALREADY REDUCED to one of three labels, computed by the caller from
+    # the text it already holds (`decorators.row_cap_for_arguments`). This function does not
+    # derive it, for the same reason it does not call `_call_shape`: the contract above is
+    # that nothing raw reaches `log_intercept`, and the one place that can see a statement
+    # is the door that was already scanning it.
+    #
+    # `reversibility` arrives the same way (`decorators.reversibility_for_arguments`), and
+    # a caller that passes nothing gets UNKNOWN written rather than NULL: the column's
+    # contract is that NULL means "older ledger", never "this caller forgot".
     log_intercept(trace_id, agent_id, tool_name, rule_id, rule_name, INVENTORY_STATUS,
                   arg_names=names, amount=amount, target_class=target_class,
-                  quantity=quantity, posture=("audit" if in_audit else "enforce"))
+                  quantity=quantity, posture=("audit" if in_audit else "enforce"),
+                  rule_uncompared=uncompared_id, row_cap=row_cap,
+                  reversibility=(reversibility or REVERSIBILITY_UNKNOWN))
 
 
 def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status, tokens=None, time_saved=None,
                   arg_names=None, amount=0.0, target_class=None, challenge_issued=None,
-                  quantity=0.0, posture=None):
+                  quantity=0.0, posture=None, rule_uncompared=None, row_cap=None,
+                  reversibility=None):
+    # `rule_uncompared`: the id of an adopted rule whose shape this call had and whose
+    # `only_when` threshold could not be compared (see the column's comment). Our own string.
     # 🔴 CONTRACT: `arg_names`/`amount`/`target_class`/`quantity` MUST ALREADY BE REDUCED, via
     # `_call_shape`, before they reach here — never pass a raw `arguments` dict, a raw
     # query string, or an unreduced value to these three parameters. This function does
@@ -4129,19 +4406,56 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
                     if _durable:
                         conn.execute("PRAGMA synchronous=FULL")
                     cursor = conn.cursor()
+                    _shape = (arg_names, amount if amount is not None else 0.0,
+                              target_class, challenge_issued,
+                              quantity if quantity is not None else 0.0, posture)
                     try:
                         cursor.execute(
                             "INSERT INTO event_log (%s, arg_names, amount, target_class, "
-                            "challenge_issued, quantity, posture) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)" % _COLUMNS,
-                            _values + (arg_names, amount if amount is not None else 0.0,
-                                       target_class, challenge_issued,
-                                       quantity if quantity is not None else 0.0,
-                                       posture))
+                            "challenge_issued, quantity, posture, rule_uncompared, row_cap, "
+                            "reversibility) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            % _COLUMNS,
+                            _values + _shape + (rule_uncompared, row_cap, reversibility))
                     except sqlite3.OperationalError:
-                        cursor.execute(
-                            "INSERT INTO event_log (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                            % _COLUMNS, _values)
+                        # One rung down: a ledger carrying `row_cap` but not `reversibility`.
+                        # Each rung keeps everything the column set below it can hold and
+                        # loses only the newest mark -- a ledger that was current yesterday
+                        # must not drop arg_names and posture from every row because one
+                        # column arrived today.
+                        try:
+                            cursor.execute(
+                                "INSERT INTO event_log (%s, arg_names, amount, target_class, "
+                                "challenge_issued, quantity, posture, rule_uncompared, row_cap) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                                % _COLUMNS,
+                                _values + _shape + (rule_uncompared, row_cap))
+                        except sqlite3.OperationalError:
+                            # Two rungs down: `rule_uncompared` but not `row_cap`.
+                            try:
+                                cursor.execute(
+                                    "INSERT INTO event_log (%s, arg_names, amount, "
+                                    "target_class, challenge_issued, quantity, posture, "
+                                    "rule_uncompared) "
+                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                                    % _COLUMNS, _values + _shape + (rule_uncompared,))
+                            except sqlite3.OperationalError:
+                                # The ledger has the shape columns but none of the marks:
+                                # keep the shape. Falling straight to the legacy set here
+                                # would have dropped arg_names and posture from every row
+                                # on a ledger that was current the day before the first
+                                # mark column existed.
+                                try:
+                                    cursor.execute(
+                                        "INSERT INTO event_log (%s, arg_names, amount, "
+                                        "target_class, challenge_issued, quantity, posture) "
+                                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                                        % _COLUMNS, _values + _shape)
+                                except sqlite3.OperationalError:
+                                    cursor.execute(
+                                        "INSERT INTO event_log (%s) "
+                                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                                        % _COLUMNS, _values)
                     conn.commit()
                 finally:
                     # 🔴 ROLL BACK BEFORE RESTORING, OR THE RESTORE CANNOT RUN AT ALL. SQLite
@@ -4735,3 +5049,330 @@ def get_would_block_summary(path=None, exclude_agents=None):
             for pname, pid, wb, tools in rows
         ]
     return {"total": sum(row["would_blocks"] for row in policies), "policies": policies}
+
+
+# --- THE LEDGER HALF OF `agentx review` ----------------------------------------------------
+#
+# The incident store (`overrides.py`, "the incident store the gateway wrote") holds a block
+# only when a gateway parked it, and in audit posture the gateway parks nothing on purpose.
+# So the blocks a free-door user sees ("📝 Recorded locally") and every `ran, flagged` call
+# lived only here, where nothing asked about them. These readers and writers are the ledger
+# twins of `overrides._incidents_by_verdict_state` / `record_outcome` / `clear_outcome`, keyed
+# on the row `id` because a ledger row has no receipt.
+#
+# What a ledger row can SHOW a reviewer is bounded by the privacy rule at the top of
+# `_EVENT_LOG_COLUMNS`: the tool, the policy, the coaching we issued, argument NAMES, a target
+# CLASS, a row-cap CLASS, a reversibility CLASS. Never the statement. That is a weaker
+# picture than an incident's `raw_payload`, and it is the picture the free door has.
+
+def _ledger_verdict_columns_present(conn):
+    have = {r[1] for r in conn.execute("PRAGMA table_info(event_log)")}
+    return "status" in have, all(c in have for c in _LEDGER_LABEL_COLUMNS)
+
+
+def _ensure_ledger_verdict_columns(conn):
+    """Add the verdict columns to a ledger written by an older SDK. `init_db` normally
+    migrates them, but a review can be the first thing this SDK version touches on a
+    ledger the agent last wrote from an older one. ADD COLUMN of a nullable column is
+    non-destructive; the same self-heal `overrides._ensure_label_columns` does."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(event_log)")}
+    for name in _LEDGER_LABEL_COLUMNS:
+        if name not in have:
+            conn.execute("ALTER TABLE event_log ADD COLUMN %s TEXT" % name)
+
+
+# 🔴 THE MCP DOOR TURNS THIS OFF, AND THE FLAG IS HERE SO THE COUNT AND THE LIST AGREE.
+# On that door `agentx review` already offers ONE verdict per policy from the MCP corpus
+# (`cli._mcp_review_items`), and `db.DB_PATH` is the MCP ledger, so per-block items from it
+# would ask the same person the same question twice on the one screen where re-asking costs
+# the most. `mcp_proxy._point_stores_at_mcp_home` clears this beside the three stores it
+# repoints. It gates every reader below, including the count the atexit nudge prints, so the
+# nudge cannot promise blocks the walk will not show.
+PER_BLOCK_LEDGER_REVIEW = True
+
+
+def _ledger_verdict_where(labelled, has_labels, incident_attached):
+    """The WHERE for "awaiting a verdict" (``labelled=False``) or "carrying one"
+    (``labelled=True``), plus params. Our own scripted agents are excluded on BOTH reads:
+    `agentx demo --audit` writes a flagged DROP TABLE, and asking a person whether OUR demo's
+    block was right is noise on the one screen where re-asking costs the most.
+
+    🔴 A BLOCK THE GATEWAY PARKED IS ASKED ABOUT ONCE, FROM THE INCIDENT. The decorator
+    writes its CHALLENGED ledger row and THEN parks the incident, so a keyed user's block is
+    in both notebooks. The incident carries the statement and the agent's reasoning; the
+    ledger row carries a class and a name. The pending read therefore skips a ledger row
+    whose (trace_id, policy_id) has an incident, via the attached store (``inc``), and the
+    count uses the same clause so the two never disagree. Not applied to the labelled read:
+    a ledger row carrying a verdict got it through this path."""
+    ours, params = _our_agents_clause(negate=True)
+    if labelled:
+        # 🔴 NO STATUS CLAUSE, the same rule the incident store's labelled read states: a
+        # verdict, once given, stays visible whatever happens to the row afterwards. This
+        # ledger rewrites a CHALLENGED row to RECOVERED in place when the agent retries
+        # narrower, so a status filter here made a verdict vanish from `--undo` and from the
+        # per-policy evidence count the moment the agent got past the block. (A ledger with
+        # no label columns cannot carry a verdict; the reader returns before reaching here.)
+        return "label_verdict IS NOT NULL AND label_verdict != '' AND %s" % ours, params
+    marks = ",".join("?" for _ in REVIEWABLE_LEDGER_STATUSES)
+    where = "status IN (%s) AND %s" % (marks, ours)
+    params = list(REVIEWABLE_LEDGER_STATUSES) + params
+    if has_labels:
+        where += " AND (label_verdict IS NULL OR label_verdict = '')"
+    if incident_attached:
+        where += (" AND NOT EXISTS (SELECT 1 FROM inc.incidents i WHERE i.trace_id = "
+                  "event_log.trace_id AND i.policy_id = event_log.policy_id)")
+    return where, params
+
+
+def _attach_incident_store(conn, incident_db, ledger_path):
+    """ATTACH the incident store as ``inc`` when it is a different, existing file with an
+    ``incidents`` table that carries the two join columns. Returns whether it did. The MCP
+    door points AGENTX_INCIDENT_DB at the ledger file itself; that is the same file, so no
+    attach (and that door is gated off above anyway)."""
+    if not incident_db or not os.path.exists(incident_db):
+        return False
+    try:
+        if os.path.samefile(incident_db, ledger_path):
+            return False
+    except OSError:
+        return False
+    try:
+        conn.execute("ATTACH DATABASE ? AS inc", (incident_db,))
+        cols = {r[1] for r in conn.execute("PRAGMA inc.table_info(incidents)")}
+        if {"trace_id", "policy_id"} <= cols:
+            return True
+        conn.execute("DETACH DATABASE inc")
+    except sqlite3.Error:
+        pass
+    return False
+
+
+def list_ledger_blocks_by_verdict_state(limit, labelled, path=None, incident_db=None):
+    """``(rows, more_exist)`` -- ledger blocks WITHOUT a verdict (``labelled=False``) or
+    WITH one, newest first, the LIMIT spent on rows that QUALIFY (the rule the incident read states), read one
+    past the limit so ``more_exist`` is a fact and not a guess. Each row is a dict of the
+    row's columns. Missing ledger / locked / no `status` column / the MCP door ->
+    ``([], False)``; a ledger predating the verdict columns has nothing labelled and
+    everything pending. ``incident_db`` is the store whose parked blocks are skipped."""
+    p = path or DB_PATH
+    if not PER_BLOCK_LEDGER_REVIEW or not os.path.exists(p):
+        return [], False
+    try:
+        with _connection(p) as conn:
+            has_status, has_labels = _ledger_verdict_columns_present(conn)
+            if not has_status or (labelled and not has_labels):
+                return [], False
+            attached = (not labelled) and _attach_incident_store(conn, incident_db, p)
+            where, params = _ledger_verdict_where(labelled, has_labels, attached)
+            cur = conn.execute(
+                "SELECT * FROM event_log WHERE %s ORDER BY id DESC LIMIT ?" % where,
+                params + [int(limit) + 1])
+            names = [c[0] for c in cur.description]
+            rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    except Exception:
+        return [], False
+    more_exist = len(rows) > limit
+    return rows[:limit], more_exist
+
+
+def count_ledger_awaiting_verdict(path=None, incident_db=None):
+    """The EXACT number of ledger blocks with no verdict yet, the SAME clause as the
+    pending read so the nudge and the walk agree. A ``COUNT(*)``, cheap enough for the
+    atexit nudge. 0 on a missing or unreadable ledger, and on the MCP door."""
+    p = path or DB_PATH
+    if not PER_BLOCK_LEDGER_REVIEW or not os.path.exists(p):
+        return 0
+    try:
+        with _connection(p) as conn:
+            has_status, has_labels = _ledger_verdict_columns_present(conn)
+            if not has_status:
+                return 0
+            attached = _attach_incident_store(conn, incident_db, p)
+            where, params = _ledger_verdict_where(False, has_labels, attached)
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM event_log WHERE %s" % where, params).fetchone()[0] or 0)
+    except Exception:
+        return 0
+
+
+def ledger_verdict_stats(path=None, incident_db=None):
+    """Per-verdict counts over the ledger's blocks (ours excluded), for
+    ``agentx review --stats``. Two populations, the same two the list reads use: a row
+    carrying a verdict counts whatever its status or gateway twin (it is on the ``--undo``
+    read); a row without one counts only while it is a question (a reviewable status, no
+    incident twin), so ``unlabeled`` equals what the walk will ask. Shape:
+    ``{"TRUE_POSITIVE": n, ..., "unlabeled": n, "total": n}``. Off-vocab values count as
+    unlabeled rather than raising: a stats screen must never fail on one odd row. All zero
+    on a missing or unreadable ledger, and on the MCP door."""
+    from .overrides import _VERDICT_VOCAB    # function-local: overrides imports this module
+    out = {v: 0 for v in sorted(_VERDICT_VOCAB)}
+    out["unlabeled"] = 0
+    out["total"] = 0
+    p = path or DB_PATH
+    if not PER_BLOCK_LEDGER_REVIEW or not os.path.exists(p):
+        return out
+    try:
+        with _connection(p) as conn:
+            has_status, has_labels = _ledger_verdict_columns_present(conn)
+            if not has_status:
+                return out
+            attached = _attach_incident_store(conn, incident_db, p)
+            ours, params = _our_agents_clause(negate=True)
+            marks = ",".join("?" for _ in REVIEWABLE_LEDGER_STATUSES)
+            col = "label_verdict" if has_labels else "NULL"
+            # The same two populations the two list reads use: a row carrying a verdict
+            # counts whatever its status or twin; a row without one counts only while it is
+            # a question (reviewable status, not parked at the gateway).
+            pending = "status IN (%s)" % marks
+            if attached:
+                pending += (" AND NOT EXISTS (SELECT 1 FROM inc.incidents i WHERE i.trace_id = "
+                            "event_log.trace_id AND i.policy_id = event_log.policy_id)")
+            if has_labels:
+                where = ("%s AND ((label_verdict IS NOT NULL AND label_verdict != '') OR (%s))"
+                         % (ours, pending))
+            else:
+                where = "%s AND %s" % (ours, pending)
+            for verdict, n in conn.execute(
+                    "SELECT %s, COUNT(*) FROM event_log WHERE %s GROUP BY 1" % (col, where),
+                    params + list(REVIEWABLE_LEDGER_STATUSES)):
+                out[verdict if verdict in _VERDICT_VOCAB else "unlabeled"] += n
+                out["total"] += n
+    except Exception:
+        return out
+    return out
+
+
+def record_ledger_verdict(row_id, verdict, source, path=None):
+    """Write a person's (or a standing rule's) answer onto one ledger block. Off-vocab
+    RAISES, the same fail-safe as ``overrides.record_outcome``. Returns True iff a row was
+    updated; False when the ledger or the row is missing, or the row is not a block, so
+    the CLI can report an honest no-op. Self-heals the columns on an older ledger."""
+    from .overrides import _VERDICT_VOCAB, _VERDICT_SOURCE_VOCAB
+    if verdict not in _VERDICT_VOCAB:
+        raise ValueError("verdict %r not in %s" % (verdict, sorted(_VERDICT_VOCAB)))
+    if source not in _VERDICT_SOURCE_VOCAB:
+        raise ValueError("source %r not in %s" % (source, sorted(_VERDICT_SOURCE_VOCAB)))
+    p = path or DB_PATH
+    if not os.path.exists(p):
+        return False
+    try:
+        with _connection(p) as conn:
+            _ensure_ledger_verdict_columns(conn)
+            marks = ",".join("?" for _ in REVIEWABLE_LEDGER_STATUSES)
+            cur = conn.execute(
+                "UPDATE event_log SET label_verdict = ?, label_verdict_source = ?, "
+                "outcome_at = ? WHERE id = ? AND (status IN (%s) OR "
+                "(label_verdict IS NOT NULL AND label_verdict != ''))" % marks,
+                [verdict, source, datetime.now(timezone.utc).isoformat(),
+                 int(row_id)] + list(REVIEWABLE_LEDGER_STATUSES))
+            conn.commit()
+            return cur.rowcount > 0
+    except Exception:
+        return False
+
+
+def list_ledger_policies(path=None):
+    """Distinct ``(policy_id, policy_name)`` pairs the ledger has recorded a block under,
+    so a user-typed policy ref can be resolved against what THIS machine has seen when no
+    gateway ever parked an incident for it (the free door's custom or pulled policies).
+    Empty on a missing or unreadable ledger."""
+    p = path or DB_PATH
+    if not os.path.exists(p):
+        return []
+    try:
+        with _connection(p) as conn:
+            marks = ",".join("?" for _ in REVIEWABLE_LEDGER_STATUSES)
+            return [tuple(r) for r in conn.execute(
+                "SELECT DISTINCT policy_id, policy_name FROM event_log WHERE status IN (%s) "
+                "AND (policy_id IS NOT NULL OR policy_name IS NOT NULL)" % marks,
+                list(REVIEWABLE_LEDGER_STATUSES))]
+    except Exception:
+        return []
+
+
+def ledger_has_block(trace_id, policy_id, path=None):
+    """Whether the ledger holds a block for this (trace_id, policy_id): the twin of a
+    gateway-parked incident, written by the decorator before the park. Read by the review
+    walk's delete so it can say the copy stays. False on a missing or unreadable ledger."""
+    p = path or DB_PATH
+    if not trace_id or not policy_id or not os.path.exists(p):
+        return False
+    try:
+        with _connection(p) as conn:
+            marks = ",".join("?" for _ in REVIEWABLE_LEDGER_STATUSES)
+            row = conn.execute(
+                "SELECT 1 FROM event_log WHERE trace_id = ? AND policy_id = ? AND "
+                "status IN (%s) LIMIT 1" % marks,
+                [trace_id, policy_id] + list(REVIEWABLE_LEDGER_STATUSES)).fetchone()
+            return row is not None
+    except Exception:
+        return False
+
+
+def ledger_block_is_pending(trace_id, policy_id, path=None, incident_db=None):
+    """Whether the next `agentx review` will ASK about the ledger row for this
+    (trace_id, policy_id): the pending read's own predicate (`_ledger_verdict_where`,
+    labelled=False, with the incident store attached) narrowed to the one block, so a
+    sentence that promises "will be asked about" is derived from the reader that decides
+    it and not from a second reading of the row. Evaluate it AFTER the delete it describes.
+    False on a missing or unreadable ledger, and on the MCP door."""
+    p = path or DB_PATH
+    if not PER_BLOCK_LEDGER_REVIEW or not trace_id or not policy_id or not os.path.exists(p):
+        return False
+    try:
+        with _connection(p) as conn:
+            has_status, has_labels = _ledger_verdict_columns_present(conn)
+            if not has_status:
+                return False
+            attached = _attach_incident_store(conn, incident_db, p)
+            where, params = _ledger_verdict_where(False, has_labels, attached)
+            row = conn.execute(
+                "SELECT 1 FROM event_log WHERE %s AND trace_id = ? AND policy_id = ? LIMIT 1"
+                % where, params + [trace_id, policy_id]).fetchone()
+            return row is not None
+    except Exception:
+        return False
+
+
+def list_ledger_declared_verdicts(path=None):
+    """``[(id, policy_id, policy_name), ...]`` for every ledger row a standing rule stamped
+    (``label_verdict_source = 'declared'``), so ``overrides.unlabel_declared_verdicts`` can
+    match them by the same name/id union it uses for incidents. Empty on a missing or
+    unreadable ledger, and on a ledger without the columns."""
+    p = path or DB_PATH
+    if not os.path.exists(p):
+        return []
+    try:
+        with _connection(p) as conn:
+            _has_status, has_labels = _ledger_verdict_columns_present(conn)
+            if not has_labels:
+                return []
+            return [tuple(r) for r in conn.execute(
+                "SELECT id, policy_id, policy_name FROM event_log "
+                "WHERE label_verdict_source = 'declared'")]
+    except Exception:
+        return []
+
+
+def clear_ledger_verdicts(row_ids, path=None):
+    """Take the verdict back off the named ledger rows: verdict and provenance cleared
+    together (a lingering "declared" on a row with no verdict claims a rule nobody kept).
+    Returns the count actually changed. The by-policy twin of ``overrides.clear_outcome``;
+    a per-row clear from the CLI does not exist yet (a ledger row has no receipt)."""
+    ids = [int(i) for i in (row_ids or [])]
+    p = path or DB_PATH
+    if not ids or not os.path.exists(p):
+        return 0
+    try:
+        with _connection(p) as conn:
+            _has_status, has_labels = _ledger_verdict_columns_present(conn)
+            if not has_labels:
+                return 0
+            cur = conn.executemany(
+                "UPDATE event_log SET label_verdict = NULL, label_verdict_source = NULL, "
+                "outcome_at = ? WHERE id = ? AND label_verdict IS NOT NULL",
+                [(datetime.now(timezone.utc).isoformat(), i) for i in ids])
+            conn.commit()
+            return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+    except Exception:
+        return 0

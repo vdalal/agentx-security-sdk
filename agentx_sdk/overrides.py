@@ -2222,27 +2222,90 @@ def count_awaiting_verdict(db_path=None):
     the walkthrough header both read a 200-row window and could not say anything but 200.
     A reader with all three in front of them cannot tell which is the size of their job.
     The cap on the WALKTHROUGH is real work-limiting and stays; the cap on the COUNT was
-    never anything but an artifact of reusing the list-read to do arithmetic."""
+    never anything but an artifact of reusing the list-read to do arithmetic.
+
+    Both notebooks: the incident store's pending blocks plus the ledger's, the
+    ledger count excluding a block the incident store already holds, so this number is
+    the number of QUESTIONS the walk will ask and not a sum of two overlapping stores."""
+    from . import db as _db
     p = _incident_db_path(db_path)
+    in_ledger = _db.count_ledger_awaiting_verdict(incident_db=p)
     if not os.path.exists(p):
-        return 0
+        return in_ledger
     statuses = sorted(_BLOCKING_STATUSES)
     try:
         conn = sqlite3.connect(p)
         try:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(incidents)")}
             if "status" not in cols:
-                return 0
+                return in_ledger
             where = "status IN (%s)" % ",".join("?" for _ in statuses)
             if "label_verdict" in cols:
                 where += " AND (label_verdict IS NULL OR label_verdict = '')"
             row = conn.execute(
                 "SELECT COUNT(*) FROM incidents WHERE %s" % where, statuses).fetchone()
-            return int(row[0] or 0)
+            return int(row[0] or 0) + in_ledger
         finally:
             conn.close()
     except sqlite3.Error:
-        return 0
+        return in_ledger
+
+
+# --------------------------------------------- the ledger half of the verdict queue -----
+# `agentx review` read one notebook: the incident store, which only a gateway writes, and
+# which the gateway deliberately does not write in audit posture. A free-door block
+# ("📝 Recorded locally (no key needed)") and every `ran, flagged` call under audit lived
+# only in the call ledger (`db.DB_PATH`), where nothing asked about them. These readers
+# merge the ledger's blocks into the same queue; `db` owns the SQL, this file owns the item
+# shape the walk renders. A ledger item carries ``store="ledger"`` and ``ledger_id``; an
+# incident item carries ``receipt_id``; the MCP wedge item carries neither and ``mcp=True``.
+
+def _ledger_verdict_item(r):
+    """The review item for one ledger block. What it can show is what the ledger holds
+    (see `db._EVENT_LOG_COLUMNS`): the tool, the policy, the coaching we issued, and four
+    bounded labels. Never the statement; `raw_payload` and `agent_cot` are incident-only."""
+    ts = r.get("timestamp")
+    try:
+        created = datetime.fromtimestamp(float(ts), timezone.utc).isoformat() if ts else None
+    except (TypeError, ValueError, OSError):
+        created = None
+    return {
+        "kind": "verdict",
+        "store": "ledger",
+        "ledger_id": r.get("id"),
+        "receipt_id": None,
+        "policy_id": r.get("policy_id"),
+        "policy_violated": r.get("policy_name"),
+        "status": r.get("status"),
+        "created_at": created,
+        "challenge_issued": r.get("challenge_issued"),
+        "label_verdict": r.get("label_verdict"),
+        "tool_name": r.get("tool_name"),
+        "agent_id": r.get("agent_id"),
+        "arg_names": r.get("arg_names"),
+        "target_class": r.get("target_class"),
+        "row_cap": r.get("row_cap"),
+        "reversibility": r.get("reversibility"),
+        "posture": r.get("posture"),
+    }
+
+
+def _ledger_items_by_verdict_state(limit, labelled, db_path=None):
+    """``(items, more_exist)`` -- the ledger twin of ``_incidents_by_verdict_state``, with
+    the incident store passed through so a block parked at the gateway is asked about
+    once, from the incident."""
+    from . import db as _db
+    rows, more = _db.list_ledger_blocks_by_verdict_state(
+        limit, labelled, incident_db=_incident_db_path(db_path))
+    return [_ledger_verdict_item(r) for r in rows], more
+
+
+def _merge_newest_first(a_rows, b_rows, limit):
+    """One window over two stores. Each read already spent its own LIMIT on rows that
+    qualify; merging by ``created_at`` and cutting to ``limit`` keeps the header's
+    "showing the most recent N" true across both notebooks."""
+    merged = sorted(a_rows + b_rows, key=lambda it: it.get("created_at") or "", reverse=True)
+    return merged[:limit], len(merged) > limit
 
 
 def _reviewable_with_truncation(db_path=None, cluster=True):
@@ -2270,10 +2333,12 @@ def _reviewable_with_truncation(db_path=None, cluster=True):
     items = _adopt_items(db_path, cluster)
     raw, hit_the_cap = _incidents_by_verdict_state(REVIEW_READ_CAP, labelled=False,
                                                    db_path=db_path)
+    incident_items = []
     for r in raw:
-        items.append({
+        incident_items.append({
             "kind": "verdict",
             "receipt_id": r.get("receipt_id"),
+            "trace_id": r.get("trace_id"),
             "policy_id": r.get("policy_id"),
             "policy_violated": r.get("policy_violated"),
             "status": r.get("status"),
@@ -2283,7 +2348,14 @@ def _reviewable_with_truncation(db_path=None, cluster=True):
             "agent_cot": r.get("agent_cot"),
             "raw_payload": r.get("raw_payload"),
         })
-    return items, hit_the_cap
+    # The second notebook. Both reads are capped and both flags are real; the
+    # merge keeps one window so "showing the most recent 200" stays one sentence.
+    ledger_items, ledger_cap = _ledger_items_by_verdict_state(REVIEW_READ_CAP, labelled=False,
+                                                              db_path=db_path)
+    verdict_items, merged_cap = _merge_newest_first(incident_items, ledger_items,
+                                                    REVIEW_READ_CAP)
+    items.extend(verdict_items)
+    return items, hit_the_cap or ledger_cap or merged_cap
 
 
 def _adopt_items(db_path=None, cluster=True):
@@ -2367,6 +2439,7 @@ def labeled_items_with_truncation(db_path=None):
             items.append({
                 "kind": "verdict",
                 "receipt_id": r.get("receipt_id"),
+                "trace_id": r.get("trace_id"),
                 "policy_id": r.get("policy_id"),
                 "policy_violated": r.get("policy_violated"),
                 "status": r.get("status"),
@@ -2377,7 +2450,11 @@ def labeled_items_with_truncation(db_path=None):
                 "agent_cot": r.get("agent_cot"),
                 "raw_payload": r.get("raw_payload"),
             })
-    return items, more_exist
+    # A verdict given on a ledger block is taken back on the same screen.
+    ledger_items, ledger_more = _ledger_items_by_verdict_state(REVIEW_READ_CAP, labelled=True,
+                                                               db_path=db_path)
+    items, merged_more = _merge_newest_first(items, ledger_items, REVIEW_READ_CAP)
+    return items, more_exist or ledger_more or merged_more
 
 
 def count_reviewable(db_path=None):
@@ -2418,6 +2495,18 @@ def label_stats(db_path=None):
         stats["harm"][h if h in _HARM_VOCAB else "unknown"] += 1
         if r.get("status") in _BLOCKING_STATUSES and not v:
             stats["blocking_open"] += 1
+    # The ledger's blocks, on the verdict axis only: the ledger has no safe-path or
+    # harm column. Reported under its own key too, so the screen can say where the total
+    # came from. ``blocking_open`` takes the DEDUPLICATED count (a block parked at the
+    # gateway is one question, not two), the same number the walk and the nudge use.
+    from . import db as _db
+    ledger = _db.ledger_verdict_stats(incident_db=_incident_db_path(db_path))
+    stats["ledger_blocks"] = ledger["total"]
+    stats["total"] += ledger["total"]
+    for k in ("TRUE_POSITIVE", "FALSE_POSITIVE", "ACCEPTED_RISK", "unlabeled"):
+        stats["verdict"][k] += ledger.get(k, 0)
+    stats["blocking_open"] += _db.count_ledger_awaiting_verdict(
+        incident_db=_incident_db_path(db_path))
     return stats
 
 
@@ -2675,9 +2764,19 @@ def unlabel_declared_verdicts(policy_id=None, policy_name=None, db_path=None):
         if n == 1:
             target_id = entry["id"]
     ids = {i for i in (policy_id, target_id) if i}
+
+    def _mine(pid, pname):
+        return (pid and pid in ids) or (target_name and _norm_for_dedup(pname or "") == target_name)
+
+    # The ledger half first: `apply_declared_verdicts` stamps ledger rows too, so a
+    # clear that read only the incident store told the screen "no longer settled" and left
+    # every free-door block the rule had stamped settled for good.
+    from . import db as _db
+    cleared = _db.clear_ledger_verdicts(
+        [rid for rid, pid, pname in _db.list_ledger_declared_verdicts() if _mine(pid, pname)])
     p = _incident_db_path(db_path)
     if not os.path.exists(p):
-        return 0
+        return cleared
     try:
         conn = sqlite3.connect(p)
         try:
@@ -2686,22 +2785,20 @@ def unlabel_declared_verdicts(policy_id=None, policy_name=None, db_path=None):
                 "SELECT receipt_id, policy_id, policy_violated FROM incidents "
                 "WHERE label_verdict_source = 'declared'"
             ).fetchall()
-            targets = [r[0] for r in rows
-                       if (r[1] and r[1] in ids)
-                       or (target_name and _norm_for_dedup(r[2] or "") == target_name)]
+            targets = [r[0] for r in rows if _mine(r[1], r[2])]
             if not targets:
-                return 0
+                return cleared
             conn.executemany(
                 "UPDATE incidents SET label_verdict = NULL, label_verdict_source = NULL, "
                 "outcome_at = ? WHERE receipt_id = ?",
                 [(_now_iso(), rid) for rid in targets],
             )
             conn.commit()
-            return len(targets)
+            return cleared + len(targets)
         finally:
             conn.close()
     except sqlite3.Error:
-        return 0
+        return cleared
 
 
 def count_policy_verdict_evidence(policy_id=None, policy_name=None, verdict=None, db_path=None):
@@ -2723,6 +2820,8 @@ def count_policy_verdict_evidence(policy_id=None, policy_name=None, verdict=None
         rows = list_recent_incidents(limit=100000, db_path=db_path)
     except Exception:
         return 0
+    # Both notebooks: a verdict on a ledger block counts the same as one on an incident.
+    rows = rows + _ledger_items_by_verdict_state(100000, labelled=True, db_path=db_path)[0]
     for r in rows:
         lv = r.get("label_verdict")
         if not lv or (verdict is not None and lv != verdict):
@@ -2759,7 +2858,27 @@ def count_policy_unlabeled_blocks(policy_id=None, policy_name=None, db_path=None
         rname = _norm_for_dedup(r.get("policy_violated") or "")
         if (rid and rid in ids) or (target_name and rname == target_name):
             count += 1
+    # The ledger's pending blocks on this policy; the read already excludes a block
+    # the incident store holds, so the two loops never count one block twice.
+    for it in _ledger_items_by_verdict_state(100000, labelled=False, db_path=db_path)[0]:
+        rid = it.get("policy_id")
+        rname = _norm_for_dedup(it.get("policy_violated") or "")
+        if (rid and rid in ids) or (target_name and rname == target_name):
+            count += 1
     return count
+
+
+def record_verdict_on_item(item, verdict, source="human"):
+    """ONE write for a verdict item, whichever notebook it came from. The walk, the
+    batch answer and the declared-verdict sweep all come through here, so "which store" is
+    decided once. An MCP wedge item (neither key) is the caller's to route to
+    ``set_declared_verdict``; this returns False for it rather than guessing."""
+    from . import db as _db
+    if item.get("store") == "ledger":
+        return _db.record_ledger_verdict(item.get("ledger_id"), verdict, source)
+    if item.get("receipt_id"):
+        return record_outcome(item["receipt_id"], verdict=verdict, source=source)
+    return False
 
 
 def apply_declared_verdicts(path=None, db_path=None):
@@ -2779,6 +2898,12 @@ def apply_declared_verdicts(path=None, db_path=None):
             continue
         v = get_declared_verdict(r.get("policy_id"), r.get("policy_violated"), path=path)
         if v and record_outcome(r.get("receipt_id"), verdict=v, source="declared", db_path=db_path):
+            labeled += 1
+    # The ledger's pending blocks too: a standing verdict that skipped only the
+    # incident store would leave the same policy's free-door blocks coming back every run.
+    for it in _ledger_items_by_verdict_state(100000, labelled=False, db_path=db_path)[0]:
+        v = get_declared_verdict(it.get("policy_id"), it.get("policy_violated"), path=path)
+        if v and record_verdict_on_item(it, v, source="declared"):
             labeled += 1
     return labeled
 

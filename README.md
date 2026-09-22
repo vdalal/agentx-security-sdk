@@ -39,19 +39,19 @@ Add `@agentx_protect` over any high-risk tool. The SDK inspects the call at runt
 ```python
 from agentx_sdk.decorators import agentx_protect
 
-@agentx_protect(agent_id="crm_agent")
-def dispatch_crm_update(client_id: str, profile_notes: str, db_session=None):
-    print(f"Updating records for {client_id}")
+@agentx_protect(agent_id="crm_worker")
+def run_sql(query: str, db=None):
+    ...
 ```
 
-That wrap watches and records every call it sees. To have it stop a flagged one, export `AGENTX_POSTURE=enforce` for the whole process, or pin the single tool with `@agentx_protect(agent_id="crm_agent", posture="enforce")`. A pinned tool keeps that posture until you delete the argument, and it wins over the environment variable.
+That wrap watches and records every call it sees. To have it stop a flagged one, export `AGENTX_POSTURE=enforce` for the whole process, or pin the single tool with `@agentx_protect(agent_id="crm_worker", posture="enforce")`. A pinned tool keeps that posture until you delete the argument, and it wins over the environment variable.
 
 Once blocking is on, your code reacts with `is_block()`. You never parse message text, you read structured fields:
 
 ```python
 from agentx_sdk import agentx_protect, is_block
 
-result = dispatch_crm_update(client_id="CLI-99401", profile_notes=untrusted)
+result = run_sql(query=untrusted)
 
 if is_block(result):
     print(f"Blocked by policy: {result.policy}")
@@ -70,6 +70,12 @@ try:
 except AgentXSecurityBlock as block:
     llm.send(block.challenge)
 ```
+
+The statement has to reach the Shield in an argument named for what it is. `query`, `sql`,
+`statement`, `command`, `path` and `url` are read as what they say they are, as is the single string
+argument of a tool whose own name says what it runs. Free text is not: a `note` or a `body` carrying
+the same words is recorded and left alone, so a ticket that happens to say "update the cart set aside
+for later" is not treated as a mass write.
 
 A runaway-loop circuit-breaker trip is not a policy block. It raises `AgentXCircuitBreakerTripped`, and `is_block()` returns `False` for it, so you can catch it separately to abort the run.
 

@@ -68,6 +68,8 @@ try:
         _delivered_coaching,
         _is_narrower,
         _coerce_arg_value,
+        row_cap_for_arguments,
+        reversibility_for_arguments,
         _max_cognitive_turns,
         # _scope / _target_action read as unused HERE — the module body calls neither directly,
         # only _abstract_call does, from decorators. They are re-exported on purpose: the MCP
@@ -80,6 +82,8 @@ try:
         _note_own_agent_block,
         _resolve_enforcement,
         evaluate_call_keyless,
+        _schema_declared_args,
+        _remember_table_copy,
         AgentXPolicyLoadError,
         # Read the load error through the ACCESSOR, never a by-value global import: it is
         # re-evaluated per call (so a fixed file un-bricks without a restart) and it is the
@@ -372,13 +376,67 @@ def _notify_enabled():
     return os.environ.get("AGENTX_MCP_NOTIFY", "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _with_logging_capability(line, session_stats, log=None):
-    """Return the `initialize` result with `capabilities.logging` added, or None to relay as is.
+# The three PULL channels, armed by the same flag as the notification. None enters the model's
+# context unless the human opens it: a prompt is a slash command in the host's menu whose text
+# reaches the chat only when run; a resource is an @-mention the human chooses to attach; the
+# server's name is what the host's server panel prints. Which of the three a given host shows
+# is the open question the flag exists to answer on a real client; nothing here claims one is.
+_PULL_PROMPT = {
+    "name": "agentx_report",
+    "description": "What AgentX saw your agent do through this server, and what is new "
+                   "since you last looked.",
+    "arguments": [],
+}
+_PULL_RESOURCE = {
+    "uri": "agentx://report",
+    "name": "AgentX report",
+    "description": _PULL_PROMPT["description"],
+    "mimeType": "text/plain",
+}
+
+
+def _pull_report_text():
+    """The text behind the prompt and the resource: what is new for this agent, or that
+    nothing is yet, and where the full screen is. The same sentence the notification carries,
+    so the three channels never disagree about what AgentX saw."""
+    # Never raises: a ledger that cannot be read answers with the fallback sentence. Raising
+    # here propagated to `_answer_pull_request`'s catch-all, which returned "forward", so the
+    # person who ran our slash command got the wrapped server's "unknown prompt" error.
+    try:
+        body = _novelty_body()
+    except Exception:
+        body = None
+    if body:
+        return body
+    return ("AgentX is watching this server and has nothing new to report for your agent yet. "
+            "See what it recorded: uvx agentx-mcp --audit")
+
+
+def _pull_prompt_message():
+    """The prompt's one user message. A host runs a prompt by sending its text to the MODEL as
+    the person's message and showing the person only the command name and the reply, so a
+    report addressed to nobody reaches nobody (walked in Claude Code: the text arrived at the
+    model, the screen showed nothing). The message is therefore the person's
+    own request, which is what running a slash command is: show this, then stop. The report
+    itself is the same sentence the resource and the notification carry."""
+    return ("Show me this AgentX report exactly as it is, then stop: %s"
+            % _pull_report_text())
+
+
+def _with_agentx_handshake(line, session_stats, log=None):
+    """Return the `initialize` result with AgentX's declarations added, or None to relay as is.
+
+    Added, each only when the server did not declare it itself: `capabilities.logging` (for
+    the notification), `capabilities.prompts` and `capabilities.resources` (for the two pull
+    channels), and a suffix on `serverInfo.name` saying AgentX is in the path and in which
+    posture, since today nothing in any host says so. Which capabilities the server holds on
+    its own is remembered (`_server_prompts`, `_server_resources`) so the relay knows whether
+    to answer a listing itself or merge into the server's.
 
     None means "not this line, or not safe to touch" and the caller relays the original bytes
-    untouched. Returning None on every doubt is the whole design: the cost of missing the
-    declaration is one notification a client may ignore; the cost of mangling `initialize` is
-    a session that never starts.
+    untouched. Returning None on every doubt is the whole design: the cost of missing a
+    declaration is one channel a client may ignore; the cost of mangling `initialize` is a
+    session that never starts.
 
     Clears `_init_id` once matched, so exactly one line can ever be rewritten per session.
     """
@@ -399,24 +457,141 @@ def _with_logging_capability(line, session_stats, log=None):
         result["capabilities"] = caps
     if not isinstance(caps, dict):
         return None                      # a server doing something we should not second-guess
-    if "logging" in caps:
-        # 🔴 NOTHING TO REWRITE IS NOT NOTHING TO SEND. This returns None so the relay passes
-        # the server's own bytes through untouched, which is right. But the caller read that
-        # None as "no notification either", so a server that declares `logging` ITSELF got
-        # zero notices -- and those are the servers whose clients are MOST likely to render
-        # one. The flag separates the two questions: rewrite (no) and notify (yes).
-        # Deliberately NOT set on the other None paths above and below: an error response or
-        # a shape we did not expect is not a handshake worth speaking into, and a failed
-        # re-serialize means we never declared the capability at all.
-        session_stats["_logging_already_declared"] = True
-        return None                      # already declared: relay the server's own bytes
-    caps["logging"] = {}
+    # 🔴 THE HANDSHAKE IS THE ONE MOMENT, WHETHER OR NOT WE REWRITE IT. This flag tells the
+    # relay "the client has its handshake and is listening", so the notification goes out
+    # even when the server declared `logging` itself and there was nothing of ours to add. An
+    # earlier cut set it only on the already-declared path and the relay read None as "no
+    # notification either": the servers whose clients were MOST likely to render one got none.
+    # Deliberately NOT set on the None paths above: an error response or a shape we did not
+    # expect is not a handshake worth speaking into.
+    session_stats["_handshake_seen"] = True
+    changed = False
+    if "logging" not in caps:
+        caps["logging"] = {}
+        changed = True
+    session_stats["_server_prompts"] = "prompts" in caps
+    session_stats["_server_resources"] = "resources" in caps
+    if "prompts" not in caps:
+        caps["prompts"] = {}
+        changed = True
+    if "resources" not in caps:
+        caps["resources"] = {}
+        changed = True
+    info = result.get("serverInfo")
+    if isinstance(info, dict) and isinstance(info.get("name"), str) and info["name"]:
+        posture = "watching" if session_stats.get("_enforcement", "audit") == "audit" else "enforcing"
+        info["name"] = "%s (agentx: %s)" % (info["name"], posture)
+        changed = True
+    if not changed:
+        return None                      # nothing of ours to add: relay the server's own bytes
     try:
         return json.dumps(msg) + "\n"
     except Exception:
         if log is not None:
             print("[agentx-mcp] (could not re-serialize initialize; relayed unchanged)", file=log)
         return None
+
+
+def _answer_pull_request(msg, writer, session_stats):
+    """Answer a client's request for one of AgentX's pull channels, or return False to forward.
+
+    Handled here, never forwarded: `prompts/get` for our prompt and `resources/read` for our
+    resource (the server never advertised them and may error on an unknown name). A listing
+    (`prompts/list`, `resources/list`) is ALWAYS forwarded with its id remembered, and decided
+    on the way back (`_merge_pull_listing`): a list the server returned gets our entry
+    appended; an error or a list-less answer (a server that never claimed the capability we
+    declared for it) is replaced with our own one-entry listing. Deciding on the answer, not
+    on what the handshake said the server owns, keeps this right whatever order the client's
+    first requests arrive in. Never raises."""
+    try:
+        method = msg.get("method")
+        mid = msg.get("id")
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        # Only the FIRST page of a listing carries our entry: a server that paginates with
+        # `nextCursor` gets a request per page, and remembering every one put agentx_report
+        # on each page and N times in the host's menu. A request carrying `cursor` is a
+        # later page, forwarded and relayed untouched.
+        if method == "prompts/list":
+            if mid is not None and params.get("cursor") is None:
+                session_stats.setdefault("_pending_prompt_ids", set()).add(mid)
+            return False
+        if method == "resources/list":
+            if mid is not None and params.get("cursor") is None:
+                session_stats.setdefault("_pending_resource_ids", set()).add(mid)
+            return False
+        if method == "prompts/get" and params.get("name") == _PULL_PROMPT["name"]:
+            if mid is not None:
+                writer.send({"jsonrpc": "2.0", "id": mid, "result": {
+                    "description": _PULL_PROMPT["description"],
+                    "messages": [{"role": "user",
+                                  "content": {"type": "text", "text": _pull_prompt_message()}}]}})
+            return True
+        if method == "resources/read" and params.get("uri") == _PULL_RESOURCE["uri"]:
+            if mid is not None:
+                writer.send({"jsonrpc": "2.0", "id": mid, "result": {
+                    "contents": [{"uri": _PULL_RESOURCE["uri"], "mimeType": "text/plain",
+                                  "text": _pull_report_text()}]}})
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _merge_pull_listing(line, session_stats):
+    """The server's answer to a `prompts/list` or `resources/list` we forwarded, with our
+    entry on it, or None to relay as is. Matched by the id remembered in
+    `_answer_pull_request`. A list the server returned gets our entry appended, the server's
+    own first and untouched; an error, or a result with no such list (a server that never
+    owned the capability we declared for it, answering `{}` or "method not found"), is
+    replaced by our own one-entry listing, since the client asked because WE said it could.
+    An answer that is not JSON, or one whose id we did not remember, goes through untouched.
+    Never raises."""
+    try:
+        s = line.strip()
+        if not s or s[0] != "{" or '"id"' not in s:
+            return None
+        msg = json.loads(s)
+        if not isinstance(msg, dict):
+            return None
+        mid = msg.get("id")
+        result = msg.get("result")
+        for key, entry, pending_key in (("prompts", _PULL_PROMPT, "_pending_prompt_ids"),
+                                        ("resources", _PULL_RESOURCE, "_pending_resource_ids")):
+            pending = session_stats.get(pending_key)
+            if not pending or mid not in pending:
+                continue
+            pending.discard(mid)
+            if isinstance(result, dict) and isinstance(result.get(key), list):
+                result[key].append(dict(entry))
+                return json.dumps(msg) + "\n"
+            return json.dumps({"jsonrpc": "2.0", "id": mid, "result": {key: [dict(entry)]}}) + "\n"
+    except Exception:
+        return None
+    return None
+
+
+def _novelty_body():
+    """The one sentence about what is new for this agent, or None when nothing is. A pure
+    read (`read_novelty` advances nothing); the session-end path still owns the advance."""
+    current = current_call_shape()
+    novelty = read_novelty(WATERMARK_SESSION, current=current)
+    items = top_novelty(novelty["items"], 2)
+    lines = []
+    for item in items:
+        text = format_novelty_item(item)
+        if text:
+            prefix = ("%s: " % item["tool"]) if item["tool"] else ""
+            lines.append("%s%s" % (prefix, text))
+    if not lines:
+        return None
+    # One sentence, then the command. The items already read as full clauses
+    # ("read_file: first call to your filesystem"), so joining them under another colon
+    # gave "New for your agent: read_file: first call ..." and two colons in six words.
+    body = "AgentX watched your agent do something new. " + ". ".join(lines) + "."
+    hidden = len(novelty["items"]) - len(items)
+    if hidden > 0:
+        body += " And %d more." % hidden
+    return body + " See them: uvx agentx-mcp --audit"
 
 
 def _notify_novelty_now(writer, log=None):
@@ -452,25 +627,9 @@ def _notify_novelty_now(writer, log=None):
         #
         # 🔴 IF THIS EVER BECOMES DEFAULT-ON, THE GATE COMES BACK. Then arming is no longer a
         # decision anyone made, and a CI harness would notify for nobody.
-        current = current_call_shape()
-        novelty = read_novelty(WATERMARK_SESSION, current=current)
-        items = top_novelty(novelty["items"], 2)
-        lines = []
-        for item in items:
-            text = format_novelty_item(item)
-            if text:
-                prefix = ("%s: " % item["tool"]) if item["tool"] else ""
-                lines.append("%s%s" % (prefix, text))
-        if not lines:
+        body = _novelty_body()
+        if not body:
             return False
-        # One sentence, then the command. The items already read as full clauses
-        # ("read_file: first call to your filesystem"), so joining them under another colon
-        # gave "New for your agent: read_file: first call ..." and two colons in six words.
-        body = "AgentX watched your agent do something new. " + ". ".join(lines) + "."
-        hidden = len(novelty["items"]) - len(items)
-        if hidden > 0:
-            body += " And %d more." % hidden
-        body += " See them: uvx agentx-mcp --audit"
         _send_log_notification(writer, body, log=log)
         return True
     except Exception:
@@ -703,13 +862,31 @@ def _match_adopted_rule_mcp(tool_name, arguments, session_stats):
     decorator: a match is about shape, not meaning. Narrates ONCE PER RULE per session, on
     stderr (stdout is the protocol channel). Never raises.
     """
+    return _adopted_rule_outcome_mcp(tool_name, arguments, session_stats)[0]
+
+
+def _adopted_rule_outcome_mcp(tool_name, arguments, session_stats):
+    """`(matched_rule, uncompared_rule)` on the MCP door; the decorator's
+    `_adopted_rule_outcome_keyless` ported here, same gates as `_match_adopted_rule_mcp`.
+    The uncompared slot is a rule whose shape the call had but whose `only_when` number could
+    not be read; narrated once per rule, recorded on the row, never counted as a match."""
     try:
         if not _MCP_PROJECT:
-            return None
-        from .rules import match_adopted_rule
-        rule = match_adopted_rule(tool_name, arguments)
+            return (None, None)
+        from .rules import evaluate_adopted_rule, only_when_clause, _only_when_unreadable_reason
+        rule, status = evaluate_adopted_rule(tool_name, arguments)
         if not rule:
-            return None
+            return (None, None)
+        if status == "uncompared":
+            narrated = session_stats.setdefault("rule_uncompared_narrated", set())
+            if rule["id"] not in narrated:
+                narrated.add(rule["id"])
+                reason = _only_when_unreadable_reason(rule["only_when"], arguments)
+                print("[agentx-mcp] '%s' has the shape of your rule '%s' (%s) but %s, so it was "
+                      "not compared. Not counted as a match. See:  uvx agentx-mcp --audit"
+                      % (tool_name, rule["name"], only_when_clause(rule), reason),
+                      file=sys.stderr)
+            return (None, rule)
         session_stats["rule_matches_seen"] = session_stats.get("rule_matches_seen", 0) + 1
         session_stats["rule_matches"] = session_stats.get("rule_matches", 0) + 1
         narrated = session_stats.setdefault("rule_matches_narrated", set())
@@ -719,9 +896,9 @@ def _match_adopted_rule_mcp(tool_name, arguments, session_stats):
                   "matches the shape of a rule, and only a gateway judges the meaning. See "
                   "every match:  uvx agentx-mcp --audit" % (tool_name, rule["name"]),
                   file=sys.stderr)
-        return rule
+        return (rule, None)
     except Exception:
-        return None
+        return (None, None)
 
 
 def _mcp_ledger_path():
@@ -732,9 +909,10 @@ def _mcp_ledger_path():
     anywhere else, and none of them is the one they see when they run `agentx insights` in their
     project.
 
-    SCOPE, said plainly: `agentx review` does NOT read this file (it reads the harvest corpus and
-    incidents.db), so this does not affect the review loop. It is here so the MCP door has one
-    ledger instead of a trail of them.
+    SCOPE, said plainly: `agentx review` does NOT read this file per block (it reads the harvest
+    corpus and incidents.db, and now the DECORATOR's ledger; `_point_stores_at_mcp_home`
+    turns the per-block ledger read off on this door), so this does not affect the review loop.
+    It is here so the MCP door has one ledger instead of a trail of them.
 
     Only the MCP path uses this. `agentx_sdk.db.DB_PATH` keeps its cwd-relative default, so the
     Python decorator path is untouched and no existing user's ledger moves."""
@@ -976,10 +1154,13 @@ def mcp_recovery_candidates(path=None, log=None):
 
 
 def _auto_coach_enabled():
-    """Auto-coach is default ON, so recovered safe-paths accumulate without a manual step.
-    One explicit off wins:
-    AGENTX_MCP_AUTO_COACH in {0,false,no,off}."""
-    return os.environ.get("AGENTX_MCP_AUTO_COACH", "on").strip().lower() not in ("0", "false", "no", "off")
+    """Auto-coach is default OFF: text an agent generated becomes live coaching only when a
+    person approves it (`agentx-mcp --review`), or when the operator turns this on. It was
+    default on for a year; the stated control "agent-generated text never becomes a live
+    security challenge without a human blessing it" and a default that promoted it after
+    three sightings could not both be true, and the review command already exists for the
+    human step. AGENTX_MCP_AUTO_COACH in {1,true,yes,on} enables it."""
+    return os.environ.get("AGENTX_MCP_AUTO_COACH", "off").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _auto_coach_min():
@@ -1002,7 +1183,8 @@ def auto_coach(path=None, log=None):
         scatter an overrides.json and no longer needs a project-root gate (see below);
       * a HUMAN-authored override always WINS -- an existing non-'mcp_auto' entry is never touched
         (hand-adopt beats auto), and an unchanged auto entry is left alone (no churn);
-      * AGENTX_MCP_AUTO_COACH=off disables it entirely.
+      * OFF unless AGENTX_MCP_AUTO_COACH=on: the default path to live coaching is a person
+        approving it in `agentx-mcp --review`.
     Best-effort: any error is swallowed so it can never affect the proxy or the run."""
     log = log or sys.stderr
     if not _auto_coach_enabled():
@@ -1073,9 +1255,11 @@ def auto_coach(path=None, log=None):
             # `uvx agentx-mcp --review`, not `agentx mcp-insights`: same reachability rule as
             # the rest of this door, and --review is what ACTS on these (adopt / reject) rather
             # than just listing them.
+            # Printed only when the operator turned auto-coach on, so the line says how to
+            # turn it back off, not that it is optional.
             print("[agentx-mcp] auto-coach promoted %d recovery path(s) into the org-brain "
                   "(source=mcp_auto; review them:  uvx agentx-mcp --review  ·  "
-                  "AGENTX_MCP_AUTO_COACH=off to stop)." % promoted, file=log)
+                  "unset AGENTX_MCP_AUTO_COACH to stop)." % promoted, file=log)
     except Exception as err:
         print("[agentx-mcp] auto-coach skipped: %s" % err, file=log)
 
@@ -1321,6 +1505,12 @@ def _inspect_list_line(line, pins, pending_list_ids, server_key, mode, drifted, 
         # six fixed surface labels and is never stored, displayed or sent anywhere.
         try:
             descs = session_stats.setdefault("_tool_desc", {})
+            # What each tool's inputSchema DECLARES about its arguments, for the shield:
+            # a `format: uri` argument or one described as a query/command/path is read as
+            # a statement whatever its name (`_schema_declared_args`). Same rule as the
+            # descriptions above: session-scoped, never persisted, and it can only ADD an
+            # argument to what the shield reads, so a hostile schema cannot hide one.
+            declared = session_stats.setdefault("_tool_declared", {})
             for tool in tools:
                 if not isinstance(tool, dict):
                     continue
@@ -1328,6 +1518,8 @@ def _inspect_list_line(line, pins, pending_list_ids, server_key, mode, drifted, 
                 desc = tool.get("description")
                 if isinstance(name, str) and name and isinstance(desc, str) and desc:
                     descs[name] = desc
+                if isinstance(name, str) and name:
+                    declared[name] = _schema_declared_args(tool.get("inputSchema"))
         except Exception:
             pass
         # THE ROSTER: the NAMES on this menu, kept for the audit screen's denominator
@@ -1427,14 +1619,46 @@ class _ClientWriter:
                 print("[agentx-mcp] client write failed: %s" % err, file=sys.stderr)
 
     def close(self):
+        """Give the client EOF. The stream's own close is NOT enough for the real stdout: the
+        interpreter opens its standard streams with `closefd=False`, so `sys.stdout.close()`
+        closes the Python wrapper and leaves the OS pipe handle open, and the host keeps
+        waiting on a stream that will never end. Observed: a wrapped server that died at
+        startup (a directory it could not open) left Claude Code waiting the full 30 s to a
+        CONNECT_TIMEOUT, on every kind of child, a bare `python -c "exit(1)"` included.
+        So the descriptor is closed too, taken before the wrapper close so it is still valid.
+        A stream with no descriptor (a StringIO in the tests) has nothing more to close."""
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+            # Close the descriptor ourselves ONLY when the wrapper does not own it
+            # (`closefd=False`, the standard streams). A stream that owns its descriptor
+            # closes it in `close()`, and a second `os.close` on that number would land on
+            # whatever reused it in between (the relay thread's ledger, for one).
+            fd = None
+            try:
+                owns_fd = True
+                layer = self._stream
+                for _ in range(3):           # TextIOWrapper -> BufferedWriter -> FileIO
+                    if hasattr(layer, "closefd"):
+                        owns_fd = bool(layer.closefd)
+                        break
+                    layer = getattr(layer, "buffer", None) or getattr(layer, "raw", None)
+                    if layer is None:
+                        break
+                if not owns_fd:
+                    fd = self._stream.fileno()
+            except Exception:
+                fd = None
             try:
                 self._stream.close()
             except Exception:
                 pass
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
 
 
 def _forward(line, child_in):
@@ -1645,7 +1869,21 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # narrower than (BACKLOG P-191). Recomputing it at the two sites below would be a
         # second copy of the payload shape, which is how these two paths drift.
         flat_payload = _flatten_call(name, params.get("arguments"))
-        decision = evaluate_call_keyless(flat_payload)
+        # This proxy is one process per host session and has no per-call trace, so the
+        # copies a run makes (a same-store `CREATE TABLE b AS SELECT * FROM sessions`, allowed
+        # as not a read-out) are remembered on the session dict: a read of `b` is then judged
+        # as a read of `sessions` for the life of the proxy. Same rule as the decorator's
+        # per-trace map, same helper.
+        _table_copies = session_stats.setdefault("_table_copies", {})
+        # The argument names travel with the flattened text, so the shield reads a statement
+        # only where the tool declared one (`_STATEMENT_ARG_NAMES`), and the tool name stays
+        # in front (name_leads) for the verb-in-the-name case this door owns.
+        decision = evaluate_call_keyless(
+            flat_payload, table_copies=_table_copies,
+            arguments=params.get("arguments"), tool_name=name, name_leads=True,
+            declared_args=session_stats.get("_tool_declared", {}).get(str(name)))
+        if decision is None:
+            _remember_table_copy(_table_copies, flat_payload)
     except Exception as err:
         # STILL FAIL-OPEN, on purpose (hard-blocking on ANY shield exception was rejected:
         # it turns a latent bug into an outage of the user's agent on the free tier). This is
@@ -1683,24 +1921,39 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # blocked payload, which outlives the streak: an episode stays open until something
         # narrower arrives, however many unrelated clean calls pass through first.
         _blocked_payloads = session_stats.setdefault("_blocked_payloads", {})
+        _blocked_args = session_stats.setdefault("_blocked_args", {})
         _blocked_payload = _blocked_payloads.get(tool_key)
         _had_open_block = bool(streaks.pop(tool_key, None)) or _blocked_payload is not None
-        _verdict = _is_narrower(_blocked_payload, flat_payload) if _had_open_block else False
+        # same_tool=True: this door keys its episodes by tool name, so the retry is on the
+        # tool that was blocked and the predicate does not re-derive that from the text.
+        _verdict = (_is_narrower(_blocked_payload, flat_payload,
+                                 _blocked_args.get(tool_key), params.get("arguments"),
+                                 same_tool=True)
+                    if _had_open_block else False)
         _recovered = _verdict is True
+        # 🔴 EPISODES, NOT CALLS, the same unit the decorator counts. These
+        # were integers bumped per clean call, so one block followed by fifty clean calls
+        # on the tool read "50 continued" beside the decorator's 1. Now a set keyed the way
+        # this door keys its episodes (by tool name, no per-call trace), so however many
+        # times the agent comes back, the episode is counted once and in one bucket; a
+        # recovery closes it and removes it from both.
+        _continued = session_stats.setdefault("continued_challenges", set())
+        _unmeasured = session_stats.setdefault("unmeasured_challenges", set())
         if _had_open_block and _verdict is None:
             # We cannot read scope on this surface. UNMEASURED, not continued: claiming the
             # agent came back and failed is a statement we have no evidence for. This surface
             # sees more non-SQL tools than the decorator does, so it is where the bucket
             # actually fills.
-            session_stats["unmeasured_challenges"] = (
-                session_stats.get("unmeasured_challenges", 0) + 1)
+            _unmeasured.add(tool_key)
         elif _had_open_block and _verdict is False:
             # Came back on the tool, but not with a narrowing. The episode stays open so a
             # genuine narrowing later still counts, and no recovery is claimed.
-            session_stats["continued_challenges"] = (
-                session_stats.get("continued_challenges", 0) + 1)
+            _continued.add(tool_key)
         if _recovered:
             _blocked_payloads.pop(tool_key, None)
+            _blocked_args.pop(tool_key, None)
+            _continued.discard(tool_key)
+            _unmeasured.discard(tool_key)
             session_stats["self_corrections"] = session_stats.get("self_corrections", 0) + 1
             # Flip EXACTLY the latest open ledger block for this tool to RECOVERED (see the
             # block-logging twin), so one clean call counts as one recovery. A session-wide
@@ -1762,12 +2015,16 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 # `stats=` is what puts this surface on the funnel. Without it the proxy
                 # wrote a full inventory and pulsed audit_calls=0, so every MCP install
                 # reported "never ran audit" and the rung read 0 for that whole population.
+                matched, uncompared = _adopted_rule_outcome_mcp(
+                    tool_key, params.get("arguments"), session_stats)
                 record_call(inv_trace, "mcp_proxy", tool_key, params.get("arguments"),
                             stats=session_stats,
                             in_audit=session_stats.get("_enforcement") == "audit",
                             description=(session_stats.get("_tool_desc") or {}).get(tool_key),
-                            matched_rule=_match_adopted_rule_mcp(
-                                tool_key, params.get("arguments"), session_stats))
+                            matched_rule=matched, uncompared_rule=uncompared,
+                            row_cap=row_cap_for_arguments(params.get("arguments")),
+                            reversibility=reversibility_for_arguments(
+                                params.get("arguments")))
             except Exception:
                 pass
             # The numerator exists now; a menu seen before this call can be written.
@@ -1782,6 +2039,10 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     # two keyless surfaces can't drift. Placed before the breaker: a would-block that
     # actually runs is not a blocked-retry loop.
     if session_stats.get("_enforcement") == "audit":
+        # The call is forwarded and runs, so a would-blocked copy really fills its table:
+        # remembered here too, the decorator's twin, or the follow-up read of the copy is not
+        # counted as the would-block it is.
+        _remember_table_copy(_table_copies, flat_payload)
         # 🔴 BOTH HALVES OF THE PAIR, BECAUSE THIS IS THE SECOND INDEPENDENT WOULD-BLOCK
         # WRITER. The decorator's `_record_would_block` keeps a screen-facing counter beside
         # the funnel-facing one: the funnel excludes our own demo and example agents by
@@ -1814,8 +2075,9 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 pass
             _flush_mcp_roster(session_stats)
         try:
-            # `agentx-mcp --insights`, never `agentx insights`: under uvx the SDK's `agentx`
-            # script is not on PATH, so the bare form sent this reader to a command not found.
+            # `uvx agentx-mcp --audit --calls`, never a bare `agentx ...`: under uvx the SDK's
+            # `agentx` script is not on PATH, so the bare form sent this reader to a command
+            # not found.
             # 🔴 NO MODE IS NAMED. This said "AUDIT: ... but audit is on, so it ran", which
             # reads as a mode somebody switched on, eight lines under a box that calls the
             # same state WATCHING and eight lines above a reader who set nothing. Watching is
@@ -1823,8 +2085,12 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
             # (Before that it said "AGENTX_ENFORCEMENT=audit", which was a claim about the
             # reader's environment; test_audit_copy_never_asserts_the_env_var.py is the rule
             # that keeps that one out, with no carve-out for this door.)
+            # 🔴 "See it" IS A CALL, so the pointer is the per-call screen, the twin of the
+            # decorator's narration: `--insights` aggregates by policy and cannot show the
+            # row that ran (the founder's fresh-ledger walk of the Python door; one door
+            # after the demo).
             print("[agentx-mcp] WATCHING: would have stopped '%s' (%s); it ran and was "
-                  "recorded. See it: uvx agentx-mcp --insights"
+                  "recorded. See it: uvx agentx-mcp --audit --calls"
                   % (tool_key, decision.get("policy_name")), file=log)
         except Exception:
             pass
@@ -1848,6 +2114,11 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
     # of a comparison, and the surface would report zero recoveries forever while looking
     # like it was applying a rule. That is a check measuring nothing (BACKLOG P-191).
     session_stats.setdefault("_blocked_payloads", {})[tool_key] = flat_payload
+    # The structured arguments beside the flattened text, for the numeric arm of the
+    # narrowing test (a labelled amount, count or limit compared exactly, in memory).
+    _blocked_arguments = params.get("arguments")
+    session_stats.setdefault("_blocked_args", {})[tool_key] = (
+        dict(_blocked_arguments) if isinstance(_blocked_arguments, dict) else None)
     # Record the block in the local flight-recorder ledger (CHALLENGED) so a real MCP
     # catch fills `agentx status`. Each block gets a UNIQUE trace and remembers itself as
     # this tool's latest open block, so a later clean call recovers exactly ONE block
@@ -1994,6 +2265,13 @@ def _route_line(line, child_in, writer, session_stats, streaks, max_turns, log, 
     except Exception:
         pass
 
+    # The two pull channels, same reasoning as setLevel: what we declared on the server's
+    # behalf we answer ourselves, and a listing the server does own is forwarded with its id
+    # remembered so our entry rides back on the server's answer.
+    if session_stats.get("_notify") and isinstance(msg, dict) \
+            and _answer_pull_request(msg, writer, session_stats):
+        return
+
     # JSON-RPC batch: removed in MCP 2025-06-18, but a legacy client may still send an
     # array. Screen each member and forward only the ones we did not block, so a
     # dangerous tools/call buried in a batch can't slip through unscreened.
@@ -2007,6 +2285,56 @@ def _route_line(line, child_in, writer, session_stats, streaks, max_turns, log, 
 
     if _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest) == "forward":
         _forward(line, child_in)             # scalar: forward the ORIGINAL line verbatim
+
+
+def _resolve_child_cmd(cmd):
+    """The wrapped server's command as the OS can start it. The proxy starts its child
+    without a shell, and on Windows `npx`, `uvx` and most Node launchers are `.cmd` files,
+    which CreateProcess will not run by name: the documented `agentx-mcp npx -y <server>`
+    printed "cannot start MCP server, command not found: npx" on every Windows install
+    (found on the founder's first wrap in Claude Code). So the first word is resolved on
+    PATH, and a `.cmd` / `.bat` is run through `cmd /c`, which is what a shell would have
+    done. Anything already runnable, or not found at all, is returned as given so the
+    existing "command not found" line still names what the operator typed.
+
+    One STRING for the `.cmd` case, not a list. Handed a list, Popen quotes each spaced
+    token, and cmd.exe strips the first and last quote of its whole command line the moment
+    two tokens are quoted: `npx.CMD` under `C:/Program Files` plus a spaced server argument
+    (`"C:/Users/First Last/Documents"`) died at startup. `cmd /d /s /c "<line>"` makes cmd
+    strip only the outer pair, and the line inside is `list2cmdline` of the real argv.
+    """
+    try:
+        cmd = list(cmd)
+        if not cmd or os.name != "nt":
+            return cmd
+        import shutil
+        resolved = shutil.which(cmd[0])
+        if not resolved:
+            return cmd
+        if resolved.lower().endswith((".cmd", ".bat")):
+            line = subprocess.list2cmdline([resolved] + cmd[1:])
+            return 'cmd /d /s /c "%s"' % line
+        return [resolved] + cmd[1:]
+    except Exception:
+        return list(cmd)
+
+
+def _kill_child_tree(child):
+    """Stop the wrapped server for real. Under the `cmd /c` wrapper `child` is cmd.exe and a
+    plain `kill()` leaves the node server it started running, holding its state and the
+    stdout pipe; `taskkill /T` takes the tree. Never raises; falls back to `kill()`."""
+    try:
+        if os.name == "nt":
+            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(child.pid)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            if done.returncode == 0:
+                return               # a non-zero exit (access denied, already gone) falls through to kill()
+    except Exception:
+        pass
+    try:
+        child.kill()
+    except Exception:
+        pass
 
 
 def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
@@ -2056,7 +2384,7 @@ def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
         # errors="replace": a stray non-UTF-8 byte from the server must not raise in the
         # relay's `for line in child.stdout` and tear the whole session down.
         return subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+            _resolve_child_cmd(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
 
@@ -2085,29 +2413,30 @@ def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
                 if pins is not None:
                     _inspect_list_line(line, pins, pending_list_ids, server_key,
                                        pin_mode, drifted, session_stats, log)
-                # 🔴 THE ONLY LINE THIS PROXY EVER REWRITES, AND ONLY WHEN ARMED. Everywhere
+                # 🔴 THE ONLY LINES THIS PROXY EVER REWRITES, AND ONLY WHEN ARMED. Everywhere
                 # else the relay is a byte-identical pump, deliberately: a proxy that edits a
-                # server's answers is a proxy that can corrupt them. The exception is the
-                # `initialize` RESULT, where we add the `logging` capability so a client will
-                # accept the one notification we send. It is protocol metadata, not a tool
-                # result and not model context. On any doubt -- not armed, not the right id,
-                # unparseable, unexpected shape -- fall through to the verbatim relay.
+                # server's answers is a proxy that can corrupt them. The exceptions are
+                # protocol metadata, never a tool result and never model context: the
+                # `initialize` RESULT (our capabilities and a suffix on the server's name),
+                # and the server's own `prompts/list` / `resources/list` answers, with our one
+                # entry appended. On any doubt -- not armed, not the right id, unparseable,
+                # unexpected shape -- fall through to the verbatim relay.
                 if session_stats.get("_notify") and session_stats.get("_init_id") is not None:
-                    patched = _with_logging_capability(line, session_stats, log)
-                    if patched is not None:
-                        writer.relay(patched)
-                        # The client has its handshake and is provably listening, so this is
-                        # the one moment in the session when a notice can reach it. Sent AFTER
-                        # the initialize result, never before: a frame arriving mid-handshake
-                        # is a good way to confuse a client for no benefit.
+                    patched = _with_agentx_handshake(line, session_stats, log)
+                    writer.relay(patched if patched is not None else line)
+                    # The client has its handshake and is provably listening, so this is the
+                    # one moment in the session when a notice can reach it. Sent AFTER the
+                    # initialize result, never before: a frame arriving mid-handshake is a
+                    # good way to confuse a client for no benefit. Whether or not there was
+                    # anything of ours to add to the handshake: a server that declared
+                    # everything itself has the clients likeliest of all to render this.
+                    if session_stats.pop("_handshake_seen", False):
                         _notify_novelty_now(writer, log)
-                        continue
-                    # The server declared `logging` itself, so there was nothing to rewrite.
-                    # Same moment, same guarantee that the client is listening, and a client
-                    # whose server advertises logging is the likeliest of all to render this.
-                    if session_stats.pop("_logging_already_declared", False):
-                        writer.relay(line)
-                        _notify_novelty_now(writer, log)
+                    continue
+                if session_stats.get("_notify"):
+                    merged = _merge_pull_listing(line, session_stats)
+                    if merged is not None:
+                        writer.relay(merged)
                         continue
                 writer.relay(line)
         except Exception:
@@ -2136,10 +2465,7 @@ def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
     try:
         rc = child.wait(timeout=10)
     except Exception:
-        try:
-            child.kill()
-        except Exception:
-            pass
+        _kill_child_tree(child)            # the whole tree: under `cmd /c`, `child` is cmd.exe
         try:
             rc = child.wait(timeout=5)
         except Exception:
@@ -2174,11 +2500,26 @@ def _protection_report(session_stats, log):
         # labelled "runaway-halted call(s)", never "looped". Not a strict partition of
         # `blocked` (ceiling and drift blocks take a different path), so it is counts.
         recovered_n = int(session_stats.get("self_corrections", 0) or 0)
-        abandoned_n = len(session_stats.get("_open_blocks", {}) or {})
+        # continued / not measurable: open episodes the agent came back to, split the way
+        # the decorator's _recovery_breakdown splits them (a tool that saw both a judgeable
+        # and an unjudgeable retry is reported as not measurable, the weaker claim). They
+        # were counted and never printed, so the walk that compares the two doors had one
+        # number to read here and four on the other side.
+        _unmeasured_tools = set(session_stats.get("unmeasured_challenges") or ())
+        _continued_tools = set(session_stats.get("continued_challenges") or ()) - _unmeasured_tools
+        unmeasured_n = len(_unmeasured_tools)
+        continued_n = len(_continued_tools)
+        # Disjoint from the two above, as on the decorator: a tool the agent came back to is
+        # continued or not measurable, not abandoned as well. (`_open_blocks` is ledger-gated
+        # and the two sets are not, so with no ledger this reads 0 while they can be non-zero;
+        # that is the pre-existing shape of this line, not a new one.)
+        abandoned_n = len(set(session_stats.get("_open_blocks", {}) or {})
+                          - _unmeasured_tools - _continued_tools)
         halted_calls = int(session_stats.get("runaway_halts", 0) or 0)
-        if recovered_n or abandoned_n or halted_calls:
-            print("[agentx-mcp]   -> %d recovered, %d still-open (abandoned), %d runaway-halted call(s)."
-                  % (recovered_n, abandoned_n, halted_calls), file=log)
+        if recovered_n or continued_n or unmeasured_n or abandoned_n or halted_calls:
+            _unmeasured_note = ", %d not measurable" % unmeasured_n if unmeasured_n else ""
+            print("[agentx-mcp]   -> %d recovered, %d continued%s, %d still-open (abandoned), %d runaway-halted call(s)."
+                  % (recovered_n, continued_n, _unmeasured_note, abandoned_n, halted_calls), file=log)
         # Recovery nudge -> the unified review (twin of the decorator's `agentx review`
         # nudge), so the MCP surface points at the same one-key adopt/label pass. `review`
         # covers the keyless-MCP wedge's learned safe-paths too (cli._mcp_review_items).
@@ -2310,6 +2651,7 @@ def _reader_globals(fn, argv):
     # this restore put back two -- caught immediately by test_decorator_ledger_default_is_
     # untouched, which is the existing suite doing what my own new test did not.
     saved_path = _db.DB_PATH
+    saved_per_block = _db.PER_BLOCK_LEDGER_REVIEW
     # The project decision joined the list with the per-project stores: the reader may ADOPT
     # the walked project into AGENTX_PROJECT_DIR so every resolver agrees, and the next
     # in-process caller must not inherit that.
@@ -2340,6 +2682,7 @@ def _reader_globals(fn, argv):
     finally:
         cli.MCP_ENTRY = saved_entry
         _db.DB_PATH = saved_path
+        _db.PER_BLOCK_LEDGER_REVIEW = saved_per_block
         _MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE = saved_globals
         for _var, _saved in (("AGENTX_INCIDENT_DB", saved_db),
                              ("AGENTX_OVERRIDES", saved_overrides),
@@ -2392,6 +2735,10 @@ def _point_stores_at_mcp_home():
         from agentx_sdk import db as _db
         ledger = _mcp_ledger_path()
         _db.DB_PATH = ledger
+        # The FOURTH thing: once db.DB_PATH is this door's ledger, per-block verdict
+        # items read from it would double the policy-level MCP verdict `_mcp_review_items`
+        # already offers. Off here, beside the repoint that would otherwise turn it on.
+        _db.PER_BLOCK_LEDGER_REVIEW = False
         os.makedirs(os.path.dirname(ledger) or ".", exist_ok=True)
         os.environ["AGENTX_INCIDENT_DB"] = ledger
         overrides_path = _mcp_overrides_path()
@@ -2604,7 +2951,11 @@ def main(argv=None):
             print("[agentx-mcp]  AUDIT MODE (%s=audit): destructive tool calls are "
                   "RECORDED and still RUN." % _set_name, file=sys.stderr)
             print("[agentx-mcp]  Your server is NOT protected.", file=sys.stderr)
-            print("[agentx-mcp]  See what would have been stopped:  uvx agentx-mcp --insights",
+            # The per-call screen, the twin of the WATCHING line's pointer: "what would have
+            # been stopped" is a list of calls, listed there as `ran, flagged`; `--insights`
+            # aggregates by policy and, on a ledger holding only would-blocks, opens on the
+            # empty safe-paths state (scoped review; the same walk on the Python door).
+            print("[agentx-mcp]  See what would have been stopped:  uvx agentx-mcp --audit --calls",
                   file=sys.stderr)
         else:
             # Founder copy pass: one line for the state, present tense. This used

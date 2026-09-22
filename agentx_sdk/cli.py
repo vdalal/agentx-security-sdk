@@ -14,6 +14,7 @@ from .overrides import (harvest_candidates, load_overrides, adopt as adopt_overr
                         get_active_override, _overrides_path, _norm_for_dedup,
                         _org_rules_path,
                         record_outcome, clear_outcome, list_recent_incidents,
+                        record_verdict_on_item,
                         find_incidents_by_receipt_prefix,
                         delete_incident, delete_incidents,
                         reconcile_safe_paths,
@@ -26,7 +27,8 @@ from .overrides import (harvest_candidates, load_overrides, adopt as adopt_overr
                         count_policy_unlabeled_blocks,
                         unlabel_declared_verdicts, _resolve_policy_ref)
 from .rules import (harvest_rule_candidates, harvest_rule_candidates_from_calls,
-                    adopt_rule, adopted_rules, remove_rule, rule_name, _existing_rule_actions)
+                    withheld_rule_proposals, adopt_rule, adopted_rules, remove_rule, rule_name,
+                    _existing_rule_actions, ONLY_WHEN_GATEWAY_MIN)
 
 # Re-exported from the stdlib-only envfile module (kept importable here for
 # backward compatibility — callers and tests still do `from .cli import load_env_file`).
@@ -1676,8 +1678,13 @@ def _print_coaching_effectiveness(verbose=False):
     print("")
 
 
-def _print_local_blocks_section():
+def _print_local_blocks_section(census=None):
     """What the floor stopped ON THIS MACHINE, read from the SDK's own ledger.
+
+    `census`: the incident-store census the caller already read, so this section's one use
+    of it (is there a gateway store, which decides whether the recovery fact prints here) does
+    not read it a second time. Read here when the caller did not (tests and scripts drive
+    this function on its own).
 
     🔴 THIS SCREEN USED TO SAY NOTHING AT THE ONE MOMENT THE PRODUCT HAD JUST PROVED
     ITSELF. Two real keyless blocks land in `.agentx.db`, then
@@ -2013,6 +2020,23 @@ def _print_local_blocks_section():
                                   recoveries_too=_recs):
             print(_ln)
 
+    # 🔴 WHAT "recovered" MEANS, BESIDE THE COUNT THAT USES THE WORD, AND ONLY WHEN IT DOES.
+    # This sentence was the whole of WHAT HAPPENED AFTER A BLOCK on a keyless ledger: a
+    # section header, this paragraph, a fence, identical on every run, forty lines below the
+    # "(1 recovered)" it explains (the founder's fresh-ledger walk). A gateway store makes
+    # that section real, so with one this stays out of the way; without one the fact lives
+    # here, once, next to its number, and prints only when a recovery is on the screen.
+    if any(r.get("recoveries") for r in rows):
+        try:
+            _has_gateway_store = bool((census or incident_db_census()).get("exists"))
+        except Exception:
+            _has_gateway_store = False
+        if not _has_gateway_store:
+            print("")
+            print("  A recovery is the agent revising a blocked call so it runs. Whether")
+            print("  the run then finished the job is not recorded here; only a gateway")
+            print("  sees that.")
+
     print("")
     # 🔴 THE POPULATED HALF OF THE SAME FALSE CLAIM, and the one a developer actually reads:
     # this branch runs whenever they have a single block. "Calls that passed were screened
@@ -2054,16 +2078,37 @@ def _print_recovery_section(census, verbose=False):
     """
     from .overrides import recovery_summary, refine_recoveries, settle_stale_blocks
 
+    # 🔴 KEYLESS, THIS SECTION PRINTS ONLY WHAT CAN VARY. Without a gateway store it has one
+    # local reader (the coaching readout below) and one fixed paragraph, and on a ledger
+    # where the readout has nothing to say it printed a header and the paragraph: the same
+    # three lines on every run, under a heading that promised a record. The founder's
+    # fresh-ledger walk asked what the section was for. A section that never varies is a
+    # footnote; the paragraph's one fact (what a recovery is, and that only a gateway
+    # records what followed) now prints beside the `(N recovered)` count it explains, in
+    # the block section, and this header prints only when the readout has content.
+    #
+    # The readout is rendered first into a buffer so the decision is made on what it
+    # PRINTED rather than on a second reading of the same ledger that could disagree.
+    import contextlib
+    import io
+    _readout = io.StringIO()
+    with contextlib.redirect_stdout(_readout):
+        # 🔴 BEFORE EVERY BRANCH BELOW, AND THAT PLACEMENT IS THE POINT. This section has
+        # five exits, and the FIRST one is the keyless path: no gateway store. That is the
+        # door most users arrive through, and it was the door with nothing local to show.
+        # The coaching readout is answered entirely from the local ledger, so it belongs
+        # above the branch that gives up.
+        _print_coaching_effectiveness(verbose)
+    _readout = _readout.getvalue()
+
+    if not census["exists"] and not _readout.strip() and not census.get("strays"):
+        return
+
     print("")
     print("🔁 WHAT HAPPENED AFTER A BLOCK           (local to this machine)")
     print("=" * 75)
-
-    # 🔴 BEFORE EVERY BRANCH BELOW, AND THAT PLACEMENT IS THE POINT. This section has five
-    # exits, and the FIRST one is the keyless path: no gateway store, so it prints "run your
-    # agents against a gateway" and returns. That is the door most users arrive through, and
-    # it was the door with nothing local to show. The coaching readout is answered entirely
-    # from the local ledger, so it belongs above the branch that gives up.
-    _print_coaching_effectiveness(verbose)
+    if _readout:
+        print(_readout, end="")
 
     if not census["exists"]:
         # 🔴 P-102: THIS BRANCH USED TO DENY WHAT THE SAME SCREEN HAD JUST SHOWN. The old copy
@@ -2095,9 +2140,11 @@ def _print_recovery_section(census, verbose=False):
         # one link on one screen. The link now prints once, at the end of
         # `execute_insights`, where a screen's one next action goes; this section says the
         # fact and stops.
-        print("  A recovery is your agent revising a blocked call so it runs. Those are")
-        print("  recorded. Whether the run then finished the job is not; only a gateway")
-        print("  sees that.")
+        # 🔴 THE PARAGRAPH ITSELF MOVED. "A recovery is your agent revising a blocked call
+        # so it runs ... only a gateway sees that" now prints in the block section beside
+        # the `(N recovered)` it explains (`_print_local_blocks_section`), and only when
+        # there is a recovery to explain. Here it was the whole section on most keyless
+        # ledgers.
         _print_strays(census)
         print("=" * 75)
         return
@@ -2804,7 +2851,19 @@ def _fit_tail(text, width):
     and the YOUR RULES header clipped from the left read `(C:\\Users\\vdala\\AppData\\Local\\Te...)`,
     thirty-four characters that named no file (this branch's own walk)."""
     text = str(text or "")
-    return text if len(text) <= width else "..." + text[-(width - 3):]
+    if len(text) <= width:
+        return text
+    tail = text[-(width - 3):]
+    # 🔴 CLIP AT A SEPARATOR, NOT MID-SEGMENT. A raw tail printed `...mp\agentx-sep20-fresh\`
+    # on the founder's walk: three characters of a directory name nobody can recognise,
+    # standing where a segment should. Drop the partial leading segment when a whole one is
+    # left; keep the raw tail when the last segment alone is longer than the budget, since a
+    # visibly clipped name beats an empty one.
+    for sep in ("\\", "/"):
+        cut = tail.find(sep)
+        if 0 < cut < len(tail) - 1:
+            return "..." + tail[cut:]
+    return "..." + tail
 
 
 # Below this, a "magnitude" is noise rather than a fact worth a line of its own: the bucket
@@ -3008,6 +3067,51 @@ def _reset_demo_row_note():
     """Start a fresh screen. MUST be called by every entry point that renders the note, or
     the second command in one process inherits the first's suppression and goes silent."""
     _DEMO_NOTE_SAID.clear()
+
+
+def _ledger_holds_only_ours():
+    """True when the ledger has rows and every one of them was written by our own demo or
+    examples: the first-run state, where the reader's one move is to wrap a tool.
+
+    One read, through the census every other "what does this ledger hold" sentence uses,
+    so this cannot disagree with the attribution lines above it. False on an empty ledger
+    (the rung there is `agentx demo`, and the block section already offers it) and false
+    the moment one row of theirs exists. Ours are counted by status the way the census
+    splits them; a status-less legacy row of ours would read as theirs, which errs toward
+    NOT printing the first-run rung, the harmless direction.
+    """
+    from .db import get_ledger_census
+    try:
+        c = get_ledger_census()
+    except Exception:
+        return False
+    total = int(c.get("total_rows") or 0)
+    ours = (int(c.get("inventory_from_demo") or 0)
+            + int(c.get("would_blocks_from_demo") or 0)
+            + int(c.get("block_episodes_from_demo") or 0))
+    return total > 0 and ours >= total
+
+
+def _ownership_clause(total, ours):
+    """The attribution as a CLAUSE on the count's own line, for a sentence that opens with
+    the count ("2 calls tripped a policy, both from AgentX's own demo or examples.").
+
+    `_demo_row_note` is the same fact as a sentence of its own, for the places that print
+    it under a table. This is for the one place where a sentence of its own arrived two
+    lines after the count and left the lines between it reading as claims about the
+    reader (the founder's fresh-ledger walk). Empty when none are ours, so the caller's
+    sentence closes on the count.
+    """
+    total, ours = int(total or 0), int(ours or 0)
+    if ours <= 0:
+        return ""
+    if ours >= total:
+        if total == 1:
+            return ", from %s" % OURS_PHRASE
+        if total == 2:
+            return ", both from %s" % OURS_PHRASE
+        return ", all from %s" % OURS_PHRASE
+    return ", %d of them from %s" % (ours, OURS_PHRASE)
 
 
 def _demo_row_note(count, of_total=None, pronoun="those", recoveries_too=0):
@@ -4939,20 +5043,27 @@ def execute_audit(args=None):
           % (_plural(inventory['total_calls'], "call"),
              _plural(inventory['distinct_tools'], "tool"),
              _since_phrase(inventory["window_start"])))
-    # SAY WHEN THE TABLE IS NOT THE WHOLE HEADER. The counts above are ledger-wide and the
-    # rows below are capped, so "30 tools" over 25 rows silently invites the reader to
-    # believe they are looking at all of them. Same class as the counts that were being
-    # summed from this list: the part is not the whole, and the screen has to admit which
-    # one it is showing.
-    # 🔴 DIRECTLY UNDER THE COUNT, BECAUSE IT QUALIFIES IT. `agentx demo --audit` writes four
-    # real ALLOWED rows into this ledger so that this screen has something to show, and
-    # without this line they are reported, tool by tool, as what THEIR agent did. The flagged
-    # count next to it has carried the same footnote since P-92; the inventory did not,
-    # because until `--audit` existed no demo could write an inventory row at all.
+    # 🔴 DIRECTLY UNDER THE COUNT BECAUSE IT QUALIFIES IT, and it is the one line on this
+    # screen that reports something we did NOT decide. "Tripped nothing" is true of these
+    # rows and invites exactly one wrong reading: that nothing among them was large. A real
+    # agent ran `DELETE FROM audit_log WHERE created < date('now','-30 days')` against a
+    # 120,000-row table, every row matched, the table emptied, and the call tripped
+    # nothing. That row is what this counts.
     #
-    # The all-ours case gets its own sentence rather than a number the reader has to compare
-    # against the line above: on the first run of the ladder that is the whole table, and
-    # "4 of those" beside "4 calls" is a subtraction we should do for them.
+    # 🔴 GUARDED ON `unsized_readable`, NOT ON THE COUNT. A ledger older than the column
+    # answers 0, which is indistinguishable from "none", so printing the zero would make a
+    # claim about the reader's agent on the strength of a column that is not there. Silent
+    # is the honest rendering of "cannot say"; see `db._ledger_totals`.
+    #
+    # No CTA: there is nothing for the reader to do about it yet, and inventing one would
+    # promise a screen that does not exist. A rule you write is what turns this into a block.
+    # 🔴 THE DEMO NOTE PRINTS BEFORE THE LABEL LINE, AND THE ORDER IS THE FIX. On the
+    # founder's mixed-ledger walk the screen read "30 calls ... / Of those: 1 read-only, 0
+    # bounded, 0 destructive, 0 could not tell. / 29 of those came from AgentX's own demo or
+    # examples": the partition held (1 + 29 = 30) and the reader met "Of those: 1" before
+    # learning 29 were ours, so it read as 1 of 30 with 29 unlabelled. Attribution a line
+    # late, the same class as the tripped-call block below. Whose rows first, then the label
+    # line scoped to what is left ("Of your 1: ...").
     from_demo = inventory.get("inventory_from_demo") or 0
     # 🔴 READ HERE BECAUSE THE INSTRUCTION BELOW HAS TO KNOW WHETHER THE ENFORCE ASK WILL
     # PRINT, AND ONE VARIABLE MAY NOT CARRY TWO VALUES ON ONE SCREEN. Computed again at its
@@ -4999,6 +5110,77 @@ def execute_audit(args=None):
                 print("  here beside these.")
             else:
                 print("  Wrap one of your tools and its calls land here beside these.")
+    _totals = inventory.get("totals") or {}
+    # The same count split four ways by what each call established about itself.
+    # This is the line a clean agent's day is worth opening for: a SELECT and a DROP TABLE
+    # both "tripped nothing", and until this line the screen could not tell them apart.
+    #
+    # All four numbers, zeroes included, and "could not tell" always among them: a reader
+    # must see how much of the day the label could not classify, or three small numbers
+    # read as the whole day. The words are POSITIONS, chosen so none reads as a promise --
+    # "bounded" is what the statement names, never "we kept a copy".
+    #
+    # Guarded on `reversibility_readable`, not on the counts, for the reason the line
+    # below gives. Skipped when the reader's own agents have no inventory rows at all --
+    # labelled or older -- because four zeroes under a demo-only table describe nothing of
+    # theirs. (The first guard counted only LABELLED rows, so a freshly upgraded ledger,
+    # hundreds of older calls and no new one yet, printed nothing here at all.)
+    #
+    # 🔴 "OF THOSE" IS A PARTITION CLAIM, SO EVERY ROW THE HEADER COUNTED IS IN A TERM. The
+    # four labels cover the reader's own rows that carry one. The header also counts our
+    # demo's rows and, on an upgraded ledger, every row written before the label existed;
+    # the first cut left both out and printed "7 calls ... Of those: 1, 1, 0, 1". The
+    # older rows get a fifth term here when nonzero; the demo's rows are carried by the
+    # demo footnote a few lines down, which already names their number, so it is not
+    # printed twice. `test_the_screen_line_sums_to_its_header` drives a mixed ledger
+    # through this exact rendering and sums the terms and the footnote against the header.
+    _split = _totals.get("reversibility") or {}
+    _unlabelled = _totals.get("reversibility_unlabelled") or 0
+    if _totals.get("reversibility_readable") and (sum(_split.values()) + _unlabelled):
+        _terms = ["%s read-only" % f"{_split.get('READ_ONLY', 0):,}",
+                  "%s bounded" % f"{_split.get('BOUNDED', 0):,}",
+                  "%s destructive" % f"{_split.get('DESTRUCTIVE', 0):,}",
+                  "%s could not tell" % f"{_split.get('UNKNOWN', 0):,}"]
+        if _unlabelled:
+            _terms.append("%s recorded before this label existed"
+                          % f"{_totals['reversibility_unlabelled']:,}")
+        # Packed a whole TERM at a time, never word-wrapped: `_wrap` broke the line
+        # between a number and its words ("... could not tell, 2 / recorded before this
+        # label existed"), which the founder's walk read as a stranded digit. Same 75
+        # fence as every other line on this screen.
+        # A continuation line starts under the first term, one column past the lead
+        # ("  Of those:" or "  Of your N:"), which is why the indent is the lead's length
+        # and not a number; the founder's MCP walk once showed it one column further right.
+        _pieces = [t + ("," if i < len(_terms) - 1 else ".") for i, t in enumerate(_terms)]
+        # "Of your N:" when the header's count includes our rows (the note above has just
+        # said how many), "Of those:" when every row the header counted is theirs.
+        _theirs = max(0, int(inventory["total_calls"]) - int(from_demo))
+        _lead = "  Of your %s:" % f"{_theirs:,}" if from_demo else "  Of those:"
+        _line = _lead
+        for _p in _pieces:
+            if len(_line) + 1 + len(_p) > 75 and _line != _lead:
+                print(_line)
+                _line = " " * len(_lead)      # a continuation starts under the first term
+            _line += " " + _p
+        print(_line)
+    if _totals.get("unsized_readable") and _totals.get("unsized_writes"):
+        print("  %s we could not size: a condition picks the rows, and nothing"
+              % _plural(_totals["unsized_writes"], "write"))
+        print("  in the statement caps how many match.")
+    # SAY WHEN THE TABLE IS NOT THE WHOLE HEADER. The counts above are ledger-wide and the
+    # rows below are capped, so "30 tools" over 25 rows silently invites the reader to
+    # believe they are looking at all of them. Same class as the counts that were being
+    # summed from this list: the part is not the whole, and the screen has to admit which
+    # one it is showing.
+    # 🔴 DIRECTLY UNDER THE COUNT, BECAUSE IT QUALIFIES IT. `agentx demo --audit` writes four
+    # real ALLOWED rows into this ledger so that this screen has something to show, and
+    # without this line they are reported, tool by tool, as what THEIR agent did. The flagged
+    # count next to it has carried the same footnote since P-92; the inventory did not,
+    # because until `--audit` existed no demo could write an inventory row at all.
+    #
+    # The all-ours case gets its own sentence rather than a number the reader has to compare
+    # against the line above: on the first run of the ladder that is the whole table, and
+    # "4 of those" beside "4 calls" is a subtraction we should do for them.
     # 🔴 AFTER THE DEMO NOTE, NOT UNDER THE COUNT, AND THE ORDER IS A CORRECTNESS FIX. This
     # line counts the DEVELOPER's rows and the count above is ledger-wide, so on a ledger
     # holding one demo row the screen read "12 calls across 3 tools" and then "9 of 11 calls"
@@ -5050,6 +5232,15 @@ def execute_audit(args=None):
     print("  " + _AUDIT_COLS % ("TOOL", "CALLS", "SURFACE", "ARGUMENTS"))
     print("  " + "-" * 71)
     _rule_matches = db_module.get_rule_match_summary()
+    # Whether the header has ALREADY said every row is ours (the all-ours branch of the demo
+    # note above). When it has, the rows carry no marker: the sentence covers them and a
+    # marker plus a legend under it would say the same fact a second time. When it has not,
+    # a tool whose every call is ours gets the `*` the `--calls` screen uses for the same
+    # fact, explained once under the table, instead of a prose clause on every such row.
+    # The founder's fresh-ledger walk read that clause five times under a header that had
+    # already said "All 5 came from ..."; one fact, six spellings, on one screen.
+    _header_said_all_ours = bool(from_demo) and from_demo >= inventory["total_calls"]
+    _marked_ours = False
     for row in inventory["tools"]:
         classes = "/".join(
             db_module._SURFACE_LABELS.get(c, c)
@@ -5097,8 +5288,18 @@ def execute_audit(args=None):
         # ("DB/HTTP/SHE"). A comment left describing the code it replaced is the same defect
         # this PR is named for.
         bucket = _format_bucket(row["max_amount"])
+        _from_demo = int(row.get("from_demo") or 0)
+        _row_all_ours = bool(_from_demo) and _from_demo >= (row.get("calls") or 0)
+        # The marker rides on the tool cell exactly as it does on `--calls`, so a reader
+        # moving between the two screens meets one glyph with one meaning. The NAME is
+        # fitted to the width the marker leaves, never the pair: fitting `name + "*"` to 20
+        # clipped the glyph off any our-agent tool of 20+ characters (`execute_database_query`
+        # in the shipped examples) while the legend below still explained it (scoped review).
+        _mark = "*" if _row_all_ours and not _header_said_all_ours else ""
+        _tool_cell = _fit(row["tool"], 20 - len(_mark)) + _mark
+        _marked_ours = _marked_ours or bool(_mark)
         print("  " + _AUDIT_COLS
-              % (_fit(row["tool"], 20), f"{row['calls']:,}", _fit(classes, 13), names))
+              % (_tool_cell, f"{row['calls']:,}", _fit(classes, 13), names))
         # The magnitude and the flag count are the two facts most likely to be the reason a
         # reader keeps reading, so they get their own line rather than a cramped column.
         detail = []
@@ -5145,9 +5346,10 @@ def execute_audit(args=None):
         # Both numbers stated, not one and a subtraction: the split is the whole point, and a
         # reader who has to do arithmetic to trust a row will not do it.
         #
-        # ⚠️ AND A ROW THAT IS ENTIRELY OURS SAYS SO, rather than opening with a zero. The
-        # first cut printed "0 yours, 4 our demo's" on every demo-only tool -- true, and it
-        # makes a reader parse a subtraction to learn the row is not about them at all. The
+        # ⚠️ A ROW THAT IS ENTIRELY OURS CARRIES THE MARKER ON ITS TOOL CELL (set above), not
+        # a clause here, and not a zero: the first cut printed "0 yours, 4 our demo's" on
+        # every demo-only tool, the second printed "all from AgentX's own demo or examples"
+        # under each of five rows whose header had already said all five were ours. The
         # split is worth printing only where there is actually a split.
         #
         # `OURS_PHRASE` is the header's phrase ("came from AgentX's own demo or examples"),
@@ -5155,11 +5357,7 @@ def execute_audit(args=None):
         # "our own demo" here, a second spelling of the same fact 30 lines under the first;
         # founder walk. `from_demo` counts OUR_AGENT_IDS, demo AND example agents, which is
         # why the phrase names both: it used to say "demo" for a row a shipped example wrote.
-        _from_demo = int(row.get("from_demo") or 0)
-        if _from_demo >= (row.get("calls") or 0):
-            if _from_demo:
-                detail.append("all from %s" % OURS_PHRASE)
-        elif _from_demo:
+        if _from_demo and not _row_all_ours:
             detail.append("%s yours, %s from %s"
                           % (f"{row['calls'] - _from_demo:,}", f"{_from_demo:,}", OURS_PHRASE))
         # Which of THEIR rules this tool's calls matched used to be interleaved here as
@@ -5185,8 +5383,19 @@ def execute_audit(args=None):
             # format string above rather than picked: "  " + 20 + "  " + 6 + "  " = 32. A
             # constant that does not move with the columns is how an aligned screen goes
             # crooked one release after the change that did it -- it has now moved twice.
-            print("  %-20s          %s" % ("", "; ".join(detail)))
+            # Through `_wrap` at the fence with the same hanging indent: the split clause
+            # ("1 yours, 1 from AgentX's own demo or examples") ran to 77 columns on the
+            # founder's walk of this branch, and the population's one name is not shortened
+            # to fit a row.
+            print(_wrap("; ".join(detail), "  %-20s          " % "", width=75))
     print("")
+    if _marked_ours:
+        # The same legend `--calls` prints for the same glyph, gated on the glyph being on
+        # the page: a footnote about a marker the reader cannot see is a footnote about
+        # nothing (the `--calls` screen learned that under --limit).
+        print("  * every call of that tool was written by %s," % OURS_PHRASE)
+        print("    not by your agent.")
+        print("")
     if unknown_surface:
         # 🔴 A DASH READS AS MISSING DATA, AND IT MEANS THE OPPOSITE OF NOTHING. The
         # classifier is deliberately under-inclusive (db._TARGET_CLASSES): it matches whole
@@ -5357,6 +5566,24 @@ def execute_audit(args=None):
             if _eg:
                 print("     (e.g. agentx adopt %s)" % _eg)
         print("")
+    # 🔴 A WITHHELD PROPOSAL IS SAID, IN THE PROPOSAL'S PLACE. The harvester no longer proposes
+    # a rule for a tool whose row carries nothing a rule could key on (no recorded magnitude,
+    # no other tool to weigh it against): one `SELECT 1` through `run_sql` proposed "a rule to
+    # watch run_sql" on the founder's #413 walk, a tool inventory dressed as a proposal. The
+    # harvester's own comment argues, rightly, against a sighting floor because a dropped
+    # candidate is indistinguishable from having nothing to propose; so the tool it withheld
+    # is named here with the reason, and the omission is never the silent kind. Read through
+    # the same query the proposals come from, so the two cannot disagree about a tool.
+    try:
+        _withheld = withheld_rule_proposals() if not _proposals else []
+    except Exception:
+        _withheld = []
+    for _w in _withheld[:3]:
+        print(_wrap("No rule proposed yet: %s to %s, nothing in %s a rule could key on."
+                    % (_plural(_w["count"], "call"), _w["target_action"],
+                       "it" if _w["count"] == 1 else "them"), "  ", width=75))
+    if _withheld:
+        print("")
     # OUTSIDE `if _proposals`, and on BOTH doors. The MCP arm printed "None of these are
     # active" and never showed what was armed -- and that door CAN adopt once
     # AGENTX_POLICY_DB is set, so a reader who had just armed a rule there was told nothing
@@ -5380,106 +5607,99 @@ def execute_audit(args=None):
     flagged = inventory["flagged_total"]
     would_block = inventory["would_block_total"]
     if flagged:
-        # Door-correct reader command. Under uvx the SDK's `agentx` script is not on PATH,
-        # so the bare form is a command-not-found for exactly the person we just told to
-        # go look at their catches.
-        reader = "uvx agentx-mcp --insights" if MCP_ENTRY else "agentx insights"
-        if would_block == flagged:
-            # Every one was recorded-and-released, so the conditional is honest.
-            # 🔴 "Nothing above was blocked." IS GONE FROM BOTH FLAGGED BRANCHES. Its subject
-            # was US, it sat four lines above a warning that says the same thing better
-            # ("That call ran. Audit records; it does not stop it."), and this screen belongs
-            # to the reader's agent. What survives is the number and where to see it.
-            # ⚠️ TWO LINES, BECAUSE THE MCP DOOR'S READER COMMAND IS LONGER. Merged onto one
-            # line this rendered ~82 columns with `uvx agentx-mcp --insights` and a two-digit
-            # count, past the 75 fence every other width on this screen is derived from. Only
-            # the `agentx insights` door fitted, which is the kind of overflow that ships
-            # because the author tested one door.
-            print("  %s tripped a policy and would have been stopped."
-                  % _plural(flagged, "call"))
-            print("  See them:  %s" % reader)
+        # 🔴 WHOSE CALLS, IN THE SENTENCE WITH THE COUNT. This block used to print the count,
+        # then what became of them, then a pointer, and only THEN "All 2 came from AgentX's
+        # own demo or examples too" -- so on a fresh ledger after `agentx demo` a reader who
+        # had turned nothing on read "1 was stopped while blocking was on" as a claim about
+        # their install. Every sentence was true of the ledger and the order made the block
+        # false of the reader (the founder's fresh-ledger walk). Attribution now rides on the
+        # first line, through the same phrase every other attribution on this screen uses,
+        # and the trailing note is gone: one fact, one place.
+        _ours = int(inventory.get("flagged_from_demo") or 0)
+        print(_wrap("%s tripped a policy%s."
+                    % (_plural(flagged, "call"), _ownership_clause(flagged, _ours)),
+                    "  ", width=75))
+        # 🔴 NOT `flagged - would_block`. `flagged_total` counts every row that is not
+        # inventory, which INCLUDES the status-less legacy rows this same reader already
+        # counts separately (unclassified_total, and viewable_total exists because "not
+        # NULL" was not good enough either). Subtracting the audited rows from it called
+        # every one of those a call we STOPPED. Reproduced on a ledger holding 3 legacy
+        # rows + 1 WOULD_BLOCK: this screen said "3 were stopped" and `agentx insights`,
+        # the command on the very next line, said "Nothing has been blocked in this
+        # ledger yet" -- which is the exact mismatch this split was added to remove.
+        #
+        # `viewable_total` is the count insights can actually render (CHALLENGED /
+        # RECOVERED / WOULD_BLOCK), so viewable minus audited IS what was stopped, in the
+        # same terms as the screen the reader is being sent to.
+        stopped = max(0, inventory["viewable_total"] - would_block)
+        older = max(0, flagged - inventory["viewable_total"])
+        # Which of the stopped ones were ours: counted by the ledger over the same two
+        # statuses `stopped` is (`stopped_from_demo`), never derived. The first cut derived
+        # it as `flagged_from_demo - would_block_from_demo`, and `flagged_from_demo` counts
+        # a status-less legacy row too (`IS NOT 'ALLOWED'` is true of NULL), so an old ledger
+        # could credit the reader's own block to us (scoped review). `agentx demo` blocks its
+        # own scripted DROP TABLE with blocking turned on for that half and off again after,
+        # and a shipped example pins enforce on its tool; either is a stopped row a watching
+        # install did not ask for.
+        _ours_stopped = int(inventory.get("stopped_from_demo") or 0)
+        # 🔴 "while blocking was on" IS TRUE OF THE LEDGER AND, FOR OUR ROWS, FALSE OF THE
+        # READER. When every stopped row is ours the clause says who turned blocking on, by
+        # the population's one name (the examples are in it, not only the demo: example 04
+        # pins enforce). When any is theirs the plain clause stands: it ran with blocking on.
+        # 🔴 SAID ONCE: when the count's own line has ALREADY attributed every tripped call to
+        # us, the clause does not spell the population's name a second time two lines on
+        # (the copy pass on this branch read it twice in two lines); it says the one thing
+        # the first line did not, which is that the reader did not turn blocking on. The full
+        # name stays for the mixed ledger, where the first line could not cover the stopped
+        # ones.
+        if stopped and _ours_stopped >= stopped:
+            _which = "that one" if stopped == 1 else "those"
+            if _ours >= flagged:
+                _stopped_how = "(blocking was turned on for %s, not by you)" % _which
+            else:
+                _stopped_how = "(%s turned blocking on for %s)" % (OURS_PHRASE, _which)
         else:
-            # A mixed ledger (enforce runs as well as audit ones), where "would have been
-            # stopped" is false about the rows we actually stopped.
-            #
-            # 🔴 BOTH NUMBERS, BECAUSE THE READER IS ABOUT TO BE HANDED ONE OF THEM. This
-            # said "46 calls tripped a policy. See them: agentx insights" on the founder's
-            # ledger, and insights showed 39 -- its block section counts what was STOPPED,
-            # and the 7 missing rows were the audited catches, which are the ones this screen
-            # is most about. One total split into the two things it is made of, so the number
-            # he lands on is the number he was promised.
-            print("  %s tripped a policy." % _plural(flagged, "call"))
-            # 🔴 NOT `flagged - would_block`. `flagged_total` counts every row that is not
-            # inventory, which INCLUDES the status-less legacy rows this same reader already
-            # counts separately (unclassified_total, and viewable_total exists because "not
-            # NULL" was not good enough either). Subtracting the audited rows from it called
-            # every one of those a call we STOPPED. Reproduced on a ledger holding 3 legacy
-            # rows + 1 WOULD_BLOCK: this screen said "3 were stopped" and `agentx insights`,
-            # the command on the very next line, said "Nothing has been blocked in this
-            # ledger yet" -- which is the exact mismatch this split was added to remove.
-            #
-            # `viewable_total` is the count insights can actually render (CHALLENGED /
-            # RECOVERED / WOULD_BLOCK), so viewable minus audited IS what was stopped, in the
-            # same terms as the screen the reader is being sent to.
-            stopped = max(0, inventory["viewable_total"] - would_block)
-            older = max(0, flagged - inventory["viewable_total"])
-            # One line, because the two-line version wrapped onto an orphaned "to run." in
-            # the founder's terminal. A sentence broken across a line break at a point that
-            # is not a clause boundary reads as two half-sentences.
-            # 🔴 BOTH POSTURES ARE NAMED, BECAUSE THIS LINE ONLY PRINTS ON A MIXED LEDGER AND
-            # DID NOT SAY SO. It read "37 were stopped; 1 ran anyway, recorded while audit was
-            # on", and the founder read the whole sentence as being about audit -- at which
-            # point "37 were stopped" contradicts the fact that audit stops nothing. The 37
-            # came from ENFORCE runs; only the 1 came from an audit run. The trailing clause
-            # attached to the second number and the reader attached it to the sentence.
-            #
-            # 🔴 "ran anyway" IS GONE. "Anyway" says despite-something without saying despite
-            # WHAT, and it was read as "no policy caught it but it was dangerous" -- the exact
-            # opposite of the truth. A policy DID catch it; audit is why it ran. Naming the
-            # posture is what makes that readable, and it is the same fact the warning three
-            # lines below states in full.
-            # 🔴 "because audit was on" SAID SOMEBODY SWITCHED SOMETHING ON. The clause exists
-            # to name WHY those calls ran, and the note above is right that naming it is what
-            # makes the line readable. What changed is the answer: watching is the default, so
-            # on most ledgers nobody turned anything on and the sentence credited the reader
-            # with a decision they never made. "nothing was blocking" is the same fact and is
-            # true however the posture arose -- the default, either env spelling, or a
-            # per-tool argument. Same reason this line has never named the env var.
-            if would_block and stopped:
-                print("  %d %s stopped while blocking was on; %d ran because nothing was."
-                      % (stopped, "were" if stopped != 1 else "was", would_block))
-            elif would_block:
-                print("  %d ran because nothing was blocking." % would_block)
-            elif stopped:
-                # The all-stopped ledger had no sentence at all: "2 calls tripped a policy."
-                # and then the pointer, while the mixed and all-watching ledgers each say
-                # what became of theirs (founder walk, MCP door).
-                print("  %d %s stopped while blocking was on."
-                      % (stopped, "were" if stopped != 1 else "was"))
-            if older:
-                # Said rather than folded into either number: these rows carry no status, so
-                # neither "stopped" nor "recorded" is true of them, and `agentx insights`
-                # cannot show them at all. "The other" only when there IS another -- on a
-                # ledger that is entirely legacy rows it would be describing the whole count.
-                lead = "The other %d" % older if (stopped or would_block) else "%d" % older
-                print("  %s %s from a ledger older than this version, so there is"
-                      % (lead, "are" if older != 1 else "is"))
-                print("  nothing left to show about them.")
-            # 🔴 ONLY WHEN THERE IS SOMETHING TO SEE. This printed unconditionally, so on a
-            # ledger of nothing but legacy rows it said "nothing left to show about them"
-            # and then, on the very next line, sent the reader to a command that shows
-            # nothing. The EMPTY branch of this same screen has guarded on `viewable_total`
-            # since it was written; the populated branch never got the guard -- one rule,
-            # one of its two sites, which is the shape this whole PR keeps meeting.
-            if inventory["viewable_total"]:
-                print("  See them:  %s" % reader)
-        # The same attribution the EMPTY branch was fixed for, which this branch did not
-        # get: `flagged` counts `agentx demo`'s own catch, so without this the populated
-        # screen credits our scripted call to their agent too.
-        if inventory["flagged_from_demo"]:
-            for _ln in _demo_row_note(inventory["flagged_from_demo"],
-                                      of_total=inventory["flagged_total"]):
-                print(_ln)
+            _stopped_how = "while blocking was on"
+        # 🔴 "because nothing was" WAS A CLAUSE MISSING ITS NOUN (founder walk). It named
+        # WHY those calls ran without saying the posture, because watching is the default
+        # and "because audit was on" credited the reader with a decision they never made.
+        # The noun is back; the posture is still unnamed, for the same reason, and the fact
+        # is dated to when the row was written, since this terminal cannot see the posture
+        # the reader runs under now.
+        _ran_why = "because nothing was blocking at the time"
+        _was = lambda n: "was" if n == 1 else "were"
+        # Through `_wrap`: with the demo clause the mixed form is over 100 columns, and a
+        # terminal breaking it mid-clause is the orphaned "to run." this line was once
+        # rewritten to avoid.
+        # 🔴 ONE OUTCOME PER LINE (founder, reading the copy pass): the stopped ones and the
+        # ones that ran are two facts, and on one line the second began mid-line after a
+        # wrapped parenthetical. Each is its own sentence, wrapped on its own. The
+        # all-stopped ledger used to have no sentence at all, "2 calls tripped a policy."
+        # and then the pointer, while the other ledgers said what became of theirs.
+        if stopped:
+            print(_wrap("%d %s stopped %s." % (stopped, _was(stopped), _stopped_how),
+                        "  ", width=75))
+        if would_block:
+            print(_wrap("%d ran %s." % (would_block, _ran_why), "  ", width=75))
+        if older:
+            # Said rather than folded into either number: these rows carry no status, so
+            # neither "stopped" nor "recorded" is true of them, and no per-call view can
+            # show them. "The other" only when there IS another -- on a ledger that is
+            # entirely legacy rows it would be describing the whole count.
+            lead = "The other %d" % older if (stopped or would_block) else "%d" % older
+            print("  %s %s from a ledger older than this version, so there is"
+                  % (lead, "are" if older != 1 else "is"))
+            print("  nothing left to show about them.")
+        # 🔴 THE POINTER ANSWERS THE QUESTION THE LINE ABOVE RAISES, WHICH IS "WHAT RAN?".
+        # That is a question about a CALL, and `agentx insights` aggregates per policy and
+        # cannot name one; the founder's walk followed "See them: agentx insights" and got a
+        # policy count. The per-call screen names the tool, the time and the status, and its
+        # legend explains the words. Printed only when there is something it can show (the
+        # legacy-only ledger has nothing viewable), and not when the loud block below is
+        # about to hand over the same command with the row's tool and policy on it: one
+        # pointer per screen, and that one carries more.
+        if inventory["viewable_total"] and not _their_would_blocks:
+            print("  Call by call:  %s" % _audit_calls_cmd())
     else:
         # The clean-ledger arm, recast the same way: their agent is the subject, and there is
         # no "above was blocked" half to drop because nothing was flagged at all.
@@ -5781,10 +6001,11 @@ def execute_audit(args=None):
         print("")
         print("  To cover another tool, wrap it:")
         print("")
-        print("       from agentx_sdk import agentx_protect")
-        print("")
-        print("       @agentx_protect(agent_id=\"your_agent\")")
-        print("       def your_tool(...): ...")
+        # The one snippet the demo footer prints, through the one helper: this site spelled
+        # it `agent_id="your_agent"` over `def your_tool(...)`, the demo `"my_agent"`, and a
+        # reader met two spellings of one instruction two screens apart (founder walk).
+        for _ln in wrap_snippet_lines("       "):
+            print(_ln)
 
     # --- THE ENFORCE CTA, EARNED RATHER THAN ALWAYS-ON -----------------------------------
     #
@@ -5962,9 +6183,13 @@ def execute_insights(args=None):
     # and it describes what just happened to them; the two sections below describe the
     # gateway's recovery loop and are empty by construction without a key. Leading with
     # the paid path was the P-93(b) defect.
-    _print_local_blocks_section()
-
+    #
+    # The census is read ONCE, here, and handed to the block section: that section decides
+    # whether to print the recovery fact from it, and reading it twice on one screen ran the
+    # strays walk of the project root twice (scoped review of the branch that moved the fact).
     census = incident_db_census()
+    _print_local_blocks_section(census=census)
+
     harvest, _reframe_flat, rule_list, mcp_flat = _collect_candidates()
     store = load_overrides(warn=True)   # surface a corrupt store instead of showing an empty one
     active = store.get("overrides", {})
@@ -6076,7 +6301,16 @@ def execute_insights(args=None):
         # re-broken on this screen by the fix for its opposite. The sibling does it correctly
         # and is the shape copied here: branch the LEAD-IN on the door, and let the emitter
         # print the form that door can actually use.
-        if in_audit or MCP_ENTRY:
+        #
+        # 🔴 AND ONLY OFF EVIDENCE THAT IS THEIRS. `agentx demo` writes its scripted DROP
+        # TABLE as a WOULD_BLOCK, so on the fresh-ledger walk this nudge told a reader to
+        # flip to enforcing on the strength of our own demo's catch, the same sale off the
+        # same row that `audit` stopped making (its loud enforce ask is gated on
+        # `_their_would_blocks`). When every audited row is ours the screen's one rung is
+        # the wrap line at the end, and the enforce command stays where `audit` and the
+        # demo footer already print it. The MCP door is unaffected in practice: its demo
+        # records into a throwaway directory, so its audited rows are always theirs.
+        if (in_audit or MCP_ENTRY) and audit["total"] > _ours:
             print("")
             if MCP_ENTRY:
                 # No claim about their current posture, because this terminal cannot see it:
@@ -6110,8 +6344,15 @@ def execute_insights(args=None):
     # render order, because it describes the whole SCREEN; this title names the THIRD section
     # of that screen. A future editor should not try to re-couple them: the constant is the
     # table of contents, this is one chapter heading. Padding keeps "(local to..." at column 38 with its siblings.
-    print("\n🧠 SAFE-PATHS YOUR WRAPPED TOOLS LEARNED (local to this machine)")
-    print("=" * 75)
+    #
+    # 🔴 PRINTED BELOW, AFTER THE SCREEN KNOWS WHETHER THE SECTION CAN VARY. A safe-path is
+    # written only by the gateway's judge from a retry it saw, so on an install with no
+    # gateway store and nothing adopted this section is empty BY CONSTRUCTION, on every run,
+    # and it printed a header, "No reusable safe-paths to show yet", a bullet explaining the
+    # gateway, and (further down) the gateway link, to a reader who has run one demo. The
+    # founder's fresh-ledger walk: too early to mention the gateway, twice. Keyless and
+    # empty, the section does not print; the one quiet gateway line at the end of the
+    # screen carries the gateway. With a store, or anything adopted, it is real and prints.
     seq_by_pid = {}
     for item in enumerate_candidates(harvest):
         seq_by_pid.setdefault(item["policy_id"], {})[item["suggestion"]] = item["seq"]
@@ -6140,12 +6381,22 @@ def execute_insights(args=None):
     # DETECTION RULES heading, the CTA, the store paragraph and the footer -- the whole
     # actionable tail of the screen, as the reward for doing what the screen asked.
     _safe_paths_empty = not harvest and not active and not rule_list
+    # Empty by construction: no gateway store to have written one, and no keyless MCP
+    # recovery path to offer instead (that line is the one thing the empty branch can say
+    # to a keyless reader, so it keeps the section when it has something).
+    _safe_paths_hidden = _safe_paths_empty and not census["exists"] and not mcp_flat
+
+    if not _safe_paths_hidden:
+        print("\n🧠 SAFE-PATHS YOUR WRAPPED TOOLS LEARNED (local to this machine)")
+        print("=" * 75)
 
     # The intro promise below only prints once we know a fix was saved (see the populated
     # branch further down) -- this empty-state block says only what it can back up: the
     # posture (what's missing and why), never a path/env-var diagnosis aimed at someone
     # who isn't misconfigured. They're keyless, which is the normal case.
-    if _safe_paths_empty:
+    if _safe_paths_hidden:
+        pass
+    elif _safe_paths_empty:
         print("\n  No reusable safe-paths to show yet.")
         if not census["exists"]:
             # Same fix as the recovery section above, and the SECOND site is why this needed
@@ -6607,13 +6858,40 @@ def execute_insights(args=None):
             else:
                 print("  Adopted coaching lands in ./.agentx/overrides.json. Commit it to share.")
                 _print_shared_store_note()
-    # 🔴 THE ONE LINK ON THIS SCREEN, AND IT PRINTS FOR EVERY READER. The recovery section
-    # and the SAFE-PATHS empty state each used to carry it, and the footer's copy said
-    # "Share adopted safe-paths across your team + add the full deterministic floor" to a
-    # reader with no safe-paths, one screen after `audit` called the built-in floor's list
-    # "the whole list". One sentence, in the words `agentx status` uses for the same door.
-    print("\n  A gateway blocks on your rules and records what happened after a block.")
-    print("  It costs nothing from us; recovery uses your own Gemini key:")
+    # 🔴 ONE RUNG PER SCREEN, THE ONE THE LEDGER SAYS THE READER CAN CLIMB. The CTA block
+    # above prints when there is something to review or adopt, which is the rung for a
+    # reader with blocks of their own. A reader whose ledger holds only our demo has one
+    # move, and it is not any of those and not the gateway: wrap a tool. The audit screen
+    # says so at the same point; this screen said nothing and offered the gateway. Loud
+    # beside the evidence, quiet without it, never absent -- the shape the enforce ask on
+    # `audit` already has.
+    if not _screen_has_actions and not _reader_has_adopted:
+        # The footer's opening rule, which the CTA block above prints when it runs. Without
+        # it, on a keyless screen whose two gateway sections are hidden, the last section had
+        # closed its own fence and the rung, the gateway line and the --verbose hint sat
+        # under nothing, ending on a fence no header opened (scoped review). Same rule, same
+        # place, whichever block opens the footer.
+        print("\n  " + "─" * 71)
+    if not _screen_has_actions and not _reader_has_adopted and _ledger_holds_only_ours():
+        print("")
+        if MCP_ENTRY:
+            print("  ▶ Put agentx-mcp in front of your own server, and what it trips lands")
+            print("    here beside these.")
+        else:
+            print("  ▶ Wrap one of your tools, and what it trips lands here beside these:")
+            print("")
+            for _ln in wrap_snippet_lines("       "):
+                print(_ln)
+    # 🔴 THE ONE LINK ON THIS SCREEN, AND IT PRINTS FOR EVERY READER, LAST AND QUIET. The
+    # recovery section and the SAFE-PATHS empty state each used to carry it, and the
+    # footer's copy said "Share adopted safe-paths across your team + add the full
+    # deterministic floor" to a reader with no safe-paths, one screen after `audit` called
+    # the built-in floor's list "the whole list". Then it was three lines here plus a bullet
+    # in SAFE-PATHS, to a reader who had run one demo (the founder's fresh-ledger walk:
+    # too early, twice). One sentence, the link, nothing sold; `reached_gateway` is 0 all
+    # time and a Docker image is not the step after a demo. The /gateway page says what it
+    # costs.
+    print("\n  A gateway blocks on your rules, coaches each block, records what follows:")
     print("     %s" % _gateway_url())
     if mcp_flat and not _safe_paths_empty:
         # Same reason as the branch above: no MCP-door equivalent, and this reader is here.
@@ -6644,8 +6922,9 @@ def execute_mcp_insights():
     agentx-mcp wedge (harvested silently, opt-in AGENTX_MCP_HARVEST). Each recurring safe path
     is a value-free, minimal-privilege reframe you can ADOPT into your org-brain with the SAME
     `agentx adopt <#>` (one number space across insights + rules + these); then A1b coaches your
-    agents straight to it on the next block. Auto-coach (AGENTX_MCP_AUTO_COACH, default on) also
-    promotes the strongest paths for you; a hand-adopt always WINS over an auto one."""
+    agents straight to it on the next block. Auto-coach (AGENTX_MCP_AUTO_COACH=on, off by
+    default) promotes the strongest paths without that step; a hand-adopt always WINS over an
+    auto one."""
     from .mcp_proxy import _harvest_enabled, _harvest_path
 
     _harvest, _reframe, _rules, mcp_flat = _collect_candidates()
@@ -6698,7 +6977,7 @@ def execute_mcp_insights():
     print("\n" + "=" * 75)
     print("  ▶ Adopt one (pins it; a hand-adopt WINS over auto):   agentx adopt <#>")
     print("       tweak first:  agentx adopt <#> --edit")
-    print("  Auto-coach promotes the strongest paths for you (AGENTX_MCP_AUTO_COACH=off to stop).")
+    print("  To promote the strongest paths without adopting each: AGENTX_MCP_AUTO_COACH=on")
     print("  Adopted coaching lands in ./.agentx/overrides.json. Commit to share with your team.")
     _print_shared_store_note()
     print("=" * 75)
@@ -6948,6 +7227,9 @@ def _print_rule_adopted(entry, verb="Adopted", said_when=False):
     print(_wrap(f"action={entry['target_action']} · {entry['semantic_description']}", "     "))
     if entry.get("indicators"):
         print(f"     exact indicators: {', '.join(entry['indicators'])}")
+    if entry.get("only_when"):
+        from .rules import only_when_clause
+        print(f"     {only_when_clause(entry)}")
     # The path on its own line, whole: a path cannot wrap and must not be clipped.
     print("   💾 Saved (commit it; a gateway that reads it enforces it) to:")
     print(f"      {entry['path']}")
@@ -7029,11 +7311,14 @@ def _active_rules_lines(indent="  "):
     # this list, one screen apart -- one rule, two names, found on a founder walk. A
     # switched-off rule is listed and marked, never dropped: absence would carry the
     # decision.
+    from .rules import only_when_clause
     lines = ["%sRules you have added:" % indent]
     for r in armed:
-        lines.append("%s   • %s  (%s)%s" % (indent, r.get("name") or r["id"],
-                                           r.get("target_action") or "—",
-                                           "" if r.get("active", True) else "  off"))
+        clause = only_when_clause(r)
+        lines.append("%s   • %s  (%s%s)%s" % (indent, r.get("name") or r["id"],
+                                             r.get("target_action") or "—",
+                                             (", " + clause) if clause else "",
+                                             "" if r.get("active", True) else "  off"))
     return lines
 
 
@@ -7062,6 +7347,8 @@ def _print_your_rules_table(db_module, rule_matches):
     if not armed:
         return
     by_id = (rule_matches or {}).get("by_id") or {}
+    uncompared_by_id = (rule_matches or {}).get("uncompared_by_id") or {}
+    from .rules import only_when_clause
     # "since adopted": a rule adopted after the calls it was proposed from reads 0 here,
     # which the founder read as "the rules do not work". Matches count from the adoption.
     # 2 + 33 + 3 + 1 + 34 + 1 = 74.
@@ -7073,6 +7360,19 @@ def _print_your_rules_table(db_module, rule_matches):
         count = "off" if not r.get("active", True) else f"{by_id.get(r['id'], 0):,}"
         print("  %-32s  %-22s %7s" % (_fit(name, 32), _fit(r.get("target_action") or "-", 22),
                                      count))
+        # A rule with a threshold says so under its row, in the words the adopt screen used,
+        # and says how many calls had its shape but no number it could read: without that
+        # line "4 matched" reads as "every refund was checked". The ledger keeps only that
+        # the comparison could not be made, not whether the argument was absent or unreadable
+        # (the run's own line says which), so the row says what it knows. 4 + 30 + 2 + 36 = 72.
+        clause = only_when_clause(r)
+        if clause:
+            skipped = uncompared_by_id.get(r["id"], 0)
+            argument = (r.get("only_when") or {}).get("argument")
+            note = ("" if not skipped else
+                    "%s call%s had no %s we could read" % (f"{skipped:,}", "" if skipped == 1 else "s",
+                                                            argument))
+            print("    %-30s  %s" % (_fit(clause, 30), _fit(note, 36)))
     # The same sentence about blocking as everywhere else this feature speaks, once.
     print("  Recorded, not blocked: the SDK matches the shape of a rule, and only a")
     print("  gateway judges the meaning. Remove one:  %s --undo" % _review_cmd())
@@ -7099,10 +7399,16 @@ def _expect_or_exit(expect, actual):
     sys.exit(1)
 
 
-def _refuse_name_on_coaching(name, what):
+def _refuse_name_on_coaching(name, what, only_when=None):
     """`--name` names a RULE. Coaching is keyed to a policy and keeps that policy's name, so
     on a coaching candidate the flag is refused out loud: dropping it silently would let a
-    script believe it named something."""
+    script believe it named something. `--only-when` is refused the same way and for the
+    stronger reason: coaching has no argument to compare, so a script that passed a threshold
+    here and got exit 0 would believe the small refunds were exempted."""
+    if only_when is not None:
+        print(f"\n❌ --only-when puts a threshold on a detection rule, and {what} is coaching")
+        print("   for a policy, which compares nothing. Drop --only-when, or pick a rule's number.")
+        _adopt_usage_exit()
     if name is None:
         return
     print(f"\n❌ --name names a detection rule, and {what} is coaching for a policy, which")
@@ -7110,17 +7416,79 @@ def _refuse_name_on_coaching(name, what):
     _adopt_usage_exit()
 
 
-def _adopt_rule_candidate(rule, do_edit, assume_yes=False, name=None):
+_ONLY_WHEN_EXAMPLE = "amount >= 1000"
+
+
+def _only_when_or_exit(text):
+    """The parsed clause for a typed `--only-when`, or exit 1 with the parser's own sentence.
+    A clause that cannot be read must not arm a rule without one: the developer typed a
+    threshold, and a rule that then matched every call would be the exact thing they
+    typed it to avoid."""
+    from .rules import parse_only_when
+    try:
+        return parse_only_when(text)
+    except ValueError as err:
+        print(f"\n❌ --only-when: {err}")
+        print(f"   Example:  --only-when \"{_ONLY_WHEN_EXAMPLE}\"   (>=, >, <, <= are accepted)")
+        _adopt_usage_exit()
+
+
+def _ask_only_when():
+    """One question, on a terminal only, when `--only-when` was not typed. Enter skips it.
+    Asked at most twice: a clause that cannot be read is explained and asked once more, then
+    the adopt proceeds WITHOUT a threshold and says so, rather than looping."""
+    from .rules import parse_only_when
+    for attempt in range(2):
+        try:
+            typed = input(f"   Only when an argument crosses a number? (Enter to skip, "
+                          f"e.g. {_ONLY_WHEN_EXAMPLE}):  ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not typed:
+            return None
+        try:
+            return parse_only_when(typed)
+        except ValueError as err:
+            print(f"   ✗ {err}")
+    print("   Adopting without a threshold. To add one later, remove the rule (%s --undo)"
+          % _review_cmd())
+    print("   and adopt it again with --only-when.")
+    return None
+
+
+def _say_only_when(only_when):
+    """The clause the file will carry, in the words every screen uses for it, at the prompt
+    where the reader commits. A gateway older than the field ignores it and matches every
+    call; said here, once, where the number is typed. Both adopt paths (with and without
+    `--edit`) call this, so no path can write a threshold nobody was shown."""
+    if not only_when:
+        return
+    from .rules import only_when_clause
+    print(f"     {only_when_clause({'only_when': only_when})}")
+    print(f"     (a gateway older than {ONLY_WHEN_GATEWAY_MIN} ignores the threshold "
+          f"and matches every call)")
+
+
+def _adopt_rule_candidate(rule, do_edit, assume_yes=False, name=None, only_when=None):
     """Adopt a harvested DETECTION rule (the #N pointed at a rule, not a reframe).
     Writes it into `.agentx/rules.json`; the gateway reads the file at boot and on each
     sync tick. Manual confirm is the anti-poisoning gate (agent-derived rule text never
-    arms itself). `name` is the developer's own name for it (`--name`), if typed."""
+    arms itself). `name` is the developer's own name for it (`--name`), if typed.
+    `only_when` is the parsed threshold clause (`--only-when`), if typed; on a terminal
+    without the flag, one question offers it before the confirm."""
     # The name the confirm prints IS the name the file will carry: one function decides both.
     label = rule_name(rule, override=name)
     desc = rule["semantic_description"]
 
     challenge = None
     if do_edit:
+        # The threshold is asked for and said on THIS path too. The first cut kept the
+        # question, the clause and the gateway-build caveat inside the non-edit branch, so
+        # `adopt N --edit --only-when ...` wrote a threshold nobody was shown (a scoped review
+        # of this branch). Asked before the editor opens, so the editor is the last step.
+        if only_when is None and sys.stdin.isatty():
+            only_when = _ask_only_when()
+        _say_only_when(only_when)
         seed = (f"Policy Violation: {label}. {desc} Reach the goal a safe way "
                 f"instead, or request human approval.")
         challenge = _edit_text(seed)
@@ -7146,6 +7514,9 @@ def _adopt_rule_candidate(rule, do_edit, assume_yes=False, name=None):
         print(_wrap(f"{_when[:1].upper()}{_when[1:]}.", "     "))
         if rule.get("indicators"):
             print(f"     exact indicators: {', '.join(rule['indicators'])}")
+        if only_when is None and sys.stdin.isatty():
+            only_when = _ask_only_when()
+        _say_only_when(only_when)
         if sys.stdin.isatty():
             try:
                 if input("   Proceed? [y/N]: ").strip().lower() not in ("y", "yes"):
@@ -7167,7 +7538,7 @@ def _adopt_rule_candidate(rule, do_edit, assume_yes=False, name=None):
             print("=" * 75)
             sys.exit(1)
 
-    entry = _adopt_rule_or_exit(rule, challenge=challenge, name=name)
+    entry = _adopt_rule_or_exit(rule, challenge=challenge, name=name, only_when=only_when)
     # The disclosure above already said WHEN (unless --edit skipped it); the confirmation
     # does not say it again. Twice per adopt was the review screen's defect in miniature.
     _print_rule_adopted(entry, verb="Adopted", said_when=not do_edit)
@@ -7201,7 +7572,7 @@ def _author_rule(args):
     unlike a reframe's single challenge string, so it has its own flag set rather
     than overloading `--text`. Human-authored, so no confirm gate (the
     anti-poisoning rule only forbids auto-applying *agent*-generated text)."""
-    action = effect = desc = name = challenge = None
+    action = effect = desc = name = challenge = only_when = None
     indicators = []
     i = 0
     while i < len(args):
@@ -7212,7 +7583,8 @@ def _author_rule(args):
             # to bypass; erroring would punish someone who passes it to every adopt form.
             i += 1
             continue
-        if tok in ("--action", "--effect", "--desc", "--indicators", "--challenge", "--name"):
+        if tok in ("--action", "--effect", "--desc", "--indicators", "--challenge", "--name",
+                   "--only-when"):
             if i + 1 >= len(args):
                 print(f"\n❌ {tok} needs a value.")
                 _adopt_usage_exit()
@@ -7229,6 +7601,8 @@ def _author_rule(args):
                 challenge = val
             elif tok == "--indicators":
                 indicators = [s.strip() for s in val.split(",") if s.strip()]
+            elif tok == "--only-when":
+                only_when = _only_when_or_exit(val)
             i += 2
         else:
             print(f"\n❌ Unexpected argument '{tok}' for `adopt --rule`.")
@@ -7255,7 +7629,7 @@ def _author_rule(args):
         "policy_violated": None,
     }
     # `--name` is the developer's name; with none, `rule_name` falls back to the action.
-    entry = _adopt_rule_or_exit(candidate, challenge=challenge, name=name)
+    entry = _adopt_rule_or_exit(candidate, challenge=challenge, name=name, only_when=only_when)
     _print_rule_adopted(entry, verb="Authored")
 
 
@@ -7295,6 +7669,9 @@ def execute_adopt(args):
     # no name of its own to replace (it is keyed to a policy), so on one of those the flag is
     # refused below rather than silently dropped.
     name = None
+    # A threshold on a RULE (`adopt N --only-when "amount >= 1000"`): parsed here, before
+    # anything is read or printed, so a clause that cannot be read exits before the confirm.
+    only_when = None
     i = 0
     while i < len(args):
         tok = args[i]
@@ -7302,7 +7679,7 @@ def execute_adopt(args):
             do_edit = True; i += 1
         elif tok == "--yes":
             assume_yes = True; i += 1
-        elif tok in ("--text", "--safe-path", "--expect", "--name"):
+        elif tok in ("--text", "--safe-path", "--expect", "--name", "--only-when"):
             if i + 1 >= len(args):
                 print(f"\n❌ {tok} needs a value.")
                 _adopt_usage_exit()
@@ -7315,6 +7692,8 @@ def execute_adopt(args):
                 if not name.strip():
                     print("\n❌ --name needs a value.")
                     _adopt_usage_exit()
+            elif tok == "--only-when":
+                only_when = _only_when_or_exit(args[i + 1])
             else:
                 safe_path = args[i + 1]
             i += 2
@@ -7381,7 +7760,8 @@ def execute_adopt(args):
                 # (or a log) the words "About to ENFORCE" for a rule that was never a
                 # candidate for adoption on this run.
                 _expect_or_exit(expect, rule_match.get("target_action"))
-                _adopt_rule_candidate(rule_match, do_edit, assume_yes=assume_yes, name=name)
+                _adopt_rule_candidate(rule_match, do_edit, assume_yes=assume_yes, name=name,
+                                      only_when=only_when)
                 return
             # ...then into keyless MCP recovery paths. An MCP candidate adopts AS A REFRAME
             # (templated value-free challenge, keyed to its policy), so it falls through the
@@ -7410,7 +7790,7 @@ def execute_adopt(args):
         # script pinning either one is stating the same thing.
         _expect_or_exit(expect, [match.get("policy_violated"), match.get("policy_id"),
                                  match.get("tool")])
-        _refuse_name_on_coaching(name, f"#{seq}")
+        _refuse_name_on_coaching(name, f"#{seq}", only_when=only_when)
         pid = match["policy_id"]
         seed = match["suggestion"]
         resolution_type = match["resolution_type"]
@@ -7421,7 +7801,7 @@ def execute_adopt(args):
     else:
         # ---- POLICY-ID MODE:  adopt <pid> [<index>] [--text ...] ----
         pid = positionals[0]
-        _refuse_name_on_coaching(name, pid)
+        _refuse_name_on_coaching(name, pid, only_when=only_when)
         known_ids = set(harvest) | set(active)   # resolve against harvested AND already-overridden ids
         if pid not in known_ids:                 # forgiving unique-prefix match on the id
             prefixed = [k for k in known_ids if k.startswith(pid)]
@@ -7763,7 +8143,8 @@ def _render_payload(raw):
 # intent:" (the longest) would otherwise push its value further right than "challenge
 # shown:" or "recovered via:", raggeding the left edge of the content down the page.
 _REVIEW_FIELD_LABELS = ("recovered via:", "agent's stated intent:", "attempted action:",
-                        "challenge shown:", "safe path so far:", "current verdict:")
+                        "challenge shown:", "safe path so far:", "current verdict:",
+                        "call shape:")
 _REVIEW_LABEL_WIDTH = max(len(l) for l in _REVIEW_FIELD_LABELS)
 
 
@@ -7806,6 +8187,36 @@ def _print_review_item(n, total, it):
     count = it.get("count") or 1
     header = f"VERDICT ({count} blocks)" if it["kind"] == "verdict_group" else "VERDICT"
     print(f"\n[{n}/{total}] {header} · {label}")
+    if it.get("store") == "ledger":
+        # A block from the call ledger: no receipt, and the status is said in the
+        # words `agentx audit` uses for the same row, because "WOULD_BLOCK" read cold names
+        # a call we let RUN. `stopped` is the enforced block; `ran, flagged` is the audit
+        # one, and the second line says which posture wrote it so the reader knows whether
+        # their agent was protected on this call.
+        _status = _CALL_STATUS_LABELS.get(it.get("status"), it.get("status"))
+        print(f"   {_status} {_relative_age(it.get('created_at'))}, tool `{it.get('tool_name')}`"
+              f"  (recorded locally, no receipt)"
+              + (f"   (showing the most recent of {count})" if it["kind"] == "verdict_group" else ""))
+        if it.get("status") == "WOULD_BLOCK":
+            print("   ran while watching: AgentX objected and did not stop it")
+        _shape = []
+        if it.get("arg_names"):
+            _shape.append(f"arguments {it['arg_names']}")
+        if it.get("target_class"):
+            _shape.append(f"target {it['target_class']}")
+        if it.get("row_cap"):
+            _shape.append(f"rows {it['row_cap']}")
+        if it.get("reversibility"):
+            _shape.append(f"{it['reversibility'].lower().replace('_', '-')}")
+        if _shape:
+            # The ledger keeps the SHAPE of a call and never its values, so this is the
+            # whole picture the free door has: names and classes, not the statement.
+            print(_wrap(", ".join(_shape), _field("call shape:")))
+        if it.get("challenge_issued"):
+            print(_wrap(it["challenge_issued"], _field("challenge shown:")))
+        if it.get("label_verdict"):
+            print(f"{_field('current verdict:')}{_verdict_phrase(it['label_verdict'])}  (choosing again overwrites this)")
+        return
     print(f"   blocked {_relative_age(it.get('created_at'))} — receipt {it.get('receipt_id', '')}"
           f"  (status: {it.get('status')})"
           + (f"   (showing the most recent of {count})" if it["kind"] == "verdict_group" else ""))
@@ -7819,7 +8230,7 @@ def _print_review_item(n, total, it):
     if it.get("label_safe_path"):
         print(f"{_field('safe path so far:')}{it['label_safe_path']}")
     if it.get("label_verdict"):
-        print(f"{_field('current verdict:')}{it['label_verdict']}  (choosing again overwrites this)")
+        print(f"{_field('current verdict:')}{_verdict_phrase(it['label_verdict'])}  (choosing again overwrites this)")
 
 
 def _mcp_review_items():
@@ -7956,14 +8367,18 @@ def _print_review_stats():
     stats = label_stats()
     print("\n📊 Label channel — outcome summary")
     print("=" * 75)
-    if not census["exists"] or stats["total"] == 0:
-        print("   No incidents recorded yet; nothing to summarize.")
+    # `total` spans both notebooks, so a store that does not exist beside a ledger
+    # holding blocks is NOT the empty state; only a zero is.
+    if stats["total"] == 0:
+        print("   No blocks recorded yet; nothing to summarize.")
         if not census["exists"]:
             print(f"   (no incident store yet at {census['path']})")
         print("=" * 75)
         return
     v, sp, h = stats["verdict"], stats["safe_path"], stats["harm"]
-    print(f"   {stats['total']} incident(s) in the store")
+    print(f"   {stats['total']} incident(s) recorded")
+    if stats.get("ledger_blocks"):
+        print(f"   {stats['ledger_blocks']} of them recorded locally by your wrapped tools, no key")
     print("\n   Verdict    (was the block right?)")
     print(f"     ✓ correct:         {v['TRUE_POSITIVE']}")
     print(f"     ✗ false positive:  {v['FALSE_POSITIVE']}")
@@ -8056,13 +8471,70 @@ def _group_verdict_items(items):
         if len(it["items"]) == 1:
             out.append(it["items"][0])
             continue
-        rep = it["items"][0]   # most recent (list_recent_incidents is newest-first)
+        rep = it["items"][0]   # most recent (both reads are newest-first, merged that way)
         it.update({"count": len(it["items"]), "created_at": rep.get("created_at"),
                    "challenge_issued": rep.get("challenge_issued"), "agent_cot": rep.get("agent_cot"),
                    "raw_payload": rep.get("raw_payload"), "receipt_id": rep.get("receipt_id"),
                    "status": rep.get("status"), "label_verdict": rep.get("label_verdict")})
+        # The representative may be a ledger block; the printer reads these off it.
+        for k in ("store", "ledger_id", "tool_name", "arg_names", "target_class", "row_cap",
+                  "reversibility", "posture"):
+            if rep.get(k) is not None:
+                it[k] = rep[k]
         out.append(it)
     return out
+
+
+def _ledger_twin(it):
+    """Whether this incident item's block is also in the call ledger."""
+    from .db import ledger_has_block
+    return bool(it.get("receipt_id")) and ledger_has_block(it.get("trace_id"), it.get("policy_id"))
+
+
+def _ledger_twin_will_be_asked(it):
+    """Whether the next review will ASK about that ledger copy. Asked of the pending reader
+    itself (`db.ledger_block_is_pending`), AFTER the incident is deleted: another incident on
+    the same session and policy still hides the row, a copy under one of our own example
+    agents is never asked, and a copy already answered is not a question. The first cut of
+    this sentence promised "will be asked about" from the row's existence alone, and the
+    review drove two cases where it printed and the next run asked nothing."""
+    from .db import ledger_block_is_pending
+    from .overrides import _incident_db_path
+    return ledger_block_is_pending(it.get("trace_id"), it.get("policy_id"),
+                                   incident_db=_incident_db_path())
+
+
+def _say_copy_stays(n_twins, n_asked, indent="   "):
+    """The one sentence about ledger copies after a delete, single or group. Two facts, each
+    from the reader that owns it: how many copies stay (`_ledger_twin`, before the delete),
+    and how many of those the next run will ask about (`_ledger_twin_will_be_asked`, after)."""
+    if not n_twins:
+        return
+    if n_twins == 1:
+        head = f"{indent}  the locally recorded copy stays"
+        tail = " and will be asked about next time" if n_asked else ""
+    else:
+        # Copies, not incidents: two blocks from one session on one policy share ONE
+        # ledger row, so the caller counts distinct (trace, policy) pairs.
+        head = f"{indent}  {n_twins} locally recorded copies stay"
+        tail = (f"; {n_asked} will be asked about next time" if n_asked else "")
+    print(head + tail)
+
+
+def _skipped(ans, keys, why=None):
+    """The one line for a key that did nothing. Enter and the skip keys mean skip and say
+    so. Any OTHER key says it was not an option and names the keys, because `– skipped`
+    alone reads as "the thing I asked for was declined" and the founder pressed `d` on a
+    block that has no delete and could not tell which. ``why`` is the reason a key that
+    exists on a sibling item is absent on this one."""
+    if ans in ("",) + _SKIP:
+        print("   – skipped")
+        return
+    keys_text = ", ".join(keys[:-1]) + " or " + keys[-1] if len(keys) > 1 else keys[0]
+    if why:
+        print(f"   – `{ans}` is not an option here ({why}); skipped")
+    else:
+        print(f"   – `{ans}` is not a key on this item; use {keys_text}. Skipped")
 
 
 def _prompt_single_verdict(it):
@@ -8070,26 +8542,49 @@ def _prompt_single_verdict(it):
     No capitalized default shown -- there IS no safe default for a human call on whether a
     block was right, so Enter honestly means skip, not a guess. Delete has no MCP form (a
     policy-level MCP verdict carries no receipt_id -- nothing to delete)."""
-    q = ("   were blocks on this policy right? [c]orrect / [w]rong / [a]ccept-risk / [s]kip / [q]uit: "
-         if it.get("mcp") else
-         "   was the block right? [c]orrect / [w]rong / [a]ccept-risk / [d]elete / [s]kip / [q]uit: ")
+    # A ledger block has no [d]elete: the ledger is the call history `agentx audit`
+    # counts, and removing a row from it would change those counts to hide a question. A
+    # flagged one ran, so the question is whether the block WOULD have been right.
+    if it.get("mcp"):
+        q = "   were blocks on this policy right? [c]orrect / [w]rong / [a]ccept-risk / [s]kip / [q]uit: "
+    elif it.get("store") == "ledger":
+        q = ("   would this block have been right? " if it.get("status") == "WOULD_BLOCK"
+             else "   was the block right? ")
+        q += "[c]orrect / [w]rong / [a]ccept-risk / [s]kip / [q]uit: "
+    else:
+        q = "   was the block right? [c]orrect / [w]rong / [a]ccept-risk / [d]elete / [s]kip / [q]uit: "
     raw = input(q)
     ans = raw.strip().lower()
     if ans in _QUIT:
         raise _ReviewQuit()
-    if ans == "d" and not it.get("mcp"):
+    if ans in _DELETE_KEYS and it.get("receipt_id"):
+        # A block the gateway parked is also in the call ledger (the decorator writes its
+        # row first), and the ledger row is never deleted from here (the decision: keep the
+        # ledger row, tell the reader). Whether the next run will ASK
+        # about it is the pending reader's call, taken after the delete.
+        twin = _ledger_twin(it)
         delete_incident(it["receipt_id"])
-        print("   ✓ deleted — removed from the local store, not just skipped")
+        if twin:
+            print("   ✓ deleted from the incident store;")
+            _say_copy_stays(1, 1 if _ledger_twin_will_be_asked(it) else 0)
+        else:
+            print("   ✓ deleted — removed from the local store, not just skipped")
         return "deleted"
     verdict = _VERDICT_KEYS.get(ans[:1])
     if not verdict:
-        print("   – skipped")
+        if ans in _DELETE_KEYS and it.get("store") == "ledger":
+            _skipped(ans, ["c", "w", "a", "s", "q"], why="a call recorded locally cannot be deleted from here")
+        else:
+            _skipped(ans, ["c", "w", "a"] + (["d"] if it.get("receipt_id") else []) + ["s", "q"])
         return None
-    if it.get("receipt_id"):
-        record_outcome(it["receipt_id"], verdict=verdict, source="human")   # per-block (incidents.db)
-    else:
+    if it.get("mcp"):
         set_declared_verdict(it.get("policy_id"), verdict,          # per-policy (MCP wedge)
                              policy_name=it.get("policy_violated"))
+    elif not record_verdict_on_item(it, verdict, source="human"):   # per-block, either notebook
+        # The row is gone (the ledger's 30-day / 10,000-row retention, or a deleted
+        # incident). Say so rather than print a tick over a write that did not land.
+        print("   – not recorded: this block is no longer in the store")
+        return None
     print(f"   ✓ marked {_verdict_phrase(verdict)}")
     return "labeled"
 
@@ -8100,6 +8595,11 @@ def _prompt_single_verdict(it):
 # screen" (a review finding, carried on the check-scripts row). Six sites, one pair of tuples.
 _QUIT = ("q", "quit")
 _SKIP = ("s", "skip")
+# The printed spellings only, never a first-letter match: delete is the one irreversible key
+# on this screen, and a prefix read turned "definitely" (a natural answer to "was the block
+# right?") into a delete (scoped review of #413). The verdict keys read their first letter
+# because every answer they accept is reversible.
+_DELETE_KEYS = ("d", "delete", "delete-all")
 
 
 class _ReviewQuit(Exception):
@@ -8135,6 +8635,11 @@ def _print_review_help():
     print("    RECOVERY item     [Y]es adopt / [n]o / [s]kip / [q]uit")
     print("    NEW RULE item     [y]es add / [n]o / [s]kip / [q]uit   (Enter does NOT add)")
     print("    VERDICT item      [c]orrect / [w]rong / [a]ccept-risk / [d]elete / [s]kip / [q]uit")
+    if not MCP_ENTRY:
+        # The MCP door offers one verdict per policy and never a ledger block, so
+        # this parenthetical would describe an item that door never shows.
+        print("      (a block recorded locally, without a gateway, has no [d]elete: it is")
+        print(f"       part of the call history `{_audit_cmd()}` counts)")
     print("    a GROUP of blocks on one policy also offers:")
     print("      [c]orrect-all / [w]rong-all / [a]ccept-risk-all / [d]elete-all / [i]ndividually")
     print("    --undo's first two screens  [y]es / [n]o / [s]kip-section / [q]uit")
@@ -8809,8 +9314,29 @@ def execute_review(args=None):
                 print("    blocks appear here once the gateway records them; keyless Shield")
                 print("    runs keep local stats too.)")
             else:
-                print("    blocks appear here once the gateway records them; keyless Shield")
-                print("    runs keep local stats in `agentx status`.)")
+                # On this door the queue reads the call ledger too, so a block needs
+                # no gateway to arrive here. The old sentence told a keyless reader their
+                # blocks would never show up, which was true and is not any more.
+                # 🔴 AND NO GATEWAY CLAUSE. "a gateway adds the statement and the agent's
+                # reasoning" was the third screen in a row to mention the gateway to a
+                # reader who has run one demo (the founder's fresh-ledger walk); the
+                # sentence about what a gateway adds belongs on the screen that has one.
+                print("    blocks your wrapped tools hit appear here, key or no key.)")
+        # 🔴 WHAT TO DO, NOT ONLY WHAT IS ABSENT. Three absences and a path gave the reader
+        # nothing to type. The rung is the same one `audit` and `insights` offer on a ledger
+        # holding only our demo: wrap a tool. Only then -- on a ledger with rows of theirs an
+        # empty queue means their blocks are all answered, and telling them to wrap a tool
+        # would be the dead-CTA defect pointing the other way.
+        # Not under `--undo`: that pass answers "what can I take back", and a rung about
+        # wrapping a tool is not an answer to it (scoped review of this branch).
+        if not undo_mode and _ledger_holds_only_ours():
+            if MCP_ENTRY:
+                print("   ▶ Put agentx-mcp in front of your own server; what it blocks is")
+                print("     asked about here.")
+            else:
+                print("   ▶ Wrap one of your tools; what it blocks is asked about here:")
+                for _ln in wrap_snippet_lines("        "):
+                    print(_ln)
         print("=" * 75)
         return
 
@@ -8893,9 +9419,14 @@ def execute_review(args=None):
                         print("   🚫 not added: %s" % err)
                     else:
                         rules_added += 1
-                        print(_wrap(_rule_armed_clause(), "   ✓ added: "))
-                else:
+                        # Bare on purpose. The clause this used to repeat is on the item,
+                        # four lines up, read before the key; the founder's walk showed it
+                        # printed three times in fifteen lines (item, tick, tally).
+                        print("   ✓ added")
+                elif ans in ("n", "no"):
                     print("   – skipped")
+                else:
+                    _skipped(ans, ["y", "n", "q"])
             elif it["kind"] == "adopt":
                 raw = input("   teach this recovery? [Y]es / [n]o / [s]kip / [q]uit: ")
                 if raw.strip().lower() in _QUIT:
@@ -8907,8 +9438,10 @@ def execute_review(args=None):
                                    policy_violated=it.get("policy_violated"), source="review")
                     adopted += 1
                     print("   ✓ adopted: it will coach your agents on the next block")
-                else:
+                elif ans in ("n", "no"):
                     print("   – skipped")
+                else:
+                    _skipped(ans, ["y", "n", "s", "q"])
             elif it["kind"] == "verdict_group":
                 count = it["count"]
                 # ⚠️ ONE SCREEN, TWO MODES, AND BOTH SENTENCES ONLY FIT ONE OF THEM.
@@ -8917,20 +9450,26 @@ def execute_review(args=None):
                 # looking at them. And "declare" is the wrong verb once the declaring is
                 # gated off in this mode: nothing standing is written here any more.
                 # Option letters are deliberately identical in both modes.
+                # [d]elete-all is offered only when every block in the group is an incident:
+                # a ledger block is call history `agentx audit` counts and cannot be
+                # deleted from here, and an option that would delete SOME of what is on
+                # screen is worse than none.
+                _deletable = all(sub.get("receipt_id") for sub in it["items"])
+                _d_opt = " / [d]elete-all" if _deletable else ""
                 if undo_mode:
                     print(f"   {count} blocks on this policy already carry a verdict.")
                     raw = input(f"   answer all {count} again, or go one at a time?"
-                                " [c]orrect-all / [w]rong-all / [a]ccept-risk-all / [d]elete-all"
+                                f" [c]orrect-all / [w]rong-all / [a]ccept-risk-all{_d_opt}"
                                 " / [i]ndividually / [s]kip / [q]uit: ")
                 else:
                     print(f"   {count} blocks on this policy await a verdict.")
                     raw = input(f"   declare ONE verdict for all {count}, or go one at a time?"
-                                " [c]orrect-all / [w]rong-all / [a]ccept-risk-all / [d]elete-all"
+                                f" [c]orrect-all / [w]rong-all / [a]ccept-risk-all{_d_opt}"
                                 " / [i]ndividually / [s]kip / [q]uit: ")
                 ans = raw.strip().lower()
                 if ans in _QUIT:
                     raise _ReviewQuit()
-                if ans == "i":
+                if ans in ("i", "individually"):
                     for sub in it["items"]:
                         _print_review_item(1, 1, sub)
                         outcome = _prompt_single_verdict(sub)
@@ -8939,24 +9478,31 @@ def execute_review(args=None):
                         elif outcome == "deleted":
                             deleted += 1
                     continue
-                if ans == "d":
+                if ans in _DELETE_KEYS and _deletable:
                     # Deliberately scoped to exactly the receipts shown in this group (see
                     # delete_incidents) -- unlike batch labeling, deletion is irreversible,
                     # so it must never reach beyond what the human actually saw.
+                    # One ledger copy per (session, policy), however many incidents share it.
+                    twins = {(sub.get("trace_id"), sub.get("policy_id")): sub
+                             for sub in it["items"] if _ledger_twin(sub)}
                     n_deleted = delete_incidents([sub["receipt_id"] for sub in it["items"]])
                     deleted += n_deleted
                     print(f"   ✓ deleted {n_deleted} block(s) for this policy")
+                    # Counted after the delete: see `_ledger_twin_will_be_asked`.
+                    _say_copy_stays(len(twins),
+                                    sum(1 for sub in twins.values() if _ledger_twin_will_be_asked(sub)))
                     continue
                 verdict = _VERDICT_KEYS.get(ans[:1])
                 if verdict:
-                    # 1. Label every VISIBLE receipt DIRECTLY -- guaranteed, regardless of any
-                    #    policy_id/name variation among them. A name/id-keyed declared verdict
-                    #    alone is not enough: it only reaches rows matching ONE identity, and a
-                    #    group can span several (the keyword-shield-vs-gateway id flicker, OR a
-                    #    historical policy rename leaving the same policy_id under two names) --
-                    #    a batch answer must never leave something you just saw unlabeled.
-                    direct = sum(1 for sub in it["items"] if sub.get("receipt_id")
-                                and record_outcome(sub["receipt_id"], verdict=verdict, source="human"))
+                    # 1. Label every VISIBLE block DIRECTLY, in whichever notebook it lives --
+                    #    guaranteed, regardless of any policy_id/name variation among them. A
+                    #    name/id-keyed declared verdict alone is not enough: it only reaches
+                    #    rows matching ONE identity, and a group can span several (the
+                    #    keyword-shield-vs-gateway id flicker, OR a historical policy rename
+                    #    leaving the same policy_id under two names) -- a batch answer must
+                    #    never leave something you just saw unlabeled.
+                    direct = sum(1 for sub in it["items"]
+                                 if record_verdict_on_item(sub, verdict, source="human"))
                     # 🔴 A REVERSAL MUST NOT ARM THE THING IT IS REVERSING.
                     # Steps 2 and 3 are the FORWARD half of a batch answer: they declare a
                     # standing verdict for the policy and sweep it across the whole store.
@@ -9003,8 +9549,13 @@ def execute_review(args=None):
                     # state only that command could leave. `--undo` exists on both doors and
                     # its first pass is exactly this.
                     print(f"     Change your mind:  {_review_cmd()} --undo")
-                else:
+                elif ans in ("",) + _SKIP:
                     print("   – skipped (all)")
+                elif ans in _DELETE_KEYS:
+                    _skipped(ans, ["c", "w", "a", "i", "s", "q"],
+                             why="a call recorded locally cannot be deleted from here, and this group holds one")
+                else:
+                    _skipped(ans, ["c", "w", "a"] + (["d"] if _deletable else []) + ["i", "s", "q"])
             else:
                 outcome = _prompt_single_verdict(it)
                 if outcome == "labeled":
@@ -9033,11 +9584,15 @@ def execute_review(args=None):
         _done.append(f"    {adopted} {rec_word} adopted: your agents get coached straight "
                      f"to the fix next time")
     if rules_added:
-        _done.append(_wrap(_rule_armed_clause(), f"    {rules_added} {rule_word} added: "))
+        # No clause: the item said what a rule does before the key (and a keyless run's
+        # footer under this tally says it needs a gateway to fire). Said once, not three times.
+        _done.append(f"    {rules_added} {rule_word} added")
     if labeled:
         _done.append(f"    {labeled} block(s) settled: they stop coming back here")
     if deleted:
-        _done.append(f"    {deleted} block(s) deleted: gone from this ledger for good")
+        # "the incident store", not "this ledger": the line above it may have just said a
+        # locally recorded copy stays, and the call ledger is what "ledger" means on screen.
+        _done.append(f"    {deleted} block(s) deleted: gone from the incident store for good")
     if _done:
         print("\n✓ Review done.")
         for _ln in _done:
@@ -9076,7 +9631,8 @@ def execute_review(args=None):
             print("     %s" % _gateway_url())
         else:
             print("  Not every tool is covered yet, only the ones you wrapped:")
-            print("     @agentx_protect(agent_id=\"your_agent\")   # around any tool function")
+            for _ln in wrap_snippet_lines("     "):
+                print(_ln)
         print("  See what your agents did:   agentx audit")
     print("=" * 75)
 
@@ -9267,7 +9823,8 @@ def _resolve_policy_target(ref):
     """Map a user-typed policy ref (a built-in NAME or a raw policy id, as shown by
     ``agentx review`` / ``agentx policies``) to ``(policy_id, policy_name, known)``. ``known``
     is True only when the ref matches a built-in policy OR a policy actually present in the
-    local incident store — so a typo can't silently mint a junk standing rule when SETTING."""
+    local incident store or the call ledger — so a typo can't silently mint a junk standing
+    rule when SETTING."""
     pid, pname = _resolve_policy_ref(ref)          # built-in name -> (id, name); else (ref, None)
     if pname is not None:
         return pid, pname, True
@@ -9275,6 +9832,13 @@ def _resolve_policy_target(ref):
     for r in list_recent_incidents(limit=100000):
         if r.get("policy_id") == ref or _norm_for_dedup(r.get("policy_violated") or "") == target:
             return r.get("policy_id") or ref, r.get("policy_violated") or None, True
+    # The ledger too: a custom or pulled policy on the free door has blocks only
+    # there, and a name that resolved to nothing left the id-keyed standing rule live while
+    # `--clear` printed "no longer settled" (the branch review's probe).
+    from .db import list_ledger_policies
+    for pid, pname in list_ledger_policies():
+        if pid == ref or _norm_for_dedup(pname or "") == target:
+            return pid or ref, pname or None, True
     return ref, None, False
 
 
@@ -9326,7 +9890,7 @@ def _verdict_policy(ref, verdict, do_clear, force):
 
     # set / change
     if not known:
-        print(f"\n❌ No policy named or id '{ref}' in your catalog or incident store.")
+        print(f"\n❌ No policy named or id '{ref}' in your catalog, incident store or call ledger.")
         print("   Check the exact name in `agentx review` / `agentx policies`.")
         print("=" * 75)
         sys.exit(1)
@@ -10148,10 +10712,13 @@ def execute_demo(closing=True):
     # attacker smuggled a destructive statement into the payload.
     poisoned = "Update notes for client 99401; DROP TABLE users;"
     print("\n A poisoned agent tool call is about to run:")
-    # No trailing blank: the decorator's own narration opens with a newline and supplies the
-    # separation. A blank here as well left a two-line hole on the day that narration was
-    # briefly suppressed.
+    # ONE blank between the listed call and the shield's line about it, printed HERE: the
+    # decorator's narration no longer opens with a newline (four quiet calls in a row on the
+    # watching half rendered as a blank-separated list), so every site that listed a call and
+    # relied on that newline for the gap supplies it. This comment used to say the opposite,
+    # and the scoped review found the three sites glued after the writer changed.
     print(f"   run_sql(query={poisoned!r})")
+    print("")
 
     # Run as a pure LOCAL sandbox: temporarily clear AGENTX_API_KEY so this synthetic
     # block uses the in-process keyword shield with a local receipt and does NOT park
@@ -10224,6 +10791,7 @@ def execute_demo(closing=True):
         print("\n The agent revises the call and tries again:")
         safe_query = "UPDATE notes SET status='reviewed' WHERE client_id='CLI-99401'"
         print(f"   run_sql(query={safe_query!r})")
+        print("")     # the gap the decorator's narration used to open with; see the first site
         recovered = run_sql(query=safe_query, db_session="<live SqlAlchemy session>")
         print()
         if not is_block(recovered):
@@ -10259,10 +10827,15 @@ def execute_demo(closing=True):
     # up and does something unrelated has also continued. Founder's two questions on the walk.
     # One indent for the whole paragraph: it was 1 then 3, which read as a hanging list
     # item (founder demo re-read).
+    # 🔴 NO COMMAND ON THIS PARAGRAPH. It ended "you can adopt:  agentx insights", the third
+    # command on a screen whose footer names `agentx audit`; the founder chose one door after
+    # the demo (audit), and a paragraph about the paid step is not where the reader is sent
+    # next. `agentx insights` is named the first time it has a policy of theirs to show: the
+    # session-end summary of their own run's first catch, and `agentx status`.
     print("\n That ran with no key and no signup. With the gateway and your own Gemini")
     print(" key, the block carries coaching written for the call it stopped, and each")
     print(" time your agent retries narrower and gets through, that becomes a lesson")
-    print(" you can adopt:  agentx insights")
+    print(" you can adopt.")
     if not closing:
         # The combined run owns the closing screen. Returning here rather than skipping just
         # the footer keeps ONE next-steps block on the screen: two would be two calls to
@@ -10361,6 +10934,9 @@ def execute_audit_demo(closing=True):
     # characters past the frame every other screen here keeps to.
     print("   issue_refund(order_id='ORD-8842', amount=2400.00, currency='usd', ...)")
     print("   write_ticket_note(path='tickets/SUP-1191.md', contents='...')")
+    # One blank between the list and the shield's four lines about it, now that the
+    # narration no longer opens with its own.
+    print("")
 
     # Keyless for the same reason `agentx demo` is: with a key set and no gateway every call
     # below fails open, costs a timeout and prints a DEGRADED banner over the story. Restored
@@ -10391,6 +10967,7 @@ def execute_audit_demo(closing=True):
         print(" that the agent follows:")
         print("")
         print("   query_orders_db(sql=\"... WHERE id='ORD-8842'; DROP TABLE orders; --\")")
+        print("")     # the gap the decorator's narration used to open with; see the enforce demo
         poisoned = "SELECT * FROM orders WHERE id = 'ORD-8842'; DROP TABLE orders; --"
         result = query_orders_db(sql=poisoned)
     finally:
