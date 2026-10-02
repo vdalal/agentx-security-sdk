@@ -1,6 +1,48 @@
 import os
 import re
 from setuptools import setup, find_packages
+from setuptools.command.build_py import build_py as _build_py
+from setuptools.command.sdist import sdist as _sdist
+
+# `__released__` is stamped with the BUILD date, so it is never hand-edited and the publish
+# carries no deadline. Full reasoning in build_stamp.py, which is kept OUT of this file so it
+# can be tested without executing setup().
+from build_stamp import stamp_file
+
+
+class build_py(_build_py):
+    """Stamps the WHEEL. `build_py` has already copied the package into build/lib."""
+
+    def run(self):
+        _build_py.run(self)
+        # 🔴 AN EDITABLE INSTALL HAS NO BUILD TREE TO STAMP, AND STAMPING IS NOT WANTED THERE.
+        # setuptools sets `editable_mode` and does not populate `build_lib`, so the path below does
+        # not exist and `stamp_file` RAISES by design. setuptools currently swallows that and
+        # silently discards this whole command, while warning that the behaviour will change -- at
+        # which point `pip install -e .` fails outright. The draft CI workflow and the
+        # quickstart-audit flow both use editable installs, so that is a real path.
+        # Returning early is the CORRECT answer rather than a workaround: there is no artifact to
+        # date, and someone working in the tree should read the in-tree default.
+        if getattr(self, "editable_mode", False):
+            return
+        stamp_file(os.path.join(self.build_lib, "agentx_sdk", "__init__.py"))
+
+
+class sdist(_sdist):
+    """Stamps the SDIST too, which the wheel hook cannot reach. An sdist install is rare
+    (PyPI serves the py3-none-any wheel to almost everyone) but it is not impossible, and an
+    unstamped sdist would carry the cut date and nag its user on day one."""
+
+    def make_release_tree(self, base_dir, files):
+        _sdist.make_release_tree(self, base_dir, files)
+        target = os.path.join(base_dir, "agentx_sdk", "__init__.py")
+        # make_release_tree HARD-LINKS by default, so writing through the link would edit the
+        # SOURCE tree. Replace the link with a real copy first. Verified by building with a
+        # deliberately wrong in-tree date and checking the source afterwards.
+        if os.path.exists(target):
+            os.unlink(target)
+            self.copy_file(os.path.join("agentx_sdk", "__init__.py"), target, link=None)
+        stamp_file(target)
 
 
 def _read_version():
@@ -68,4 +110,5 @@ setup(
         "Operating System :: OS Independent",
     ],
     python_requires=">=3.8",
+    cmdclass={"build_py": build_py, "sdist": sdist},
 )

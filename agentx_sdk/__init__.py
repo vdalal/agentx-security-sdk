@@ -1,4 +1,4 @@
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 # 🔴 0.5.0, NOT 0.4.32, BECAUSE THE DEFAULT POSTURE FLIPPED. A keyless install that upgrades
 # across this line goes from blocking every catch to recording it and letting the call run.
 # No API changed, so a patch number would have been "honest" and would have told an
@@ -8,7 +8,7 @@ __version__ = "0.5.2"
 # (pulse.staleness_notice): an old install nags ITSELF to upgrade with no network
 # call, because pip cannot declare a minimum version of the leaf package and so
 # nothing else can reach a pinned install. MUST move with __version__.
-__released__ = "2026-09-14"
+__released__ = "2026-10-01"
 
 # The rule "never ship SDK source under a version that is ALREADY published" still
 # stands; what is gone is the hand-maintained `__published__` constant that used to
@@ -27,13 +27,29 @@ __released__ = "2026-09-14"
 #   stale `info.version` for long enough to wave through an upload of a version that already
 #   existed. The per-version endpoint is not cached the same way.
 #
-#   🔴 THREE OUTCOMES, NOT TWO, AND CONFLATING THEM IS THE WHOLE POINT: free, taken, and
-#   "could not ask". A first cut of this instruction said "a 404 means the number is free"
-#   over a bare urlopen -- but urlopen raises on a 404 AND on a DNS failure, a proxy block or
-#   a timeout, so any network hiccup read as permission to upload. Same fail-open direction as
-#   the cached index it replaced: every failure looks like good news.
+#   🔴 FOUR OUTCOMES, NOT TWO, AND CONFLATING THEM IS THE WHOLE POINT: free, taken,
+#   "could not ask", and "your date constant lags". A first cut of this instruction said "a
+#   404 means the number is free" over a bare urlopen -- but urlopen raises on a 404 AND on a
+#   DNS failure, a proxy block or a timeout, so any network hiccup read as permission to
+#   upload. Same fail-open direction as the cached index it replaced: every failure looks like
+#   good news.
 #
-#     py scripts/check_pypi_version_free.py       # 0 = free, 1 = taken, 2 = could not ask
+#   ⚠️ THE FOURTH ARRIVED AFTER THIS BLOCK WAS WRITTEN AND THE BLOCK STILL SAID THREE,
+#   which is the defect the gate itself exists to prevent: an operator following the
+#   instruction next to `__released__` would have met an undocumented `exit 3` from the one
+#   step whose entire design rule is that outcomes must not be conflated. Exit 3 refuses the
+#   publish when the date below is too far behind the upload day, because that date is what
+#   a user's install measures its own age against.
+#
+#   🔴 IT IS A WINDOW, NOT AN EQUALITY. The date may lag the upload by up to
+#   MAX_RELEASED_LAG_DAYS and may never be in the future. Equality refused builds that would
+#   have behaved correctly -- a one-day lag leaves a fresh install at age=1 against a
+#   threshold of 7 -- and made every publish carry a hand edit whose only purpose was to
+#   satisfy the gate. The window may NOT be as wide as the staleness threshold itself: a lag
+#   eats a new installer's grace period day for day.
+#
+#     py scripts/check_pypi_version_free.py
+#     # 0 = free, 1 = taken, 2 = could not ask, 3 = __released__ is stale or in the future
 #
 #   It reads __version__ from this file rather than restating it, so it cannot go stale the
 #   way the retired __published__ marker did.

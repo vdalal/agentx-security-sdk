@@ -100,21 +100,45 @@ _env_overlay = None
 
 def _env(key):
     """Resolve an AGENTX_* var from the process env, falling back to the project
-    `.env` (via the stdlib-only envfile.load_env_file). The SDK runtime does not
-    auto-load `.env`, so without this a flag placed in `.env` — exactly where
-    .env.example tells users to put AGENTX_TELEMETRY — would silently no-op unless
-    the host app happened to call load_dotenv(). Cached after first read. Never
-    raises (telemetry must never break a run)."""
+    `.env` (via the stdlib-only envfile reader). Without this, a flag placed in `.env` —
+    exactly where .env.example tells users to put AGENTX_TELEMETRY — would silently no-op
+    unless the host app happened to call load_dotenv(). Cached after first read. Never
+    raises (telemetry must never break a run).
+
+    ⚠️ THIS DOCSTRING USED TO SAY "the SDK runtime does not auto-load `.env`", WHICH WAS THE
+    REASON THIS FUNCTION EXISTED AND IS NO LONGER TRUE: `client.gateway_url` reads it too
+    now, through `envfile.resolve_env`. What is still true is the part that matters here —
+    this one reads UP THE TREE (`include_parent=True`) while the gateway URL does not,
+    because failing to see an opt-out and failing to see a destination are harms in opposite
+    directions. The note above the two caches in envfile.py is the long version.
+
+    🔴 BLANK IS A VALUE HERE, AND IT IS THE OPPOSITE OF THE RULE `resolve_env` USES. An
+    attempt to make the two agree broke `test_disabled_for_falsey_values[]` immediately, and
+    the test was right: `AGENTX_TELEMETRY=` exported empty is in this product's falsey list
+    alongside `off`, `false`, `0` and `no`, so an empty export is an explicit REFUSAL. For a
+    destination, blank means "nothing configured, keep looking"; for a consent flag, blank
+    means "no". Treating them the same here would have read a refusal as silence and fallen
+    through to the default, which is ON. Two settings, two meanings of empty, and the rule
+    belongs to the question rather than to the reader."""
     val = os.environ.get(key)
     if val is not None:
         return val
     global _env_overlay
     if _env_overlay is None:
         try:
-            from .envfile import load_env_file   # stdlib-only — no requests at atexit
-            _env_overlay = load_env_file() or {}
+            from .envfile import dotenv_overlay  # stdlib-only — no requests at atexit
+            # `include_parent=True` is the OPT-OUT direction and is deliberate: a refusal
+            # written at a repo root must still be seen by an agent running in a
+            # subdirectory. The gateway URL is read the other way; the note above the two
+            # caches in envfile.py says why they differ.
+            _env_overlay = dotenv_overlay(include_parent=True)
         except Exception:
             _env_overlay = {}
+    # `_env_overlay` IS KEPT AS ITS OWN NAME, not replaced by a call to the shared
+    # reader, because seven tests monkeypatch it to `{}` to stop a real ./.env bleeding
+    # into a pulse assertion. Reaching past it would disarm that isolation silently and
+    # every one of those tests would still pass on a machine with no ./.env. The rule
+    # (env, then .env) now lives once in envfile.resolve_env; this holds the seam.
     return _env_overlay.get(key)
 
 

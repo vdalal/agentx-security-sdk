@@ -32,7 +32,7 @@ from .rules import (harvest_rule_candidates, harvest_rule_candidates_from_calls,
 
 # Re-exported from the stdlib-only envfile module (kept importable here for
 # backward compatibility — callers and tests still do `from .cli import load_env_file`).
-from .envfile import load_env_file
+from .envfile import load_env_file, resolve_env
 
 
 def _ledger_path_line(path, indent="   "):
@@ -230,7 +230,8 @@ def _render_offline_dashboard(gateway_url, mode="local"):
         # reader below uses .get() for that, deliberately, because a screen whose whole job
         # is to work when things are broken must not depend on a literal staying in sync.
         census = {"total_rows": 0, "block_episodes": 0, "would_blocks": 0, "recoveries": 0,
-                  "interceptions": 0, "would_blocks_from_demo": 0, "inventory_from_demo": 0}
+                  "interceptions": 0, "inventory": 0, "would_blocks_from_demo": 0,
+                  "inventory_from_demo": 0}
 
     # 🔴 "YOUR AGENTS ARE PROTECTED RIGHT NOW" WAS UNCONDITIONAL, ON THE DEFAULT SCREEN. Bare
     # `agentx` lands here, so it is the first sentence most readers ever see -- and on a fresh
@@ -245,9 +246,13 @@ def _render_offline_dashboard(gateway_url, mode="local"):
     # gets the "wrap a tool" wording, which is the safe direction to be wrong in -- it
     # understates coverage rather than promising protection nobody has.
     #
-    # Same arithmetic as the audit section below (total_rows minus interceptions), reusing the
-    # ONE census read for the reason that comment gives.
-    _inventory_calls = max(0, (census.get("total_rows") or 0) - (census.get("interceptions") or 0))
+    # ⚠️ THE CENSUS COUNTS THIS NOW; IT USED TO BE `total_rows` MINUS `interceptions`. That
+    # subtraction was exact only while every row was either routine traffic or something we had
+    # an opinion about. It stopped being exact when a third kind arrived -- a write that ran and
+    # could not be sized is in neither term, so the remainder quietly grew to include calls we
+    # had objected to sizing. Reusing the ONE census read, for the reason the audit section
+    # below gives; what changed is which field of it answers.
+    _inventory_calls = census.get("inventory") or 0
     _seen_your_own = (_inventory_calls - (census.get("inventory_from_demo") or 0)) > 0
 
     if local:
@@ -488,11 +493,14 @@ def _render_offline_dashboard(gateway_url, mode="local"):
             # It also removes a second reader of the same table from this screen, which is
             # the rule this function has now been fixed for three times: two queries over one
             # table eventually disagree, and the screen states the disagreement as fact.
-            _inventory_calls = max(
-                0, (census.get("total_rows") or 0) - (census.get("interceptions") or 0))
+            # Counted, not derived -- see the twin of this line in the populated branch above for
+            # why the subtraction it replaces stopped being exact.
+            _inventory_calls = census.get("inventory") or 0
             # Same rule as the populated branch above: this section is about BLOCKS, so it
-            # discloses the deletion of a block. Routine-traffic trimming is disclosed where
-            # it actually qualifies something -- `agentx audit`, off inventory["covers_all"].
+            # discloses the deletion of a block. The OTHER disclosure lives where it actually
+            # qualifies something -- `agentx audit`, off inventory["covers_all"] -- and that one
+            # now covers ANY eviction rather than routine traffic only, since that screen reports
+            # three counts and trimming any of them shortens what it describes.
             if retention and retention.get("blocks_dropped"):
                 print(f"   {retention['blocks_dropped']:,} older block record(s) have been "
                       f"dropped; this ledger keeps")
@@ -591,6 +599,31 @@ def _render_offline_dashboard(gateway_url, mode="local"):
                 # inventory to point at, and telling them to wrap a tool is the same wrong
                 # next step. Their rows are on the insights screen.
                 print(f"   See them, by policy:   {_insights_cmd()}")
+            elif census.get("observed", 0) > 0:
+                # 🔴 THE SAME WRONG NEXT STEP, ONE POPULATION OVER, AND THIS BRANCH IS WHY THE
+                # ONE ABOVE EXISTS. A ledger whose only row is an unsized write has no inventory
+                # and no would-block, so it fell to the `else` and told a developer who had
+                # wrapped a tool and run their agent to go and wrap a tool. Measured on both
+                # trees: at base this state cannot occur, because every non-routine row was a
+                # catch and `interceptions` caught it. An observation is the first recorded row
+                # of theirs that leaves that count at zero, so this is a state this branch
+                # introduced and has to answer for.
+                #
+                # ⚠️ `agentx review`, NOT `insights`. The insights readers filter on the three
+                # block statuses and would render nothing for this row -- the dead-CTA defect
+                # that the `viewable_total` guard on the audit screen exists to prevent. Review
+                # is where the question about it is actually asked.
+                #
+                # 🔴 AND IT NAMES WHAT IT IS ABOUT FIRST. The headline above this is the
+                # empty-ledger copy ("no blocks recorded in this ledger yet"), correctly, so a
+                # bare CTA underneath asked the reader to go and say what is reasonable about
+                # nothing at all. The audit sibling states the row and then offers the command;
+                # this said only the command. One sentence, and the CTA has a subject.
+                # One line, action-led, same words as the audit screen's twin so the two
+                # screens describe one thing one way. No competing sentence on THIS screen, but a
+                # reader moving between them should not have to notice that.
+                print("   %s waiting for your verdict:   %s"
+                      % (_plural(census.get("observed", 0), "write"), _review_cmd()))
             else:
                 print("   Wrap a tool with @agentx_protect (or one line in mcp.json) and run your")
                 print("   agent. Your catches and streak show up here.")
@@ -1212,6 +1245,25 @@ def execute_contribution_push(gateway_url, control_plane_url, api_key, env):
         print("=" * 75)
         return
 
+    # 🔴 THE SAME GUARD THE SDK'S AUTOMATIC PATH NOW HAS, because a check on one door and not
+    # the other is the shape this codebase keeps re-fixing. The POST below carries the API key
+    # to whatever CONTROL_PLANE_URL says, and port 0 is not refused by the HTTP layer -- it is
+    # REWRITTEN to the scheme default, so a typo'd `:0` sends the key and the payload to
+    # whatever is listening on port 80 of that host.
+    #
+    # This door SPEAKS, unlike the SDK's: a person ran `agentx push` and is reading the output,
+    # so the reason is worth printing and they can act on it. Exit is not an error -- nothing was
+    # sent, which is the safe outcome, and the signals are still on disk.
+    from .client import _unusable_gateway_url   # local, matching the other CLI call site
+    _plane_unusable = _unusable_gateway_url(control_plane_url)
+    if _plane_unusable:
+        print(f"\n   ❌ Not sending: CONTROL_PLANE_URL ({control_plane_url}) is not usable, "
+              f"because {_plane_unusable}.")
+        print("      Your API key was NOT sent anywhere. Fix the URL and run this again;")
+        print(f"      your signals are still saved locally at ./{artifact}.")
+        print("=" * 75)
+        return
+
     try:
         post = requests.post(
             f"{control_plane_url}/api/edge/contribute",
@@ -1511,6 +1563,58 @@ def _print_strays(census):
 # Imported, not restated. A second copy of "demo_cli" here is a second place to update
 # when the set grows -- which it just did, with the shipped examples.
 from .db import OUR_AGENT_IDS as _OUR_AGENT_IDS
+# The observation status, imported for the same reason as the set above: this file branches on
+# it in three places (the status word, the review question, the audit sentence) and three
+# string literals are three chances to spell it differently.
+from .db import UNSIZED_WRITE_STATUS as _UNSIZED
+from .db import (REVERSIBILITY_READ_ONLY as _REV_READ_ONLY,
+                 REVERSIBILITY_BOUNDED as _REV_BOUNDED,
+                 REVERSIBILITY_DESTRUCTIVE as _REV_WHOLE_TABLE,
+                 REVERSIBILITY_UNKNOWN as _REV_UNKNOWN,
+                 _REVERSIBILITY_LABELS)
+
+
+# The word each stored label shows a reader. ONE table, because TWO screens render this column
+# and they had already drifted: `agentx audit` printed "could not tell" (the word the founder
+# chose) while `agentx insights` lowercased the raw value and printed "unknown" for the same
+# row. A reader comparing the two screens saw two labels for one call.
+#
+# 🔴 THE STORED TOKEN AND THE PRINTED WORD DIFFER ON PURPOSE FOR ONE VALUE, AND UNDOING THAT IS
+# A REGRESSION. `DESTRUCTIVE` is stored and "unbounded" is shown. The token is not renamed
+# because installed ledgers already hold it on every row they have written, and a value rename
+# is a migration that would make those rows fall out of `_ledger_totals`'s own inventory. The
+# WORD is what a reader sees, and "destructive" was the one word of the four that was not a
+# POSITION: the rule this screen's own comment states three lines into `_render_audit` is that
+# none of the words may read as a promise, and "destructive" promised that the call could not be
+# undone. It cannot know that. Under a DELETE or UPDATE the label is `row_cap_class`'s answer
+# and nothing else, so what was measured is how many rows the statement can touch -- which makes
+# a whole-table soft delete (`UPDATE users SET is_deleted = 1`, every byte still on disk) read
+# as `destructive`, the same word as `DROP TABLE users`. "unbounded" is the sibling of
+# "bounded", says exactly what was measured, and promises nothing either way.
+# Measured and held by `sdk_tests/test_decision_corpus_reversibility.py`.
+_LABEL_WORDS = {_REV_READ_ONLY: "read-only",
+                _REV_BOUNDED: "bounded",
+                _REV_WHOLE_TABLE: "unbounded",
+                _REV_UNKNOWN: "could not tell"}
+
+
+def _label_word(stored):
+    """The reader's word for a stored label, or the stored value when it is not one of ours.
+
+    The fallback is deliberate and is not a default: an older ledger, or one written by a newer
+    SDK, can hold a value this build has no word for, and printing it raw is honest where
+    printing "could not tell" would silently relabel it.
+
+    ⚠️ SCOPED TO THIS FUNCTION, because the sentence above reads as a claim about the whole
+    screen and is not one. On the call-shape line an unrecognised value prints raw, as described.
+    On the `agentx audit` count line it reaches NO term: `_ledger_totals` fills only keys already
+    in `_REVERSIBILITY_LABELS` and counts only NULL as unlabelled, so a fifth value is in neither
+    the four terms nor the "recorded before this label existed" term, and that line's own
+    "OF THOSE IS A PARTITION CLAIM" comment quietly stops holding. Pre-existing in `db.py` and
+    unreachable today, since nothing writes a fifth value; recorded here rather than filed,
+    because it is not a verdict any user can reach.
+    """
+    return _LABEL_WORDS.get(stored, str(stored))
 
 
 # How many wordings to list before summarising the rest. Small on purpose: this is a
@@ -3441,6 +3545,18 @@ def _print_concentration(novelty):
 # grouped view machine-readably.
 _AUDIT_SCHEMA = "agentx.audit/1"
 
+# `agentx policies --json`. The SECOND of the three artifacts a security reviewer asks for:
+# the allowlist itself, the log of calls actually denied (`agentx audit --json`), and who can
+# change the policy. This document answers the first and third; the ledger answers the second.
+#
+# 🔴 IT NAMES ITS OWN SURFACE AND MAKES NO CLAIM ABOUT THE OTHER ONE. The keyless floor and a
+# gateway's deterministic list are two vocabularies, not a subset and a superset: names exist
+# on each with no equivalent on the other, in both directions. "N of M" is therefore not a
+# sentence this document is allowed to imply, which is why there is a `surface` field and no
+# total. A reviewer handed a file that quietly compared them would be reading a number nobody
+# can support.
+_POLICIES_SCHEMA = "agentx.policies/1"
+
 # The human page sizes. JSON is never capped (see _effective_limit). Two numbers because
 # the two views count different things: calls, and tools. 25 is the grouped reader's own
 # long-standing default, restated here so both views ask the same function for their bound.
@@ -3625,6 +3741,12 @@ _CALL_STATUS_LABELS = {
     # The row is the SAME row: log_self_correction updates a CHALLENGED row in place, so
     # this status means "stopped, and then the agent got there another way".
     "RECOVERED": "retried",
+    # It ran, and nothing in the statement says how many rows it touched.
+    # ⚠️ NOT "flagged": that word means WE objected, and here we did not -- we could not tell.
+    # The distinction is the whole reason this status exists rather than reusing WOULD_BLOCK.
+    # 12 characters exactly, the same ceiling "ran, flagged" was written to, and it uses the
+    # screen's own shipped vocabulary for this population ("writes we could not size").
+    _UNSIZED: "ran, unsized",
 }
 # Not a status: a MARKER on the status cell of an ALLOWED row whose policy_id is a `rule-`
 # id. It ran, and it was the shape of a rule the developer adopted. The first cut folded
@@ -3657,6 +3779,10 @@ _CALL_STATUS_MEANINGS = {
     # word sits on the STOPPED row, which the founder read as the retry itself; "that retry
     # ran" points at the other row.
     "retried": "retried = stopped here; the agent retried it narrower, and that ran.",
+    # ⚠️ NO "AgentX objected" HERE, unlike every other non-"ran" line. We did not object; we
+    # could not tell. A reader who takes this for a softer flag will read the next screen's
+    # question ("was this worth flagging?") as being about a block that never happened.
+    "ran, unsized": "ran, unsized = ran; nothing in the statement caps how many rows it hits.",
     "unrecorded": "unrecorded = written before the verdict was kept; no claim either way.",
 }
 
@@ -4222,6 +4348,22 @@ def _audit_json_payload(db_module, opts, inventory=None, log=None):
         # total finds a gap with nothing in the payload explaining it. The human screen
         # footnotes that split in prose; a document has no prose, so the name carries it.
         "flagged_excluding_ours": row["flagged"],
+        # Writes on this tool that ran and the parser could not size. Same
+        # naming rule as the key above, and same reason it is in the DOCUMENT and not on the
+        # table: the founder's walk deleted the per-tool flagged count from the human screen
+        # because "run_sql 21 ... plus 37 calls flagged" made a reader ask whether 21 and 37
+        # were the same thing. A second "plus N" column would put that question straight back.
+        # A program can combine populations; a reader should not have to.
+        #
+        # 🔴 `observed_`, NOT `unsized_`, AND THE FIRST CUT OF THIS KEY GOT IT WRONG. This
+        # document already carries `totals.unsized_writes`, which is the FREE regex reader's
+        # count, and this is the PARSER's -- two measures that disagree on ordinary statements
+        # and that the rest of this branch insists must never be summed. Shipping them under one
+        # word left a consumer adding this column up against `totals.unsized_writes` and finding
+        # a gap with nothing in the payload explaining it: verbatim the failure the
+        # `flagged_excluding_ours` note above describes. The parser's three figures now share one
+        # word -- `totals.observed`, `totals.observed_excluding_ours`, and this.
+        "observed_excluding_ours": row["observed"],
     } for row in inventory["tools"]]
     return payload
 
@@ -4402,11 +4544,31 @@ def _print_call_log(db_module, log, opts):
     # earlier draft of this comment called that folding "a false claim", which was wrong: it
     # is a documented decision on the other surface, not a bug. Which of the two is right is
     # a real open question and neither should be quoted until it is settled.
+    # 🔴 A FOURTH TERM, AND WITHOUT IT THIS SENTENCE SWITCHES ITSELF OFF ON EVERY KEYED
+    # LEDGER. The guard is an equality against `rows`, so the moment observations became their
+    # own population a two-term sum stopped adding up and the line silently
+    # vanished for exactly the users who have the most to read. The guard did its job -- it
+    # refused to print a split it could not stand behind -- which is why it is the term that
+    # had to change and not the guard.
+    #
+    # ⚠️ AND `_unsized` OPENS THE SENTENCE, WHICH `_tripped` ALONE USED TO. The old condition
+    # skipped a clean ledger because "77 ran with no objection and 0 tripped a policy" is a
+    # line about us. An observation is not that: it is a write that ran and that we could not
+    # size, and a ledger holding one is not clean in the sense that condition was protecting.
     _ran_clean = log["totals"]["inventory"]
     _tripped = log["totals"]["flagged"]
-    if _tripped and _ran_clean + _tripped == log["totals"]["rows"]:
-        print("  Of those, %d ran with no objection and %d tripped a policy."
-              % (_ran_clean, _tripped))
+    _unsized = log["totals"]["observed"]
+    if (_tripped or _unsized) and \
+            _ran_clean + _tripped + _unsized == log["totals"]["rows"]:
+        _parts = ["%d ran with no objection" % _ran_clean]
+        if _tripped:
+            _parts.append("%d tripped a policy" % _tripped)
+        if _unsized:
+            # "could not be sized", never "flagged": nothing objected to these.
+            _parts.append("%d could not be sized" % _unsized)
+        print("  Of those, %s."
+              % (", ".join(_parts[:-1]) + " and " + _parts[-1] if len(_parts) > 1
+                 else _parts[0]))
     if log["shown"] < log["totals"]["rows"]:
         print("  (showing the most recent %d; %s more not listed: use --all)"
               % (log["shown"], f"{log['totals']['rows'] - log['shown']:,}"))
@@ -4834,34 +4996,81 @@ def execute_audit(args=None):
         # say. Kept as a correction because the sentence named a cause, and naming the wrong
         # cause is how this screen went wrong the first time.
         # Both branches now fall through to the same guidance.
-        if inventory["flagged_total"]:
+        #
+        # 🔴 A THIRD THING THE LEDGER CAN HOLD, AND WITHOUT IT THIS SCREEN PRINTED "No calls
+        # recorded yet" OVER THE ONE ROW THE OBSERVATION FEATURE EXISTS FOR. `total_calls` counts
+        # ALLOWED rows and `flagged_total` counts verdicts plus legacy rows; an UNSIZED row is in
+        # NEITHER, so a keyed install whose agent made exactly the motivating call fell to the
+        # genuinely-empty branch and was handed a wrap-a-tool snippet. Reproduced on a ledger of
+        # one row. Same false-empty class this function's comment above says it has been fixed for
+        # twice, arriving a third time through a filter that stopped being exhaustive.
+        #
+        # ⚠️ AND THE FLAGGED BRANCH'S OWN SENTENCE WAS FALSE IN THE SAME CASE. It said "every
+        # call on record tripped a policy", which an observation did not. So the populations are
+        # named one clause each, and only the ones that are actually there.
+        #
+        # Ledger-wide for the TEST, `_excluding_ours` for the SENTENCE, which is the rule every
+        # other count on this screen obeys: our own demo's rows must not be described as the
+        # developer's, and must still stop us claiming the ledger is empty.
+        _obs_all = (inventory.get("totals") or {}).get("observed") or 0
+        _obs_theirs = (inventory.get("totals") or {}).get("observed_excluding_ours") or 0
+        if inventory["flagged_total"] or _obs_all:
             print("  Nothing here yet. This screen lists the calls AgentX had no objection")
-            print("  to, and every call on record tripped a policy.")
-            print("")
-            # Offer `insights` only for rows it can actually SHOW. flagged_total counts
-            # status-less legacy rows too, and every insights reader filters on
-            # CHALLENGED / RECOVERED / WOULD_BLOCK -- so on a ledger of those, "see them"
-            # sends the reader to a screen with nothing on it.
-            # Counted from what `agentx insights` can actually RENDER, not from "not NULL".
-            # That reader filters on CHALLENGED / RECOVERED / WOULD_BLOCK, so any other
-            # legacy status string still routes someone to a screen that will not show it.
-            viewable = inventory["viewable_total"]
-            if viewable > 0:
-                print("  %s on record. See them:  %s"
-                      % (_plural(viewable, "call"),
-                         "uvx agentx-mcp --insights" if MCP_ENTRY else "agentx insights"))
+            if inventory["flagged_total"] and _obs_all:
+                print("  to. Every call on record either tripped a policy or is a write")
+                print("  AgentX could not size.")
+            elif _obs_all:
+                print("  to, and every call on record is a write AgentX could not size.")
             else:
-                print("  %s on record, from a ledger older than this version, so there is"
-                      % _plural(inventory["flagged_total"], "call"))
-                print("  nothing left to show about them.")
-            # AFTER the count, because it qualifies it. `agentx demo` writes a catch under
-            # our own agent id and its footer sends the reader straight here, so on the first
-            # run of the ladder this screen was reporting OUR scripted call under a header
-            # naming THEIR agent. Same footnote `agentx insights` already carries.
-            if inventory["flagged_from_demo"]:
-                for _ln in _demo_row_note(inventory["flagged_from_demo"],
-                                          of_total=inventory["flagged_total"]):
-                    print(_ln)
+                print("  to, and every call on record tripped a policy.")
+            print("")
+            # The observation's own line and its own CTA: `agentx insights` filters on the three
+            # block statuses and cannot render one of these, so sending a reader there would be
+            # the dead-CTA defect. `agentx review` is where the question gets asked.
+            if _obs_theirs:
+                # ⚠️ NO PRONOUN, AND THE FIRST DRAFT HAD ONE: "1 write ... how many rows THEY
+                # touch" does not agree with itself, and the count is 1 on the run that matters
+                # most. Phrased so the number cannot disagree with the sentence.
+                # Action-led, and the same wording as the twin on the populated branch: see
+                # there for why describing the measurement twice made the two lines compete.
+                # `_review_cmd()`, never the literal -- under uvx the SDK's `agentx` script is
+                # not on PATH, so a bare `agentx review` is a command-not-found aimed at exactly
+                # the person we just told to go and look.
+                print("  %s waiting for your verdict:  %s"
+                      % (_plural(_obs_theirs, "write"), _review_cmd()))
+            elif _obs_all:
+                # Every observation on record is ours. Say so rather than printing a count of
+                # the reader's writes that is really a count of our demo's.
+                print("  The only unsized writes on record came from AgentX's own demo.")
+            # Nested, NOT a sibling `if`: the `else` far below is the genuinely-empty ledger and
+            # has to answer the OUTER question. Written flat first, which silently re-attached
+            # that else to this condition and sent a ledger holding only observations back to
+            # "No calls recorded yet" -- the defect being fixed, restored by its own fix.
+            if inventory["flagged_total"]:
+                # Offer `insights` only for rows it can actually SHOW. flagged_total counts
+                # status-less legacy rows too, and every insights reader filters on
+                # CHALLENGED / RECOVERED / WOULD_BLOCK -- so on a ledger of those, "see them"
+                # sends the reader to a screen with nothing on it.
+                # Counted from what `agentx insights` can actually RENDER, not from "not NULL".
+                # That reader filters on CHALLENGED / RECOVERED / WOULD_BLOCK, so any other
+                # legacy status string still routes someone to a screen that will not show it.
+                viewable = inventory["viewable_total"]
+                if viewable > 0:
+                    print("  %s on record. See them:  %s"
+                          % (_plural(viewable, "call"),
+                             "uvx agentx-mcp --insights" if MCP_ENTRY else "agentx insights"))
+                else:
+                    print("  %s on record, from a ledger older than this version, so there is"
+                          % _plural(inventory["flagged_total"], "call"))
+                    print("  nothing left to show about them.")
+                # AFTER the count, because it qualifies it. `agentx demo` writes a catch under
+                # our own agent id and its footer sends the reader straight here, so on the
+                # first run of the ladder this screen was reporting OUR scripted call under a
+                # header naming THEIR agent. Same footnote `agentx insights` already carries.
+                if inventory["flagged_from_demo"]:
+                    for _ln in _demo_row_note(inventory["flagged_from_demo"],
+                                              of_total=inventory["flagged_total"]):
+                        print(_ln)
         else:
             print("  No calls recorded yet.")
             # 🔴 NAME THE LEDGER, because the likeliest cause of this screen is the reader
@@ -5059,7 +5268,7 @@ def execute_audit(args=None):
     # promise a screen that does not exist. A rule you write is what turns this into a block.
     # 🔴 THE DEMO NOTE PRINTS BEFORE THE LABEL LINE, AND THE ORDER IS THE FIX. On the
     # founder's mixed-ledger walk the screen read "30 calls ... / Of those: 1 read-only, 0
-    # bounded, 0 destructive, 0 could not tell. / 29 of those came from AgentX's own demo or
+    # bounded, 0 unbounded, 0 could not tell. / 29 of those came from AgentX's own demo or
     # examples": the partition held (1 + 29 = 30) and the reader met "Of those: 1" before
     # learning 29 were ours, so it read as 1 of 30 with 29 unlabelled. Attribution a line
     # late, the same class as the tripped-call block below. Whose rows first, then the label
@@ -5137,10 +5346,10 @@ def execute_audit(args=None):
     _split = _totals.get("reversibility") or {}
     _unlabelled = _totals.get("reversibility_unlabelled") or 0
     if _totals.get("reversibility_readable") and (sum(_split.values()) + _unlabelled):
-        _terms = ["%s read-only" % f"{_split.get('READ_ONLY', 0):,}",
-                  "%s bounded" % f"{_split.get('BOUNDED', 0):,}",
-                  "%s destructive" % f"{_split.get('DESTRUCTIVE', 0):,}",
-                  "%s could not tell" % f"{_split.get('UNKNOWN', 0):,}"]
+        # Keyed off the four constants and `_LABEL_WORDS`, never off literals: the words used to
+        # be spelled here and again on the insights screen, and the two spellings drifted.
+        _terms = ["%s %s" % (f"{_split.get(_value, 0):,}", _label_word(_value))
+                  for _value in _REVERSIBILITY_LABELS]
         if _unlabelled:
             _terms.append("%s recorded before this label existed"
                           % f"{_totals['reversibility_unlabelled']:,}")
@@ -5167,6 +5376,45 @@ def execute_audit(args=None):
         print("  %s we could not size: a condition picks the rows, and nothing"
               % _plural(_totals["unsized_writes"], "write"))
         print("  in the statement caps how many match.")
+    # The paid door's own answer on the same question, and a SEPARATE sentence from the one
+    # above on purpose.
+    #
+    # 🔴 TWO READERS, TWO COUNTS, NEVER SUMMED AND NEVER MERGED INTO ONE LINE. The sentence
+    # above counts rows the free regex reader could not size; this one counts rows the
+    # gateway's parser could not size. They disagree on ordinary shapes -- `DELETE FROM
+    # sessions WHERE id = 41` is unsized to the regex and AT MOST 1 row to the parser -- so a
+    # ledger routinely holds a large count above and none here. Adding them would report the
+    # same call twice on a keyed install.
+    #
+    # 🔴 AND THIS ONE HAS A CTA WHERE THAT ONE HAS NONE, WHICH IS THE POINT OF THE STATUS.
+    # The comment on the count above says "there is nothing for the reader to do about it
+    # yet". Now there is: the row is in the review queue, and the answer we need is a number
+    # only the operator has.
+    # ⚠️ `observed_excluding_ours`, NOT `observed`. This sentence sits under a header about what
+    # THEIR agent did, so it has to count their traffic -- the same scoping the unsized-writes
+    # sentence above it already uses. The ledger-wide `observed` exists for the per-call screen's
+    # partition arithmetic and would report our own demo's rows as theirs if printed here.
+    if _totals.get("observed_excluding_ours"):
+        # 🔴 DELIBERATELY NOT PHRASED LIKE THE SENTENCE ABOVE IT, WHICH IT WOULD OTHERWISE
+        # ECHO ALMOST WORD FOR WORD. Both can print on one screen, and two near-identical
+        # sentences carrying different numbers over different populations is the adjacency
+        # defect this reader has already been fixed for. This one names WHO could not size the
+        # write and carries the CTA; the one above explains the shape and has none. No pronoun,
+        # so the wording cannot disagree with a count of 1.
+        # 🔴 LEADS WITH THE ACTION, NOT A SECOND MEASUREMENT, AND THE FIRST VERSION DID THE
+        # OPPOSITE. It read "N writes the gateway could not size", which sits DIRECTLY under
+        # "N writes we could not size" above -- two near-identical sentences with different
+        # numbers, and a reader's first thought is "is that 1 one of the 5?". It is not: the
+        # populations are disjoint (that line counts ALLOWED rows the regex could not size, this
+        # one counts rows with their own status), so it cannot even be joined with "1 of them".
+        # Describing what the reader can DO leaves nothing to reconcile, because the two lines
+        # stop answering the same question.
+        #
+        # ⚠️ "your verdict", NOT "a row limit". `agentx review` asks "was this worth flagging?"
+        # today; the number is a later step. Promising a limit here would be copy that outruns
+        # the product, which is the thing this screen keeps being fixed for.
+        print("  %s waiting for your verdict:  %s"
+              % (_plural(_totals["observed_excluding_ours"], "write"), _review_cmd()))
     # SAY WHEN THE TABLE IS NOT THE WHOLE HEADER. The counts above are ledger-wide and the
     # rows below are capped, so "30 tools" over 25 rows silently invites the reader to
     # believe they are looking at all of them. Same class as the counts that were being
@@ -7091,8 +7339,21 @@ def _gateway_reachable(timeout=0.4, gateway_url=None):
     inspection`) must probe THAT one, not risk silently disagreeing with it."""
     if gateway_url is None:
         env = load_env_file()
-        gateway_url = (os.environ.get("AGENTX_GATEWAY_URL")
-                       or env.get("AGENTX_GATEWAY_URL", "http://localhost:8000"))
+        # One statement of the precedence, shared with the SDK runtime. The overlay is
+        # passed rather than resolved inside, so this keeps the CLI's ../.env fallback
+        # (a human ran this command in that tree) and keeps `load_env_file` patchable.
+        gateway_url = resolve_env("AGENTX_GATEWAY_URL", "http://localhost:8000", overlay=env)
+    # 🔴 A URL THE SDK REFUSES IS NOT A REACHABLE GATEWAY, AND SAYING OTHERWISE MAKES THIS
+    # COMMAND CONTRADICT THE THING IT REPORTS ON. Without this check,
+    # `AGENTX_GATEWAY_URL=http://gw:0` made `agentx status` report the gateway reachable:
+    # urllib3 rewrites port 0 to 80, and the `RequestException` branch below reads any
+    # non-connection answer as "a gateway IS there". Meanwhile every `@agentx_protect` call
+    # refused the same string outright. One variable, two answers, and neither door said so.
+    # Imported inside the function rather than at module scope to leave the import graph as
+    # it is; `client` pulls in nothing `cli` does not already have.
+    from .client import _unusable_gateway_url
+    if _unusable_gateway_url(gateway_url):
+        return False
     try:
         requests.get(f"{gateway_url}/health", timeout=timeout)
         return True
@@ -7910,6 +8171,195 @@ def execute_adopt(args):
     print("=" * 75)
 
 
+def _policies_usage():
+    # The two flags are alternatives, and the line says so. Written as `[--check] [--json]` it
+    # advertised the pair as combinable, and the refusal for that pair then printed this exact
+    # line underneath it -- a screen contradicting itself at the moment it says no.
+    return ("usage: agentx policies [--check | --json]\n"
+            # Both stores, because that is what it does: `_policies_check` runs the pulled
+            # rulebook's check first and exits non-zero if either fails. Naming only the
+            # override store sent a CI author wiring this expecting one gate and getting two.
+            "  --check   validate your rulebook and override store, and report what would\n"
+            "            not apply\n"
+            "  --json    the machine-readable inventory, for a reviewer or a report\n"
+            "  (one or the other: --check prints a screen, --json writes a document)")
+
+
+# 🔴 WHAT THE SHIELD REFUSES TO LET AN AGENT TOUCH, AND WHAT IT DOES NOT. Both lists are
+# reported, because a document that named only the protected half would overstate the control
+# to the one reader who is looking for a reason to say no.
+#
+# THE LINE IS WHETHER AN AGENT WRITING THE FILE CAN MOVE A VERDICT. `policies.json` can: an
+# entry there takes a shipped rule out of enforcement. The three writable ones cannot, and they
+# are NOT all the same kind of file -- an earlier version of this comment called them all
+# coaching stores, which is wrong about the first:
+#
+#   `rules.json`      DETECTION rules the developer adopted, which the gateway arms. An agent
+#                     can delete them or mark them inactive and the gateway stops enforcing
+#                     them on its next refresh. It cannot touch a SHIPPED rule; the design puts
+#                     that file under pull-request review on purpose.
+#   `overrides.json`  the coaching TEXT swapped in before a block is delivered. The block
+#   `import.json`     still happens; only the wording changes.
+#
+# They are left writable because the path floor is operation-blind: listing a file there
+# refuses reading and NAMING it, not only writing it, and the CLI asks people to commit these.
+#
+# ⚠️ THESE TWO TUPLES ARE CLAIMS ABOUT A DETECTOR IN ANOTHER MODULE, so they are asserted by
+# DRIVING it (sdk_tests/test_policies_export.py), never by reading its pattern. A list that
+# only matched a regex by eye is how the two halves drift.
+_RULEBOOK_AGENT_PROTECTED = (".agentx/policies.json",)
+_RULEBOOK_AGENT_WRITABLE = (".agentx/rules.json", ".agentx/overrides.json",
+                            ".agentx/import.json")
+
+
+def _rulebook_file_facts(path):
+    """Identity of one rulebook file: is it there, and is it the bytes you last saw.
+
+    🔴 `present: false` IS NOT `sha256: null` MEANING THE SAME THING. A file that is absent
+    and a file that could not be read are different answers to a reviewer, and the second one
+    is the interesting one, so `readable` is separate from `present` rather than folded in.
+    """
+    facts = {"path": os.path.abspath(path) if path else None,
+             "present": False, "readable": False,
+             "sha256": None, "bytes": None, "modified": None, "modified_iso": None}
+    if not path:
+        return facts
+    try:
+        st = os.stat(path)
+    except OSError:
+        return facts
+    facts["present"] = True
+    facts["bytes"] = st.st_size
+    facts["modified"] = st.st_mtime
+    facts["modified_iso"] = _iso(st.st_mtime)
+    try:
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        facts["sha256"] = h.hexdigest()
+        facts["readable"] = True
+    except OSError:
+        pass
+    return facts
+
+
+def _policies_json_payload():
+    """The `agentx policies --json` document.
+
+    🔴 THE RULEBOOK BLOCK IS THE POINT, not an extra. "Which rules are armed" is answerable
+    from the catalog alone; "could anything have changed them since you last looked" is not,
+    and it is the question a reviewer actually asks. The hash answers it without anyone
+    trusting our word for it.
+    """
+    from . import decorators as _dec
+    from .overrides import _overrides_path, list_customizable_policies
+
+    # The SAME resolver the loader uses, so this reports the file actually IN FORCE rather
+    # than the first place we happened to look. A signature read off a different candidate
+    # than the shield loads is worse than no signature: it is a confident wrong answer.
+    _sig = _dec._policy_file_signature()
+    rulebook_path = _sig[0] if _sig else None
+
+    # 🔴 THE CATALOG SAYS WHAT SHIPS. IT DOES NOT SAY WHAT IS RUNNING, AND THIS DOCUMENT IS
+    # READ BY SOMEONE DECIDING WHETHER TO TRUST THE CONTROL. A rules file may carry
+    # `is_active: false` for a switchable shipped rule, which takes it out of enforcement
+    # entirely -- measured: with Customer Privacy Shield switched off that way,
+    # `UPDATE customers SET credit_card = 'x' WHERE id = 5` runs, where a stock install
+    # stops it. The first cut of this export listed that rule with its full coaching text
+    # and no hint it was off, which is the export overstating the product to the one reader
+    # who must not be misled.
+    #
+    # Ask the same accessor the shield asks on every call: it re-reads the file when the
+    # file has moved, so this is the live answer rather than whatever was true at import.
+    # 🔴 A SWALLOWED EXCEPTION MUST NOT RENDER AS THE GOOD ANSWER. The accessor re-raises
+    # things that are not AgentXPolicyLoadError, and the first cut caught everything and
+    # passed, so the document said `rules_readable: true, load_error: null` over a shield
+    # whose state we had failed to determine -- then counted a possibly-stale rule list
+    # underneath it. "We could not tell" is reported as itself, in the one document whose
+    # stated job is not to overstate the control.
+    try:
+        _load_error = _dec.current_policy_load_error()
+    except Exception as _probe_failed:
+        _load_error = ("could not determine whether the rules file loaded: %s: %s"
+                       % (type(_probe_failed).__name__, _probe_failed))
+    _enforced_ids = {str(p.get("id")) for p in (_dec.LOCAL_POLICY_KEYWORDS or [])}
+
+    policies = list_customizable_policies()
+    return {
+        "schema": _POLICIES_SCHEMA,
+        # Named, for the reason on _POLICIES_SCHEMA: two surfaces, two vocabularies, and no
+        # comparison between them is supportable.
+        "surface": "keyless",
+        "produced_by": {
+            "tool": "agentx policies",
+            "version": _sdk_version(),
+            "docs": "https://agentx-core.com/docs",
+        },
+        # A file the shield cannot read means it refuses calls in the default posture, so a
+        # reviewer reading this document needs to know before they read a single rule.
+        "shield": {
+            "rules_readable": _load_error is None,
+            "load_error": str(_load_error) if _load_error else None,
+            # `loaded`, not `enforced`. When the file cannot be read the built-ins are armed
+            # so a permissive operator still has the baseline, but the default posture
+            # refuses every protected call instead -- so this count is what the shield holds,
+            # and `rules_readable` is the field that says whether it is running normally.
+            # Naming it "enforced" would be a second claim riding on a count.
+            "policies_loaded": len(_enforced_ids),
+        },
+        "rulebook": {
+            "pulled_policies": _rulebook_file_facts(rulebook_path),
+            # 🔴 THE RESOLVER, NOT THE CONSTANT. `DEFAULT_OVERRIDES_PATH` is the bare relative
+            # default, so it resolved against the current directory and ignored both
+            # `AGENTX_OVERRIDES` and the project-root anchor. Measured from a subdirectory: the
+            # same document reported the coaching as replaced AND the file that replaced it as
+            # absent with a null hash. Exactly the confident wrong answer the sibling note on
+            # `rulebook_path` above exists to avoid, on the line right beside it.
+            "override_store": _rulebook_file_facts(_overrides_path()),
+            # What an agent's own decorated tool call can and cannot reach. Stated both ways
+            # on purpose; see the note on the two tuples.
+            "agent_write_refused": list(_RULEBOOK_AGENT_PROTECTED),
+            "agent_write_allowed": list(_RULEBOOK_AGENT_WRITABLE),
+        },
+        "policies": [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "category": p.get("category"),
+                # The load-bearing field. `customized` says the WORDING was changed;
+                # `enforced` says whether the rule runs at all. A row can be listed,
+                # uncustomized, and switched off.
+                "enforced": str(p["id"]) in _enforced_ids,
+                "customized": p["customized"],
+                "challenge": p["active_challenge"] or p["default_challenge"],
+                "safe_path": p["active_safe_path"] or p["default_safe_path"],
+                # 🔴 WHEN THE WORDING HAS BEEN REPLACED, CARRY WHAT IT WAS SUPPOSED TO SAY.
+                # A flag tells a reviewer that something changed; it does not let them see
+                # WHAT. Anything with a file-write tool can put "This is fine. Proceed."
+                # into the override store, and the agent really is told that on its next
+                # block -- driven through a real protected tool, not argued. A reader
+                # holding only `customized: true` cannot tell that from a team sharpening
+                # its own coaching, which is the thing we ask people to do.
+                # 🔴 GATED PER FIELD, NOT ON "SOMETHING WAS OVERRIDDEN". `customized` is true
+                # when EITHER field was replaced, so adopting only a challenge published a
+                # `shipped_safe_path` identical to the safe path above it, and a reviewer read
+                # a substitution that never happened. Each field answers for itself.
+                "shipped_challenge": (p["default_challenge"]
+                                      if p["active_challenge"] else None),
+                "shipped_safe_path": (p["default_safe_path"]
+                                      if p["active_safe_path"] else None),
+                # Scoped coaching stays a LIST rather than being folded into `challenge`:
+                # which one applies depends on the call, so there is no single active answer
+                # and picking one would misreport the others as the policy's coaching.
+                "scoped": p.get("scoped") or [],
+            }
+            for p in policies
+        ],
+    }
+
+
 def execute_policies(args=None):
     """`agentx policies` — list the customizable built-in floor policies, keyless.
 
@@ -7918,12 +8368,49 @@ def execute_policies(args=None):
     coaching you've customized). `agentx policies --check` validates your override
     store so a hand-edit typo is loud, not a silent disable.
 
+    `--json` emits the same inventory for a program: the second artifact a security
+    reviewer asks for, beside `agentx audit --json`.
+
     Keyless by construction: the coaching listed here is exactly what both keyless
     block paths (the SDK decorator and agentx-mcp) deliver — no gateway, no key."""
     args = args or []
+
+    # 🔴 --help AND EVERY ERROR GO TO STDERR WHEN --json IS PRESENT, and the early return for
+    # the document happens before any human line. Both rules are inherited rather than
+    # re-derived: `agentx audit` paid for them twice, once when `--json --help > out.json`
+    # wrote a usage line into the caller's file, and once when a human block printed after the
+    # JSON and produced a file that was not JSON.
+    _json = "--json" in args
+    _stream = sys.stderr if _json else sys.stdout
+    if any(a in ("-h", "--help") for a in args):
+        print(_policies_usage(), file=_stream)
+        sys.exit(0)
+
+    # 🔴 `--check` IS A HUMAN SCREEN AND `--json` IS A DOCUMENT, SO THE PAIR IS REFUSED RATHER
+    # THAN SILENTLY PICKING ONE. `--check` used to be handled first, so
+    # `agentx policies --check --json > out.json` wrote the check screen into the caller's
+    # file and exited 0 -- the exact defect the stdout rule exists for, reached through the one
+    # flag combination its test did not cover. The usage line advertises both, so saying no
+    # here has to be loud and on stderr.
+    if _json and any(a in ("--check", "-c") for a in args):
+        print("\n❌ `--check` prints a screen for a person and `--json` writes a document for "
+              "a program. Run them separately.", file=sys.stderr)
+        print(_policies_usage(), file=sys.stderr)
+        sys.exit(1)
+
     if any(a in ("--check", "-c") for a in args):
         _policies_check()
         return
+
+    if _json:
+        unknown = [a for a in args if a.startswith("-") and a != "--json"]
+        if unknown:
+            print(f"\n❌ Unknown option '{unknown[0]}' for `agentx policies`.", file=sys.stderr)
+            print(_policies_usage(), file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(_policies_json_payload(), indent=2))
+        return
+
     unknown = [a for a in args if a.startswith("-")]
     if unknown:
         print(f"\n❌ Unknown option '{unknown[0]}' for `agentx policies` (did you mean --check?).")
@@ -7968,6 +8455,9 @@ def execute_policies(args=None):
     first = policies[0]["name"] if policies else "<name>"
     print(f"  ▶ Customize one:      agentx customize \"{first}\" --edit")
     print("  ▶ Validate your store:  agentx policies --check")
+    # A parenthetical, not a third CTA. The same shape `agentx audit` uses to surface its own
+    # `--json`, so a reader who has met one screen already knows the convention on the other.
+    print("     (add '--json' for the machine-readable list, and what can change it)")
     print("  Customized coaching lands in ./.agentx/overrides.json. Commit it to share with")
     print("  your team. It applies keyless on BOTH the SDK decorator and agentx-mcp.")
     print("  To coach one job rather than a whole policy, add a `when` to a coaching entry in")
@@ -8186,7 +8676,21 @@ def _print_review_item(n, total, it):
         return
     count = it.get("count") or 1
     header = f"VERDICT ({count} blocks)" if it["kind"] == "verdict_group" else "VERDICT"
-    print(f"\n[{n}/{total}] {header} · {label}")
+    # 🔴 AN OBSERVATION HAS NO POLICY, SO THIS HEADER MUST NOT NAME ONE. `label` falls back
+    # through `policy_violated` -> `policy_id` -> the literal word "policy", and `record_call`
+    # writes NULL for both on an unsized write -- so every one of these rendered
+    # `[1/1] VERDICT · policy`, asserting a policy on the one row in this queue that tripped
+    # nothing. Reproduced verbatim. Three other surfaces on this item were written carefully
+    # never to imply an objection (the status word, the second line, the legend); this header
+    # sat two lines above them and undid all three.
+    #
+    # ⚠️ IT ALSO CLOSES A COUPLING WORTH KNOWING ABOUT. `label` would render an adopted RULE's
+    # name here if one were ever on the row, i.e. the rule would read as violated. That is
+    # unreachable today -- `_adopted_rule_outcome_keyless` returns nothing once
+    # `gateway_reached` is set, and an observation requires a gateway answer, so no rule id can
+    # reach an unsized row -- but the header no longer depends on that holding.
+    _row_label = "unsized write" if it.get("status") == _UNSIZED else label
+    print(f"\n[{n}/{total}] {header} · {_row_label}")
     if it.get("store") == "ledger":
         # A block from the call ledger: no receipt, and the status is said in the
         # words `agentx audit` uses for the same row, because "WOULD_BLOCK" read cold names
@@ -8199,6 +8703,13 @@ def _print_review_item(n, total, it):
               + (f"   (showing the most recent of {count})" if it["kind"] == "verdict_group" else ""))
         if it.get("status") == "WOULD_BLOCK":
             print("   ran while watching: AgentX objected and did not stop it")
+        elif it.get("status") == _UNSIZED:
+            # ⚠️ DELIBERATELY NOT "AgentX objected". We did not: nothing about this call
+            # tripped a policy and nothing would have. Borrowing the would-block sentence here
+            # would tell the reader we had an opinion we never formed, on the one screen they
+            # read to decide whether to trust the others.
+            print("   ran while watching: a condition picked the rows, and nothing in the")
+            print("   statement caps how many match")
         _shape = []
         if it.get("arg_names"):
             _shape.append(f"arguments {it['arg_names']}")
@@ -8207,7 +8718,26 @@ def _print_review_item(n, total, it):
         if it.get("row_cap"):
             _shape.append(f"rows {it['row_cap']}")
         if it.get("reversibility"):
-            _shape.append(f"{it['reversibility'].lower().replace('_', '-')}")
+            # `_label_word`, not a lower()/replace() of the stored token. The transform spelled
+            # here printed "unknown" where `agentx audit` printed "could not tell" for the same
+            # row, and it would print "destructive" where audit now prints "unbounded".
+            #
+            # 🔴 THIS ITEM IS NOT REDUNDANT WITH `rows` ABOVE, AND IT WAS NEARLY DELETED ON THAT
+            # REASONING. On a DELETE or UPDATE the two coincide (`rows ALL, unbounded`) because
+            # the label is derived from the cap, which reads as one fact printed twice. But
+            # `row_cap_for_arguments` returns None for everything else -- MEASURED: `DROP TABLE t`
+            # is cap=None label=DESTRUCTIVE, and so are `SELECT 1` and every call carrying no
+            # statement. So on a dropped-table block there is no `rows` item at all and this is
+            # the ONLY scope word on the line. The "prints the same thing twice" reading came from
+            # a walk that seeded both fields by hand with matching values: a claim about two
+            # chosen rows, not about the product.
+            #
+            # What IS true is the narrower point: every other item names its field and this one
+            # does not, so `..., rows UNKNOWN, could not tell` invites being read as a comment on
+            # the row cap. It has already been misread that way by a probe. Deliberately left as
+            # it is; the reason is recorded here so the next reader does not re-derive the wrong
+            # half of it.
+            _shape.append(_label_word(it["reversibility"]))
         if _shape:
             # The ledger keeps the SHAPE of a call and never its values, so this is the
             # whole picture the free door has: names and classes, not the statement.
@@ -8376,10 +8906,21 @@ def _print_review_stats():
         print("=" * 75)
         return
     v, sp, h = stats["verdict"], stats["safe_path"], stats["harm"]
-    print(f"   {stats['total']} incident(s) recorded")
+    # 🔴 THIRD TIME THIS SCREEN HAS BEEN SWEPT FOR THE SAME WORD, SO THE RULE IS WRITTEN DOWN
+    # HERE RATHER THAN SWAPPED AGAIN. `ledger_verdict_stats` reads
+    # `db.REVIEWABLE_LEDGER_STATUSES`; every number on this screen comes from it; that set holds
+    # blocks AND writes we could not size. So NO line here may name one of the two. "incident"
+    # is the gateway's word for a block and was as wrong as "block(s)" was two lines down.
+    # `test_the_walk_does_not_call_an_observation_a_block` enforces the rule over the whole
+    # screen rather than line by line, which is what stops a fourth sweep.
+    print(f"   {stats['total']} item(s) recorded")
     if stats.get("ledger_blocks"):
         print(f"   {stats['ledger_blocks']} of them recorded locally by your wrapped tools, no key")
-    print("\n   Verdict    (was the block right?)")
+    # "was it right?", not "was the block right?": the counts under this heading now include
+    # unsized writes, which nothing blocked. Same half-sweep as the count at the foot of this
+    # screen -- the heading and the count have to name one population, or the reader reconciles
+    # two sentences that disagree.
+    print("\n   Verdict    (was it right?)")
     print(f"     ✓ correct:         {v['TRUE_POSITIVE']}")
     print(f"     ✗ false positive:  {v['FALSE_POSITIVE']}")
     print(f"     ~ accepted risk:   {v['ACCEPTED_RISK']}")
@@ -8393,7 +8934,17 @@ def _print_review_stats():
         print(f"     harm:              {h['HARM']}")
         print(f"     no harm:           {h['NO_HARM']}")
         print(f"     unknown:           {h['unknown']}")
-    print(f"\n   {stats['blocking_open']} block(s) still awaiting a verdict —  {_review_cmd()}")
+    # ⚠️ "item(s)", NOT "block(s)". This count comes from `count_awaiting_verdict`, which reads
+    # `db.REVIEWABLE_LEDGER_STATUSES` -- and that set now holds unsized writes as well as blocks.
+    # Reproduced on a ledger with one observation and no blocks at all: "1 block(s) still awaiting
+    # a verdict". The session-end nudge already learned this word for the same reason, and its
+    # comment says so: the count spans both kinds. The empty-state sentences on this walk were
+    # widened and these non-empty counts were left, which is the half-sweep to avoid next time.
+    # ⚠️ AND THE EM DASH WENT WITH THE REWORD, rather than the ledger gaining an entry under the
+    # new wording. The copy guard's own message says to fix the sentence and not to list it, and
+    # its ledger is documented as only ever shrinking; a reworded line that keeps the dash is
+    # both a new offender and a stale entry at once. One colon does the same work here.
+    print(f"\n   {stats['blocking_open']} item(s) still awaiting a verdict:  {_review_cmd()}")
     print("=" * 75)
 
 
@@ -8548,8 +9099,23 @@ def _prompt_single_verdict(it):
     if it.get("mcp"):
         q = "   were blocks on this policy right? [c]orrect / [w]rong / [a]ccept-risk / [s]kip / [q]uit: "
     elif it.get("store") == "ledger":
-        q = ("   would this block have been right? " if it.get("status") == "WOULD_BLOCK"
-             else "   was the block right? ")
+        # 🔴 THREE STATUSES REACH THIS PROMPT AND ONE OF THEM WAS NEVER BLOCKED AT ALL.
+        # "Would this block have been right?" is unanswerable about an UNSIZED row: nothing
+        # blocked it and nothing would have. What we did was say we could not tell how many
+        # rows it touched, so that is what the operator gets to judge -- and `correct` /
+        # `wrong` / `accept-risk` keep their stored meanings under it (worth saying / not
+        # worth saying / unbounded and fine here).
+        #
+        # ⚠️ THIS IS NOT YET THE QUESTION WORTH ASKING, which is "how many rows is fine
+        # in this table", against a real statement from the operator's own system, and it
+        # needs a number this product cannot invent. Step 1 only has to make the row
+        # ANSWERABLE at all; the sentence changes when that number exists.
+        if it.get("status") == _UNSIZED:
+            q = "   was this worth flagging? "
+        elif it.get("status") == "WOULD_BLOCK":
+            q = "   would this block have been right? "
+        else:
+            q = "   was the block right? "
         q += "[c]orrect / [w]rong / [a]ccept-risk / [s]kip / [q]uit: "
     else:
         q = "   was the block right? [c]orrect / [w]rong / [a]ccept-risk / [d]elete / [s]kip / [q]uit: "
@@ -8625,7 +9191,7 @@ def _print_review_help():
     print("=" * 75)
     print("  (no flags)   walk every pending item: recoveries + blocks + rules to add")
     print("  --recover    only the pending RECOVERY items (learned safe-paths ready to adopt)")
-    print("  --block      only the pending VERDICT items (blocks awaiting a human call)")
+    print("  --block      only the pending VERDICT items (blocks + unsized writes)")
     print("  --undo       take back anything you decided: an answer you gave for a whole")
     print("               policy, a detection rule you adopted, or your verdict on one block")
     print("  --stats      a summary across every incident in the store, not just what's pending")
@@ -9269,7 +9835,9 @@ def execute_review(args=None):
         if _page_of_more and "--recover" not in args:
             # Only when the VERDICT read was truncated, and never under --recover, where
             # blocks are not what is being listed.
-            coverage = ("showing the most recent %d of %d block(s) awaiting a verdict"
+            # "item(s)", same reason as the stats count: `count_awaiting_verdict` spans blocks
+            # and unsized writes both, so naming one of the two miscounts the other.
+            coverage = ("showing the most recent %d of %d item(s) awaiting a verdict"
                         % (REVIEW_READ_CAP, count_awaiting_verdict()))
         # Both flags keep filtering to their own kind, so BOTH exclude detection rules. That is
         # deliberate and stated rather than papered over with a third flag: `--recover` means
@@ -9291,17 +9859,22 @@ def execute_review(args=None):
             # wording ("no blocks awaiting a verdict") would claim we checked a population we
             # never opened -- the same dead-CTA defect inverted, which is what the comment
             # above guards against. The two passes before this one printed their own results.
-            print("\n✅ Nothing more to take back. You have not judged any blocks yet.")
+            print("\n✅ Nothing more to take back. You have not judged anything yet.")
         elif MCP_ENTRY and not _mcp_door_knows_its_project():
             # 🔴 "NO RULES TO ADD" WOULD BE THE DEAD-CTA DEFECT INVERTED: on this door with no
             # project named, the rules were never LOOKED AT (`_rule_review_items` withholds
             # them), so the empty state names what it checked and says why rules are absent.
-            print("\n✅ Nothing to review: no blocks awaiting a verdict and no new safe-paths to")
+            # 🔴 "no blocks" WAS NARROWER THAN WHAT THIS PASS ACTUALLY CHECKED, and it became
+            # narrower still when the queue took a third status. The population it reads is
+            # every row awaiting a verdict -- blocks, would-blocks, and writes that ran and
+            # could not be sized -- so the empty message names none of them rather than one.
+            # Same rule as the comment above: the promise has to match what was looked at.
+            print("\n✅ Nothing to review: nothing awaiting a verdict and no new safe-paths to")
             print("   adopt. Rules proposed from your calls are not offered here yet:")
             for _ln in _rules_are_read_only_here():
                 print(_ln)
         else:
-            print("\n✅ Nothing to review: no blocks awaiting a verdict, no new safe-paths to")
+            print("\n✅ Nothing to review: nothing awaiting a verdict, no new safe-paths to")
             print("   adopt, and no rules to add.")
         if not census["exists"]:
             # The path on a line of its own, fitted by its tail: with a temp-dir path this
@@ -11306,7 +11879,10 @@ def main():
         mode = "cloud" if legacy_sync else ("linked" if has_cp else "local")
 
     api_key = os.environ.get("AGENTX_API_KEY") or env.get("AGENTX_API_KEY")
-    gateway_url = os.environ.get("AGENTX_GATEWAY_URL") or env.get("AGENTX_GATEWAY_URL", "http://localhost:8000")
+    # Shared with the SDK runtime and with `_gateway_reachable` above; see resolve_env.
+    # Only this one line is ported: the neighbours resolve different variables and are
+    # left exactly as they are rather than swept up in a change about one of them.
+    gateway_url = resolve_env("AGENTX_GATEWAY_URL", "http://localhost:8000", overlay=env)
 
     # AGENTX_CLOUD_ADMIN_PLANE is retired — CONTROL_PLANE_URL is the one name for
     # the control-plane location everywhere.

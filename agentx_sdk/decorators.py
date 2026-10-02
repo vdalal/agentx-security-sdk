@@ -18,6 +18,19 @@ import contextvars
 from contextvars import ContextVar
 
 from .client import AgentXClient
+# 🔴 THE SHARED QUESTION, NOT A SHARED VERDICT (the shared-question split).
+# "Which text in this call is a statement" has ONE home in this package, so the readers inside it
+# cannot answer differently. ⚠️ The hosted gateway does NOT import this file -- its image is built
+# from its own directory, so nothing here can reach it; it carries its own reader and the two are
+# held to the same ANSWERS by a corpus. `statement.py` is stdlib-only and imports nothing of ours
+# because tooling path-loads modules out of this package, where a relative import raises
+# ImportError. Whether a statement is DANGEROUS is still each door's own answer, and the gateway
+# is allowed to be sharper.
+#
+# ⚠️ `_name_tokens` is deliberately NOT imported here. This module has its own, which returns a
+# LIST and splits letter<->digit runs; `statement._name_tokens` returns a SET and does not. The
+# difference is load-bearing in both directions -- see the warning in `statement._name_tokens`.
+from .statement import _STATEMENT_ARG_NAMES, _coerce_arg_value, _statement_text  # noqa: F401
 from .db import (init_db, ensure_ledger_current, log_intercept, get_lifetime_stats,
                  log_self_correction, get_retention_status, format_ratio, retention_is_failing,
                  retention_failure_streak, failed_ledger_path, WOULD_BLOCK_STATUS,
@@ -1281,10 +1294,14 @@ def _default_posture_for_rung():
     then runs it anyway. A developer who climbs to a gateway must not be handed a weaker
     posture than the rung below it.
 
-    ⚠️ NOT `AGENTX_GATEWAY_URL`, which is the obvious signal and the wrong one:
-    `AgentXClient` carries its URL as a CONSTRUCTOR DEFAULT (`http://localhost:8000`), so
-    it is always set and its presence distinguishes nothing. This module never reads that
-    variable at all, although four of its error strings advise a human to go check it.
+    ⚠️ NOT `AGENTX_GATEWAY_URL`, which is the obvious signal and the wrong one. The
+    CONCLUSION is unchanged and the reason it used to give has expired: `AgentXClient` now
+    READS that variable (and the project `.env`), where it used to carry
+    `http://localhost:8000` as a constructor default. Either way it always RESOLVES to a
+    URL -- an install that sets nothing still gets the literal -- so the address
+    distinguishes nothing about the rung, and a URL is not a credential. This module still
+    never reads the variable itself, although four of its error strings advise a human to
+    go check it.
 
     ⚠️ NOT `AGENTX_MODE` either. That is the control-plane switch (local/linked/cloud) and
     is a deliberately ORTHOGONAL axis; letting it decide posture too would mean one
@@ -3660,17 +3677,37 @@ _BUILTIN_POLICY_KEYWORDS = [
         # DICT, because blocked_intents above is only three of the eight cases. Keyless,
         # builtins armed, from a directory with no .agentx/policies.json shadowing them:
         #
-        #   BLOCKED   DROP TABLE / TRUNCATE TABLE / DROP DATABASE      (structure removal)
+        #   BLOCKED   DROP TABLE / TRUNCATE / DROP DATABASE / SCHEMA / INDEX / VIEW
+        #                                                              (object removal)
+        #             ALTER TABLE .. DROP COLUMN, and its CASCADE form (column's data)
         #             DELETE or UPDATE with no WHERE                   (every row)
         #             DELETE or UPDATE with WHERE 1=1 / WHERE true     (every row)
+        #             DELETE .. LIMIT n, no WHERE                      (a count, not a scope)
+        #             MERGE with a destructive WHEN and no ON, or a tautological ON
+        #             DELETE <alias> FROM ..  (MySQL multi-table)      (every row)
         #   ALLOWED   DELETE or UPDATE with a condition that excludes something
         #             (`WHERE id = 42`, `WHERE created_at < now() - interval '30 days'`)
+        #             MERGE with a real ON; an insert-only MERGE under any ON
+        #             INSERT, CREATE, and catalog reads
         #
-        # Every blocked case has ONE property in common: the statement is not limited to a
-        # subset. It drops the table or database outright, or it matches every row. So the
-        # copy below may name that, and a previous revision of this comment was wrong to
-        # forbid it -- it asserted the seed "fires on a scoped one-row delete", which the
-        # enumeration above shows it does not.
+        # 🔴 THE "ONE PROPERTY IN COMMON" SENTENCE THAT USED TO SIT HERE WENT FALSE WHEN THE
+        # FIRING SET GREW, AND SO DID THE COPY DERIVED FROM IT. It read "it drops the table
+        # or database outright, or it matches every row", which is true of the six cases
+        # above it and false of `ALTER TABLE users DROP COLUMN email`: that drops a column,
+        # not the table or the database, and matches no rows. The agent was stopped and told
+        # something untrue about its own statement. This is the second instance of the class
+        # -- #371 widened the detector to tautological WHEREs and left the gateway's lead
+        # asserting "no WHERE clause" -- so state the rule rather than patch the instance:
+        #
+        # 🔴 WIDEN THE FIRING SET, RE-READ EVERY SENTENCE THAT DESCRIBES IT. The copy names
+        # shapes; the detector decides shapes; nothing links them, so a widening silently
+        # falsifies the prose and no test goes red. The surfaces are this `socratic_prompt`,
+        # this comment, and the gateway's `_FLOOR_COACHING["mass_mutation"]` lead.
+        #
+        # What every blocked case DOES still have in common, stated so it survives the next
+        # widening: the statement removes or overwrites data and nothing in it says which
+        # data to spare. A LIMIT is a count, not a criterion, which is why the capped delete
+        # is in the blocked list.
         #
         # ⚠️ WHAT THE REAL INCIDENT WAS, AS FAR AS THE EVIDENCE GOES. The old safe path said
         # "Add a WHERE clause so the change touches only the specific rows you intend". The
@@ -3689,8 +3726,8 @@ _BUILTIN_POLICY_KEYWORDS = [
         # eval reasoning. If the transcript ever shows a genuinely bounded clause blocked,
         # this comment is wrong and the firing set above is where to start.)
         "socratic_prompt": (
-            "This is not scoped to a subset: it drops the table or database outright, or it "
-            "matches every row."
+            "This removes or overwrites data without naming what to spare, such as dropping "
+            "a whole table or column, or matching every row."
         ),
         "preferred_alternative": (
             "If only some rows should change, give a condition that leaves the rest "
@@ -4644,9 +4681,79 @@ def _normalize_for_match(raw):
 _DESTRUCTIVE_DDL_RE = re.compile(
     r"\bdrop\s+(?:table|database|schema|index|view|materialized\s+view|"
     r"role|sequence|tablespace)\b"
-    r"|\btruncate\s+(?:table\s+)?\w")
+    r"|\btruncate\s+(?:table\s+)?\w"
+    # ALTER TABLE ... DROP COLUMN destroys the column's data whatever its scope, so it
+    # needs no bound test. The list above enumerates objects that follow DROP directly
+    # and had no COLUMN case, which is why `ALTER TABLE users DROP COLUMN email` ran
+    # keyless while the gateway caught it.
+    r"|\balter\s+table\s+[\w.\"'`\[\]]+\s+drop\s+column\b")
+# 🔴 TWO VERBS, AND A THIRD ALTERNATIVE WAS TRIED TWICE AND WITHDRAWN TWICE. MySQL's multi-table delete (`DELETE u FROM users u JOIN ..`) is NOT matched
+# here, on purpose, and the reason is worth more than the shape:
+#
+#   Attempt 1, `delete\s+(?:\w+\s+)?from` -- an optional alias inside the first
+#   alternative. One word between the verb and `from` is exactly what prose does, so
+#   "can you delete this from the list" blocked.
+#   Attempt 2, `(?:^|;)\s*delete\s+\w+\s+from\s+[\w.]+` -- anchored to a statement start.
+#   An IMPERATIVE IS A STATEMENT START: "delete bob from the attendee list" blocked, and
+#   so did every "delete <thing> from <place>" an agent is handed as a tool argument.
+#   Attempt 1's two benign corpus rows passed only because each carried a leading filler
+#   word; stripping it reproduced the defect they were added to catch.
+#
+# Both attempts were measured against the SENTENCES THAT PROMPTED THEM rather than the
+# class, which is why each passed its own corpus and failed the next reader. The shape
+# `DELETE <word> FROM <word>` is not distinguishable from English by a regex, because it
+# IS English. `_detect_destructive_sql` has no parser to ask, so the free door does not
+# cover this form.
+# The GATEWAY does, structurally, off the parsed node (`detect_mass_mutation`).
+#
+# 🔴 THE FALSE POSITIVE IS THE WORSE FAILURE HERE AND THAT IS WHY THIS IS A WITHDRAWAL
+# RATHER THAN A THIRD ATTEMPT. Missing a niche MySQL form on the keyless door costs one
+# uncovered shape that the paid door still catches. Blocking "delete bob from the
+# attendee list" costs every agent whose tool takes an instruction in English, on the
+# shipped free shield, for a form most of them will never write. If a third attempt is
+# ever made, write the BENIGN corpus rows for the class first (imperatives, questions,
+# bare noun phrases) and only then the pattern.
 _MASS_WRITE_RE = re.compile(
     r"\bdelete\s+from\s+[\w.]+|\bupdate\s+[\w.]+\s+set\b")
+
+# 🔴 A `--` LINE-COMMENT CUT USED TO LIVE HERE AND WAS REMOVED. DO NOT RE-ADD IT IN THIS FORM.
+# What it did: blank the string literals, find the first `--` in the slice after the verb, and cut
+# there, so a `WHERE` inside a line comment could not stand a mass write down.
+#
+# WHY IT CAME OUT, measured on this door with controls in both directions: it ran on text that
+# `_normalize_for_match` had already COLLAPSED, and that collapse turns a newline into a SPACE,
+# which destroys the line comment's TERMINATOR. So on ordinary multi-line SQL with a comment above
+# the WHERE --
+#     delete from sessions -- clear expired sessions
+#     where expires_at < now()
+# -- the cut swallowed the real WHERE on the next line, and a scoped delete read as a MASS one.
+# The engine ALLOWS that statement, so this shield was STRICTER than the engine, which the ratified
+# invariant forbids. A false block on standard SQL formatting.
+#
+# 🔴 THE CORRECT SHAPE IS A PORT, NOT AN INVENTION. The gateway's ledger parser already cuts line
+# comments out of the RAW text, LINE BY LINE, BEFORE anything collapses whitespace, which is the
+# only point where a line comment's extent is still knowable. That precondition is the whole
+# lesson: a positional cut must run where the terminator still exists. Read that reader first.
+
+
+# A MERGE's bound is its ON, never a WHERE, so the WHERE-anchored reader above cannot be
+# pointed at it. This was added for a MERGE reader that is now WITHDRAWN (the account is in
+# `_detect_destructive_sql` below), and it survives the withdrawal for one reason only:
+# `sdk_tests/test_tautology_readers_agree.py` pins it against `_TAUTOLOGICAL_WHERE_RE` over
+# one predicate corpus, and a second suite pins the grammar against the engine's copy. That
+# pairing is worth keeping armed for whoever tries again.
+#
+# ⚠️ ITS TWO NEIGHBOURS DID NOT SURVIVE, AND THE FIRST CUT OF THIS COMMENT SAID THEY HAD.
+# `_MERGE_WRITE_RE` and `_MERGE_DESTRUCTIVE_CLAUSE_RE` were kept "because the parity test
+# pins them"; nothing referenced either, so they were dead code in a file that ships to PyPI
+# and the public mirror, under a comment asserting a reason that was not true of them. A
+# justification is a claim like any other. They are deleted; the shapes a future attempt
+# needs are the corpus rows and the failure list, not two regexes.
+_TAUTOLOGICAL_ON_RE = re.compile(
+    r"\bon\b\s*\(?\s*"
+    r"(?:true\b|(\d+)\s*=\s*\1\b|'([^']*)'\s*=\s*'\2')"
+    r"\s*\)?(?!\s*(?:and|or)\b)",
+    re.IGNORECASE)
 # A WHERE clause whose effective predicate is a canonical always-true form
 # (`true` / `1=1` / `'a'='a'`), optionally parenthesized, keyed off "not followed
 # by AND/OR" (not an end-anchor) so trailing content (a second statement, a `--`
@@ -4810,7 +4917,7 @@ _ROW_CAP_HEAD_VERBS = ("delete", "update")
 # looking. Enumerating the words English may put there next is the treadmill; the rule is
 # that a statement lives in an argument NAMED for one.
 #
-# Matched on whole TOKENS via `db._name_tokens`, never substrings -- the rule that file
+# Matched on whole TOKENS via `statement._name_tokens`, never substrings -- the rule that file
 # learned expensively (`send_feedback` classified as a database call because "fee(db)ack"
 # contains "db"). So `sql_query` and `raw_sql` qualify, and `feedback` does not.
 #
@@ -4829,7 +4936,7 @@ _ROW_CAP_ARG_NAMES = frozenset(("sql", "query", "statement"))
 
 # The argument names that DECLARE a statement, a command, a path or a URL: the only text the
 # grammar-reading floors below are allowed to read once a call arrives with its argument
-# names. Matched on whole tokens via `db._name_tokens`, like `_ROW_CAP_ARG_NAMES` above
+# names. Matched on whole tokens via `statement._name_tokens`, like `_ROW_CAP_ARG_NAMES` above
 # (whose rule this widens from the counting side to the blocking side): `sql_query`,
 # `file_path`, `target_url` and `rawSql` qualify; `note`, `contents`, `reason`, `subject`,
 # `body`, `message` and `cot` do not, and are never read as a statement by any shipped rail.
@@ -4849,16 +4956,18 @@ _ROW_CAP_ARG_NAMES = frozenset(("sql", "query", "statement"))
 # `target`. A name outside it reads as prose, so a missing word is a floor gone quiet on a
 # real server; the first cut had `path` and not `paths`, `url` and not `target`, and lost
 # the path floor on two of the filesystem server's own tools.
-_STATEMENT_ARG_NAMES = frozenset((
-    "sql", "query", "queries", "statement", "statements", "stmt", "code",
-    "command", "commands", "cmd", "shell", "script", "scripts", "bash", "exec", "execute",
-    "args", "argv", "program", "executable",
-    "path", "paths", "file", "files", "filename", "filenames", "filepath", "filepaths",
-    "dir", "dirs", "directory", "directories",
-    "source", "sources", "src", "destination", "destinations", "dest", "dst",
-    "target", "targets",
-    "url", "urls", "uri", "uris", "endpoint", "endpoints", "host", "hosts", "http", "fetch",
-))
+# `_STATEMENT_ARG_NAMES` MOVED to `statement.py` and is imported at the top of this module. The
+# comment above still explains the trade it makes; the list itself, and the note about why
+# plurals are in it, now live beside the function that reads them.
+#
+# ⚠️ WHAT THIS MODULE CANNOT ESTABLISH, so do not trust a sentence here for it: whether the
+# hosted gateway reads this same object. It does not; it keeps its own copy, because it is built
+# from a context that cannot reach this package. THE WORD LIST IS HELD EQUAL ANYWAY, as data
+# rather than as a shared import: a test on that side asserts the two sets are identical and
+# names the offending side when they are not, and two conformance corpora drive both readers
+# over the same argument shapes on top of that. The rule is that the two doors share the
+# QUESTION and not the implementation; this vocabulary IS the question stated as data, so
+# equality here is that rule rather than an exception to it.
 
 # The words a schema DESCRIPTION has to use to declare the kind itself, a narrower set than
 # the argument names above: "the SQL statement to run", "path to the file", "command to
@@ -4892,7 +5001,7 @@ def _schema_declared_args(input_schema):
     scanned, never narrow it: nothing here removes an argument from the read set.
 
     Pure; returns a frozenset; never raises on any shape."""
-    from .db import _name_tokens
+    from .statement import _name_tokens          # the SET-returning one; see its docstring
     declared = set()
     try:
         props = (input_schema or {}).get("properties") if isinstance(input_schema, dict) else None
@@ -4911,95 +5020,11 @@ def _schema_declared_args(input_schema):
     return frozenset(declared)
 
 
-def _statement_text(arguments, tool_name=None, head=None, declared=None):
-    """The text the grammar-reading floors may read for ONE call: `head` (the proxy puts
-    the tool name in front, the decorator does not), then the values of the arguments whose
-    NAME declares a statement, in argument order, or whose name is in `declared` (what the
-    tool's schema said, see `_schema_declared_args`). The read set is the STRING LEAVES under
-    a declared name, at any depth, each as its own text: a list of paths is read path by
-    path. A dict under a declared name is read by its own keys when any key declares itself
-    (`files=[{path, content}]` reads each `path` and no `content`; `command={"program",
-    "args"}` reads `args`), and reads all its string leaves when none does (`query={"text",
-    "values"}`, the statement in structured form). Known and recorded rather than fixed, four
-    review rounds in: that gate is by key NAME, not by kind family, so a `dir` or `host`
-    sibling silences a `line`/`text` leaf, and a file item keyed `name` instead of `path` has
-    its `content` read; the rule that ends this is the schema declaring an argument to be
-    TEXT, which is not built. An undeclared dict is walked for the same reason (a nested
-    `params.sql` is read); an undeclared list of strings is prose and is not. Returns
-    "" when nothing is declared, so a call made of prose reads as empty to every rail rather
-    than as a sentence to scan.
-
-    One fallback, and it is still a declaration: a tool whose own NAME carries one of the
-    tokens (`run_sql`, `execute_query`, `shell_exec`) and declares no argument by name has
-    declared all of its string arguments (`run_sql(q=..., db=...)` reads both).
-
-    Pure; never raises on any argument shape (a value whose json and str both raise is
-    skipped, as `_coerce_arg_value`'s callers already do)."""
-    from .db import _name_tokens
-    parts = []
-    if head:
-        parts.append(str(head))
-    by_schema = declared or ()
-
-    def _leaves(value):
-        # The string leaves under a declared name, each its own text: a list of paths is
-        # its paths one by one (never a JSON dump, which doubles every backslash and hid
-        # `C:\Users\me\.aws\credentials` from the path floor); a dict inside it is read by
-        # ITS OWN keys (`files[i].path` is read, `files[i].content` is not: GitHub's
-        # `push_files(files=[{path, content}])` carried prose back into the rails when a
-        # declared value was dumped whole).
-        if isinstance(value, dict):
-            # A dict with a declaring key of its own is read by those keys (`files[i]` has
-            # `path`, so `content` stays out). One with none is the statement itself in
-            # structured form, `query={"text": "DROP TABLE users", "values": []}` (the
-            # node-postgres shape), and every string leaf in it is read; reading it by
-            # keys read nothing, which round 3 of the review found.
-            if any(_name_tokens(str(k)) & _STATEMENT_ARG_NAMES for k in value):
-                _walk(value, False)
-            else:
-                for item in value.values():
-                    _leaves(item)
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                _leaves(item)
-        else:
-            _append(value)
-
-    def _walk(mapping, top):
-        for name, value in mapping.items():
-            is_statement = bool(_name_tokens(str(name)) & _STATEMENT_ARG_NAMES) or (
-                top and name in by_schema)
-            if is_statement:
-                _leaves(value)
-            elif isinstance(value, dict):
-                _walk(value, False)
-            elif isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, dict):
-                        _walk(item, False)
-
-    def _append(value):
-        try:
-            coerced = _coerce_arg_value(value)
-        except Exception:
-            return
-        if coerced is not None:
-            parts.append(coerced)
-
-    if isinstance(arguments, dict):
-        before = len(parts)
-        _walk(arguments, True)
-        if len(parts) == before and tool_name and (
-                _name_tokens(str(tool_name)) & _STATEMENT_ARG_NAMES):
-            # A tool that names its kind (`run_sql`, `execute_query`) and declares no
-            # argument by name has declared ALL its strings: `run_sql(q=..., db=...)` reads
-            # both (`db="prod"` matches no rail, so nothing is lost). The first cut read
-            # exactly one string and nothing when there were two, which lost the SQL floor
-            # on that tool the moment it took a second string.
-            for v in arguments.values():
-                if isinstance(v, str):
-                    _append(v)
-    return " ".join(parts)
+# `_statement_text` MOVED to `statement.py` (the shared-question split). Imported at the top of
+# this module; every caller here is unchanged. The paid gateway answers the same QUESTION with
+# its own reader rather than this function. What holds the two together is named above: the
+# argument-name vocabulary is asserted EQUAL outright, and two corpora drive both readers over
+# the same shapes.
 
 
 def row_cap_for_arguments(arguments):
@@ -5030,7 +5055,7 @@ def row_cap_for_arguments(arguments):
     calls -- and which is NOT a safety claim about them.
     """
     try:
-        from .db import _name_tokens
+        from .statement import _name_tokens          # the SET-returning one; see its docstring
         for name, value in (arguments or {}).items():
             # The argument's own name, not the tool's: a tool called `run_sql` may still
             # carry a `note`, and that note is where English lives.
@@ -5163,14 +5188,14 @@ def reversibility_for_arguments(arguments):
     STRING is read; and only a string whose opening word is a verb we classify is
     normalized at all. Everything else costs a slice and a `startswith` and answers
     UNKNOWN. English in a `note` never reaches the classifier, so a ticket tool cannot put
-    a "destructive" on the screen. (The blocking path does not yet have this rule, and a
+    an "unbounded" on the screen. (The blocking path does not yet have this rule, and a
     ticket note that fits SQL grammar is blocked there today; that is a separate defect.)
 
     Pure; never raises. UNKNOWN on every failure path, because a missing label on a row
     would be indistinguishable from a row written before the column existed.
     """
     try:
-        from .db import _name_tokens
+        from .statement import _name_tokens          # the SET-returning one; see its docstring
         for name, value in (arguments or {}).items():
             if not _name_tokens(str(name)) & _ROW_CAP_ARG_NAMES:
                 continue
@@ -5206,9 +5231,64 @@ def _detect_destructive_sql(normalized):
     So: this keeps its own text, unchanged, and the classifier stands beside it answering a
     different question. They are unified once that is decided -- with a test that says
     which verdicts move, not a diff that hopes none do.
+
+    🔴 WIDENED TO READ MORE OPERATIONS, AND WHAT WAS AND WAS NOT TOUCHED. The warning above
+    is about AXIS 2, the SCOPE test ("is there a real WHERE"), and that text is still byte-for-
+    byte what it was. What changed is AXIS 1, WHICH OPERATIONS ARE LOOKED AT: a COLUMN case in
+    `_DESTRUCTIVE_DDL_RE`, and nothing else that survived. ONE shape that ran keyless now
+    blocks, in two forms (`held/alter-drop`, `held/drop-col`). A MERGE reader and a
+    multi-table-delete alternative were also built and BOTH WITHDRAWN; see below. The docstring above asked for "a test
+    that says which verdicts move": that test now exists
+    (`sdk_tests/test_decision_corpus_scope_vs_verb.py`) and it says which, in the intended
+    direction, with the false-positive rate unchanged at 0 -- now over 26 benign rows rather
+    than 17: widening this function forced the benign side to grow twice more, once per
+    attempt that had to be driven against the class before it was believed. The corpus
+    file records the sequence (10 -> 17 -> 21 -> 23 -> 26); cite it rather than restating it.
+
+    🔴 TWO MORE WERE ATTEMPTED AND BOTH WITHDRAWN, AND THAT IS THE MOST INSTRUCTIVE PART OF
+    THIS CHANGE. Three shapes were closed; two were given back:
+
+      MySQL multi-table delete  two `_MASS_WRITE_RE` spellings, both matched ordinary English
+                                ("delete bob from the attendee list" on the shipped shield)
+      unbounded MERGE           five defects in three review rounds, alternating over-block
+                                and under-block, in about fifteen lines of regex
+
+    Each attempt passed the corpus that existed when it was written, because each new benign
+    row had been written FOR the previous attempt -- which is how a false-positive rate becomes
+    a claim about the author rather than the product. See `_MASS_WRITE_RE` and the withdrawal
+    note below for the accounts, and `ctl/imperative*` and `merge/case-*` for the rows that
+    hold those lines now. Both shapes are blocked by the gateway, which parses.
+
+    🔴 AND THIS IS ENUMERATION, SAID PLAINLY SO NOBODY READS IT AS THE FIX. Not one of those
+    three was closed by the rule generalising. Each was a shape added to a list, and the door is
+    exactly as good as it was at `REPLACE INTO`, at MySQL's multi-table delete, or at the next
+    form nobody has written down. The structural answer is to ask a parser which node kinds
+    mutate without bound, which CANNOT be done here as things stand, because `sqlglot` is not in
+    the SDK's `install_requires` and this floor must still fire when it is absent. That is a
+    dependency decision, not a refactor. The gateway, which has a parser, does it structurally,
+    which is why it still catches the shape this door gave back.
     """
     if _DESTRUCTIVE_DDL_RE.search(normalized):
         return True
+    # 🔴 THE MERGE READER THAT USED TO SIT HERE IS WITHDRAWN. Five defects in three review
+    # rounds, alternating direction, in about fifteen lines:
+    #
+    #   1  any later `on` disarmed the no-ON test      under-block   (value, comment, tail)
+    #   2  a `CASE WHEN` truncated the ON window       OVER-block    (introduced by fix 1)
+    #   3  a JOIN's `ON` inside USING disarmed it      under-block
+    #   4  the destructive-clause test was unwindowed  OVER-block    (a trailing comment)
+    #   5  only the FIRST merge in a payload was read  under-block
+    #
+    # Every one was found by driving the class rather than reading the code, and the
+    # PARSER-BASED gateway is correct on all five. A MERGE states its bound in a clause, and
+    # deciding which text belongs to that clause is a parsing question; a regex answers it by
+    # guessing where the clause ends, which is what each defect above is. The shape is left
+    # to the gateway, and `held/merge` is back on the known-open ledger in
+    # `sdk_tests/test_decision_corpus_scope_vs_verb.py` rather than quietly dropped.
+    #
+    # This is the SECOND withdrawal on this axis (see `_MASS_WRITE_RE` for the first) and
+    # together they are the evidence for the structural answer: this door needs a parser to
+    # read an operation it does not already have a verb for, and it does not have one.
     m = _MASS_WRITE_RE.search(normalized)
     if not m:
         return False
@@ -5465,6 +5545,44 @@ def _detect_dotenv_read(raw):
 # (the two surfaces agreed only after audit finding #3), and Windows-home paths
 # (`C:\...\.pypirc`, `C:\...\.ssh\authorized_keys`) match via the backslash in the anchor
 # class + the `[/\\]` separator (audit finding #4). KEEP IN SYNC with the gateway.
+#
+# 🔴 AND THE PULLED RULEBOOK: a control the policed thing can rewrite is not a control.
+# `.git/hooks` was already here -- a file whose edit changes what runs later -- and our own
+# config was simply never added to the same enumeration. `.agentx/policies.json` earns its
+# place because an entry there can take a shipped rule OUT of enforcement; measured, a file
+# that switches off the customer-privacy rule lets `UPDATE customers SET credit_card = ...`
+# run where a stock install refuses it.
+#
+# 🔴 EXACTLY ONE FILE IS LISTED, AND THE THREE NEIGHBOURS ARE ABSENT BY DECISION RATHER THAN
+# BY THE SAME OMISSION ONE LINE LATER. This list is OPERATION-BLIND: _detect_credfile_read
+# below searches the payload, so listing a file refuses READING it and NAMING it in a shell
+# line, not only writing it. That cost is only worth paying for a file nobody is asked to
+# commit.
+#
+#   `.agentx/rules.json`      the developer's OWN adopted detection rules. It exists in order
+#                             to be committed and reviewed in a pull request -- that is the
+#                             stated design, and the CLI prints "commit it to share them".
+#                             Listing it refused `git add` on the one file whose purpose is
+#                             being added. Founder's call.
+#   `.agentx/overrides.json`  the coaching TEXT swapped in before a block is delivered. The
+#   `.agentx/import.json`     block still happens; only the wording changes.
+#
+# 🔴 THE LINE THAT DECIDES IS SHIPPED VERSUS THE DEVELOPER'S OWN, AND THE GATE FOR THE SECOND
+# IS THE PULL REQUEST. An agent that can write `.agentx/rules.json` CAN move a verdict -- it
+# deletes an adopted rule, or sets `"active": false`, and `rules.py`'s loader skips it, so a
+# call that was blocked runs. What it cannot touch is anything WE ship. That file was moved out
+# of a database precisely so a rule change lands in a `git diff` and is reviewed like any other
+# configuration, which is the control its design names.
+#
+# ⚠️ THREE VERSIONS OF THIS NOTE STATED THE REASON WRONG BEFORE THIS ONE, so the full reasoning
+# is kept in one place in our tracker rather than in four paraphrases here that can each be
+# wrong on their own. The short history, because it is what stops a fifth: "nobody is told to
+# commit them" was false (the CLI says to, three times); "its reader refuses any id that is not
+# `rule-`" was true of one of that filename's TWO readers; "only the pulled rulebook moves a
+# verdict" ignored the `active: false` path above.
+#
+# Widening this entry to the whole `.agentx/` directory was measured and rejected: it refused
+# four more read/mention shapes, one of them a line the product itself prints.
 _SENSITIVE_PATH_RE = re.compile(
     r"""(?:
         /etc/(?:shadow|sudoers|gshadow)\b           # credential / privilege files
@@ -5479,6 +5597,7 @@ _SENSITIVE_PATH_RE = re.compile(
       | (?:^|[\s'"/=(\\])\.envrc\b                     # direnv env/secrets file
       | \bapplication_default_credentials\.json\b      # GCP application-default credentials
       | \.git[/\\](?:config|hooks|credentials)\b
+      | \.agentx[/\\]policies\.json\b                  # the PULLED rulebook (see the note above)
       | /proc/self/environ\b | /proc/\d+/environ\b
       | [A-Za-z]:\\Windows\\System32\\config\\SAM\b
       | \\Windows\\System32\\config\\(?:SAM|SYSTEM|SECURITY)\b
@@ -6059,6 +6178,21 @@ _NON_COLLECTING_AGGREGATES = frozenset({
     "percentile_disc", "median", "mode", "any_value", "count_if", "countif", "bool_and",
     "bool_or",
 })
+# The subset of the above whose result IS A VALUE FROM THE COLUMN rather than a number about it.
+# The gateway's reach vocabulary splits these the same way: MIN / MAX / ANY_VALUE / a percentile
+# read `one_per_group`, "one value per group", while COUNT / SUM / AVG / a statistic are absent
+# from the walk entirely because "a number leaves". Only the first group can carry a credential
+# or an address out of the database, so only the first group loses its exemption below.
+#
+# KEEP THIS A SUBSET, never a new vocabulary: adding a name here that is not in
+# `_NON_COLLECTING_AGGREGATES` would break the parity that test_coaching_consistency.py asserts
+# by parsing each name. `first` / `last` are absent for that reason and are a known residual.
+_VALUE_RETURNING_AGGREGATES = frozenset({
+    "min", "max", "any_value", "percentile_cont", "percentile_disc", "median", "mode",
+})
+assert _VALUE_RETURNING_AGGREGATES <= _NON_COLLECTING_AGGREGATES
+_GROUP_BY_RE = re.compile(r"\bgroup\s+by\b", re.IGNORECASE)
+_WINDOW_SPLITS_ROWS_RE = re.compile(r"\b(?:partition\s+by|order\s+by)\b", re.IGNORECASE)
 
 
 def _select_list_columns(view, scan, start):
@@ -6084,13 +6218,56 @@ def _select_list_columns(view, scan, start):
     if not end:
         return set(), None
     columns = set()
+    # Read on `scan`, whose paren groups are masked, so a GROUP BY belonging to a subquery in
+    # the FROM clause is not mistaken for this scope's.
+    scope_groups = bool(_GROUP_BY_RE.search(scan, end.start()))
+    # 🔴 AND THE BOUND ITSELF HAS A BOUND: A REAL `WHERE` STANDS THE READ DOWN.
+    # Without this, the grouping rule below blocked `SELECT MAX(email) FROM users WHERE id = 41
+    # GROUP BY id` -- one entity, one group, one address -- which is ordinary scoped work, and it
+    # put this door AHEAD of the paid one, inverting the ratified gateway >= sdk invariant.
+    #
+    # 🔴 THE QUESTION IS "IS A WHERE PRESENT", WHICH IS THE QUESTION THE GATEWAY ASKS. Measured
+    # against it rather than assumed: the gateway blocks
+    # `SELECT MAX(password_hash) FROM users GROUP BY id` and allows that same read as soon as any
+    # WHERE appears -- `id = 41`, `plan = 'x'` and `id > 0` alike. Asking a narrower question here
+    # would make this shield stricter than the engine, and stricter is still a divergence: the
+    # invariant is that the engine is at least as exact as the shield, in both directions.
+    #
+    # 🔴 WHAT THIS DELIBERATELY DOES **NOT** ASK IS WHETHER THE PREDICATE BOUNDS ANYTHING, AND THAT
+    # GAP IS SHARED WITH THE ENGINE RATHER THAN CREATED HERE. `WHERE id > 0`, `IS NOT NULL`,
+    # `LIKE '%'` and an always-true comparison each stand the read down on both paths, and each
+    # returns one value per row. Telling a bounding predicate from a decorative one needs to know
+    # the column is a key and that the filter does not narrow it, which is schema knowledge neither
+    # path has. Tracked as a known gap against both paths rather than half-closed here.
+    #
+    # 🔴 AND DO NOT ADD AN ALWAYS-TRUE-PREDICATE READER HERE WITHOUT MOVING THE ENGINE IN THE SAME
+    # CHANGE. One was tried and removed: it made this shield refuse `WHERE 1=1 GROUP BY id` while
+    # the engine allowed it, and the shared conformance corpus could not see the divergence,
+    # because no row in it pairs an always-true WHERE with a grouped aggregate.
+    #
+    # 🔴 A KNOWN LIMIT, STATED SO IT IS NOT MISTAKEN FOR A GUARANTEE: the bound is read from the
+    # call's DECLARED TEXT, and that text may carry more than this statement. A tool invoked with
+    # several string arguments has them joined before any of this runs, so a bound appearing
+    # anywhere in the joined text answers the question above even when it belongs to something
+    # else. The one-entity veto further down carries the same warning for the same reason and is
+    # anchored to the whole statement precisely to avoid it; this clause cannot be, because the
+    # joined text has no separator to anchor to. The engine does not share the limit -- it parses,
+    # so it reads one statement at a time -- which is why this is a floor beneath the engine and
+    # not a replacement for it. Widening it by searching a narrower window has been tried three
+    # times on this clause; read the backlog row before a fourth.
+    scope_bounded = bool(_TOP_LEVEL_WHERE_RE.search(scan, end.start()))
     item_start = start
     for cut in [m.start() for m in _COMMA_RE.finditer(scan, start, end.start())] + [end.start()]:
         item = view[item_start:cut]
         item_start = cut + 1
         item = _SINGLE_QUOTED_RE.sub(" ", item)
         item = _SELECT_ALIAS_RE.sub(" ", item)
-        item = _OVER_RE.split(item, 1)[0]
+        # The window is read up to the OVER, so keep what follows BEFORE discarding it: a
+        # PARTITION BY or an ORDER BY makes a per-group aggregate a value PER ROW.
+        over_parts = _OVER_RE.split(item, 1)
+        item = over_parts[0]
+        windowed_per_row = (len(over_parts) > 1
+                            and bool(_WINDOW_SPLITS_ROWS_RE.search(over_parts[1])))
         idents = [t.lower() for t in _IDENT_TOKEN_RE.findall(item)]
         if not idents:
             continue
@@ -6099,7 +6276,20 @@ def _select_list_columns(view, scan, start):
         # and is counted whole: the "count what cannot be read" rule runs before the skip, not
         # after it, so the free door is never the looser of the two on any item.
         if idents[0] in _NON_COLLECTING_AGGREGATES and _is_one_call(item):
-            continue
+            # 🔴 THE EXEMPTION HAS A BOUND, AND IT WAS MISSING. "One value per group" is one
+            # value only while there is ONE group. With a GROUP BY the groups can be the rows,
+            # so `SELECT MAX(password_hash) FROM users GROUP BY id` returns every hash -- and it
+            # ran keyless with no verdict, while the bare column blocked. Same for a window
+            # carrying a PARTITION BY or an ORDER BY: a frame per row.
+            #
+            # Only the VALUE-returning aggregates lose the exemption. COUNT / SUM / AVG stay
+            # exempt whatever the grouping, because a number leaves and no column value does.
+            # This is the gateway's own split (`one_per_group` becomes `all` in a scope that has
+            # a GROUP BY), ported as text because this door has no parser.
+            if not (idents[0] in _VALUE_RETURNING_AGGREGATES
+                    and (scope_groups or windowed_per_row)
+                    and not scope_bounded):
+                continue
         columns.update(idents)
     return columns, end.start()
 
@@ -7383,26 +7573,8 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
     return None
 
 
-def _coerce_arg_value(value):
-    """Coerce ONE argument value into the text the keyless keyword shield scans, or
-    None to skip it. The single home for value flattening, shared by the decorator's
-    arg loop and the agentx-mcp proxy's _flatten_call so the two feeders can't drift:
-    str as-is, bool/int/float stringified, dict/list as compact JSON."""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, (bool, int, float)):   # bool is an int subclass; str() is identical
-        return str(value)
-    if isinstance(value, (dict, list)):
-        try:
-            # ensure_ascii=False so non-ASCII codepoints survive into the flattened text
-            # the shield scans. Otherwise json would escape an invisible-Unicode carrier (a
-            # bidi override / Tags-block char) smuggled inside a NESTED arg into \uXXXX TEXT,
-            # slipping it past _detect_invisible_unicode. The ASCII-pattern detectors (keyword
-            # / SSRF / destructive-SQL) are unaffected — their targets were already ASCII.
-            return json.dumps(value, ensure_ascii=False)
-        except Exception:
-            return str(value)
-    return None
+# `_coerce_arg_value` MOVED to `statement.py` (the shared-question split). It is the value
+# flattener `_statement_text` needs, so it had to travel with it rather than be mirrored.
 
 
 def _max_cognitive_turns():
@@ -7430,7 +7602,7 @@ def suppress_atexit_summary():
 # `_FS_DESTRUCTIVE_TOOL_VERBS` + `_fs_action_from_tool`. The VERB SET and the READ are
 # single-sourced there — this side no longer has a copy of either. What IS duplicated
 # is the mechanical name split (`_name_tokens` below has a hand copy in the gateway as
-# `_tool_name_tokens`, since neither package may import the other); that copy is pinned
+# `_tool_name_tokens`, because the gateway image is built from its own directory and cannot reach this package); that copy is pinned
 # by the cross-surface tool-name tripwire.
 #
 # WHY IT MOVED. Here it could only be spent by writing "filesystem_delete" into the
@@ -7622,12 +7794,21 @@ class _ExecuteTool:
     #   OPEN". The fault branch in _audit_release already refuses this and says why: "An
     #   unevaluated call is not a clean one; fix this before trusting the report." The rule
     #   now lives on the object instead of in one branch's prose.
-    __slots__ = ("scrub_targets", "recorded", "screened")
+    # `unsized_write` -- THE GATEWAY SAID ITS PARSER COULD NOT SIZE THIS ROW WRITE.
+    #   A fact off the reply, carried here for the same reason `scrub_targets` is:
+    #   the decision core reads the reply, the recording happens in the wrapper's own gate,
+    #   and a fact that has to cross that boundary rides on this object rather than through a
+    #   module global. False on every keyless path, because only a gateway can answer it, and
+    #   False on a keyed path whose gateway is older than the field. See
+    #   `db.UNSIZED_WRITE_STATUS` for why the SDK's own regex reader must not drive it.
+    __slots__ = ("scrub_targets", "recorded", "screened", "unsized_write")
 
-    def __init__(self, scrub_targets=None, recorded=False, screened=True):
+    def __init__(self, scrub_targets=None, recorded=False, screened=True,
+                 unsized_write=False):
         self.scrub_targets = scrub_targets or []
         self.recorded = recorded
         self.screened = screened
+        self.unsized_write = bool(unsized_write)
 
 
 def _audit_scope_phrase():
@@ -7861,6 +8042,22 @@ def _inventory_due(outcome):
             and not outcome.recorded)
 
 
+def _unsized_write_of(outcome):
+    """Did the gateway say it could not size this write? Never raises.
+
+    🔴 A READER, NOT AN ATTRIBUTE ACCESS, FOR THE SAME REASON `_inventory_due` IS ONE. Both
+    inventory call sites hold an `outcome` that is only SOMETIMES an `_ExecuteTool`: the audit
+    site's is whatever `_decide` returned or raised, and a released verdict reaching
+    `_record_inventory` with a bare `outcome.unsized_write` would be an AttributeError on the
+    recording path of a call that already succeeded. Asking through one function means the two
+    sites cannot answer it differently, which is the failure this module states as a rule.
+
+    Defaults to False on everything else, and False is the honest default: it means "nobody
+    told us this write was unsized", which covers a keyless call, an older gateway, and a
+    verdict object alike."""
+    return isinstance(outcome, _ExecuteTool) and outcome.unsized_write
+
+
 def _match_adopted_rule_keyless(agent_id, tool_name, arguments):
     """The adopted rule this passing call is the shape of, when the SDK is the only
     thing that could know. Returns the rule dict for `record_call`, or None. Never raises.
@@ -7937,8 +8134,16 @@ def _adopted_rule_outcome_keyless(agent_id, tool_name, arguments):
         return (None, None)
 
 
-def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, description=None):
+def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, description=None,
+                      unsized_write=False):
     """P-92: record ONE call we had NO opinion about. Best-effort; never raises.
+
+    🔴 `unsized_write` IS THE ONE EXCEPTION TO THE SENTENCE ABOVE, AND IT IS NOT AN OPINION
+    EITHER. The gateway allowed the call and told us its parser could not
+    establish how many rows the write touches. That is a FACT about the statement, so the row
+    is still written from here rather than through `_record_would_block` -- we objected to
+    nothing -- but it carries `db.UNSIZED_WRITE_STATUS` so a person can be asked what a
+    reasonable bound would be. Never True on a keyless call: only a gateway can answer it.
 
     The other half of the audit record, and the half that was missing. `_record_would_block`
     above writes the calls we DID have an opinion about, which is why a clean agent's audit
@@ -7967,7 +8172,8 @@ def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, descri
                     in_audit=in_audit, description=description,
                     matched_rule=matched, uncompared_rule=uncompared,
                     row_cap=row_cap_for_arguments(arguments),
-                    reversibility=reversibility_for_arguments(arguments))
+                    reversibility=reversibility_for_arguments(arguments),
+                    unsized_write=unsized_write)
     except Exception:
         # Deliberately silent, unlike the would-block narration. This runs on EVERY passing
         # call, so a per-call complaint would turn one broken ledger into thousands of lines
@@ -8087,7 +8293,8 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
                 # the enforce path calls the same writer with False. See db._bump_audit_counters
                 # for why the two postures must not share one counter.
                 _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit=True,
-                                  description=description)
+                                  description=description,
+                                  unsized_write=_unsized_write_of(outcome))
             return outcome
         _record_would_block(
             trace_id, agent_id, tool_name, "local-dlp", "Local DLP (PII scrub)",
@@ -9102,6 +9309,13 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 trace_id=current_trace_id,
                 action=resolved_action,
                 args=structured_args or None,
+                # The statement text this door worked out from the bound arguments by NAME
+                # (`shield_args`, lists and dicts kept). The gateway IGNORES it and reads the
+                # argument names in `args` itself; the key stays on the wire, see `client.py`.
+                # None on the extractor path, where the caller chose the scan text and the
+                # names are not what it scans -- so nothing is sent.
+                statement_text=(_statement_text(shield_args, tool_name=func_name)
+                                if isinstance(shield_args, dict) else None),
                 # The tool's own name, as its own channel. `func_name` is the
                 # partial-safe DISPLAY name (the same one every log line and the
                 # context-scoped override key use), so what an operator configures a
@@ -9111,6 +9325,20 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 session_cost_usd=session_cost_total,
                 budget_pool_id=resolved_pool_id,
                 enforcement=enforcement_level,
+                # 🔴 THE SAME CONDITION THE RECEIPT ABOVE IS WITHHELD ON, AND FOR THE OTHER
+                # HALF OF ONE REASON. Withholding the receipt
+                # stopped the gateway flipping an incident to COMPLIED over a call that never
+                # ran. It could not stop the rest: on its allow path the gateway also resets
+                # the trace's strike run, writes a routine-call row, counts the run's allowed
+                # call, remembers a CREATE and a copy source, and spends the trace's read
+                # budget -- six records of a call this client is about to block. An absence
+                # cannot carry that (it is the same shape as the receipt: absent means
+                # "ordinary call" to every older gateway), so it is said POSITIVELY here.
+                #
+                # `deferred_shield` is the matched policy dict; the id is what the gateway
+                # keys its own divergence record on, and it is the SAME string the block
+                # would have carried. None on every other call, so nothing is sent.
+                shield_matched=(deferred_shield or {}).get("policy_id") or None,
             )
 
             status = eval_res.get("status") if isinstance(eval_res, dict) else None
@@ -9591,6 +9819,61 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         elif status_check.status_code == 401:
                             print(f"\n❌ [AgentX SDK] Auth Error: Gateway rejected polling request.")
                             return json.dumps({"error": "Unauthorized Polling"})
+
+                        elif status_check.status_code == 403:
+                            # 🔴 A REFUSAL IS TERMINAL, NOT TRANSIENT, AND THIS LOOP USED TO READ
+                            # IT AS TRANSIENT. Only a 200 was handled, so a gateway that answers
+                            # "I do not serve incident status" fell through to the sleep and was
+                            # asked again every few seconds for the whole budget -- then the
+                            # timeout branch below announced "no human decision within Ns", which
+                            # is not what happened. Nobody was ever going to decide, because the
+                            # question was refused the first time.
+                            #
+                            # This is the SAME defect as the DISMISSED case above, one status code
+                            # over: an outcome the loop could not name, reported as a wait that
+                            # ran out. A hosted gateway shared between several callers refuses
+                            # this route by design, because the status of one caller's receipt is
+                            # not another's to read -- so on exactly the deployment most likely to
+                            # be someone's first contact with us, every escalation spent the full
+                            # budget and then lied about why.
+                            #
+                            # Same shape as DENIED and DISMISSED: `{error, instruction}`, so the
+                            # model is told what to do rather than left to infer it from a stall.
+                            # The action does NOT run: refused approval is not approval.
+                            # 🔴 THE BODY IS AN INPUT FROM SOMETHING THAT MAY NOT BE OUR GATEWAY,
+                            # AND THE FIRST CUT OF THIS READ CRASHED ON IT. `except ValueError`
+                            # covers a body that is not JSON at all, which is the case everyone
+                            # thinks of. It does NOT cover a body that is VALID JSON but not an
+                            # object: a proxy answering 403 with the bare string `"Forbidden"`, or
+                            # `[]`, makes `.get` raise AttributeError, which is not a
+                            # RequestException, so it escaped the enclosing try and propagated out
+                            # of the protected call into the caller's own code. A guard that turns a
+                            # refusal into an exception in someone's agent is worse than the hang it
+                            # replaced. Driven with a `"Forbidden"` body, not reasoned.
+                            #
+                            # `isinstance` before `.get`, and the except is broad ON PURPOSE: this
+                            # is a diagnostic string on a path whose job is to END a wait, so no
+                            # failure to read it may change what the function returns.
+                            reason = ""
+                            try:
+                                parsed = status_check.json()
+                                if isinstance(parsed, dict):
+                                    reason = parsed.get("message", "") or ""
+                            except Exception:
+                                pass
+                            if not isinstance(reason, str):
+                                reason = ""
+                            print("\n🚫 [AgentX SDK] This gateway does not serve human-approval "
+                                  "status, so there is nothing to wait for.")
+                            if reason:
+                                print("   Gateway: %s" % reason)
+                            print("   The action was NOT executed. Waiting longer cannot change "
+                                  "this; the request was refused, not unanswered.")
+                            _expire_escalation(_client.gateway_url, receipt_id, headers)
+                            return json.dumps({
+                                "error": "AgentX Human Approval Unavailable",
+                                "instruction": "This gateway refuses to report human-approval status, so the escalation can never be answered here and the action did not run. Do not retry the same call: either find an alternative path that does not need approval, or tell the user this action requires a human reviewer on a gateway that provides one."
+                            })
                             
                     except requests.exceptions.RequestException as e:
                         print(f"⚠️ Ignore transient network drops. Keep trying. Polling error: {e}")
@@ -9696,7 +9979,12 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # to fix, arriving through an over-strict guard instead of a missing writer.
                 # The genuinely unscreened case is the keyless allow above, where nothing sits
                 # behind the shield -- and that is where `shield_did_not_run` belongs.
-                return _ExecuteTool(scrub_targets=pii_targets, screened=not nothing_to_screen)
+                # The gateway's own answer about whether it could size this row
+                # write. Read HERE, on the one branch that holds a real gateway ALLOW reply --
+                # the keyless allow above cannot produce it and must not manufacture it, which
+                # is the whole point of the paid-door scoping.
+                return _ExecuteTool(scrub_targets=pii_targets, screened=not nothing_to_screen,
+                                    unsized_write=bool(eval_res.get("unsized_write")))
 
             # 4. Handle actual Gateway crashes
             else:
@@ -9778,7 +10066,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 if _inventory_due(outcome):
                     _record_inventory(trace_id_var.get(), agent_id, _func_name,
                                       _bound_arguments(_func_sig, args, kwargs),
-                                      in_audit=False, description=_func_doc)
+                                      in_audit=False, description=_func_doc,
+                                      unsized_write=_unsized_write_of(outcome))
                 return outcome
             try:
                 outcome = _decide(args, kwargs, call_state)

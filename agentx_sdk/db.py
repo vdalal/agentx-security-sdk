@@ -8,6 +8,19 @@ import os
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
+# 🔴 `_name_tokens` IS **NOT** IMPORTED HERE, AND THE REASON IS A TEST THAT CAUGHT IT.
+# It now lives in `statement.py` (the shared-question split), shared with the paid gateway. The
+# obvious `from .statement import _name_tokens` at this line BREAKS
+# `scripts/assurance_report.py`, which PATH-LOADS this module to read two constants without
+# running the package `__init__`. (That script's own note is the authority on WHY it path-loads,
+# and the reason has changed: it is no longer about a ledger being written at import -- that was
+# re-measured and retired -- but about answering for the TREE it is run against rather than for
+# whatever `agentx_sdk` is importable on the operator's path.) A path-loaded module has no
+# package context, so a relative import here raises ImportError, the shim falls back to its
+# hardcoded pair, and `test_the_sdk_constants_have_not_drifted` goes red.
+#
+# So the import is LOCAL to the two functions that need it, which is also how the original
+# `_statement_text` did it. Reading a constant out of this file must stay import-free.
 
 # Hidden file in the directory where the developer runs their agent.
 #
@@ -66,6 +79,63 @@ WOULD_BLOCK_STATUS = "WOULD_BLOCK"
 # a list of protected statuses, so a hit status added later is protected by DEFAULT rather
 # than by somebody remembering to add it here.
 INVENTORY_STATUS = "ALLOWED"
+
+# THE OBSERVATION STATUS: one row per row-write that RAN and that the gateway's PARSER could
+# not size. Written on the keyed path only, by the decorator, from the gateway's own answer on
+# the allow reply -- never from the free door's regex reader.
+#
+# 🔴 A FACT WITH NO OPINION ATTACHED, WHICH IS WHY IT IS A THIRD VALUE AND NOT EITHER OF THE
+# TWO IT SITS BETWEEN. `ALLOWED` means we looked and had nothing to say. The block statuses
+# mean we had an opinion and acted on it. This row says something narrower and true: the
+# statement ran, and nothing in it bounds how many rows it touched. A real agent ran
+# `DELETE FROM audit_log WHERE created < date('now','-30 days')` against a 120,000-row table,
+# every row matched, the table emptied, and the call tripped nothing -- because a WHERE was
+# read as proof of safety. That row had nowhere to be recorded and nowhere to be asked about.
+#
+# 🔴 NOT `WOULD_BLOCK`, AND REUSING IT WAS THE CHEAP WRONG ANSWER. WOULD_BLOCK asserts we
+# would have stopped the call, which we cannot say here, and it becomes a REAL block the
+# moment the posture changes to enforce -- the one thing observing exists to avoid.
+#
+# 🔴 THE PARSER'S ANSWER ONLY, AND THE NUMBER IS NINE IN TWELVE. Driven from the free door's
+# regex reader this would fire on ordinary work: of twelve boring housekeeping statements, NINE
+# read UNKNOWN to the regex -- `DELETE FROM cart_items WHERE cart_id = 99` among them -- because
+# that reader proves a cap only for equality against a column it knows is a key. UNKNOWN is the
+# safe direction for a LABEL and the wrong direction for a TRIGGER.
+#
+# ⚠️ EVICTION: protected, and by DEFAULT rather than by a list. `prune_ledger` drops
+# INVENTORY_STATUS first and protects everything else, so this status inherited the right
+# side of that rule without an edit. Do not "fix" that by naming it anywhere in prune.
+UNSIZED_WRITE_STATUS = "UNSIZED"
+
+# The statuses that are NOT us having formed an opinion about a call: routine traffic, and an
+# observation. Every count whose SENTENCE says we objected has to leave both out.
+#
+# 🔴 STATED AS AN EXCLUSION, NOT AS A POSITIVE LIST, AND THAT IS DELIBERATE. `status IS NOT
+# 'ALLOWED'` is TRUE for a NULL status in SQLite, so today's "flagged" counts include the
+# legacy status-less rows the status-column migration contemplates. A positive `status IN
+# ('CHALLENGED', 'RECOVERED', 'WOULD_BLOCK')` would read better and would silently drop those
+# rows from counts they have always been in -- a behaviour change on every upgraded ledger,
+# arriving as a tidy-up. So the new status is excluded by name beside the old one.
+_NOT_AN_OPINION_STATUSES = (INVENTORY_STATUS, UNSIZED_WRITE_STATUS)
+
+
+def _had_an_opinion_clause():
+    """``(sql, params)`` for "we formed an opinion about this call" -- the same shape as
+    `_our_agents_clause` below, so a caller composes it the same way.
+
+    Kept as one helper rather than repeated at each count site for the reason this module has
+    been bitten by before: a rule stated at four sites comes to be answered three ways. Adding
+    a status here reaches every count at once.
+
+    🔴 PARENTHESIZED, BECAUSE THE DOCSTRING ABOVE IS A PROMISE ABOUT COMPOSITION. This returned
+    a bare `status IS NOT ? AND status IS NOT ?`, which every current caller AND-joins, so
+    nothing misbehaved -- but `_our_agents_clause` wraps its own disjunction for exactly this
+    reason, and "the same shape as it" is what tells the next author an `OR` is safe here. It
+    would not have been: `x OR a AND b` binds as `x OR (a AND b)`, and the count would have been
+    silently wrong with the docstring vouching for it."""
+    return ("(" + " AND ".join(["status IS NOT ?"] * len(_NOT_AN_OPINION_STATUSES)) + ")",
+            list(_NOT_AN_OPINION_STATUSES))
+
 
 # The agent ids OUR OWN scripted code writes under. They live here rather than in cli.py
 # because the readers that must tell our traffic from the developer's are in this module.
@@ -582,7 +652,19 @@ _EVENT_LOG_COLUMNS = [
 # RECOVERED: that row was a CHALLENGED one the agent then got past another way, and the
 # incident store's twin (COMPLIED) is not asked about either; NOT ALLOWED: no opinion to
 # judge. One set, read by every function below that asks "does this row await a verdict".
-REVIEWABLE_LEDGER_STATUSES = ("CHALLENGED", WOULD_BLOCK_STATUS)
+#
+# 🔴 AND ONE ROW THAT IS HERE FOR THE OPPOSITE REASON. `UNSIZED` carries no
+# opinion at all -- that is its definition. It is reviewable anyway, because the QUESTION it
+# raises is the one only the operator can answer: how many rows is fine to touch here. The
+# organising rule for this set is therefore no longer "we had an opinion" but "a person's
+# answer would tell us something we cannot work out alone", and the two block statuses satisfy
+# it for a different reason than this one does. A reader who keeps the old rule in mind will
+# conclude an observation was filed here by mistake and take it out.
+#
+# ⚠️ SO THE WALK MUST NOT ASK ONE QUESTION FOR THE WHOLE SET. "Would this block have been
+# right?" is unanswerable about a call nothing blocked; `cli._prompt_single_verdict` branches
+# on the status for exactly this reason.
+REVIEWABLE_LEDGER_STATUSES = ("CHALLENGED", WOULD_BLOCK_STATUS, UNSIZED_WRITE_STATUS)
 _LEDGER_LABEL_COLUMNS = ("label_verdict", "label_verdict_source", "outcome_at")
 
 # The four values the `reversibility` column may hold. Defined HERE, beside the column,
@@ -1385,22 +1467,12 @@ def _labelled_quantity(arguments):
     return best
 
 
-def _name_tokens(raw):
-    """Split identifier-ish text into whole lowercase tokens. Pure.
-
-    🔴 ONE COPY, BECAUSE THE RULE WAS LEARNED EXPENSIVELY. `_classify_target` originally tested
-    `needle in haystack` and read tool names like an anagram -- `send_feedback` classified as DB
-    because "fee(db)ack" contains "db". The fix was to compare whole TOKENS, and it is the whole
-    correctness of every name-matching rule in this file. A second matcher written from scratch
-    (P-103's amount hints) would have had to re-learn it, and `discount_id` matching "count" is
-    the same bug wearing a different hat. So both callers come through here.
-
-    camelCase is a boundary too: MCP servers and JS tools are routinely `sendHttpRequest`, which
-    is ONE token under a punctuation-only split. Split before lowercasing, because the case IS
-    the boundary.
-    """
-    raw = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(raw or ""))
-    return {t for t in re.split(r"[^a-z0-9]+", raw.lower()) if t}
+# `_name_tokens` MOVED to `statement.py` (the shared-question split). ⚠️ It is imported INSIDE the
+# two functions that use it, NOT at the top of this module -- see the red note at the head of the
+# file for why, and do not hoist it. It moved because `_statement_text` needs it and that function
+# must stay loadable with NO relative imports, which makes `statement.py` the leaf.
+# The expensive whole-token lesson, and the warning about the second tokenizer in
+# `decorators.py`, live in its new docstring.
 
 
 def _classify_target(tool_name, names):
@@ -1422,6 +1494,7 @@ def _classify_target(tool_name, names):
     equality. `run_sql` -> {run, sql} still matches "sql"; `send_feedback` -> {send,
     feedback} matches nothing and correctly answers `other`.
     """
+    from .statement import _name_tokens          # local: see the note at the top of this file
     tokens = _name_tokens(" ".join([str(tool_name or "")] + [str(n) for n in (names or [])]))
     for needles, klass in _CLASS_HINTS:
         if tokens.intersection(needles):
@@ -1452,6 +1525,7 @@ def _classify_text(text):
     writing a sentence. Rankings use argument shape and recorded magnitude, which the caller
     supplies, not the server.
     """
+    from .statement import _name_tokens          # local: see the note at the top of this file
     tokens = _name_tokens(str(text or ""))
     for needles, klass in _CLASS_HINTS:
         if tokens.intersection(needles):
@@ -1669,6 +1743,19 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
             # Counted alongside `dropped` on every path below, because "we deleted a row" and
             # "we deleted one of your catches" are different disclosures and only the second
             # one is what three screens are actually asking about. See _RETENTION_COLUMNS.
+            #
+            # 🔴 A CATCH, NOT MERELY A NON-INVENTORY ROW, AND THE THREE SITES BELOW SPELT IT THE
+            # SECOND WAY. `status IS NOT 'ALLOWED'` meant "a catch" exactly while the ledger held
+            # two kinds of row. An observation is neither routine traffic nor a catch, so an
+            # aged-out one incremented `blocks_dropped`, `ledger_empty_reason` flipped to
+            # "trimmed", and four screens then said older BLOCK records had been dropped -- over
+            # a write nobody ever objected to. Reproduced with `max_age_days=0`.
+            #
+            # This is the rule `_RETENTION_COLUMNS` was added for, stated there as "the counter
+            # that decides a sentence has to be the counter that sentence is ABOUT, same rule as
+            # get_ledger_census's `interceptions`". That is the rule -- and applying it to the
+            # census and not here is what left it half-done.
+            _catch_sql, _catch_params = _had_an_opinion_clause()
             blocks = 0
 
             # Capture the oldest timestamp we are about to destroy BEFORE destroying it --
@@ -1683,8 +1770,8 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
             # rows are gone and the question is unanswerable.
             cursor.execute(
                 "SELECT COUNT(*) FROM event_log "
-                "WHERE timestamp IS NOT NULL AND timestamp < ? AND status IS NOT ?",
-                (cutoff, INVENTORY_STATUS))
+                "WHERE timestamp IS NOT NULL AND timestamp < ? AND " + _catch_sql,
+                tuple([cutoff] + _catch_params))
             blocks += cursor.fetchone()[0] or 0
 
             cursor.execute("DELETE FROM event_log WHERE timestamp IS NOT NULL AND timestamp < ?",
@@ -1741,8 +1828,8 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
                     cursor.execute(
                         "SELECT MIN(timestamp) FROM event_log WHERE timestamp IS NOT NULL")
                     oldest_by_size = _older(oldest_by_size, cursor.fetchone()[0])
-                    cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS NOT ?",
-                                   (INVENTORY_STATUS,))
+                    cursor.execute("SELECT COUNT(*) FROM event_log WHERE " + _catch_sql,
+                                   tuple(_catch_params))
                     blocks += cursor.fetchone()[0] or 0
                     cursor.execute("DELETE FROM event_log")
                     dropped += cursor.rowcount or 0
@@ -1759,8 +1846,8 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
                         # Pass 1 above deletes ONLY inventory rows, so it contributes nothing
                         # here by construction. This pass is the one that can reach a catch.
                         cursor.execute(
-                            "SELECT COUNT(*) FROM event_log WHERE id < ? AND status IS NOT ?",
-                            (floor_id, INVENTORY_STATUS))
+                            "SELECT COUNT(*) FROM event_log WHERE id < ? AND " + _catch_sql,
+                            tuple([floor_id] + _catch_params))
                         blocks += cursor.fetchone()[0] or 0
                         cursor.execute("DELETE FROM event_log WHERE id < ?", (floor_id,))
                         dropped += cursor.rowcount or 0
@@ -2032,6 +2119,14 @@ def get_ledger_census(path=None):
               # read THIS one -- see ledger_empty_reason, where the difference printed a false
               # sentence about the user's own deleted blocks.
               "interceptions": 0,
+              # Routine traffic, counted rather than left to be derived as `total_rows` minus
+              # `interceptions`. Two screens did that subtraction and it was exact only while
+              # those were the ledger's only two kinds of row; see where this is filled in below.
+              "inventory": 0,
+              # Writes that ran and the parser could not size. Here as well as in
+              # `_ledger_totals` because the status screen reads THIS reader and must not send a
+              # developer who has one to go and wrap a tool.
+              "observed": 0,
               # 🔴 OUR OWN DEMO'S ROWS, COUNTED IN THE SAME PASS. `agentx demo --audit` writes
               # four ALLOWED rows and one WOULD_BLOCK into the reader's real ledger, and
               # `agentx status` reads this census to say what "your agent" did. The audit
@@ -2056,25 +2151,66 @@ def get_ledger_census(path=None):
             # with a ledger on disk. Second time in one day; grep for the enclosing scope,
             # do not assume a name is in it.
             _ours_sql, _ours_params = _our_agents_clause()
+            # 🔴 `interceptions` IS "WE HAD AN OPINION", NOT "NOT ROUTINE", AND THE TWO CAME
+            # APART WHEN THE OBSERVATION STATUS SHIPPED, and an UNSIZED row is a call we never
+            # got in the way of. Two readers turn on it: `ledger_empty_reason` answers
+            # "not_empty" off this count, and `agentx status` decides from it whether the ledger
+            # holds a catch worth a sentence. Folding an observation in would tell both that we
+            # objected to something when we had only measured it. NULL-status legacy rows stay
+            # counted, exactly as before; see `_had_an_opinion_clause`.
+            #
+            # ⚠️ IT IS NOT PRINTED AS A NUMBER ON ANY SCREEN, AND AN EARLIER DRAFT OF THIS
+            # COMMENT SAID IT WAS ("agentx status prints this as Total intercepts"). That wording
+            # was removed from the status screen in an earlier pass, and the `Intercepts:` lines
+            # that remain come from the gateway's telemetry and from `get_lifetime_stats`, not
+            # from here. Checked by grep, not remembered.
+            _op_sql, _op_params = _had_an_opinion_clause()
             cursor.execute("""
                 SELECT COUNT(*),
                        SUM(CASE WHEN status IN ('CHALLENGED', 'RECOVERED') THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status = ? THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status = 'RECOVERED' THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN status IS NOT ? THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN {opinion} THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status = ? AND {ours} THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status IS ? AND {ours} THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status IN ('CHALLENGED', 'RECOVERED') AND {ours}
                                 THEN 1 ELSE 0 END),
-                       SUM(CASE WHEN status = 'RECOVERED' AND {ours} THEN 1 ELSE 0 END)
+                       SUM(CASE WHEN status = 'RECOVERED' AND {ours} THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END)
                   FROM event_log
-            """.format(ours=_ours_sql), (WOULD_BLOCK_STATUS, INVENTORY_STATUS,
+            """.format(ours=_ours_sql, opinion=_op_sql), (WOULD_BLOCK_STATUS, *_op_params,
                   WOULD_BLOCK_STATUS, *_ours_params,
                   INVENTORY_STATUS, *_ours_params,
-                  *_ours_params, *_ours_params))
+                  *_ours_params, *_ours_params, INVENTORY_STATUS,
+                  UNSIZED_WRITE_STATUS))
             (total, episodes, would, recovered, intercepted,
-             would_demo, inv_demo, episodes_demo, recovered_demo) = cursor.fetchone()
+             would_demo, inv_demo, episodes_demo, recovered_demo, inventory,
+             observed) = cursor.fetchone()
             census["total_rows"] = total or 0
+            # 🔴 COUNTED, NOT DERIVED, AND THE SUBTRACTION IT REPLACES WAS ABOUT TO GO WRONG.
+            # Two screens read "routine calls" as `total_rows - interceptions`, which was exactly
+            # right while every row was either routine traffic or something we had an opinion
+            # about: a NULL-status legacy row lands in `interceptions` (SQLite answers TRUE to
+            # `IS NOT 'ALLOWED'` for NULL), so the remainder was the ALLOWED rows and nothing
+            # else. The observation status broke that in the quietest possible way -- it is in
+            # neither term, so the remainder silently grew to include writes we had said we could
+            # not size, and both screens would have reported them as calls nothing objected to.
+            # Adding a third term to the subtraction would have fixed the arithmetic and left the
+            # next status to break it again. This is the number those screens actually want.
+            census["inventory"] = inventory or 0
+            # 🔴 THE STATUS SCREEN NEEDS THIS TO AVOID TELLING A READER TO WRAP A TOOL THEY HAVE
+            # ALREADY WRAPPED. Same name as `_ledger_totals["observed"]` on purpose: two readers
+            # with two names for one fact is how a screen comes to disagree with its own --json.
+            #
+            # ⚠️ AND `ledger_empty_reason` IS DELIBERATELY NOT CHANGED TO CONSULT IT. That
+            # function answers "is there a CATCH to explain the absence of", and its docstring
+            # argues at length that routine traffic must not flip it -- an observation is not a
+            # catch, so "no blocks recorded in this ledger yet" stays TRUE for a ledger holding
+            # one. Measured on both trees: the defect was never that headline, it was the ADVICE
+            # under it. Widening the emptiness verdict was the tempting fix and it would have
+            # removed the empty-state disclosure from two other screens that are correctly empty.
+            census["observed"] = observed or 0
             census["block_episodes"] = episodes or 0
             census["would_blocks"] = would or 0
             census["recoveries"] = recovered or 0
@@ -2295,12 +2431,30 @@ def get_call_inventory(path=None, limit=25):
                 # ours. A footnote at the bottom of the screen does not undo an annotation on
                 # THEIR row; that line is the one a reader takes as "my run_sql tripped a
                 # policy". Excluded here and still disclosed in the screen-level count below.
+                # 🔴 AND NOT AN OBSERVATION EITHER. This annotates the developer's own tool row
+                # as "plus N calls flagged", which a reader takes as "my run_sql tripped a
+                # policy". An UNSIZED row tripped nothing; it is reported by its own sentence
+                # on this screen, not as a flag on a tool the developer owns. Same rule as the
+                # demo exclusion directly above, one status over.
+                # 🔴 TWO NUMBERS OUT OF THE QUERY THAT WAS ALREADY RUNNING, NOT A SECOND
+                # QUESTION PER TOOL. An observation is in neither `calls` (that column is
+                # ALLOWED rows) nor `flagged`, so without a count of its own it would be
+                # missing from this row entirely: `run_sql 5` over a tool that made six calls,
+                # with the sixth the one worth looking at. This function's own docstring
+                # measures its cost in questions per tool and puts it at 20,013 on the
+                # pathological ledger, so the count rides the existing pass as a conditional
+                # SUM -- the same move the demo split made, for the same reason.
                 _not_ours_sql, _not_ours_params = _our_agents_clause(negate=True)
+                _tool_op_sql, _tool_op_params = _had_an_opinion_clause()
                 cursor.execute(
-                    "SELECT COUNT(*) FROM event_log "
-                    "WHERE tool_name IS ? AND status IS NOT ? AND " + _not_ours_sql,
-                    (name, INVENTORY_STATUS, *_not_ours_params))
-                flagged = cursor.fetchone()[0] or 0
+                    "SELECT SUM(CASE WHEN " + _tool_op_sql + " THEN 1 ELSE 0 END), "
+                    "       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END) "
+                    "  FROM event_log "
+                    " WHERE tool_name IS ? AND " + _not_ours_sql,
+                    (*_tool_op_params, UNSIZED_WRITE_STATUS, name, *_not_ours_params))
+                _flag_row = cursor.fetchone() or (0, 0)
+                flagged = _flag_row[0] or 0
+                observed = _flag_row[1] or 0
                 tools.append({
                     "tool": name, "calls": calls, "max_amount": amount or 0.0,
                     # The counted-quantity twin of max_amount. Kept a SEPARATE key rather than
@@ -2309,6 +2463,10 @@ def get_call_inventory(path=None, limit=25):
                     "max_quantity": quantity or 0.0,
                     "arg_names": names, "classes": classes, "agents": agents,
                     "first_ts": first_ts, "last_ts": last_ts, "flagged": flagged,
+                    # Writes on THIS tool that ran and the parser could not size (the
+                    # piece 3). Its own key rather than folded into `flagged`, because
+                    # "flagged" on this screen means we objected and here we did not.
+                    "observed": observed,
                     # 🔴 THE PER-TOOL SPLIT, SO A ROW CAN BE RECONCILED WHERE IT IS READ. The
                     # screen-level note says "21 of those came from AgentX's own demo or examples",
                     # which is a total across every tool -- so a reader looking at `run_sql 26`
@@ -2330,27 +2488,83 @@ def get_call_inventory(path=None, limit=25):
             # perfectly. Inside the outer try that turned the whole screen into "your ledger
             # could not be read" -- a false statement about their data, produced by a missing
             # counter table nobody was asking about.
-            # 🔴 AND THE COUNT IT READS IS THE INVENTORY'S OWN. `covers_all` drives one
+            # 🔴 ANY EVICTION AT ALL, AND THIS DELIBERATELY MATCHES THE PER-CALL READER RATHER
+            # THAN DIFFERING FROM IT, which is a ratified call and not a tidy-up. `covers_all`
+            # drives one
             # sentence -- "this ledger has been trimmed, so the counts below describe what was
-            # KEPT, not everything your agent has ever done" -- printed directly above the
-            # CALL counts. Read from `rows_dropped` it fired on any deletion at all, so an
-            # enforce-only user whose BLOCKS were trimmed, who then switched to audit, got
-            # that warning over an inventory that was completely intact.
+            # KEPT, not everything your agent has ever done" -- and this screen now prints THREE
+            # counts under it: calls that tripped nothing, calls that tripped a policy, and
+            # writes we could not size. If any row is evicted, one of those numbers is a window
+            # rather than a history, so the sentence is true and has to appear.
             #
-            # This is the last instance of the template the rest of this change already
-            # fixed: the counter that decides a sentence has to be the counter that sentence
-            # is about. The number is exact rather than a proxy -- both counters are
-            # incremented over the same delete sets, so their difference IS the count of
-            # inventory rows deleted.
-            # ONE except, because both failures mean the same thing here: a ledger with no
-            # ledger_retention table, and one whose table predates `blocks_dropped`, BOTH
-            # predate the inventory writer -- so no inventory row can ever have been dropped
-            # out of either. None is exact for them, not a fallback guess. (Written as two
-            # nested handlers first; the outer one was unreachable, which is a branch nobody
-            # can test and everybody later has to reason about.)
+            # ⚠️ IT USED TO SUBTRACT `blocks_dropped`, FOR A REASON THAT OUTLIVED THE SCREEN.
+            # The complaint was an enforce-only user whose blocks were trimmed getting this
+            # warning over an intact call list. That was a screen reporting the call count and
+            # nothing else. It reports their catch count now, and trimming a catch lowers it --
+            # so the exclusion had turned into the opposite defect: the number shrank and nothing
+            # said so, which is the one direction retention is not allowed to fail in, because
+            # deletion here is disclosed rather than silent.
+            #
+            # 🔴 AND THE EXCLUSION IS WHAT MADE THE TWO SCREENS DISAGREE ABOUT ONE LEDGER. The
+            # per-call reader has always used `rows_dropped` alone, with a comment explaining
+            # that it holds every status so any eviction shortens its window. Both readers now
+            # ask one question, so `agentx audit` and `agentx audit --calls` can no longer answer
+            # it two ways -- the class this file keeps being fixed for.
+            #
+            # ⚠️ AND IT IS A DELETION. No third counter, no migration, no per-status arithmetic to
+            # keep in step as the screen grows. The subtraction is what produced a review finding,
+            # a backlog row filed against a non-defect, and three false versions of this comment;
+            # "was anything evicted" cannot go stale the same way. `blocks_dropped` is untouched
+            # and still answers a DIFFERENT question for `ledger_empty_reason`: trimmed-of-catches
+            # versus never-had-any.
+            #
+            # 🔴 AND WHAT IT COUNTS IS "ROWS THIS SCREEN REPORTS", WHICH IS WIDER THAN THE WORD
+            # "inventory" ABOVE. This paragraph used to end "their difference IS the count of
+            # inventory rows deleted", which was exact while every row was either routine traffic
+            # or a catch. A third kind now exists -- a write that ran and whose size the parser
+            # could not establish -- and an evicted one bumps `rows_dropped` and not
+            # `blocks_dropped`, so the difference reads inventory-dropped PLUS
+            # observations-dropped.
+            #
+            # ⚠️ THAT IS STILL THE RIGHT NUMBER FOR THE SENTENCE, AND IT WAS NEARLY "FIXED" INTO
+            # BEING WRONG. A review round read this comment's old wording, concluded the warning
+            # now fires over an intact inventory, and it was filed as a defect on that reasoning.
+            # Driven instead of argued: an agent made two unsized writes and three ordinary
+            # calls, one unsized write aged out, and the screen printed "3 calls that tripped
+            # nothing" and "1 write the gateway could not size" under the warning. The agent made
+            # TWO. So on the SENTENCE's own words -- "the counts below", of which the observation
+            # line is one -- an evicted observation belongs in this number and the warning is true.
+            #
+            # 🔴 AND THE `blocks_dropped` SUBTRACTION IS NOT JUSTIFIED BY THE SAME READING. A first
+            # version of this paragraph claimed a catch is not on this screen, which is why it is
+            # subtracted out. That is FALSE, measured: a ledger with three ordinary calls and one
+            # catch prints "1 call tripped a policy. 1 was stopped while blocking was on." So a
+            # catch IS reported here, and on the sentence's own words an evicted catch should make
+            # the warning fire, and it does not.
+            #
+            # ⚠️ TWO READINGS OF ONE SENTENCE LIVE IN THIS FILE, AND THEY PREDATE THE THIRD STATUS.
+            # The comment above states the NARROW one (this is the inventory's own count, and the
+            # blocks exclusion was added deliberately so an enforce-only user's trimmed catches
+            # stopped warning about an intact call list). The printed sentence says "the counts
+            # below", which is the BROAD one and covers every count on the screen. Under the narrow
+            # reading an evicted observation should be subtracted out too; under the broad one an
+            # evicted catch should not be. The code currently implements neither consistently.
+            #
+            # NOT SETTLED HERE, because it is a question about what that sentence is FOR rather
+            # than a mechanical defect, it predates this branch, and the two directions fail
+            # oppositely: the narrow reading over-warns, the broad one under-warns. Whoever settles
+            # it fixes both terms at once. What this branch establishes is only that an observation
+            # is treated the same way as the inventory, not as a catch.
+            # ONE except, and it now covers ONE case rather than two. It used to read "a ledger
+            # with no ledger_retention table, and one whose table predates `blocks_dropped`" --
+            # the second half went with the subtraction, because `rows_dropped` is on every
+            # version of this table that has ever existed. What is left is a ledger with no
+            # counter table at all, which has never been pruned, so None is exact rather than a
+            # fallback guess. (Written as two nested handlers first; the outer one was
+            # unreachable, which is a branch nobody can test and everybody later has to reason
+            # about.)
             try:
-                cursor.execute(
-                    "SELECT rows_dropped - blocks_dropped FROM ledger_retention WHERE id = 1")
+                cursor.execute("SELECT rows_dropped FROM ledger_retention WHERE id = 1")
                 dropped_row = cursor.fetchone()
             except Exception:
                 dropped_row = None
@@ -2385,10 +2599,18 @@ def get_call_inventory(path=None, limit=25):
             # header naming THEIR agent. `get_block_frequency` already takes exclude_agents
             # for exactly this; the counts below carry the split instead of hiding it, the
             # same way `agentx insights` footnotes its demo rows rather than dropping them.
+            #
+            # ⚠️ OVER THE SAME STATUS POPULATION AS `_ledger_totals["flagged"]`, WHICH IS WHY
+            # THE OBSERVATION STATUS IS EXCLUDED HERE TOO. The screen subtracts this from
+            # `flagged_total`, so the two counts have to answer one question. Our demo is
+            # keyless and cannot write an UNSIZED row today, which is exactly why the exclusion
+            # has to be written rather than reasoned about: the day a keyed demo exists, a
+            # difference of definition between these two lines becomes a negative count.
             _ours_sql, _ours_params = _our_agents_clause()
+            _demo_op_sql, _demo_op_params = _had_an_opinion_clause()
             cursor.execute(
-                "SELECT COUNT(*) FROM event_log WHERE status IS NOT ? AND " + _ours_sql,
-                (INVENTORY_STATUS, *_ours_params))
+                "SELECT COUNT(*) FROM event_log WHERE " + _demo_op_sql + " AND " + _ours_sql,
+                (*_demo_op_params, *_ours_params))
             flagged_from_demo = cursor.fetchone()[0] or 0
 
             # 🔴 THE SAME SPLIT, ON THE OTHER STATUS, AND IT WAS MISSING. The comment above
@@ -2682,7 +2904,8 @@ def get_mcp_roster(path=None):
 
 #: Every count a sentence about this ledger can rest on, and the ONLY place they are
 #: computed. Both audit views and both output shapes read these, so they cannot disagree.
-_LEDGER_TOTAL_KEYS = ("rows", "inventory", "flagged", "unclassified", "ours",
+_LEDGER_TOTAL_KEYS = ("rows", "inventory", "flagged", "observed", "observed_excluding_ours",
+                      "unclassified", "ours",
                       "distinct_tools", "window_start", "unsized_writes")
 
 
@@ -2727,6 +2950,13 @@ def _ledger_totals(cursor):
     counted apart as `unclassified`, because the per-call screen renders one as "unrecorded"
     and a total that called it flagged would contradict the row beside it.
 
+    🔴 FIVE SINCE THE OBSERVATION STATUS, AND `rows` IS THE ONLY TOTAL THAT COVERS THEM ALL. An UNSIZED
+    row is a write that ran and that the parser could not size: no opinion, so not `flagged`;
+    not routine, so not `inventory`. It is counted as `observed`, and the four buckets are
+    still disjoint, so `inventory + flagged + observed + unclassified == rows`. Any caller
+    that reconstructed `rows` from three of them is now short by the observations and must
+    add the fourth term rather than widen one of the three to swallow it.
+
     ⚠️ AND THAT IS A NARROWER NUMBER THAN THE GROUPED SCREEN'S, DELIBERATELY. Before P-92
     this ledger held ONLY calls we had an opinion about (see INVENTORY_STATUS above), so a
     status-less row genuinely IS one -- which is why `agentx audit` counts it under "tripped
@@ -2755,10 +2985,48 @@ def _ledger_totals(cursor):
     cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS ?", (INVENTORY_STATUS,))
     inventory = cursor.fetchone()[0] or 0
 
+    # 🔴 A FIFTH POPULATION, AND IT HAD TO COME OUT OF `flagged` RATHER THAN RIDE INSIDE IT.
+    # `flagged` feeds the screen's "N calls tripped a policy" and its --json twin. An UNSIZED
+    # row tripped no policy -- there is no policy on it to name -- so counting it here would
+    # put a number under a header it contradicts, which is the split this reader has already
+    # been fixed for twice. Counted apart, and the screen says what it is.
+    _op_sql, _op_params = _had_an_opinion_clause()
     cursor.execute(
-        "SELECT COUNT(*) FROM event_log WHERE status IS NOT ? AND status IS NOT NULL",
-        (INVENTORY_STATUS,))
+        "SELECT COUNT(*) FROM event_log WHERE " + _op_sql + " AND status IS NOT NULL",
+        tuple(_op_params))
     flagged = cursor.fetchone()[0] or 0
+
+    # Writes that RAN and that the parser could not size. Its own count, over
+    # the whole ledger and every agent, because the sentence it feeds is about the ledger.
+    #
+    # ⚠️ NOT THE SAME NUMBER AS `unsized_writes` BELOW, AND THE DIFFERENCE IS WHICH READER
+    # ANSWERED. That one counts ALLOWED rows the FREE regex reader could not size and is a
+    # guess at the shape; this one counts rows the PAID parser could not size and is the
+    # gateway's answer. On `DELETE FROM sessions WHERE id = 41` the regex says UNKNOWN and the
+    # parser says AT_MOST 1, so a ledger can hold a large `unsized_writes` and no observations
+    # at all. Two readers, two counts, never summed.
+    # 🔴 TWO COUNTS OVER TWO POPULATIONS, AND NEITHER ONE CAN DO BOTH JOBS. `observed` is
+    # ledger-wide because the per-call screen's partition is an equality against `rows`
+    # (`inventory + flagged + observed + unclassified == rows`), and a scoped term would make
+    # that sum false the moment our own demo wrote one -- which silently switches the sentence
+    # off rather than printing a wrong number, so nothing on screen would say why.
+    # `observed_excluding_ours` is the developer's own traffic, and it is what a SENTENCE about
+    # what their agent did has to rest on. The unsized-writes sentence directly above it is
+    # scoped that way, and two adjacent lines over different populations is the defect this
+    # reader has already been fixed for twice: a consumer subtracting one from the other counted
+    # our own demo's row as the developer's.
+    # ⚠️ BOUND HERE, NOT READ FROM FURTHER DOWN THIS FUNCTION. The unsized-writes count below
+    # binds the same pair thirty lines later, and reaching for it from up here is a NameError on
+    # every `agentx audit` with a ledger on disk. This module's census reader carries a comment
+    # about having shipped exactly that once; caught by reading, before running.
+    _not_ours, _not_ours_params = _our_agents_clause(negate=True)
+    cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS ?",
+                   (UNSIZED_WRITE_STATUS,))
+    observed = cursor.fetchone()[0] or 0
+    cursor.execute(
+        "SELECT COUNT(*) FROM event_log WHERE status IS ? AND " + _not_ours,
+        tuple([UNSIZED_WRITE_STATUS] + _not_ours_params))
+    observed_theirs = cursor.fetchone()[0] or 0
 
     cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS NULL")
     unclassified = cursor.fetchone()[0] or 0
@@ -2834,6 +3102,7 @@ def _ledger_totals(cursor):
         unlabelled = 0
 
     return {"rows": rows or 0, "inventory": inventory, "flagged": flagged,
+            "observed": observed, "observed_excluding_ours": observed_theirs,
             "unclassified": unclassified, "ours": ours,
             "distinct_tools": distinct_tools or 0, "window_start": window_start,
             "unsized_writes": unsized, "unsized_readable": unsized_readable,
@@ -2978,12 +3247,18 @@ def get_call_log(path=None, limit=50, offset=0):
             totals = _ledger_totals(cursor)
             window_start = totals["window_start"]
 
-            # 🔴 `rows_dropped`, NOT `rows_dropped - blocks_dropped`. The grouped reader
-            # subtracts because its sentence is about INVENTORY rows only. This view holds
-            # EVERY status, so any eviction at all shortens the window it describes --
-            # borrowing the sibling's expression would report a fully-trimmed ledger of
-            # blocks as complete. The counter that decides a sentence has to be the counter
-            # that sentence is about.
+            # 🔴 `rows_dropped`, BECAUSE THIS VIEW HOLDS EVERY STATUS and any eviction at all
+            # shortens the window it describes: a fully-trimmed ledger of blocks must not report
+            # itself complete.
+            #
+            # ⚠️ AND THE GROUPED READER NOW ASKS THE SAME QUESTION, which this comment used to say
+            # it did not ("the grouped reader subtracts because its sentence is about INVENTORY
+            # rows only"). That was true until the two were deliberately made to agree: its screen
+            # grew a catch count and a could-not-size count, so subtracting the catches had it
+            # staying quiet while a number on it shrank. One question, two screens, no divergence
+            # for a reader to trip over. Found by `check_half_finished.py` after the change, via a
+            # sentence deleted from a test rather than via this file -- the fourth surface that
+            # encoded the old verdict.
             #
             # Guarded separately from the read above for the sibling's reason:
             # `ledger_retention` is created by init_db, so pointing this at ANOTHER
@@ -4209,7 +4484,7 @@ def _bump_audit_counters(tool_name, stats, in_audit):
 
 def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats_lock=None,
                 in_audit=False, description=None, matched_rule=None, uncompared_rule=None,
-                row_cap=None, reversibility=None):
+                row_cap=None, reversibility=None, unsized_write=False):
     """P-92: record ONE call that passed, in ANY posture. Best-effort, never raises.
 
     `matched_rule`: the adopted rule this call is the shape of, as
@@ -4292,7 +4567,23 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
     # `reversibility` arrives the same way (`decorators.reversibility_for_arguments`), and
     # a caller that passes nothing gets UNKNOWN written rather than NULL: the column's
     # contract is that NULL means "older ledger", never "this caller forgot".
-    log_intercept(trace_id, agent_id, tool_name, rule_id, rule_name, INVENTORY_STATUS,
+    # `unsized_write`: the GATEWAY said this write ran and its parser could not size it
+    # The only thing it changes on this row is the status, and it is the
+    # caller's fact rather than ours for the same reason `row_cap` is -- the door that held
+    # the reply is the only place that can know it. A keyless caller can never pass True; see
+    # `UNSIZED_WRITE_STATUS` for why the free reader must not drive this.
+    #
+    # ⚠️ EVERYTHING ELSE ABOUT THE ROW IS UNCHANGED, INCLUDING THE PULSE. The call ran and was
+    # recorded, so `count_call_for_pulse` above has already counted it exactly as it counts any
+    # other passing call: the funnel measures adoption, not verdicts, and quietly dropping a
+    # population out of it would move `recorded_*` for a reason no reader could see.
+    #
+    # ⚠️ IT DOES MOVE THE WRITE ONTO THE DURABLE PATH. `_durable` below is
+    # `status != INVENTORY_STATUS`, so an observation is fsynced where routine traffic is not.
+    # That is the right side of that rule -- this is the rare row the product exists to keep --
+    # but it is a real per-call cost on a keyed install, paid only by unsized writes.
+    log_intercept(trace_id, agent_id, tool_name, rule_id, rule_name,
+                  UNSIZED_WRITE_STATUS if unsized_write else INVENTORY_STATUS,
                   arg_names=names, amount=amount, target_class=target_class,
                   quantity=quantity, posture=("audit" if in_audit else "enforce"),
                   rule_uncompared=uncompared_id, row_cap=row_cap,

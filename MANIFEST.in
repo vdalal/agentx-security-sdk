@@ -72,3 +72,9 @@ include examples/mcp/README.md
 
 global-exclude *.pyc
 global-exclude .agentx.db
+
+# setup.py IMPORTS build_stamp, so an sdist without it cannot build. The `__released__`
+# build-time stamp lives in its own module so it can be tested without executing setup(); the
+# cost of that is this line, and its absence is a build failure for anyone installing from the
+# sdist rather than the wheel.
+include build_stamp.py
