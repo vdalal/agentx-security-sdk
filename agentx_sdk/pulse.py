@@ -34,6 +34,7 @@ import threading
 import time
 import urllib.request
 import uuid
+from urllib.parse import urlencode
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -86,6 +87,11 @@ _ALLOWED_SESSION_KEYS = {
     # "has anyone ever seen us catch something in code THEY wrote". A boolean, never an
     # agent name: the id that decides it stays on their disk. See decorators._note_own_agent_block.
     "own_agent_block",
+    # This session ran `agentx demo`. The demo moves had_block, intercepts and
+    # first_block_ever exactly as a real agent does, so every activation count was a
+    # guess about how much of it was us. A boolean about our own command; nothing about
+    # the developer's code.
+    "demo_session",
     # P-92. COUNTS ONLY -- the tool NAMES that produced them stay on the user's disk, in the
     # same class as the raw payload we refuse. `audit_calls` is the first signal that can
     # distinguish "wired us in and ran a real agent" from "installed and never ran", because
@@ -567,6 +573,23 @@ def maybe_emit_nudge(session_stats):
         pass
 
 
+# --- OPT-IN FEEDBACK -----------------------------------------------------------
+# Nothing identifying leaves an install, so we have no way to reach anyone who uses us.
+# `agentx feedback` builds a link the person can open themselves: a pre-filled public issue
+# they decide whether to submit. Nothing is sent from here.
+
+FEEDBACK_ISSUES_URL = "https://github.com/vdalal/agentx-security-sdk/issues/new"
+def feedback_url(door="python"):
+    """The pre-filled issue link. It carries the SDK version and the door, and nothing from
+    the agent: no call, no payload, no tool name, no ledger row."""
+    body = ("**What did AgentX catch or miss?**\n\n\n"
+            "**What is your agent built with?** (framework, MCP server, model)\n\n\n"
+            "**Did anything get in your way?**\n\n\n"
+            "**May we reply here to follow up?** (yes / no)\n\n"
+            "---\nagentx-security-sdk %s, %s door\n" % (_sdk_version(), door))
+    return FEEDBACK_ISSUES_URL + "?" + urlencode({"title": "Feedback: ", "body": body})
+
+
 # --- LOCAL-ONLY protection streak (the session-end value report) -------------
 # Bookkeeping for the "here's what I protected" report both integration surfaces
 # print at session end (the decorator's atexit summary, agentx-mcp's exit
@@ -950,6 +973,10 @@ def build_payload(session_stats, state, first_block_ever=None):
             # means False, which UNDERSTATES adoption -- the safe direction for the number
             # we would quote as evidence somebody real reached us.
             "own_agent_block": bool(session_stats.get("own_agent_block", False)),
+            # Two-state like own_agent_block: the demo either ran in this process or it
+            # did not. A missing key reads False, so an older session dict is never
+            # mistaken for a demo.
+            "demo_session": bool(session_stats.get("demo_session", False)),
             # SHIELD FAIL-OPENS: tool calls the Local Shield could not screen because it
             # THREW and fell through, so the call ran unscreened. A shield BUG, not a
             # policy decision, and on the keyless tier an enforcement BYPASS (nothing sits

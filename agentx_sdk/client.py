@@ -8,7 +8,7 @@ import urllib.parse
 import requests
 
 from . import envfile
-from .envfile import resolve_env
+from .envfile import resolve_env, resolve_api_key
 
 # 🔴 HOW LONG WE WAIT FOR A VERDICT, AND WE NOW TELL THE GATEWAY (P-157).
 #
@@ -55,6 +55,9 @@ SHIELD_MATCHED_MAX_LEN = 64
 # the sender can impose on the receiver. Generous enough for any real statement -- a query longer
 # than this is not something a floor's verdict should turn on anyway.
 STATEMENT_TEXT_MAX_LEN = 8192
+# The most sites one call's `dest_hosts` carries. The ledger keeps at most 8 per call
+# (`db._MAX_DEST_HOSTS`), so this never cuts what the decorator sends; it bounds a direct caller.
+DEST_HOSTS_MAX = 8
 
 
 _SAID_PARENT_ENV_IS_IGNORED = []
@@ -251,7 +254,7 @@ class AgentXClient:
     def evaluate_intent(self, agent_id, query, chain_of_thought, receipt_id=None, trace_id=None,
                         action=None, args=None, session_tokens=0, session_cost_usd=0, budget_pool_id=None,
                         enforcement=None, strike_count=None, tool=None, shield_matched=None,
-                        statement_text=None):
+                        statement_text=None, dest_hosts=None):
         # `tool` is APPENDED, after the deprecated `strike_count`, not slotted in beside
         # the fields it belongs with. `strike_count` is retained precisely so existing
         # direct callers do not break, and inserting ahead of it would hand a caller
@@ -273,7 +276,7 @@ class AgentXClient:
                 stacklevel=2,
             )
         # ✅ Fetch it dynamically right when the network request is made
-        api_key = os.environ.get("AGENTX_API_KEY")
+        api_key = resolve_api_key()
 
         if not api_key:
             # Keyless (no key configured) is a SUPPORTED mode, not an error. Signal
@@ -368,6 +371,13 @@ class AgentXClient:
         # distinction one layer up and this keeps it in the payload; a truthy test threw it away.
         if statement_text is not None:
             payload["statement_text"] = str(statement_text)[:STATEMENT_TEXT_MAX_LEN]
+        # The sites this door recorded for the call, so the gateway records the same
+        # ones rather than rebuilding them from `query`. `is not None` for the reason above:
+        # [] says "this door looked and the call reaches no site", which an absent key (an
+        # older SDK, a direct caller) cannot say. The gateway keeps only hosts it also read in
+        # the text it screened, so this can narrow what it records, never widen it.
+        if dest_hosts is not None:
+            payload["dest_hosts"] = [str(h) for h in dest_hosts][:DEST_HOSTS_MAX]
         # Cumulative session spend for the budget-ceiling floor.
         # Sent like strike_count — the gateway owns the ceiling + verdict. Omitted
         # when zero so an un-metered caller's payload is unchanged.
@@ -724,7 +734,7 @@ class AgentXClient:
         no AGENTX_API_KEY (offline — nothing is parked; the caller uses a synthetic
         local id).
         """
-        api_key = os.environ.get("AGENTX_API_KEY")
+        api_key = resolve_api_key()
         if not api_key:
             return None
 
@@ -892,7 +902,7 @@ class AgentXClient:
             mode = pulse._mode()
             if mode not in ("linked", "cloud"):
                 return
-            api_key = os.environ.get("AGENTX_API_KEY")
+            api_key = resolve_api_key()
             if not api_key:
                 return
             plane = (pulse._env("CONTROL_PLANE_URL") or "").strip().rstrip("/")

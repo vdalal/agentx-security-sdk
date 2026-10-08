@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import hashlib
 import json
@@ -28,11 +29,13 @@ from .overrides import (harvest_candidates, load_overrides, adopt as adopt_overr
                         unlabel_declared_verdicts, _resolve_policy_ref)
 from .rules import (harvest_rule_candidates, harvest_rule_candidates_from_calls,
                     withheld_rule_proposals, adopt_rule, adopted_rules, remove_rule, rule_name,
-                    _existing_rule_actions, ONLY_WHEN_GATEWAY_MIN)
+                    _existing_rule_actions, ONLY_WHEN_GATEWAY_MIN,
+                    read_allowlist, adopt_allowlist, remove_allowlist, host_is_listed,
+                    _allowlist_file_path)
 
 # Re-exported from the stdlib-only envfile module (kept importable here for
 # backward compatibility — callers and tests still do `from .cli import load_env_file`).
-from .envfile import load_env_file, resolve_env
+from .envfile import load_env_file, resolve_env, resolve_api_key
 
 
 def _ledger_path_line(path, indent="   "):
@@ -764,6 +767,39 @@ def _self_corrections_line(pivots, recoverable):
     return "%s recovered (of the blocks it could come back from)" % format_ratio(hits, could_have)
 
 
+def _tenant_usage(gateway_url, headers):
+    """`GET /v1/usage` when it names a tenant, else None. Never raises. A hosted gateway shared
+    by several keys answers `/v1/telemetry` for its owner only, so this is what a tenant reads."""
+    try:
+        res = requests.get(f"{gateway_url}/v1/usage", headers=headers, timeout=2.0)
+        body = res.json() if res.status_code == 200 else None
+    except Exception:
+        return None
+    if isinstance(body, dict) and isinstance(body.get("tenant"), str) and body["tenant"]:
+        return body
+    return None
+
+
+def _render_hosted_tenant_status(gateway_url, usage):
+    """The status screen for a key on a hosted gateway shared with others."""
+    print(f"\n📊 HOSTED GATEWAY        ({gateway_url})")
+    print("=" * 75)
+    print(f"  Connected as:      {usage['tenant']}")
+    used, cap = usage.get("judge_calls_today"), usage.get("judge_daily_cap")
+    if isinstance(used, int) and isinstance(cap, int):
+        # "Model calls", not "judge calls": the count includes the summary written when an
+        # agent recovers from a block, so it is every model call this key caused today.
+        print(f"  Model calls today: {used} of {cap} (resets at midnight UTC)")
+        if used >= cap:
+            print("  ⚠️  Today's model calls are used up. Until midnight UTC your calls are")
+            print("     decided by the built-in rules alone, with no second look.")
+    blocks = usage.get("blocks_recorded")
+    if isinstance(blocks, int):
+        print(f"  Blocks recorded:   {blocks}")
+    print("\n  Your full record of calls and blocks: agentx audit")
+    print("=" * 75)
+
+
 def execute_status_inspection(gateway_url, api_key, mode="local"):
     """Probes local container metrics endpoints for running RAM stats and armed rules."""
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -788,6 +824,13 @@ def execute_status_inspection(gateway_url, api_key, mode="local"):
     if not _gateway_reachable(gateway_url=gateway_url, timeout=precheck_timeout):
         _render_offline_dashboard(gateway_url, mode)
         sys.exit(0 if mode == "local" else 1)
+    # A key on a hosted gateway shared with others: asked FIRST, so a tenant never knocks on the
+    # owner's routes (each knock is a 401 line in the hosted box's log). A gateway without
+    # `/v1/usage`, the box's own key, or a key that names no tenant goes on as before.
+    usage = _tenant_usage(gateway_url, headers)
+    if usage is not None and not usage.get("operator"):
+        _render_hosted_tenant_status(gateway_url, usage)
+        sys.exit(0)
     try:
         telemetry_res = requests.get(f"{gateway_url}/v1/telemetry", headers=headers, timeout=2.0)
         policy_res = requests.get(f"{gateway_url}/v1/debug/policies", headers=headers, timeout=2.0)
@@ -846,7 +889,7 @@ def execute_status_inspection(gateway_url, api_key, mode="local"):
           % _self_corrections_line(telemetry.get('successful_agent_pivots', 0),
                                    telemetry.get('recoverable_blocks_issued', 0)))
     print(f"  🎛️  Neural sensitivity:       {policies_data.get('neural_threshold', 0.30)}"
-          f"        ☁️  Control plane:  {policies_data.get('control_plane_url', 'None (local sandbox)')}")
+          f"        ☁️  Control plane:  {policies_data.get('control_plane_url') or 'none (local)'}")
 
     # 🔴 NAME THE SURFACE. This block renders only when a GATEWAY answers, so every row on it
     # is genuinely armed and every number is true. It still misleads, because nothing on it
@@ -932,11 +975,14 @@ def execute_status_inspection(gateway_url, api_key, mode="local"):
         print("\n   These are the GATEWAY's rules. A keyless `pip install` arms a set of")
         print("   its own, which this same command prints when no gateway is configured.")
 
+    # A dashboard line only when the gateway names a control plane. Without one there is no
+    # dashboard to open: the self-hosted kit runs the gateway alone, and the old fallback,
+    # `http://localhost:3000/dashboard`, sent its owner to a page that was never served.
     cp = policies_data.get("control_plane_url") or ""
-    dash = (cp.rstrip("/") + "/dashboard") if cp.startswith("http") else "http://localhost:3000/dashboard"
     print("\n" + "=" * 75)
     print("  ▶ Review what your wrapped tools learned:   agentx insights")
-    print(f"  ▶ Open the live dashboard:           {dash}")
+    if cp.startswith("http"):
+        print(f"  ▶ Open the live dashboard:           {cp.rstrip('/')}/dashboard")
     print("\n  Tune detection sensitivity with AGENTX_NEURAL_THRESHOLD.")
     print("=" * 75)
 
@@ -1210,6 +1256,16 @@ def execute_contribution_push(gateway_url, control_plane_url, api_key, env):
         res = requests.get(f"{gateway_url}/v1/contribution", headers=headers, timeout=5.0)
     except requests.exceptions.ConnectionError:
         print(f"❌ Unable to reach the AgentX gateway at {gateway_url} (is it up? `docker ps`).")
+        print("=" * 75)
+        return
+    if res.status_code == 403:
+        # A hosted gateway shared with others refuses this on purpose and says why.
+        try:
+            why = res.json().get("message")
+        except Exception:
+            why = None
+        print(f"ℹ️  {why} Nothing was shared." if why
+              else "ℹ️  This gateway does not offer contribution. Nothing was shared.")
         print("=" * 75)
         return
     if res.status_code != 200:
@@ -1488,6 +1544,29 @@ def _audit_cmd():
     # SDK's `agentx` script is not on PATH, so a bare `agentx audit` handed to an MCP reader
     # is a command-not-found aimed at exactly the person we just told to go look.
     return "uvx agentx-mcp --audit" if MCP_ENTRY else "agentx audit"
+
+
+def execute_feedback(args=None):
+    """`agentx feedback`: print, and in an interactive terminal open, a pre-filled public
+    issue. Nothing is sent from here; the person submits it or not.
+
+    Hidden: it works when typed, and no screen, hint or help line names it.
+    test_feedback_command.py pins that.
+    """
+    from . import pulse as pulse_module
+    url = pulse_module.feedback_url("mcp" if MCP_ENTRY else "python")
+    print("\n  Tell us what AgentX caught, missed, or got in the way of.")
+    print("  This opens a public GitHub issue with four questions. Nothing is sent")
+    print("  unless you submit it, and nothing from your agent is in it.\n")
+    opened = False
+    if not pulse_module.is_automation_context() and sys.stdout.isatty():
+        try:
+            import webbrowser
+            opened = bool(webbrowser.open(url))
+        except Exception:
+            opened = False
+    print("  Opened in your browser. If it did not appear, open:" if opened else "  Open:")
+    print("  " + url + "\n")
 
 
 def _audit_calls_cmd():
@@ -3769,7 +3848,7 @@ _RULE_MATCH_MARK = "^"
 # "unrecorded" is `_call_status_label`'s answer for a row with no status; it gets a line too.
 # ⚠️ Every line fits the 75 fence with its "  " indent; `test_calls_status_legend` measures it.
 _CALL_STATUS_MEANINGS = {
-    "ran": "ran = ran; AgentX had no objection.",
+    "ran": "ran = AgentX had no objection.",
     "ran, flagged": "ran, flagged = ran; AgentX objected but did not stop it (watch-only).",
     "stopped": "stopped = AgentX stopped it; no retry was recorded.",
     # 🔴 SAYS WHAT THE LEDGER MEASURED, NOT WHAT WE HOPE. "reached the goal another way" was
@@ -4159,10 +4238,11 @@ def _write_audit_share(payload, to_stderr=False):
     # send" is worth less than none.
     print("  In it:      tool names, argument names, agent names, call counts,", file=out)
     print("              surfaces, time stamps, a size BAND for any amount your", file=out)
-    print("              tool named, and (with --calls) the policy and verdict", file=out)
+    print("              tool named, the sites (host only) your agents sent", file=out)
+    print("              requests to, and (with --calls) the policy and verdict", file=out)
     print("              for each call.", file=out)
-    print("  Not in it:  argument values, file contents, trace ids, and the", file=out)
-    print("              path to your ledger on this machine.", file=out)
+    print("  Not in it:  argument values, full web addresses, file contents,", file=out)
+    print("              trace ids, and the path to your ledger on this machine.", file=out)
     print("", file=out)
     print("  Nothing was uploaded. Send it to founders@agentx-core.com if you", file=out)
     print("  want us to read it.", file=out)
@@ -4292,6 +4372,15 @@ def _audit_json_payload(db_module, opts, inventory=None, log=None):
                 "never_called": s["never_called"],
                 "advertised_at": _iso(s["ts"]),
             } for s in roster["servers"]]
+        # The sites each agent's calls were addressed to, host only. Calls
+        # that RAN; a stopped call's host stays on its ledger row and is not listed. ABSENT when nothing
+        # was recorded, the roster's rule: an empty list would claim the agent reached nothing.
+        dests = db_module.get_destinations()
+        if dests:
+            payload["destinations"] = [{"agent_id": a, "host": h, "calls": n}
+                                       for a in sorted(dests)
+                                       for h, n in sorted(dests[a].items(),
+                                                          key=lambda hn: (-hn[1], hn[0]))]
 
     if log is not None:
         payload["calls"] = [{
@@ -4312,6 +4401,8 @@ def _audit_json_payload(db_module, opts, inventory=None, log=None):
                              else None),
             "trace_id": row["trace_id"],
             "agent_id": row["agent_id"],
+            # The sites this call was addressed to, host only; [] when it named none.
+            "sites": [h for h in (row.get("dest_hosts") or "").split(",") if h],
             # 🔴 NOT `ours`, WHICH IS UNREADABLE IN THE ONE DOCUMENT DESIGNED TO TRAVEL. A
             # colleague opening `agentx-audit.json` reads `"ours": false` as the SENDER's
             # team, which is the exact opposite of what it says. The human screens cannot be
@@ -4432,6 +4523,45 @@ def _print_roster(db_module):
         print(ln)
     if lines:
         print("")
+
+
+_DEST_HOSTS_SHOWN = 6
+
+
+def _print_destinations(db_module):
+    """The sites each agent sent requests to, or nothing, followed by one blank
+    line when it printed. ONE helper for both branches of the grouped screen, the roster's rule.
+    Our own demo agent is left out, as it is everywhere else on this screen."""
+    try:
+        dests = {a: h for a, h in db_module.get_destinations().items()
+                 if a and not db_module.is_demo_agent(a)}
+    except Exception:
+        dests = {}
+    if not dests:
+        # An upgraded ledger: calls from before this version carry no site, so the section
+        # would be absent with nothing to say why. Said once, only when a web tool exists.
+        try:
+            web = any("http" in (t.get("classes") or []) or "url" in str(t.get("arg_names"))
+                      for t in (db_module.get_call_inventory(limit=None).get("tools") or []))
+        except Exception:
+            web = False
+        if web:
+            print("  Sites your agents sent requests to: recorded from this version on, so")
+            print("  calls made before it show none.")
+            print("")
+        return
+    print("  Sites your agents sent requests to (host only, never the full address):")
+    width = min(max(len(a) for a in dests), 20)
+    for agent in sorted(dests):
+        ranked = sorted(dests[agent].items(), key=lambda hn: (-hn[1], hn[0]))
+        shown = ", ".join("%s (%s)" % (h, _plural(n, "call"))
+                          for h, n in ranked[:_DEST_HOSTS_SHOWN])
+        more = len(ranked) - _DEST_HOSTS_SHOWN
+        if more > 0:
+            shown += ", and %d more" % more
+        print(_wrap(shown, "    %-*s  " % (width, _fit_tail(agent, width))))
+    print("  Limit an agent to the sites it uses:  %s" % _review_cmd())
+    print("")
 
 
 def _print_unreadable_ledger(db_module):
@@ -4685,6 +4815,10 @@ def _print_call_log(db_module, log, opts):
                              _fit(row["agent_id"] or "-", 18), _args))
         else:
             print(row_fmt % (clock, _fit(tool, 22), _status, _surface, _args))
+        if row.get("dest_hosts"):
+            # A line of its own, not a column: the table is full at 75, and a site is the
+            # one fact that answers "where did this call go" on a stopped or flagged row.
+            print(_wrap(row["dest_hosts"].replace(",", ", "), "            site: "))
 
     print("")
     # 🔴 THE LEGEND COUNTS WHAT IS ON THE PAGE, NOT WHAT IS IN THE LEDGER. `ours_total` is
@@ -4782,7 +4916,167 @@ def _print_call_log(db_module, log, opts):
     print("=" * 75)
 
 
+def _record_stores():
+    """(label, path, tables) for each local record the change journal covers."""
+    from . import db as db_module
+    from .overrides import _incident_db_path
+    return [("Call ledger", db_module.DB_PATH, db_module.CHAIN_TABLES),
+            ("Incident store", _incident_db_path(None), {"incidents": "receipt_id"})]
+
+
+def _record_status(path, tables):
+    """`chain.verify` for one store, read-only; None when the file does not exist."""
+    import sqlite3
+    from . import chain
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path), uri=True)
+    except sqlite3.Error as err:
+        return {"journaled": True, "intact": None, "error": str(err)}
+    try:
+        return chain.verify(conn, tables)
+    finally:
+        conn.close()
+
+
+def _record_keys(rows):
+    keys = [k for _t, k in rows]
+    shown = ", ".join(keys[:3]) + (", ..." if len(keys) > 3 else "")
+    return " (%s)" % shown if keys else ""
+
+
+def _record_problem_line(v):
+    parts = []
+    for key, word in (("edited", "edited"), ("added", "added"), ("removed", "removed"),
+                      ("outside", "changed before AgentX next wrote them")):
+        if v.get(key):
+            parts.append("%s %s%s" % (_plural(len(v[key]), "row"), word, _record_keys(v[key])))
+    if v.get("broken"):
+        parts.append("its change journal breaks at entry #%s (%s)"
+                     % (v["broken"]["seq"], v["broken"]["why"]))
+    return ", ".join(parts)
+
+
+_RECORD_WARNING = "changed without a journal entry (outside AgentX, or by an older AgentX)"
+
+
+def _record_head_line(v, tag):
+    when = datetime.fromtimestamp(v["head_at"]).strftime("%Y-%m-%d %H:%M") if v.get(
+        "head_at") else "?"
+    return "latest entry %s:%s:%s (%s)" % (tag, v["head_seq"], (v["head_link"] or "")[:12], when)
+
+
+def _record_check_head(path, want, tag="ledger"):
+    """(line, exit code) for a saved `tag:N:HASH` against this store's journal."""
+    import sqlite3
+    from . import chain
+    seq, link = want
+    if not path or not os.path.exists(path):
+        # Either the record was removed, or this is not where it was saved (the ledger path is
+        # relative to the folder; the incident store follows the project). Both alert.
+        where = ("the folder you saved it in, or AGENTX_LEDGER_PATH" if tag == "ledger"
+                 else "your project folder, or AGENTX_INCIDENT_DB")
+        return ("  🚨 Entry #%d cannot be checked: no record at %s. Either it was removed, "
+                "or it lives elsewhere (check %s)." % (seq, os.path.abspath(path or "."), where),
+                3)
+    conn = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path), uri=True)
+    try:
+        have = chain.link_at(conn, seq)
+        try:
+            folded = conn.execute("SELECT seq FROM chain_anchor WHERE id = 1").fetchone()
+        except sqlite3.Error:
+            folded = None
+    finally:
+        conn.close()
+    if have is not None:
+        if have.startswith(link):
+            return ("     Entry #%d still matches what you saved." % seq, 0)
+        return ("  🚨 Entry #%d no longer matches what you saved: this record was rewritten."
+                % seq, 3)
+    if folded and seq <= (folded[0] or 0):
+        return ("     Entry #%d is older than this record keeps, so it cannot be checked."
+                % seq, 0)
+    return ("  🚨 Entry #%d is missing: this record was rewritten or cut short." % seq, 3)
+
+
+def execute_audit_record(args):
+    """`agentx audit --record [--head TAG:N:HASH]`: is each local record intact, and its latest
+    entry. Exits 0 when every record present is intact, 3 when one was changed without a journal
+    entry or a saved entry no longer holds, 2 when one could not be read."""
+    want = None
+    if "--head" in args:
+        i = args.index("--head")
+        raw = (args[i + 1] if i + 1 < len(args) else "").lstrip("#")
+        parts = raw.split(":")
+        if len(parts) == 2:
+            parts = ["ledger"] + parts            # a bare N:HASH is the call ledger's
+        if len(parts) != 3 or parts[0] not in ("ledger", "incidents") or not parts[1].isdigit()                 or not parts[2]:
+            print("\n❌ --head needs the saved entry as it was printed, for example "
+                  "ledger:1234:a1b2c3d4e5f6.", file=sys.stderr)
+            sys.exit(1)
+        want = (parts[0], int(parts[1]), parts[2].lower())
+    print("\nTAMPER RECORD (each change AgentX makes to these files is chained; a change made "
+          "any other way shows here)")
+    print("=" * 75)
+    code = 0
+    for (label, path, tables), tag in zip(_record_stores(), ("ledger", "incidents")):
+        v = _record_status(path, tables)
+        if v is None:
+            print("  %s: none on this machine." % label)
+        elif not v.get("journaled"):
+            print("  %s: no tamper record yet. It starts the next time AgentX writes here."
+                  % label)
+        elif v.get("intact") is None:
+            print("  %s: could not be read (%s)." % (label, v.get("error")))
+            code = max(code, 2)
+        elif v["intact"]:
+            print("  %s: intact, %s." % (label, _record_head_line(v, tag)))
+        else:
+            print("  🚨 %s: %s: %s." % (label, _RECORD_WARNING, _record_problem_line(v)))
+            print("     This shows that a change happened, not who made it.")
+            code = 3
+        if want and want[0] == tag:
+            line, c = _record_check_head(path, want[1:], tag)
+            print(line)
+            code = max(code, c)
+    print("\n  Save a latest-entry line somewhere this machine's agents cannot reach. Later,")
+    print("  `%s --record --head TAG:N:HASH` shows whether it still holds." % _audit_cmd())
+    print("  This detects changes; it does not prevent them.")
+    sys.exit(code)
+
+
+def _record_footer():
+    """One line under the audit screen: the call ledger's tamper record. Never raises."""
+    try:
+        from . import db as db_module
+        v = _record_status(db_module.DB_PATH, db_module.CHAIN_TABLES)
+        if not v or not v.get("journaled") or v.get("intact") is None:
+            return None
+        if v["intact"]:
+            return ("Record intact, %s. Details: %s --record"
+                    % (_record_head_line(v, "ledger"), _audit_cmd()))
+        return ("🚨 This ledger was %s: %s. Details: %s --record"
+                % (_RECORD_WARNING, _record_problem_line(v), _audit_cmd()))
+    except Exception:
+        return None
+
+
 def execute_audit(args=None):
+    """`agentx audit`; `--record` shows the tamper record instead. The screen itself is
+    `_execute_audit_screen`; a human screen gets the record's one-line footer."""
+    args = list(args or [])
+    if "--record" in args:
+        execute_audit_record([a for a in args if a != "--record"])
+        return
+    _execute_audit_screen(args)
+    if not {"--json", "--share", "-h", "--help"} & set(args):
+        line = _record_footer()
+        if line:
+            print(_wrap(line, "  "))
+
+
+def _execute_audit_screen(args=None):
     """`agentx audit` — what your agent actually DID. P-92.
 
     The sibling of `agentx insights`, and deliberately a different question. `insights` says
@@ -5089,6 +5383,7 @@ def execute_audit(args=None):
         # The roster prints on this branch too: an agent whose only call was stopped still
         # has a menu it could reach, and this is the one screen that can say so.
         _print_roster(db_module)
+        _print_destinations(db_module)
         if MCP_ENTRY:
             # 🔴 NEITHER THE SHELL'S POSTURE NOR THE PYTHON CTA IS TRUE ON THIS DOOR, and
             # getting it wrong here is a documented past defect (see the --insights branch,
@@ -5450,6 +5745,7 @@ def execute_audit(args=None):
     # who sees "4 tools" in the table and only then learns there were 23 has already formed
     # the wrong idea. Prints nothing on a ledger with no roster (see _roster_lines).
     _print_roster(db_module)
+    _print_destinations(db_module)
     # 🔴 THE AGENT IS SHOWN ONLY WHEN IT DISCRIMINATES. On the common single-agent ledger
     # every row would carry the same name, which is a column of one repeated fact on the
     # screen a new user reads first. Counted across the tools ACTUALLY SHOWN rather than
@@ -6120,7 +6416,7 @@ def execute_audit(args=None):
         # at the top of this screen already honours via `keyless_door=MCP_ENTRY`; this line
         # read the key on its own, six hundred lines later, and a review caught it by running
         # the door with a key exported.
-        keyed = bool((os.environ.get("AGENTX_API_KEY") or "").strip()) and not MCP_ENTRY
+        keyed = bool(resolve_api_key()) and not MCP_ENTRY
         print("")
         print("  " + "─" * 71)
         # 🔴 THE WHY, NOT THE POLICY NAMES. This was two
@@ -7009,7 +7305,7 @@ def execute_insights(args=None):
     # nothing in the review queue and no armed rules has no action, and printing this
     # block anyway is how a BRAND-NEW install came to be offered three commands it cannot
     # run: `agentx review` (nothing to review), `agentx adopt <#>` (no <#> exists) and
-    # `agentx adopt <id> --text` (no policy id), over a paragraph about where adopted
+    # `agentx customize "<policy>" --text` (no policy), over a paragraph about where adopted
     # coaching lands, to somebody who has adopted nothing.
     #
     # ⚠️ THAT WAS INTRODUCED BY THE FIX FOR THE OPPOSITE DEFECT, which is the whole reason
@@ -7053,7 +7349,7 @@ def execute_insights(args=None):
                 print(f"  ▶ Nothing waiting. Remove one:   {_review_cmd()} --undo")
             elif printed_seqs and not review_has_items and not MCP_ENTRY:
                 print(f"  ▶ Adopt one:   agentx adopt <#>{example}")
-                print("       tweak first:  agentx adopt <#> --edit        write your own:  agentx adopt <id> --text \"…\"")
+                print("       tweak first:  agentx adopt <#> --edit        write your own:  agentx customize \"<policy>\" --text \"…\"")
                 # Guarded like its twin in the `else` below. This branch used to be gated on
                 # `rule_list`, so rules existed by construction; it is gated on `printed_seqs`
                 # now, which coaching candidates also fill.
@@ -7068,7 +7364,7 @@ def execute_insights(args=None):
                 # adopts, labels and takes verdicts, and it reads the MCP corpus (_mcp_review_items).
                 if not MCP_ENTRY:
                     print(f"       or adopt a specific one:  agentx adopt <#>{example}")
-                    print("       tweak first:  agentx adopt <#> --edit        write your own:  agentx adopt <id> --text \"…\"")
+                    print("       tweak first:  agentx adopt <#> --edit        write your own:  agentx customize \"<policy>\" --text \"…\"")
                     if rule_list:
                         print("       author a rule:  agentx adopt --rule --action <a> --desc \"…\"")
             print()
@@ -7278,14 +7574,15 @@ def _adopt_usage_exit():
     print("\n⚠️  Usage:")
     print("   agentx adopt <#>                     promote candidate #N (a coaching or a rule)")
     print("   agentx adopt <#> --edit              tweak that candidate in $EDITOR first")
+    print("   ...add --safe-path \"...\"  on a coaching candidate, to set result.safe_path")
+    print("      distinctly from the coaching")
     print("   ...add --yes  to confirm from a script. With no terminal and no --yes it")
     print("      declines and exits non-zero rather than arming a rule nobody saw.")
     print("   ...add --expect <tool-or-policy>  to say what you think that #N is. The")
     print("      numbering moves as rules are adopted; a mismatch arms nothing and exits 1.")
     print("   ...add --name \"...\"  to name a rule yourself. Without it a rule proposed from")
     print("      your calls is named after the tool and its argument names, nothing else.")
-    print("   agentx adopt <policy_id> --text \"...\"  author coaching from scratch (not a rule)")
-    print("   ...add --safe-path \"...\"  to set result.safe_path distinctly from the challenge")
+    print("   Write your own coaching:  agentx customize \"<policy name or id>\" --text \"...\"")
     print("   agentx adopt --rule --action <a> --desc \"...\"  author a detection RULE from scratch")
     print("   ...optional: --effect <CAT> --indicators \"a,b\" --challenge \"...\" --name \"...\"")
     print("   The <#> is the number shown by `agentx insights` (one sequence over both kinds).")
@@ -7300,7 +7597,9 @@ def _as_int(s):
         return None
 
 
-def _confirm_adopt(label, challenge, assume_yes=False):
+def _confirm_adopt(label, challenge, assume_yes=False,
+                   scripted_note="(--yes on a non-interactive run: adopted without asking)",
+                   preview=None):
     """Show the EXACT text about to become the live challenge and confirm it.
 
     Guards the global-#N TOCTOU: the candidate list is derived live, so a recovery
@@ -7311,12 +7610,19 @@ def _confirm_adopt(label, challenge, assume_yes=False):
     two callers are not in the same situation: `adopt <#>` promotes text the JUDGE wrote, so
     off a terminal it needs `--yes` typed by a person; `customize` only ever stores text the
     human passed in `--text`/`--edit`, so there is nothing agent-derived to gate and it keeps
-    auto-confirming. Never hangs either way — it declines instead."""
-    print(f"\n   About to adopt as the LIVE challenge for '{label}':")
-    print(f"     “{challenge}”")
+    auto-confirming. Never hangs either way — it declines instead.
+
+    `preview`: the lines to show instead of the default two, for a caller that changes less
+    than the whole challenge (`customize --safe-path` alone changes only the safe path)."""
+    if preview is None:
+        preview = [f"About to adopt as the LIVE challenge for '{label}':", f"  “{challenge}”"]
+    print()
+    for line in preview:
+        print("   " + line)
     if not sys.stdin.isatty():
         if assume_yes:
-            print("   (--yes on a non-interactive run: adopted without asking)")
+            # `customize` has no --yes; it passes its own sentence (the text is the human's).
+            print("   " + scripted_note)
             return True
         print("   🚫 Not adopted: nothing is adopted without a person, and there is no")
         print("      terminal here to ask. Re-run with --yes to adopt from a script.")
@@ -7388,7 +7694,7 @@ def _is_keyless_context():
     if _KEYLESS_CONTEXT_CACHE:
         return _KEYLESS_CONTEXT_CACHE[0]
     env = load_env_file()
-    if os.environ.get("AGENTX_API_KEY") or env.get("AGENTX_API_KEY"):
+    if resolve_api_key(env):
         result = False
     else:
         result = not _gateway_reachable()
@@ -7897,9 +8203,8 @@ def _author_rule(args):
 def execute_adopt(args):
     """Promote/author the active override for a policy — the human-in-the-loop
     anti-poisoning gate. Promote by the global candidate number from
-    `agentx insights` (`agentx adopt 3`) so there's no UUID to mistype; the
-    `<policy_id> --text` form authors fresh wording. Free-text is human-authored,
-    so it is always allowed; only auto-applying agent-generated text is forbidden."""
+    `agentx insights` (`agentx adopt 3`) so there's no UUID to mistype. Writing your own
+    wording is `agentx customize`; `adopt <policy_id> --text` is retired and says so."""
     if not args:
         _adopt_usage_exit()
 
@@ -8007,8 +8312,11 @@ def execute_adopt(args):
     if seq is not None:
         # ---- GLOBAL SEQUENCE MODE:  agentx adopt <#> [--edit] ----
         if text is not None:
-            print("\n❌ --text authors fresh wording for a policy — pass a <policy_id>, not a #N.")
-            _adopt_usage_exit()
+            print("\n❌ To write your own coaching, use `agentx customize \"<policy name or id>\" "
+                  "--text \"...\"`.")
+            print("   `agentx adopt <#>` promotes a candidate as it stands; add --edit to tweak it.")
+            print("=" * 75)
+            sys.exit(1)
         if len(positionals) > 1:
             print(f"\n❌ Unexpected extra argument '{positionals[1]}' after the candidate number.")
             _adopt_usage_exit()
@@ -8060,7 +8368,7 @@ def execute_adopt(args):
         # a hand-adopt (which WINS over any auto-coach entry) but still confirmed before it lands.
         source = "mcp_harvest" if match.get("resolution_type") == "mcp_recovery" else "harvest"
     else:
-        # ---- POLICY-ID MODE:  adopt <pid> [<index>] [--text ...] ----
+        # ---- POLICY-ID MODE:  adopt <pid> <index> ----
         pid = positionals[0]
         _refuse_name_on_coaching(name, pid, only_when=only_when)
         known_ids = set(harvest) | set(active)   # resolve against harvested AND already-overridden ids
@@ -8087,8 +8395,10 @@ def execute_adopt(args):
         if index is not None:
             candidates = (bucket or {}).get("candidates") or []
             if not candidates:
-                print(f"\n❌ No harvested candidates for policy '{pid}'. Use --text to author "
-                      f"one, or `agentx adopt <#>` from `agentx insights`.")
+                print(f"\n❌ No harvested candidates for policy '{pid}'.")
+                print("   Write your own with:  " + _customize_command(
+                    pid, "--text \"...\"", known_ids))
+                print("   or pick one with `agentx adopt <#>` from `agentx insights`.")
                 print("=" * 75)
                 sys.exit(1)
             if index < 1 or index > len(candidates):
@@ -8099,13 +8409,15 @@ def execute_adopt(args):
             seed = chosen["suggestion"]
             resolution_type = chosen.get("resolution_type")
             source = "harvest"
-        elif text is not None:
-            seed = text
-            if pid not in (set(harvest) | set(active)):
-                print(f"   ⚠️  '{pid}' isn't a policy AgentX has seen recover, nor one you've already")
-                print(f"      overridden — storing the override under it verbatim. It is delivered ONLY")
-                print(f"      if this is the EXACT policy_id; a partial or typo'd id silently won't match.")
-        elif not do_edit:
+        elif text is not None or do_edit:
+            # Writing your own coaching is `agentx customize`, which takes a name or this ID.
+            # Two spellings of one write was the duplicate; this one is the retired spelling.
+            flag = "--text \"...\"" if text is not None else "--edit"
+            print("\n❌ Write your own coaching with `agentx customize`:")
+            print("   " + _customize_command(pid, flag, known_ids))
+            print("=" * 75)
+            sys.exit(1)
+        else:
             _adopt_usage_exit()
 
     # --- shared edit / validate / adopt tail ---
@@ -8644,6 +8956,9 @@ def _field(label):
 
 def _print_review_item(n, total, it):
     label = it.get("policy_violated") or it.get("policy_id") or "policy"
+    if it["kind"] == "allowlist":
+        _print_allowlist_item(n, total, it)
+        return
     if it["kind"] == "rule":
         # 🔴 THE ARMING DISCLOSURE LIVES ON THE ITEM, NOT BEHIND THE PROMPT. `agentx adopt <#>`
         # says "About to ENFORCE a new detection rule" and then asks. Here the question is one
@@ -8692,15 +9007,24 @@ def _print_review_item(n, total, it):
     _row_label = "unsized write" if it.get("status") == _UNSIZED else label
     print(f"\n[{n}/{total}] {header} · {_row_label}")
     if it.get("store") == "ledger":
-        # A block from the call ledger: no receipt, and the status is said in the
+        # A block from the call ledger, and the status is said in the
         # words `agentx audit` uses for the same row, because "WOULD_BLOCK" read cold names
         # a call we let RUN. `stopped` is the enforced block; `ran, flagged` is the audit
         # one, and the second line says which posture wrote it so the reader knows whether
         # their agent was protected on this call.
         _status = _CALL_STATUS_LABELS.get(it.get("status"), it.get("status"))
         print(f"   {_status} {_relative_age(it.get('created_at'))}, tool `{it.get('tool_name')}`"
-              f"  (recorded locally, no receipt)"
+              f"  (recorded locally)"
               + (f"   (showing the most recent of {count})" if it["kind"] == "verdict_group" else ""))
+        if it.get("group_sites"):
+            # Accounts for every block, so "all 3" never lists two and leaves the reader to
+            # find the third.
+            parts = ["%s (%s)" % (h, _plural(c, "block"))
+                     for h, c in sorted(it["group_sites"].items(),
+                                        key=lambda hc: (-hc[1], hc[0]))]
+            if it.get("group_siteless"):
+                parts.append("%d with no site recorded" % it["group_siteless"])
+            print(_wrap(", ".join(parts), _field("sites, all %d:" % count)))
         if it.get("status") == "WOULD_BLOCK":
             print("   ran while watching: AgentX objected and did not stop it")
         elif it.get("status") == _UNSIZED:
@@ -8738,6 +9062,10 @@ def _print_review_item(n, total, it):
             # it is; the reason is recorded here so the next reader does not re-derive the wrong
             # half of it.
             _shape.append(_label_word(it["reversibility"]))
+        if it.get("dest_hosts"):
+            # Where the call was headed, host only: often the whole answer to "would this
+            # block have been right?" (a metadata address settles it at a glance).
+            _shape.append("site %s" % it["dest_hosts"].replace(",", ", "))
         if _shape:
             # The ledger keeps the SHAPE of a call and never its values, so this is the
             # whole picture the free door has: names and classes, not the statement.
@@ -8882,6 +9210,139 @@ def _rule_review_items():
     return [{"kind": "rule", "rule": r, "seq": r.get("seq"),
              "policy_id": None, "policy_violated": r.get("policy_violated")}
             for r in rule_list]
+
+
+def _gateway_destinations():
+    """{agent_id: {host: calls}} the configured gateway recorded for this key's allowed calls
+    (`GET /v1/destinations`), or {} with no key, no gateway, or any failure. Never raises.
+
+    The answer arrives over the network, so every host is read again with `db.clean_host` and
+    one that does not read back as itself is dropped: a gateway can only narrow what is offered."""
+    env = load_env_file()
+    api_key = resolve_api_key(env) or ""
+    if not api_key:
+        return {}
+    from .db import clean_host
+    gateway_url = resolve_env("AGENTX_GATEWAY_URL", "http://localhost:8000", overlay=env)
+    try:
+        if not _gateway_reachable(gateway_url=gateway_url):
+            return {}
+        res = requests.get(f"{gateway_url}/v1/destinations",
+                           headers={"Authorization": f"Bearer {api_key}"}, timeout=2.0)
+        agents = res.json().get("agents") if res.status_code == 200 else None
+    except Exception:
+        agents = None
+    if not isinstance(agents, dict):
+        # Said, because a keyed reader would otherwise read the list below as everything.
+        print("\n⚠️  Your gateway's list of sites could not be read; showing this machine's only.")
+        return {}
+    out = {}
+    for agent, hosts in agents.items():
+        if not isinstance(hosts, dict):
+            continue
+        for host, calls in hosts.items():
+            if (isinstance(host, str) and clean_host(host) == host
+                    and isinstance(calls, int) and not isinstance(calls, bool) and calls > 0):
+                out.setdefault(str(agent), {})[host] = calls
+    return out
+
+
+def _allowlist_review_items():
+    """Sites each agent reached that its outbound allowlist does not cover yet, one item per
+    agent. For an agent with no allowlist, adopting the item STARTS limiting it to
+    those sites; for one that has a list, it adds them.
+
+    Read from `db.get_proposable_destinations`, so a host a floor objected to is never offered,
+    and never from our own demo agent. Most-called first, so a one-off host (the shape an injected
+    call leaves) sits at the bottom of the list where `[p]ick` can leave it out.
+
+    Withheld on the MCP door until the host names the project, the same gate as the rules arm
+    above and for the same reason: the file's path would otherwise follow the proxy's cwd."""
+    if not _mcp_door_knows_its_project():
+        return []
+    from .db import get_proposable_destinations, is_demo_agent
+    from .decorators import _ID_OUTBOUND_ALLOWLIST
+    try:
+        current = read_allowlist()
+    except Exception as err:
+        # Said here because nothing else on this screen would: a damaged file proposes
+        # nothing, and an empty section would read as "nothing new to allow".
+        print("\n🚫 %s cannot be read, so no sites are proposed until it is fixed:"
+              % _fit_tail(_allowlist_file_path(), 40))
+        print(_wrap(str(err), "   "))
+        return []
+    # Sites the gateway saw join this machine's. A call made through this SDK to the gateway is
+    # recorded on BOTH, so a host's count is the larger of the two, never their sum.
+    reached = get_proposable_destinations(_ID_OUTBOUND_ALLOWLIST)
+    for agent, hosts in _gateway_destinations().items():
+        mine = reached.setdefault(agent, {})
+        for host, calls in hosts.items():
+            mine[host] = max(mine.get(host, 0), calls)
+    items = []
+    for agent, hosts in sorted(reached.items()):
+        if not agent or is_demo_agent(agent):
+            continue
+        entries = current.get(agent)
+        new = sorted(((h, n) for h, n in hosts.items()
+                      if not host_is_listed(h, entries or [])),
+                     key=lambda hn: (-hn[1], hn[0]))
+        if new:
+            items.append({"kind": "allowlist", "agent_id": agent, "hosts": new,
+                          "limited": entries is not None,
+                          "policy_id": None, "policy_violated": None})
+    return items
+
+
+def _print_allowlist_item(n, total, it):
+    head = "MORE SITES" if it["limited"] else "OUTBOUND ALLOWLIST"
+    print(f"\n[{n}/{total}] {head} · agent `{it['agent_id']}`")
+    print(_wrap(", ".join("%s (%s)" % (h, _plural(c, "call")) for h, c in it["hosts"]),
+                _field("reached:")))
+    # What the key does, BEFORE the key, the same rule as the rule item's arming clause.
+    if it["limited"]:
+        clause = "these join the sites this agent may reach."
+    else:
+        # 🔴 SCOPED TO WHAT IS READ. The check reads web addresses written out in full
+        # (https://...) in the arguments that carry one; a bare host after `curl` in a shell
+        # command is not read, so "a call anywhere else is stopped" over-promised.
+        clause = ("web addresses written out in full (https://...) may then point only at "
+                  "the sites you allow. Anywhere else is stopped while blocking is on, and "
+                  "recorded while watching.")
+    print(_wrap(clause, _field("if allowed:")))
+
+
+def _walk_allowlist_item(it):
+    """One allowlist item's prompt. Returns how many sites were allowed. Raises _ReviewQuit."""
+    raw = input("   allow these sites? [y]es, all / [p]ick one by one / [n]o / [q]uit: ")
+    ans = raw.strip().lower()
+    if ans in _QUIT:
+        raise _ReviewQuit()
+    if ans in ("y", "yes"):
+        chosen = [h for h, _ in it["hosts"]]
+    elif ans in ("p", "pick"):
+        chosen = []
+        for h, _ in it["hosts"]:
+            sub = input(f"     allow {h}? [y]es / [n]o / [q]uit: ").strip().lower()
+            if sub in _QUIT:
+                raise _ReviewQuit()
+            if sub in ("y", "yes"):
+                chosen.append(h)
+    elif ans in ("n", "no"):
+        print("   – skipped")
+        return 0
+    else:
+        _skipped(ans, ["y", "p", "n", "q"])
+        return 0
+    if not chosen:
+        print("   – nothing allowed")
+        return 0
+    try:
+        adopt_allowlist(it["agent_id"], chosen)
+    except ValueError as err:
+        print("   🚫 not allowed: %s" % err)
+        return 0
+    print("   ✓ allowed %s" % _plural(len(chosen), "site"))
+    return len(chosen)
 
 
 def _print_review_stats():
@@ -9032,6 +9493,17 @@ def _group_verdict_items(items):
                   "reversibility", "posture"):
             if rep.get(k) is not None:
                 it[k] = rep[k]
+        # Every member's site, not only the representative's: the most recent block may have
+        # gone somewhere unreadable while the others named a site.
+        sites, siteless = {}, 0
+        for m in it["items"]:
+            hs = [h for h in (m.get("dest_hosts") or "").split(",") if h]
+            siteless += not hs
+            for h in hs:
+                sites[h] = sites.get(h, 0) + 1
+        if sites:
+            it["group_sites"] = sites
+            it["group_siteless"] = siteless
         out.append(it)
     return out
 
@@ -9678,6 +10150,68 @@ def _undo_adopted_rules():
     return removed
 
 
+def _undo_allowlists():
+    """`agentx review --undo`, the allowlist half: stop limiting an agent.
+
+    Same contract as `_undo_adopted_rules`: the same door guard, nothing removed without a typed
+    `y`, a count returned on every exit, and `q` carrying its count out. Removes the agent's WHOLE
+    entry, which is what "stop limiting this agent" means; trimming one site is an edit to
+    `.agentx/allowlist.json`, a committed file."""
+    if not _mcp_door_knows_its_project():
+        return 0
+    try:
+        agents = read_allowlist()
+    except Exception as err:
+        print("\n🌐 OUTBOUND ALLOWLISTS")
+        print("=" * 75)
+        print("   %s cannot be read, so nothing can be removed from it here:"
+              % _fit_tail(_allowlist_file_path(), 40))
+        print(_wrap(str(err), "   "))
+        print("=" * 75)
+        return 0
+    if not agents:
+        return 0
+    print("\n🌐 OUTBOUND ALLOWLISTS")
+    print("=" * 75)
+    if not sys.stdin.isatty():
+        print("\n📋 %s, listed only. Run this in a terminal to remove any:"
+              % _plural(len(agents), "agent limited", "agents limited"))
+        for agent, hosts in sorted(agents.items()):
+            print(_wrap(", ".join(hosts), "   %s: " % agent))
+        print("=" * 75)
+        return 0
+    print("\n📋 %s. Nothing is removed unless you type y; Enter keeps."
+          % _plural(len(agents), "agent limited", "agents limited"))
+    removed = 0
+    for agent, hosts in sorted(agents.items()):
+        print(_wrap(", ".join(hosts), "   %s may reach: " % agent))
+        try:
+            raw = input("   stop limiting this agent? [y]es / [n]o / [q]uit: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\n   (stopped)")
+            raise _ReviewQuit(undone=removed)
+        ans = raw.strip().lower()
+        if ans in _QUIT:
+            raise _ReviewQuit(undone=removed)
+        if ans in ("y", "yes"):
+            try:
+                gone = remove_allowlist(agent)
+            except Exception as err:
+                print("   🚫 not removed: %s" % err)
+                continue
+            if gone:
+                removed += 1
+                print("   ✓ removed: this agent is no longer limited")
+            else:
+                print("   – nothing removed; that agent is no longer listed")
+        else:
+            print("   – kept")
+    print("\n✓ %s." % (("%s no longer limited" % _plural(removed, "agent")) if removed
+                       else "Nothing changed"))
+    print("=" * 75)
+    return removed
+
+
 def execute_review(args=None):
     """`agentx review` — the batched, one-key review of the label channel, covering BOTH the
     incidents.db loop and the keyless-MCP wedge. Reconciles safe-paths, gathers pending items
@@ -9736,6 +10270,7 @@ def execute_review(args=None):
         try:
             _undone_before_the_walk += _undo_standing_verdicts() or 0
             _undone_before_the_walk += _undo_adopted_rules() or 0
+            _undone_before_the_walk += _undo_allowlists() or 0
         except _ReviewQuit as _quit:
             # 🔴 THE COUNT SURVIVES THE QUIT. The exception is raised from inside the pass, so
             # its return value never arrives; without carrying the number here, undoing two
@@ -9831,7 +10366,8 @@ def execute_review(args=None):
         # 🔴 THREE SOURCES NOW, AND THE THIRD IS THE ONE THE DASHBOARD WAS ALREADY SHOWING.
         # Blocks awaiting a verdict, MCP safe-paths, and the detection rules `insights` prints.
         # The rules were missing here for as long as they could only come from a judge.
-        items = verdict_items + _mcp_review_items() + _rule_review_items()
+        items = (verdict_items + _mcp_review_items() + _rule_review_items()
+                 + _allowlist_review_items())
         if _page_of_more and "--recover" not in args:
             # Only when the VERDICT read was truncated, and never under --recover, where
             # blocks are not what is being listed.
@@ -9875,7 +10411,7 @@ def execute_review(args=None):
                 print(_ln)
         else:
             print("\n✅ Nothing to review: nothing awaiting a verdict, no new safe-paths to")
-            print("   adopt, and no rules to add.")
+            print("   adopt, no rules to add, and no new sites to allow.")
         if not census["exists"]:
             # The path on a line of its own, fitted by its tail: with a temp-dir path this
             # parenthetical was one ~130-column line, wrapped by the terminal mid-word on the
@@ -9951,7 +10487,7 @@ def execute_review(args=None):
     # describe a population this screen is not showing.
     if undo_mode:
         print("   These are single blocks you judged one at a time.")
-    adopted = labeled = deleted = rules_added = 0
+    adopted = labeled = deleted = rules_added = sites_allowed = 0
     # 🔴 THE THIRD PASS NEEDED THE SAME FLAG AS THE OTHER TWO. Both undo passes gained one so
     # that quitting reads "Stopped" rather than "Nothing changed", which is the wording
     # reserved for a reader who saw everything and kept it. This walk kept falling through to
@@ -9960,6 +10496,11 @@ def execute_review(args=None):
     for n, it in enumerate(items, 1):
         _print_review_item(n, len(items), it)
         try:
+            if it["kind"] == "allowlist":
+                # No default, Enter skips: the same rule as the rule item below, for the same
+                # reason. Allowing a site changes what gets stopped from the next call.
+                sites_allowed += _walk_allowlist_item(it)
+                continue
             if it["kind"] == "rule":
                 # Straight to `adopt_rule`, not through `_adopt_rule_candidate`: that helper
                 # prints its own "About to ENFORCE" disclosure and runs its own confirm, which
@@ -10160,6 +10701,8 @@ def execute_review(args=None):
         # No clause: the item said what a rule does before the key (and a keyless run's
         # footer under this tally says it needs a gateway to fire). Said once, not three times.
         _done.append(f"    {rules_added} {rule_word} added")
+    if sites_allowed:
+        _done.append(f"    {_plural(sites_allowed, 'site')} allowed, in .agentx/allowlist.json")
     if labeled:
         _done.append(f"    {labeled} block(s) settled: they stop coming back here")
     if deleted:
@@ -10197,7 +10740,7 @@ def execute_review(args=None):
     # rest of the product offers: cover another tool, or run a gateway so the rules they just
     # armed can actually fire. Only shown when they DID something, so a walk that skipped
     # everything is not nagged.
-    if adopted or rules_added or labeled:
+    if adopted or rules_added or labeled or sites_allowed:
         print("")
         if rules_added and _is_keyless_context():
             print("  Those rules need a gateway to fire. You are keyless right now:")
@@ -10646,15 +11189,103 @@ def _customize_usage_exit():
     print("   agentx customize \"<policy name>\" --text \"<coaching>\"   set the coaching inline")
     print("   agentx customize \"<policy name>\" --edit               open $EDITOR seeded with the current coaching")
     print("   ...add --safe-path \"<path>\"  to set the concrete safe path distinctly from the coaching")
+    print("   Names work for the built-in policies. For any other policy (one pulled from")
+    print("   your dashboard or reported by your gateway), pass its ID instead.")
     print("   See the names you can customize:  agentx policies")
     print("=" * 75)
     sys.exit(1)
 
 
+def _customize_command(pid, flag, known_ids=()):
+    """The `agentx customize` command to hand someone for `pid`: with `pid` itself only when
+    `customize` would accept it (a built-in, an ID `adopt` already knows, or a UUID-shaped one),
+    else the general form, so a retired command never points at one that fails."""
+    from .decorators import builtin_policy_catalog
+    accepted = (pid in set(known_ids) or bool(_POLICY_ID_SHAPE.match(pid or ""))
+                or any(p["id"] == pid for p in builtin_policy_catalog()))
+    return "agentx customize %s %s" % (pid if accepted else '"<policy name or id>"', flag)
+
+
+_ID_PREFIX_MIN = 8
+_POLICY_ID_SHAPE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _customize_target_by_id(ref):
+    """The policy `agentx customize` writes for a ref that is not a built-in NAME: a policy ID,
+    for any policy. Returns the same shape `resolve_policy_by_name` gives (`id`, `name`,
+    `challenge`, `safe_path`; the last three None when we hold nothing for it), or None.
+
+    Known IDs (the built-ins, your overrides, and the policies in your incident store and call
+    ledger) match ignoring case, exactly or by a unique prefix of at least `_ID_PREFIX_MIN`
+    characters (so `customize 2`, typed by someone thinking of `adopt <#>`, never lands on
+    `22222222-...`). A match returns the KEY AS STORED, so coaching lands where blocks look.
+
+    An unknown ref is stored as typed, with a warning, ONLY when it is UUID-shaped, the shape of
+    the built-in IDs and of policies created through the gateway or dashboard (`uuid4`): a pulled
+    policy may not have blocked here yet. Anything else (`SSRF`, `Secrets`, a name with a typo)
+    returns None and the caller lists the names, because storing it would save coaching that
+    never matches a block and still exit 0.
+
+    A `rule-` ID is refused with its own sentence and exit 1: an adopted rule's coaching is its own
+    `socratic_prompt` in the rules file, and on the free door a rule records and never blocks, so
+    an override written here would promise a delivery that does not happen."""
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    if ref.lower().startswith("rule-"):
+        print("\n❌ This is a detection rule you adopted, not a policy:")
+        print(f"   {ref}")
+        print("   Its coaching is part of the rule, in .agentx/rules.json, and is set")
+        print("   when you adopt it: agentx adopt --rule ... --challenge \"...\"")
+        print("=" * 75)
+        sys.exit(1)
+    from .decorators import builtin_policy_catalog
+    from .db import list_ledger_policies
+    builtins = {p["id"]: p for p in builtin_policy_catalog()}
+    names = {pid: p["name"] for pid, p in builtins.items()}
+    for pid, entry in load_overrides(warn=True).get("overrides", {}).items():
+        names.setdefault(pid, (entry or {}).get("policy_violated"))
+    try:
+        for r in list_recent_incidents(limit=100000):
+            if r.get("policy_id"):
+                names.setdefault(r["policy_id"], r.get("policy_violated"))
+        for pid, pname in list_ledger_policies():
+            if pid:
+                names.setdefault(pid, pname)
+    except Exception:
+        pass
+    low = ref.lower()
+    exact = [pid for pid in names if pid.lower() == low]
+    if exact:
+        ref = exact[0]
+    elif len(ref) >= _ID_PREFIX_MIN:
+        prefixed = [pid for pid in names if pid.lower().startswith(low)]
+        if len(prefixed) > 1:
+            print(f"\n❌ '{ref}' matches {len(prefixed)} policies. Type more of the ID.")
+            print("=" * 75)
+            sys.exit(1)
+        if len(prefixed) == 1:
+            ref = prefixed[0]
+    if ref in builtins:
+        return builtins[ref]
+    if ref in names:
+        return {"id": ref, "name": names[ref], "challenge": None, "safe_path": None}
+    if not _POLICY_ID_SHAPE.match(ref):
+        return None
+    print("   ⚠️  AgentX has not seen this policy ID here:")
+    print(f"      {ref}")
+    print("      The coaching is stored under it as typed. It reaches your agent ONLY")
+    print("      if this is the EXACT ID, so a typo'd ID silently won't match.")
+    print("      Names you can type instead: `agentx policies`.")
+    return {"id": ref, "name": None, "challenge": None, "safe_path": None, "unseen": True}
+
+
 def execute_customize(args):
-    """`agentx customize "<policy name>" [--text "..." | --edit] [--safe-path "..."]`
-    — override a built-in floor policy's COACHING by human-readable name (no UUID),
-    keyless. The smooth keyless path: it stores to ./.agentx/overrides.json keyed by
+    """`agentx customize "<policy name or id>" [--text "..." | --edit] [--safe-path "..."]`
+    — override a policy's COACHING by human-readable name (no UUID) for a built-in, or by
+    policy ID for any policy (`_customize_target_by_id`), keyless. The one command that
+    writes coaching by hand. It stores to ./.agentx/overrides.json keyed by
     the policy's stable id, so `get_active_override` applies it on BOTH the SDK
     decorator and the agentx-mcp block paths, no gateway.
 
@@ -10697,24 +11328,32 @@ def execute_customize(args):
         _customize_usage_exit()
 
     entry_meta, n = resolve_policy_by_name(name)
+    if entry_meta is None and n == 0:
+        # Not a built-in name: try it as a policy ID, for any policy (a pulled, custom or
+        # gateway-reported one has no built-in name to type).
+        entry_meta = _customize_target_by_id(name)
     if entry_meta is None:
         if n > 1:
             print(f"\n❌ '{name}' is ambiguous ({n} policies match).")
         else:
             print(f"\n❌ No customizable policy named '{name}'.")
-        print("   Names you can customize (from `agentx policies`):")
+        print("   Names you can customize (from `agentx policies`), or pass a policy ID:")
         for p in list_customizable_policies():
             print(f"     • {p['name']}")
         print("=" * 75)
         sys.exit(1)
 
     pid = entry_meta["id"]
+    label = entry_meta["name"] or pid
     # Current effective coaching = any active override's, else the shipped default.
     # So `--edit` seeds from what the agent gets today, and a `--safe-path`-only edit
     # keeps the current coaching instead of blanking it.
     current = get_active_override(pid, policy_name=entry_meta["name"])
     current_challenge = (current.get("challenge") if current else None) or entry_meta["challenge"]
     current_safe = (current.get("safe_path") if current else None) or entry_meta["safe_path"]
+    if not current_challenge and text is None and not do_edit:
+        print(f"\n❌ '{label}' has no coaching to keep. Pass --text \"...\" or --edit.")
+        _customize_usage_exit()
 
     if do_edit:
         challenge = _edit_text(current_challenge or "")
@@ -10737,7 +11376,25 @@ def execute_customize(args):
     # can store came from `--text` or `--edit` on this command line, so there is no
     # agent-written text here for a confirm to gate -- unlike `adopt <#>`, which promotes
     # what the judge produced. Declining here would break scripted customize for no gain.
-    if not _confirm_adopt(entry_meta["name"], challenge, assume_yes=True):
+    # Show only what this command changes, in the words the agent will meet.
+    # An unseen ID was just printed whole, on its own line; inside the sentence it runs past the
+    # fence. Any other policy is named here, because nothing above named it.
+    subject = "this policy" if entry_meta.get("unseen") else f"'{label}'"
+    preview = []
+    if text is not None or do_edit:
+        preview += [f"When {subject} blocks a call, your agent will be told:",
+                    f"  “{challenge}”"]
+    if safe_path is not None:
+        preview += [("...and pointed to:" if preview else
+                     f"When {subject} blocks a call, your agent will be pointed to:"),
+                    f"  “{safe_path}”"]
+        if text is None and not do_edit:
+            # The current coaching is written into the override with the safe path, so a later
+            # release that rewords a built-in will not reach this policy: say it is SAVED.
+            preview.append("What it is told is saved as it reads today.")
+    if not _confirm_adopt(label, challenge, assume_yes=True,
+                          scripted_note="(no terminal to ask: stored as you typed it)",
+                          preview=preview):
         print("\n🚫 Not customized.")
         print("=" * 75)
         return
@@ -10749,7 +11406,7 @@ def execute_customize(args):
         policy_violated=entry_meta["name"],
         source="customize",
     )
-    print(f"\n✅ Customized coaching for '{entry_meta['name']}'.")
+    print(f"\n✅ Customized coaching for '{label}'.")
     print("   Next block on this policy delivers:")
     print(f"   “{stored['challenge']}”")
     if stored.get("safe_path") and stored["safe_path"] != stored["challenge"]:
@@ -11200,6 +11857,14 @@ def _demo_next_steps():
     return lines
 
 
+def _mark_demo_session():
+    """Tell the pulse this process ran our bundled demo. The demo wraps a tool, gets
+    blocked and recovers, so it moves every counter a real agent moves; this one boolean is
+    what lets the funnel tell the two apart."""
+    from .decorators import _session_stats
+    _session_stats["demo_session"] = True
+
+
 def execute_demo(closing=True):
     """The ENFORCE half of the demo — a ~10-second, zero-config 'aha': watch the in-process
     SHIELD block a catastrophic DROP TABLE with NO gateway and NO API key. This is the
@@ -11309,6 +11974,7 @@ def execute_demo(closing=True):
     # and execute_demo runs in-process in the tests, so the loss propagated to everything after.
     _ov_dir = tempfile.mkdtemp(prefix="agentx-demo-")
     saved_key = os.environ.pop("AGENTX_API_KEY", None)
+    _mark_demo_session()
 
     # ...and point the OVERRIDE STORE somewhere empty, so this shows the SHIPPED keyless floor
     # rather than the running dev's customizations.
@@ -11523,6 +12189,7 @@ def execute_audit_demo(closing=True):
     # have been invisible until the first line of it did.
     _ov_dir = tempfile.mkdtemp(prefix="agentx-audit-demo-")
     saved_key = os.environ.pop("AGENTX_API_KEY", None)
+    _mark_demo_session()
     saved_overrides = os.environ.get("AGENTX_OVERRIDES")
     os.environ["AGENTX_OVERRIDES"] = os.path.join(_ov_dir, "overrides.json")
     try:
@@ -11580,7 +12247,8 @@ def execute_audit_demo(closing=True):
     # can go red, and the reader has no way to check it. Four surfaces carried this one
     # sentence -- here, both copies of example 12, and the README that ships to PyPI.
     print("    What it wrote down is the SHAPE of each call: the argument names, the")
-    print("    surface it touched, the size of any amount passed. Never the values.")
+    print("    surface it touched, the size of any amount passed, and the site any web")
+    print("    address pointed at (the host alone). Never the values.")
     print("")
     # 🔴 THE COMBINED RUN STOPS HERE, AND EVERYTHING BELOW IS WHY. What follows is this
     # command's CLOSING SCREEN: read it back, wrap your own tool, set enforce. The enforce
@@ -11761,13 +12429,13 @@ def _print_cli_usage(advanced=False):
         # ships no `--adopt`. The change costs two surfaces, and the docs row is the only
         # marketing-surface edit.
         print("    insights      Review your %s" % INSIGHTS_SUBJECT)
-        print("    adopt         Adopt a learned safe-path: 'adopt <#>' (--edit to tweak) or 'adopt <policy_id> --text ...'")
+        print("    adopt         Adopt a learned safe-path: 'adopt <#>' (--edit to tweak)")
         print("    verdict       Record a verdict: 'verdict <receipt> --wrong | --accept-risk | --correct',")
         print("                  or a policy's standing rule: 'verdict --policy \"<name>\" <verdict>'.")
         print("                  '--clear' takes either one back")
         print("    mcp-insights  Review + adopt safe-paths from the keyless MCP wedge (sibling of insights)")
         print("    policies      List the customizable floor policies + your active coaching ('--check' to validate)")
-        print("    customize     Customize a floor policy's coaching by name: 'customize \"<name>\" --text ...' (or --edit)")
+        print("    customize     Write a policy's coaching, by name or ID: 'customize \"<name>\" --text ...' (or --edit)")
         print("    import        Load coaching + verdicts a teammate wrote, from .agentx/import.json ('check' or 'apply')")
         print("\n  Team & org sync")
         print("    pull          Pull your org's policy config from the control plane")
@@ -11795,8 +12463,8 @@ def main():
     # point keeps the production meaning — "one CLI action" — without making a test's answer
     # depend on which test ran before it.
     _KEYLESS_CONTEXT_CACHE.clear()
-    # Buffering symmetry: logging.warning() (the audit-mode banner, the degraded/fail-open
-    # banners, ...) flushes to stderr per record, but stdout is block-buffered whenever this
+    # Buffering symmetry: the safety banners (the audit-mode banner, the degraded/fail-open
+    # banners, ...) go straight to stderr, which flushes per line, but stdout is block-buffered whenever this
     # process isn't attached to a live terminal -- piped, redirected to a file, `tee`'d, or
     # captured by CI/a log aggregator. So a warning that logically fires mid-command can print
     # BEFORE anything this command already printed, in exactly the headless/logged contexts
@@ -11878,7 +12546,7 @@ def main():
         has_cp = bool(os.environ.get("CONTROL_PLANE_URL") or env.get("CONTROL_PLANE_URL"))
         mode = "cloud" if legacy_sync else ("linked" if has_cp else "local")
 
-    api_key = os.environ.get("AGENTX_API_KEY") or env.get("AGENTX_API_KEY")
+    api_key = resolve_api_key(env)
     # Shared with the SDK runtime and with `_gateway_reachable` above; see resolve_env.
     # Only this one line is ported: the neighbours resolve different variables and are
     # left exactly as they are rather than swept up in a change about one of them.
@@ -11935,6 +12603,8 @@ def main():
         execute_verdict(args[1:])
     elif command == "review":
         execute_review(args[1:])
+    elif command == "feedback":
+        execute_feedback(args[1:])
     elif command in ("import", "rules"):
         # `rules` is the retired spelling, kept dispatching and out of the help listing. It
         # collided with the DETECTION RULES `agentx adopt` arms; nobody's script has to care.

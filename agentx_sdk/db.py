@@ -48,6 +48,63 @@ from datetime import datetime, timezone
 # different path should assign `db.DB_PATH` the way the root conftest already does.
 DB_PATH = os.environ.get("AGENTX_LEDGER_PATH") or ".agentx.db"
 
+try:
+    from . import chain as _chain   # noqa: E402  (stdlib-only module, no import cycle)
+except ImportError:
+    # Loaded as a lone file, not as the package: a reader that only wants this module's
+    # constants does that, so it must still load. Nothing journals in that mode.
+    _chain = None
+
+# The tables the change journal covers in this file, by key column. See `chain.py`.
+CHAIN_TABLES = {"event_log": "id"}
+
+
+# Ledgers whose change journal this process has already made sure of (`_ensure_chain_once`).
+_CHAIN_READY = set()
+
+
+def _ensure_chain_once(conn):
+    """Create the change journal on this ledger if it has none, once per ledger per process,
+    from the WRITE path. `init_db` is not called on every door (the decorator only brings an
+    existing ledger up to date), so without this an `@agentx_protect` ledger never got one and
+    `agentx audit --record` said it would start "the next time AgentX writes here", forever."""
+    key = os.path.abspath(DB_PATH)
+    if key in _CHAIN_READY:
+        return
+    try:
+        _chain.ensure(conn, CHAIN_TABLES)
+        _CHAIN_READY.add(key)
+    except Exception:
+        pass
+
+
+def _guard(conn, ids):
+    """Before AgentX updates these ledger rows: record any that were changed outside the journal,
+    so the update cannot absorb the evidence (`chain.guard`). Swallowed like `_journal`."""
+    try:
+        _chain.guard(conn, "event_log", "id", ids)
+    except sqlite3.OperationalError:
+        raise     # locked: skipping the check would let this write absorb a hand edit
+    except Exception:
+        pass
+
+
+def _chain_delete(conn, where, params=()):
+    """DELETE FROM event_log WHERE `where`, each deleted row recorded in the change journal in the
+    same transaction (retention's deletes are the record's own, never tampering). Returns the
+    count deleted."""
+    return _chain.delete(conn, "event_log", "id", where, params)
+
+
+def _journal(conn, ids, op=None):
+    """Record writes to `event_log` in the change journal, inside the caller's transaction.
+    Swallowed on failure: losing the user's ledger row to its own bookkeeping would be worse
+    than the row reading as unrecorded, which is what `agentx audit` then says about it."""
+    try:
+        _chain.record(conn, "event_log", "id", ids, op or _chain.PUT)
+    except Exception:
+        pass
+
 # Concurrency: agents sharing one process each open their own short-lived
 # connection (no shared cursor), but concurrent WRITERS still serialize at the
 # SQLite file lock. Without a busy timeout the second writer raises
@@ -645,6 +702,18 @@ _EVENT_LOG_COLUMNS = [
     ("label_verdict",        "TEXT"),
     ("label_verdict_source", "TEXT"),
     ("outcome_at",           "TEXT"),
+    # --- WHERE THE CALL WAS ADDRESSED: THE HOST ONLY --------------------------------------
+    #
+    # 🔴 THE ONE COLUMN HERE DERIVED FROM AN ARGUMENT VALUE, BY A DELIBERATE DECISION: the
+    # HOST of each scheme://URL in an argument the call declared
+    # to carry one (`url`, `endpoint`, `command`, ... see `statement._STATEMENT_ARG_NAMES`), and
+    # nothing else. Never the scheme, the path, the query, the fragment or a `user:password@`,
+    # which carry tokens and data. `destination_hosts` is the only writer's reader.
+    #
+    # Comma-joined, sorted, distinct, at most `_MAX_DEST_HOSTS`. NULL when the call declared no
+    # URL. It exists so `agentx audit` can say which sites an agent reaches and `agentx review`
+    # can propose an allowlist from them. Appended at the END, same reason as every column above.
+    ("dest_hosts",           "TEXT"),
 ]
 
 # The statuses a ledger row can carry that a person can be asked about: we had an opinion,
@@ -1132,6 +1201,13 @@ def init_db():
             conn.execute(_CREATE_NOVELTY_SQL)
             conn.execute(_CREATE_NOVELTY_SEEN_SQL)
             conn.commit()
+            # The change journal (`chain.py`): created once, adopting the rows already here.
+            # Best-effort: a ledger without one records nothing about itself and `agentx
+            # audit` says so; it never reads as tampered.
+            try:
+                _chain.ensure(conn, CHAIN_TABLES)
+            except sqlite3.Error:
+                pass
     except sqlite3.Error as exc:
         # Never raise (see the docstring). The ledger writers are already best-effort, so
         # the session runs unrecorded rather than the SDK failing to import.
@@ -1195,7 +1271,9 @@ def _ledger_exceeds_ceiling(path=None, cutoff=None, cap=None, margin=None):
 # SERVER's text), capped in length and count but not drawn from any fixed set. That is the
 # ratified design -- "argument names are safe" -- so the point is not to change it but to
 # stop the comment promising a stronger guarantee than the function delivers. The line that
-# holds without qualification is the one below: no argument VALUE is recorded.
+# holds for `_call_shape` without qualification is the one below: no argument VALUE is recorded.
+# The ledger has ONE ratified exception elsewhere, the `dest_hosts` column (the host of a
+# declared URL, never the rest of it); this function does not write it.
 #
 # A raw argument value is neither, which is why none is recorded. This is not fussiness: a
 # tool call's arguments are exactly where PII lives, the pulse posture we advertise is
@@ -1627,6 +1705,123 @@ def _call_shape(tool_name, arguments, description=None):
     return joined, amount, target_class, quantity
 
 
+# --- DESTINATION HOSTS ---------------------------------------------------------------------
+#
+# The host is the one value-derived thing the ledger keeps (see the `dest_hosts` column). It is
+# read from the arguments the call DECLARED to carry a statement, through the same reader the
+# shield uses, so a URL quoted in a ticket note is not a destination. A host is taken only from
+# inside an explicit scheme://URL (`statement.url_hosts`), then cut at the first `?`, `#` or `\`,
+# because the shared pattern lets a query or fragment ride on a host that has no `/` after it,
+# and anything after the host is exactly what must never land here.
+_MAX_DEST_HOSTS = 8
+# A DNS name or an IP literal, nothing else. Anything that does not fit (a percent-encoding, a
+# non-ASCII name) is not recorded: an unreadable host is not written as if it were one.
+# Labels joined by REAL dots. The first form, `(?:label\.?)+`, made the dot optional, so a run of
+# letters could be split into labels in exponentially many ways and backtracked for hours on a
+# 40-character run ending in a stray character, inside the call. Same accepted set, checked over
+# every string up to 8 characters on a hostile alphabet; linear time.
+_HOST_SHAPE_RE = re.compile(
+    r"^[a-z0-9_](?:[a-z0-9_\-]*[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_\-]*[a-z0-9_])?)*\.?$"
+    r"|^[0-9a-f:.]{2,45}$")
+
+
+def clean_host(raw):
+    """One host as the ledger and the allowlist compare it: lowercase, cut at the first `?`,
+    `#` or `\\`, trailing dot removed. None when what is left is not an ASCII DNS name or an IP
+    literal. Pure; never raises.
+
+    ⚠️ A NON-ASCII NAME IS UNREADABLE, NOT ENCODED. Python's `idna` codec is IDNA 2003 and maps
+    `faß.de` to `fass.de`, while the clients that send the request use IDNA 2008 and reach
+    `xn--fa-hia.de`, a different registrable domain: encoding here let a listed `fass.de` allow
+    a call to somewhere else. Where the clients disagree, the answer is the one that refuses.
+    Write such a host in the allowlist, and expect it in calls, in its `xn--` form."""
+    try:
+        h = re.split(r"[?#\\]", str(raw or ""), maxsplit=1)[0].strip().lower().rstrip(".")
+    except Exception:
+        return None
+    if not h.isascii():
+        return None
+    if not h or len(h) > 253 or not _HOST_SHAPE_RE.match(h):
+        return None
+    return h
+
+
+def destination_hosts(tool_name, arguments, declared=None):
+    """The distinct, sorted hosts this call was addressed to, as `clean_host` reads them, at
+    most `_MAX_DEST_HOSTS`. [] when the call declared no URL. Pure; never raises.
+
+    `declared`: the argument names the tool's own schema declared (the MCP door's
+    `_tool_declared`), so this reads exactly the text the shield read for the same call.
+
+    [] ALSO when the arguments could not be read, and the decorator sends that to the gateway as
+    is: both records then hold nothing for the call. Sending nothing instead was tried and
+    reverted, because the gateway's own reading could then offer a site this machine never
+    recorded, and recording errs toward offering less."""
+    if not isinstance(arguments, dict):
+        return []
+    try:
+        from .statement import _statement_text, destination_url_hosts   # local: see the top
+        text = _statement_text(arguments, tool_name=tool_name, declared=declared)
+        hosts = {h for h in (clean_host(r) for r in destination_url_hosts(text)) if h}
+    except Exception:
+        return []
+    return sorted(hosts)[:_MAX_DEST_HOSTS]
+
+
+def _dest_hosts_value(tool_name, arguments, declared=None):
+    """The `dest_hosts` column value for one call: comma-joined, or None."""
+    return ",".join(destination_hosts(tool_name, arguments, declared)) or None
+
+
+# The calls that REACHED their destination: they ran. A CHALLENGED row was stopped before it
+# left, so its host is evidence of a denial and must never be proposed as somewhere the agent
+# is allowed to go.
+DESTINATION_RAN_STATUSES = (INVENTORY_STATUS, WOULD_BLOCK_STATUS, UNSIZED_WRITE_STATUS)
+
+
+def get_destinations(path=None, statuses=None):
+    """{agent_id: {host: calls}} over ledger rows whose `dest_hosts` is set and whose status is
+    in `statuses` (default: the calls that ran, `DESTINATION_RAN_STATUSES`). Never raises.
+
+    {} for no ledger, no rows, or a ledger older than the `dest_hosts` column: a missing
+    column is a missing field, never a missing ledger (the same rule as `get_call_inventory`)."""
+    wanted = tuple(statuses or DESTINATION_RAN_STATUSES)
+    return _destinations_where("status IN (%s)" % ", ".join("?" * len(wanted)), wanted, path)
+
+
+def get_proposable_destinations(allowlist_policy_id, path=None):
+    """{agent_id: {host: calls}} an allowlist may be PROPOSED from: calls that ran with no
+    objection (`ALLOWED`, `UNSIZED`), plus calls whose only objection was the allowlist itself
+    (a `WOULD_BLOCK` row under `allowlist_policy_id`). Never raises.
+
+    🔴 A HOST A FLOOR OBJECTED TO IS NEVER PROPOSED. A metadata-address fetch that ran while
+    watching is a `WOULD_BLOCK` row too; offering `169.254.169.254` as a site to allow would turn
+    the floor's catch into the agent's permission with one keystroke."""
+    return _destinations_where(
+        "(status IN (?, ?) OR (status = ? AND policy_id = ?))",
+        (INVENTORY_STATUS, UNSIZED_WRITE_STATUS, WOULD_BLOCK_STATUS, allowlist_policy_id), path)
+
+
+def _destinations_where(where, params, path=None):
+    out = {}
+    if not os.path.exists(path or DB_PATH):
+        return out
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(
+                "SELECT agent_id, dest_hosts, COUNT(*) FROM event_log "
+                "WHERE dest_hosts IS NOT NULL AND %s "
+                "GROUP BY agent_id, dest_hosts" % where, params).fetchall()
+    except Exception:
+        return out
+    for agent, hosts, calls in rows:
+        per_agent = out.setdefault(agent or "", {})
+        for host in str(hosts or "").split(","):
+            if host:
+                per_agent[host] = per_agent.get(host, 0) + int(calls or 0)
+    return out
+
+
 def _union_arg_names_and_classes(rows):
     """Union argument NAMES (each row's own comma-joined string, re-split) and TARGET
     CLASSES across a set of DISTINCT (arg_names, target_class) rows.
@@ -1774,9 +1969,7 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
                 tuple([cutoff] + _catch_params))
             blocks += cursor.fetchone()[0] or 0
 
-            cursor.execute("DELETE FROM event_log WHERE timestamp IS NOT NULL AND timestamp < ?",
-                           (cutoff,))
-            dropped = cursor.rowcount or 0
+            dropped = _chain_delete(conn, "timestamp IS NOT NULL AND timestamp < ?", (cutoff,))
 
             # SIZE. Keep the newest `cap` rows by id; everything below that id goes.
             #
@@ -1808,10 +2001,8 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
                     "WHERE timestamp IS NOT NULL AND id IN (%s)" % inventory_pick,
                     (INVENTORY_STATUS, excess))
                 oldest_by_size = cursor.fetchone()[0]
-                cursor.execute(
-                    "DELETE FROM event_log WHERE id IN (%s)" % inventory_pick,
-                    (INVENTORY_STATUS, excess))
-                dropped += cursor.rowcount or 0
+                dropped += _chain_delete(conn, "id IN (%s)" % inventory_pick,
+                                         (INVENTORY_STATUS, excess))
 
                 # Re-count rather than subtract: pass 1 can delete FEWER rows than `excess`
                 # when there is not enough inventory to cover it, and assuming otherwise would
@@ -1831,8 +2022,7 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
                     cursor.execute("SELECT COUNT(*) FROM event_log WHERE " + _catch_sql,
                                    tuple(_catch_params))
                     blocks += cursor.fetchone()[0] or 0
-                    cursor.execute("DELETE FROM event_log")
-                    dropped += cursor.rowcount or 0
+                    dropped += _chain_delete(conn, "1 = 1")
                 else:
                     cursor.execute(
                         "SELECT id FROM event_log ORDER BY id DESC LIMIT 1 OFFSET ?", (cap - 1,))
@@ -1849,13 +2039,18 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
                             "SELECT COUNT(*) FROM event_log WHERE id < ? AND " + _catch_sql,
                             tuple([floor_id] + _catch_params))
                         blocks += cursor.fetchone()[0] or 0
-                        cursor.execute("DELETE FROM event_log WHERE id < ?", (floor_id,))
-                        dropped += cursor.rowcount or 0
+                        dropped += _chain_delete(conn, "id < ?", (floor_id,))
 
             # 🔴 COMMIT THE DELETIONS BEFORE ANY BOOKKEEPING. They are the work; the counter
             # only DESCRIBES the work. In the first draft both lived in one transaction, so a
             # failure writing the counter rolled the deletions back with it -- the ledger
             # kept growing because we could not write down that it had shrunk.
+            # The change journal is bounded the same way: past its ceiling, the oldest entries
+            # fold into a snapshot that still catches an edit made before the fold.
+            try:
+                _chain.compact(conn)
+            except Exception:
+                pass
             conn.commit()
             deletions_committed = True
             result["dropped"] = dropped
@@ -3274,8 +3469,10 @@ def get_call_log(path=None, limit=50, offset=0):
             # a REAL, so two calls inside one clock tick come back in whatever order SQLite
             # likes. That makes "newest first" wrong exactly when calls are FASTEST, which
             # is the burst this view exists to make visible.
+            # `dest_hosts` read through the same legacy retry as every newer column: on a
+            # ledger the migration has not reached it is NULL, never a failed read.
             sql = ("SELECT timestamp, tool_name, status, arg_names, amount, target_class, "
-                   "policy_name, trace_id, agent_id, policy_id FROM event_log "
+                   "policy_name, trace_id, agent_id, policy_id, %s FROM event_log "
                    "ORDER BY timestamp DESC, id DESC")
             # 🔴 OFFSET SURVIVES `limit=None`. The clause used to be appended only when a
             # limit was set, so `get_call_log(limit=None, offset=50)` silently returned the
@@ -3284,15 +3481,19 @@ def get_call_log(path=None, limit=50, offset=0):
             # documented "no limit", so the two stay independent as the signature promises.
             sql += " LIMIT ? OFFSET ?"
             params = [-1 if limit is None else int(limit), int(offset)]
-            cursor.execute(sql, params)
+            try:
+                cursor.execute(sql % "dest_hosts", params)
+            except sqlite3.OperationalError:
+                cursor.execute(sql % "NULL", params)
 
             rows = []
             for (ts, tool, status, arg_names, amount, target_class,
-                 policy_name, trace_id, agent_id, policy_id) in cursor.fetchall():
+                 policy_name, trace_id, agent_id, policy_id, dest_hosts) in cursor.fetchall():
                 rows.append({
                     "ts": ts,
                     "tool": tool,
                     "status": status,
+                    "dest_hosts": dest_hosts,
                     "arg_names": arg_names,
                     "amount": amount or 0.0,
                     "target_class": target_class,
@@ -4484,8 +4685,16 @@ def _bump_audit_counters(tool_name, stats, in_audit):
 
 def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats_lock=None,
                 in_audit=False, description=None, matched_rule=None, uncompared_rule=None,
-                row_cap=None, reversibility=None, unsized_write=False):
+                row_cap=None, reversibility=None, unsized_write=False, declared_args=None,
+                dest_arguments=None):
     """P-92: record ONE call that passed, in ANY posture. Best-effort, never raises.
+
+    `declared_args`: the argument names the tool's schema declared (MCP door), so the hosts
+    recorded are read from exactly the text the shield read.
+
+    `dest_arguments`: what the hosts are read from when it differs from `arguments`; the
+    decorator passes its arguments with parameter defaults filled in. None reads
+    `arguments`.
 
     `matched_rule`: the adopted rule this call is the shape of, as
     `rules.match_adopted_rule` returns it, or None. When present the row carries the rule's
@@ -4587,13 +4796,18 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
                   arg_names=names, amount=amount, target_class=target_class,
                   quantity=quantity, posture=("audit" if in_audit else "enforce"),
                   rule_uncompared=uncompared_id, row_cap=row_cap,
-                  reversibility=(reversibility or REVERSIBILITY_UNKNOWN))
+                  reversibility=(reversibility or REVERSIBILITY_UNKNOWN),
+                  dest_hosts=_dest_hosts_value(
+                      tool_name, arguments if dest_arguments is None else dest_arguments,
+                      declared_args))
 
 
 def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status, tokens=None, time_saved=None,
                   arg_names=None, amount=0.0, target_class=None, challenge_issued=None,
                   quantity=0.0, posture=None, rule_uncompared=None, row_cap=None,
-                  reversibility=None):
+                  reversibility=None, dest_hosts=None):
+    # `dest_hosts`: ALREADY reduced to hosts by `_dest_hosts_value`, same contract as the
+    # shape parameters below. Never pass a URL or an argument value here.
     # `rule_uncompared`: the id of an adopted rule whose shape this call had and whose
     # `only_when` threshold could not be compared (see the column's comment). Our own string.
     # 🔴 CONTRACT: `arg_names`/`amount`/`target_class`/`quantity` MUST ALREADY BE REDUCED, via
@@ -4696,57 +4910,39 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
                 try:
                     if _durable:
                         conn.execute("PRAGMA synchronous=FULL")
+                    _ensure_chain_once(conn)
                     cursor = conn.cursor()
                     _shape = (arg_names, amount if amount is not None else 0.0,
                               target_class, challenge_issued,
                               quantity if quantity is not None else 0.0, posture)
-                    try:
-                        cursor.execute(
-                            "INSERT INTO event_log (%s, arg_names, amount, target_class, "
-                            "challenge_issued, quantity, posture, rule_uncompared, row_cap, "
-                            "reversibility) "
-                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                            % _COLUMNS,
-                            _values + _shape + (rule_uncompared, row_cap, reversibility))
-                    except sqlite3.OperationalError:
-                        # One rung down: a ledger carrying `row_cap` but not `reversibility`.
-                        # Each rung keeps everything the column set below it can hold and
-                        # loses only the newest mark -- a ledger that was current yesterday
-                        # must not drop arg_names and posture from every row because one
-                        # column arrived today.
+                    # 🔴 THE RUNG LADDER. Each rung keeps everything the column set below it
+                    # can hold and loses only the NEWEST mark: a ledger that was current
+                    # yesterday must not drop arg_names and posture from every row because
+                    # one column arrived today. Newest first; a new column goes at the top of
+                    # `_marks` and nowhere else. The shape-only rung (no marks) keeps the
+                    # shape on a ledger that predates every mark column; the legacy insert
+                    # below the loop is the last resort, and its error still propagates.
+                    _marks = (("dest_hosts", dest_hosts), ("reversibility", reversibility),
+                              ("row_cap", row_cap), ("rule_uncompared", rule_uncompared))
+                    _shape_cols = ("arg_names", "amount", "target_class", "challenge_issued",
+                                   "quantity", "posture")
+                    for _keep in range(len(_marks), -1, -1):
+                        _kept = _marks[len(_marks) - _keep:]
+                        _cols = _shape_cols + tuple(name for name, _ in _kept)
                         try:
                             cursor.execute(
-                                "INSERT INTO event_log (%s, arg_names, amount, target_class, "
-                                "challenge_issued, quantity, posture, rule_uncompared, row_cap) "
-                                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                                % _COLUMNS,
-                                _values + _shape + (rule_uncompared, row_cap))
+                                "INSERT INTO event_log (%s, %s) VALUES (%s)"
+                                % (_COLUMNS, ", ".join(_cols),
+                                   ", ".join("?" * (len(_values) + len(_cols)))),
+                                _values + _shape + tuple(v for _, v in _kept))
+                            break
                         except sqlite3.OperationalError:
-                            # Two rungs down: `rule_uncompared` but not `row_cap`.
-                            try:
-                                cursor.execute(
-                                    "INSERT INTO event_log (%s, arg_names, amount, "
-                                    "target_class, challenge_issued, quantity, posture, "
-                                    "rule_uncompared) "
-                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                                    % _COLUMNS, _values + _shape + (rule_uncompared,))
-                            except sqlite3.OperationalError:
-                                # The ledger has the shape columns but none of the marks:
-                                # keep the shape. Falling straight to the legacy set here
-                                # would have dropped arg_names and posture from every row
-                                # on a ledger that was current the day before the first
-                                # mark column existed.
-                                try:
-                                    cursor.execute(
-                                        "INSERT INTO event_log (%s, arg_names, amount, "
-                                        "target_class, challenge_issued, quantity, posture) "
-                                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                                        % _COLUMNS, _values + _shape)
-                                except sqlite3.OperationalError:
-                                    cursor.execute(
-                                        "INSERT INTO event_log (%s) "
-                                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                                        % _COLUMNS, _values)
+                            continue
+                    else:
+                        cursor.execute(
+                            "INSERT INTO event_log (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                            % _COLUMNS, _values)
+                    _journal(conn, [cursor.lastrowid])
                     conn.commit()
                 finally:
                     # 🔴 ROLL BACK BEFORE RESTORING, OR THE RESTORE CANNOT RUN AT ALL. SQLite
@@ -4909,15 +5105,16 @@ def log_self_correction(trace_id, agent_id, tool_name):
             # 🛡️ ARCHITECTURAL CORRECTION:
             # Update the status of the row that was blocked on Turn 1 of this specific trace.
             # This prevents orphaned rows and keeps cumulative metrics mathematically accurate.
-            cursor.execute('''
-                UPDATE event_log
-                SET status = 'RECOVERED'
-                WHERE id = (
-                    SELECT id FROM event_log
-                    WHERE trace_id = ? AND tool_name = ? AND status = 'CHALLENGED'
-                    ORDER BY id DESC LIMIT 1
-                )
-            ''', (trace_id, tool_name))
+            # The row is found first so the change journal can name it.
+            _hit = cursor.execute(
+                "SELECT id FROM event_log WHERE trace_id = ? AND tool_name = ? "
+                "AND status = 'CHALLENGED' ORDER BY id DESC LIMIT 1",
+                (trace_id, tool_name)).fetchone()
+            if _hit:
+                _guard(conn, [_hit[0]])
+                cursor.execute("UPDATE event_log SET status = 'RECOVERED' WHERE id = ?",
+                               (_hit[0],))
+                _journal(conn, [_hit[0]])
 
             # Flip exactly ONE row -- the most-recent open CHALLENGED row for this
             # (trace, tool) -- so one recovery EPISODE flips one ledger row. An unbounded
@@ -5550,12 +5747,15 @@ def record_ledger_verdict(row_id, verdict, source, path=None):
         with _connection(p) as conn:
             _ensure_ledger_verdict_columns(conn)
             marks = ",".join("?" for _ in REVIEWABLE_LEDGER_STATUSES)
+            _guard(conn, [int(row_id)])
             cur = conn.execute(
                 "UPDATE event_log SET label_verdict = ?, label_verdict_source = ?, "
                 "outcome_at = ? WHERE id = ? AND (status IN (%s) OR "
                 "(label_verdict IS NOT NULL AND label_verdict != ''))" % marks,
                 [verdict, source, datetime.now(timezone.utc).isoformat(),
                  int(row_id)] + list(REVIEWABLE_LEDGER_STATUSES))
+            if cur.rowcount > 0:
+                _journal(conn, [int(row_id)])
             conn.commit()
             return cur.rowcount > 0
     except Exception:
@@ -5659,11 +5859,15 @@ def clear_ledger_verdicts(row_ids, path=None):
             _has_status, has_labels = _ledger_verdict_columns_present(conn)
             if not has_labels:
                 return 0
+            _guard(conn, ids)
             cur = conn.executemany(
                 "UPDATE event_log SET label_verdict = NULL, label_verdict_source = NULL, "
                 "outcome_at = ? WHERE id = ? AND label_verdict IS NOT NULL",
                 [(datetime.now(timezone.utc).isoformat(), i) for i in ids])
+            n = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+            if n:
+                _journal(conn, ids)    # an unchanged row records its same digest again
             conn.commit()
-            return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+            return n
     except Exception:
         return 0

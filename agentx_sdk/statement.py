@@ -46,6 +46,7 @@ describing itself is a defect this project has already had once.
 """
 import json
 import re
+from urllib.parse import unquote
 
 
 def _name_tokens(raw):
@@ -209,3 +210,108 @@ def _statement_text(arguments, tool_name=None, head=None, declared=None):
                 if isinstance(v, str):
                     _append(v)
     return " ".join(parts)
+
+
+# A host is read only from inside an explicit scheme://URL, never from a bare token, so a
+# number or a word elsewhere in the text cannot become a host. The keyless SSRF floor in
+# `decorators` asks this and re-exports the pattern under the same name; the gateway carries
+# a byte-identical copy, and a consistency test holds the two together.
+_SSRF_URL_RE = re.compile(r"\b[a-z][a-z0-9+.\-]*://([^\s/'\"<>]+)", re.IGNORECASE)
+
+
+# For http, https, ws, wss and ftp, the URL parser browsers and Node `fetch` use skips ANY run of
+# `/` and `\` after the colon: `http:\\h/`, `http:/h/` and `http:///h/` all go to `h`. A run of
+# ONE OR MORE is read as `://` before either host reader looks. Left alone on purpose: no slash at
+# all (`http:8080` in ordinary text would read as an address) and `file:` (`file:///etc/passwd`
+# has no host). Those parsers also delete every tab, CR and LF before reading, so the run may
+# carry them (`https:<TAB>//h` goes to `h`); it still needs one real slash. The gateway carries
+# a byte-identical copy.
+_URL_SLASH_RUN_RE = re.compile(r"(?<![a-z0-9+.\-])(https?|wss?|ftp):[\t\r\n]*[/\\][/\\\t\r\n]*",
+                               re.IGNORECASE)
+
+
+def _url_slashes(text):
+    return _URL_SLASH_RUN_RE.sub(r"\1://", text)
+
+
+# The authority runs to the first whitespace, `/`, `?` or `#`. Group 1 stops earlier, at a
+# quote, an angle bracket or a backslash; group 2 is whatever follows that stop, up to the
+# same end. Group 2 is empty for an ordinary URL and for `"https://a.com"` in a shell command.
+# Group 3 is any text glued on after a tab, CR or LF: clients delete those three characters
+# before parsing, so that text is part of the host they send to.
+_DEST_URL_RE = re.compile(
+    r"\b[a-z][a-z0-9+.\-]*://([^\s/?#'\"<>\\]*)([^\s/?#]*)((?:[\t\r\n]+[^\s/?#]+)*)",
+    re.IGNORECASE)
+
+
+def destination_url_hosts(text):
+    """The host each scheme://URL in `text` is sent to, for a check that ALLOWS on it.
+
+    🔴 THE RULE: WHERE HTTP CLIENTS DISAGREE ABOUT THE HOST, THE HOST IS UNREADABLE. Two
+    rounds of review each found a URL whose host this function read one way and a real client
+    read another (`https://evil.com?x=@api.github.com`, then `https://api.github.com\\@evil.com`
+    and `https://api.github.com'@evil.com`), each an allowlist bypass. Clients themselves
+    disagree on `\\`, quotes and angle brackets (httpx, urllib3 and curl send the backslash form
+    to different hosts), so no single reading is right. An `@` after one of those characters
+    therefore yields "" (unreadable), which the allowlist refuses for any agent it limits.
+    So does text glued on after a tab, CR or LF: clients delete those characters, so
+    `https://api.github.com<TAB>@evil.com` goes to `evil.com` and
+    `https://api.github.com<TAB>evil.com` to `api.github.comevil.com`.
+
+    `?` and `#` end the authority before the `user:password@` part is dropped, so an `@` in a
+    query or fragment is never a userinfo. The ledger reads this too, so a query value never
+    reaches it. The SSRF floor still reads `url_hosts`, deliberately: changing what it decodes
+    would move one door's verdicts without the other's. Returned as written; the caller
+    normalises."""
+    text = _url_slashes(str(text or ""))
+    if "://" not in text:
+        return []
+    hosts = []
+    for m in _DEST_URL_RE.finditer(text):
+        if "@" in m.group(2) or m.group(3):
+            hosts.append("")                  # see the rule above: unreadable, fails closed
+            continue
+        netloc = m.group(1).rsplit("@", 1)[-1]
+        if netloc.startswith("["):            # bracketed IPv6: [::1]:port
+            hosts.append(netloc[1:].split("]")[0])
+        else:
+            hosts.append(netloc.split(":")[0])
+    return hosts
+
+
+def url_hosts(text):
+    """The host of every scheme://URL in `text`, in order and exactly as written.
+
+    The `user:password@` part is dropped, a bracketed IPv6 address is unwrapped, and a port
+    is cut. The result is NOT lowercased or otherwise cleaned, because the SSRF floor decodes
+    it as written.
+
+    Up to two readings per URL, the same two the gateway's `_hosts_in_urls` yields, so the two
+    doors judge the same hosts. Reading 1 keeps a `?` or `#` straight after the host attached
+    (`http://2130706433?x=1` gives `2130706433?x=1`, which decodes to nothing). Reading 2 cuts
+    at `?`, `#` or `\\` before dropping the userinfo, cuts trailing punctuation and
+    percent-decodes, and is added only when it differs, so it can add a block and never remove
+    one. Any caller that STORES a host or ALLOWS on one must use `destination_url_hosts`
+    instead; this is for the SSRF floor only."""
+    text = _url_slashes(str(text or ""))
+    if "://" not in text:
+        return []
+    hosts = []
+    for m in _SSRF_URL_RE.finditer(text):
+        raw = m.group(1)
+        netloc = raw.split("@")[-1]
+        if netloc.startswith("["):            # bracketed IPv6: [::1]:port
+            host = netloc[1:].split("]")[0]
+        else:
+            host = netloc.split(":")[0]
+        hosts.append(host)
+        cut = re.split(r"[?#\\]", raw, maxsplit=1)[0].split("@")[-1]
+        if cut.startswith("["):
+            host2 = cut[1:].split("]")[0]
+        else:
+            host2 = re.split(r"[()\[\]{},;|`]", cut.split(":")[0], maxsplit=1)[0]
+            if "%" in host2:
+                host2 = unquote(host2)
+        if host2 and host2 != host:
+            hosts.append(host2)
+    return hosts

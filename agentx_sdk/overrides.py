@@ -924,6 +924,7 @@ def record_outcome(receipt_id, *, verdict=None, safe_path=None, harm=None, sourc
         conn = sqlite3.connect(p)
         try:
             _ensure_label_columns(conn)
+            _guard_incidents(conn, [receipt_id])
             cur = conn.execute(
                 "UPDATE incidents SET label_verdict = COALESCE(?, label_verdict), "
                 "label_safe_path = COALESCE(?, label_safe_path), "
@@ -932,6 +933,8 @@ def record_outcome(receipt_id, *, verdict=None, safe_path=None, harm=None, sourc
                 "outcome_at = ? WHERE receipt_id = ?",
                 (verdict, safe_path, harm, verdict_source, _now_iso(), receipt_id),
             )
+            if cur.rowcount > 0:
+                _journal_incidents(conn, [receipt_id])
             conn.commit()
             changed = cur.rowcount
         finally:
@@ -983,9 +986,12 @@ def clear_outcome(receipt_id, db_path=None):
                 # that was never set.
                 return False, None
             prior_source = row[1]
+            _guard_incidents(conn, [receipt_id])
             cur = conn.execute(
                 "UPDATE incidents SET label_verdict = NULL, label_verdict_source = NULL, "
                 "outcome_at = ? WHERE receipt_id = ?", (_now_iso(), receipt_id))
+            if cur.rowcount > 0:
+                _journal_incidents(conn, [receipt_id])
             conn.commit()
             changed = cur.rowcount
         finally:
@@ -993,6 +999,28 @@ def clear_outcome(receipt_id, db_path=None):
     except sqlite3.Error:
         return False, None
     return changed > 0, prior_source
+
+
+def _journal_incidents(conn, receipt_ids, op=None):
+    """Record writes to the incident store's `incidents` in its change journal (`chain.py`),
+    inside the caller's transaction. A store with no journal is left alone. Swallowed on failure:
+    a label must not be lost to its own bookkeeping."""
+    from . import chain
+    try:
+        chain.record(conn, "incidents", "receipt_id", list(receipt_ids), op or chain.PUT)
+    except Exception:
+        pass
+
+
+def _guard_incidents(conn, receipt_ids):
+    """Before an update: record any incident changed outside the journal (`chain.guard`)."""
+    from . import chain
+    try:
+        chain.guard(conn, "incidents", "receipt_id", list(receipt_ids))
+    except sqlite3.OperationalError:
+        raise     # locked: skipping the check would let this write absorb a hand edit
+    except Exception:
+        pass
 
 
 def delete_incident(receipt_id, db_path=None):
@@ -1009,7 +1037,11 @@ def delete_incident(receipt_id, db_path=None):
     try:
         conn = sqlite3.connect(p)
         try:
+            _guard_incidents(conn, [receipt_id])
             cur = conn.execute("DELETE FROM incidents WHERE receipt_id = ?", (receipt_id,))
+            if cur.rowcount > 0:
+                from . import chain
+                _journal_incidents(conn, [receipt_id], chain.DELETE)
             conn.commit()
             deleted = cur.rowcount
         finally:
@@ -1496,6 +1528,7 @@ def settle_stale_blocks(older_than_seconds=SETTLE_AFTER_SECONDS, db_path=None, n
         if not stale:
             return 0
         stamp = _now_iso()
+        _guard_incidents(conn, stale)
         # rowcount, NOT len(stale). The UPDATE carries `AND outcome_next IS NULL`, so a row that
         # recovered between the SELECT above and this write is deliberately skipped -- and that
         # race is real enough to have its own test. Reporting candidates SELECTED as though they
@@ -1506,6 +1539,8 @@ def settle_stale_blocks(older_than_seconds=SETTLE_AFTER_SECONDS, db_path=None, n
             "WHERE receipt_id = ? AND outcome_next IS NULL",
             [(stamp, r) for r in stale],
         ).rowcount
+        if settled:
+            _journal_incidents(conn, stale)   # an unmoved row records its same digest
         conn.commit()
     except sqlite3.Error:
         # A locked store loses this pass, not the command. The sweep is idempotent and runs
@@ -1590,11 +1625,13 @@ def refine_recoveries(older_than_seconds=SETTLE_AFTER_SECONDS, db_path=None, now
         # instance left the template standing.
         for outcome, ids in (("recovered_continued", continued), ("recovered_stopped", stopped)):
             if ids:
+                _guard_incidents(conn, ids)
                 moved[outcome] = conn.executemany(
                     "UPDATE incidents SET outcome_next = ? "
                     "WHERE receipt_id = ? AND outcome_next = 'recovered'",
                     [(outcome, r) for r in ids],
                 ).rowcount
+                _journal_incidents(conn, ids)
         conn.commit()
     except sqlite3.Error:
         # A locked store loses this pass, not the command. Idempotent, so the next read
@@ -2287,6 +2324,7 @@ def _ledger_verdict_item(r):
         "row_cap": r.get("row_cap"),
         "reversibility": r.get("reversibility"),
         "posture": r.get("posture"),
+        "dest_hosts": r.get("dest_hosts"),
     }
 
 
@@ -2788,11 +2826,13 @@ def unlabel_declared_verdicts(policy_id=None, policy_name=None, db_path=None):
             targets = [r[0] for r in rows if _mine(r[1], r[2])]
             if not targets:
                 return cleared
+            _guard_incidents(conn, targets)
             conn.executemany(
                 "UPDATE incidents SET label_verdict = NULL, label_verdict_source = NULL, "
                 "outcome_at = ? WHERE receipt_id = ?",
                 [(_now_iso(), rid) for rid in targets],
             )
+            _journal_incidents(conn, targets)
             conn.commit()
             return cleared + len(targets)
         finally:

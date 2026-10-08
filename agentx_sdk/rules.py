@@ -1245,3 +1245,201 @@ def adopt_rule(candidate, *, challenge=None, name=None, path=None, only_when=Non
             "effect_category": effect, "semantic_description": desc,
             "indicators": indicators, "socratic_prompt": socratic, "path": p,
             "only_when": clause}
+
+
+# =====================================================================
+# THE OUTBOUND ALLOWLIST: `.agentx/allowlist.json`
+# =====================================================================
+# Per agent, the sites it may send a request to. An agent with an entry here may reach ONLY
+# those hosts; an agent with no entry is not limited. The agent id is the one the ledger records
+# for its calls (the decorator's `agent_id`, `mcp_proxy` on the MCP door), so what `agentx
+# audit` lists and what this file names are always the same thing.
+#
+#   {"version": 1, "agents": {"<agent_id>": {"hosts": ["api.github.com", "*.example.com"],
+#                                            "adopted_at": "…"}}}
+#
+# Its own file beside `rules.json`, not a key inside it, for the reason that file gives for
+# keeping `import.json` apart: three concerns, three files. `rules.json` is also read strictly
+# by the gateway, and its writer rewrites the whole document, so a key it does not know would be
+# dropped on the next adopt.
+#
+# A `*.example.com` entry covers every subdomain and NOT `example.com` itself; a person writes
+# those by hand. `agentx review` proposes exact hosts only.
+#
+# 🔴 A FILE THAT EXISTS AND CANNOT BE READ FAILS CLOSED. Read as "nothing adopted", a typo
+# would silently switch the protection off for every agent that had one. So every outbound call
+# is refused, naming the file and the error, until it is fixed. Under the default posture
+# (watching) that is recorded, not enforced; it stops calls only for someone who turned blocking
+# on, which is the person who most needs to hear about it.
+#
+# ⚠️ KNOWN GAP: an agent that can write files can write this one. The same is true of
+# `rules.json`; the repository's review is the gate on both, and the `.agentx/` folder itself
+# is not yet protected from the agent.
+DEFAULT_ALLOWLIST_FILE_NAME = "allowlist.json"
+_ALLOWLIST_FILE_VERSION = 1
+_ALLOWLIST_WILDCARD = "*."
+
+
+def _allowlist_file_path(path=None):
+    """Explicit arg, else beside the rules file, which inherits every relocation and isolation
+    rule `_rules_file_path` already has (`AGENTX_RULES_FILE`, `AGENTX_POLICY_DB`). No variable of
+    its own: one more knob to document, and nothing needs it."""
+    if path:
+        return path
+    return os.path.join(os.path.dirname(_rules_file_path()), DEFAULT_ALLOWLIST_FILE_NAME)
+
+
+def _allowlist_entry(raw):
+    """One entry as stored and compared, or None when it is neither a host nor `*.<host>`."""
+    from .db import clean_host
+    entry = str(raw or "").strip().lower()
+    if entry.startswith(_ALLOWLIST_WILDCARD):
+        base = entry[len(_ALLOWLIST_WILDCARD):]
+        return entry if base and clean_host(base) == base else None
+    return entry if clean_host(entry) == entry else None
+
+
+def _read_allowlist_doc(p):
+    """{agent_id: {"hosts": [...], "adopted_at": ...}} as stored and validated. {} when the file
+    does not exist. Raises ValueError (or OSError) for a file that exists and cannot be read as
+    this shape: absent means none adopted, damaged must never read as none adopted."""
+    if not os.path.exists(p):
+        return {}
+    # `utf-8-sig`: Notepad and PowerShell's `Set-Content -Encoding UTF8` write a byte-order mark,
+    # and refusing it would fail closed on every outbound call over an invisible character.
+    with open(p, encoding="utf-8-sig") as fh:
+        doc = json.load(fh)
+    agents = doc.get("agents") if isinstance(doc, dict) else None
+    if not isinstance(agents, dict):
+        raise ValueError("%s is not an allowlist file (expected {\"version\", \"agents\": {...}})"
+                         % p)
+    out = {}
+    for agent, entry in agents.items():
+        hosts = entry.get("hosts") if isinstance(entry, dict) else None
+        if not isinstance(hosts, list):
+            raise ValueError("%s: agent %r has no \"hosts\" list" % (p, agent))
+        clean = []
+        for h in hosts:
+            e = _allowlist_entry(h)
+            if e is None:
+                raise ValueError("%s: agent %r lists %r, which is not a host (a name with "
+                                 "non-ASCII letters must be written in its xn-- form)"
+                                 % (p, agent, h))
+            clean.append(e)
+        out[str(agent)] = {"hosts": sorted(set(clean)),
+                           "adopted_at": entry.get("adopted_at")}
+    return out
+
+
+def _write_allowlist_doc(p, agents):
+    """Whole file, deterministically, via a temp file and rename (same as `_write_rules_file`)."""
+    parent = os.path.dirname(p)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    doc = {"version": _ALLOWLIST_FILE_VERSION,
+           "agents": {a: {"hosts": sorted(set(e["hosts"])), "adopted_at": e.get("adopted_at")}
+                      for a, e in sorted(agents.items())}}
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(doc, fh, indent=2, ensure_ascii=False, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, p)
+
+
+def read_allowlist(path=None):
+    """{agent_id: [entries]}. {} when there is no file; raises for a damaged one."""
+    return {a: e["hosts"] for a, e in _read_allowlist_doc(_allowlist_file_path(path)).items()}
+
+
+def adopt_allowlist(agent_id, hosts, path=None):
+    """Add `hosts` to `agent_id`'s allowlist, creating the entry (and so starting to limit that
+    agent) if it has none. Returns the agent's full list. Raises ValueError for a host that is
+    not one, or for a damaged file, which is never overwritten."""
+    agent_id = str(agent_id)
+    entries = []
+    for h in hosts:
+        e = _allowlist_entry(h)
+        if e is None:
+            raise ValueError("%r is not a host" % (h,))
+        entries.append(e)
+    p = _allowlist_file_path(path)
+    agents = _read_allowlist_doc(p)
+    current = agents.get(agent_id) or {"hosts": [], "adopted_at": None}
+    merged = sorted(set(current["hosts"]) | set(entries))
+    agents[agent_id] = {"hosts": merged, "adopted_at": _now_iso()}
+    _write_allowlist_doc(p, agents)
+    return merged
+
+
+def remove_allowlist(agent_id, path=None):
+    """Stop limiting `agent_id`: remove its entry. True if there was one."""
+    p = _allowlist_file_path(path)
+    agents = _read_allowlist_doc(p)
+    if str(agent_id) not in agents:
+        return False
+    del agents[str(agent_id)]
+    _write_allowlist_doc(p, agents)
+    return True
+
+
+_ALLOWLIST_CACHE = {}   # path -> ((mtime_ns, size), {agent: [entries]})
+
+
+def _armed_allowlist(path=None):
+    """{agent_id: [entries]}, re-read only when the file's (mtime, size) changes. {} when there
+    is no file. RAISES for a damaged one: the caller fails closed (see the block above)."""
+    p = _allowlist_file_path(path)
+    try:
+        st = os.stat(p)
+    except OSError:
+        _ALLOWLIST_CACHE.pop(p, None)
+        return {}
+    key = (st.st_mtime_ns, st.st_size)
+    cached = _ALLOWLIST_CACHE.get(p)
+    if cached and cached[0] == key:
+        return cached[1]
+    agents = read_allowlist(p)
+    _ALLOWLIST_CACHE[p] = (key, agents)
+    return agents
+
+
+def host_is_listed(host, entries):
+    """True when `host` (already `clean_host`-ed) is on `entries`: an exact entry, or a
+    `*.<base>` entry and `host` is a subdomain of `<base>` (never `<base>` itself)."""
+    for e in entries:
+        if e.startswith(_ALLOWLIST_WILDCARD):
+            if host.endswith(e[1:]) and host != e[len(_ALLOWLIST_WILDCARD):]:
+                return True
+        elif host == e:
+            return True
+    return False
+
+
+def allowlist_miss(agent_id, raw_hosts, path=None):
+    """Whether a call addressed to `raw_hosts` (as `statement.destination_url_hosts` reads them) may go
+    ahead for `agent_id`. None when it may; otherwise a dict saying why:
+
+      {"reason": "unlisted", "host": <host>}          a host not on the agent's list
+      {"reason": "unreadable_host", "host": None}     an address no host could be read from,
+                                                      for an agent whose list is in force
+      {"reason": "unreadable_file", "error": <text>}  the file exists and cannot be read
+
+    Never raises. A call with no URL is never limited, and an agent with no entry is not."""
+    if not raw_hosts:
+        return None
+    p = _allowlist_file_path(path)
+    try:
+        agents = _armed_allowlist(path)
+    except Exception as err:
+        return {"reason": "unreadable_file", "host": None, "path": p, "error": str(err)}
+    entries = agents.get(str(agent_id))
+    if entries is None:
+        return None
+    from .db import clean_host
+    for raw in raw_hosts:
+        host = clean_host(raw)
+        if host is None:
+            return {"reason": "unreadable_host", "host": None, "path": p}
+        if not host_is_listed(host, entries):
+            return {"reason": "unlisted", "host": host, "path": p}
+    return None

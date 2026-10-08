@@ -17,7 +17,7 @@ from agentx_sdk import decorators as agentx_runtime
 # -------------------------------------------------------------------
 # 1. SETUP: Point to the AgentX Security Gateway
 # -------------------------------------------------------------------
-GATEWAY_URL = "http://localhost:8000"
+GATEWAY_URL = os.environ.get("AGENTX_GATEWAY_URL", "http://localhost:8000").rstrip("/")
 AGENT_ID = "demo_db_agent"
 # This recovery demo makes a REAL LLM call to re-plan, so it needs a Gemini key AND the
 # `google-genai` client. Both are checked HERE, and the client is imported here rather than

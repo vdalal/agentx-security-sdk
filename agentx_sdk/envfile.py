@@ -204,3 +204,24 @@ def resolve_env(key, default=None, overlay=None):
     if val is not None and str(val).strip():
         return val
     return default
+
+
+def resolve_api_key(overlay=None):
+    """`AGENTX_API_KEY`, stripped, or None when it is unset or blank. Every SDK reader of the
+    key asks this, so the posture and the Authorization header cannot disagree.
+
+    Before this, the posture rule stripped the key and the client did not:
+    `AGENTX_API_KEY="   "` (a `.env` line with a blank value, loaded by the app's own
+    `load_dotenv`) printed WATCHING as a keyless install while every call sent
+    `Authorization: Bearer    ` to the gateway and took the 401 path. The TypeScript door fixed
+    the same split with one trimmed read (`resolveKey`).
+
+    The process environment only, unless the caller passes the `.env` dict it already trusts
+    (`overlay`), which is what the CLI does. The runtime does NOT read `.env` for the key, and
+    this does not change that: a key in a file nobody exported must not flip a running agent
+    to enforce.
+    """
+    val = (os.environ.get("AGENTX_API_KEY") or "").strip()
+    if not val and overlay is not None:
+        val = str(overlay.get("AGENTX_API_KEY") or "").strip()
+    return val or None

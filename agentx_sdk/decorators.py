@@ -31,12 +31,14 @@ from .client import AgentXClient
 # LIST and splits letter<->digit runs; `statement._name_tokens` returns a SET and does not. The
 # difference is load-bearing in both directions -- see the warning in `statement._name_tokens`.
 from .statement import _STATEMENT_ARG_NAMES, _coerce_arg_value, _statement_text  # noqa: F401
+from .statement import _SSRF_URL_RE, url_hosts, destination_url_hosts  # noqa: F401
 from .db import (init_db, ensure_ledger_current, log_intercept, get_lifetime_stats,
                  log_self_correction, get_retention_status, format_ratio, retention_is_failing,
                  retention_failure_streak, failed_ledger_path, WOULD_BLOCK_STATUS,
                  record_call, is_demo_agent as _is_demo_agent, _call_shape)
 from . import db as db_module
 from . import pulse
+from .envfile import resolve_api_key
 from .overrides import get_active_override, review_backlog_size, _anchored_root
 
 # ---------------------------------------------------------------- policy file location
@@ -493,7 +495,7 @@ def _warn_policy_load_degraded_once(error):
     if _POLICY_DEGRADED_WARNED:
         return
     _POLICY_DEGRADED_WARNED = True
-    logger.warning(
+    _print_banner(
         "[AgentX] policy file is malformed; running on the BUILT-IN floor "
         "(AGENTX_POLICY_LOAD=permissive). Your pulled/org policies are NOT applied. "
         "Fix it with: agentx policies --check  (%s)", error)
@@ -513,7 +515,7 @@ def _warn_policy_load_audit_once(error):
     if _POLICY_DEGRADED_WARNED:
         return
     _POLICY_DEGRADED_WARNED = True
-    logger.warning(
+    _print_banner(
         "[AgentX] AUDIT: your policy file is malformed. Audit does not refuse, so this call "
         "was screened by the BUILT-IN floor only and your own rules were NOT applied, so the "
         "findings under-report what your policies would catch. "
@@ -536,7 +538,7 @@ def _warn_failclosed_is_inert_in_audit():
     if _FAILCLOSED_INERT_WARNED:
         return
     _FAILCLOSED_INERT_WARNED = True
-    logger.warning(
+    _print_banner(
         "[AgentX] AGENTX_FAIL_MODE=closed has no effect right now: this install is watching, "
         "which never blocks, so a call we cannot verify still runs. Set AGENTX_POSTURE=enforce "
         "if you want unverified calls refused."
@@ -558,8 +560,10 @@ def _print_banner(text, *args):
     path. stderr, not stdout, so it survives any logging level AND never lands in a stdout
     that an in-process MCP server may be using as its protocol channel.
 
-    The degraded-protection banner and the posture-conflict warnings still go through the
-    logger; that is the same class and is filed as its own row rather than folded in here.
+    Every notice in this module whose loss would leave the operator believing protection is
+    there when it is not (fail-open, an unverified call that ran, a policy file being ignored,
+    a posture conflict) comes through here. The three `logger.warning` calls left are not that
+    kind; sdk_tests/test_safety_notices_reach_stderr.py names them and fails on a new one.
     `%`-style lazy args are kept so the call sites read as they did.
     """
     print(text % args if args else text, file=sys.stderr)
@@ -768,7 +772,7 @@ def _record_shield_failopen(tool_name, error):
     _incr("shield_failopens")
 
     if not _SHIELD_FAILOPEN_BANNER_SHOWN:
-        logger.warning(
+        _print_banner(
             "\n"
             "════════════════════════════════════════════════════════════\n"
             " ⚠️  AgentX Local Shield FAILED OPEN\n"
@@ -801,7 +805,7 @@ def _record_reflection_failopen(tool_name, error):
     _incr("reflection_failopens")
 
     if not _REFLECTION_FAILOPEN_BANNER_SHOWN:
-        logger.warning(
+        _print_banner(
             "\n"
             "════════════════════════════════════════════════════════════\n"
             " ⚠️  AgentX could not read the arguments of a call\n"
@@ -1114,7 +1118,7 @@ def _emit_failopen_warning(reason, tool_name, detail=None, answered=None):
     # three times. The throttled line still carries the cause for everything after that.
     banner_class = (d["cls"], answered)
     if not _FAILOPEN_BANNER_SHOWN or banner_class != _FAILOPEN_BANNER_CLASS:
-        logger.warning(
+        _print_banner(
             "\n"
             "════════════════════════════════════════════════════════════\n"
             " ⚠️  AgentX DEGRADED PROTECTION — failing OPEN\n"
@@ -1130,7 +1134,7 @@ def _emit_failopen_warning(reason, tool_name, detail=None, answered=None):
         _FAILOPEN_BANNER_CLASS = banner_class
     else:
         tail = "offline shield active" if shield_active else "NO checks"
-        logger.warning(
+        _print_banner(
             f"[AgentX] DEGRADED: '{tool_name}' ran with gateway bypassed "
             f"({short}; {tail})."
             + (f" Engine said: {said}" if said else "")
@@ -1154,7 +1158,7 @@ def _emit_failclosed_warning(reason, tool_name, answered=None):
     # while the other path rendered plain words for the same event.
     d, proven, _unproven = _degraded_reading(reason, answered)
     cause = d["sentence"] if proven else d.get("sentence_unproven", d["sentence"])
-    logger.warning(
+    _print_banner(
         f"[AgentX] FAIL-CLOSED: '{tool_name}' BLOCKED. {cause} "
         f"Action NOT executed (AGENTX_FAIL_MODE=closed). Set AGENTX_FAIL_MODE=open to allow."
     )
@@ -1175,7 +1179,7 @@ def _resolve_fail_mode():
     if raw in ("open", "closed"):
         return raw
     if not _FAILMODE_WARNED:
-        logger.warning(
+        _print_banner(
             f"[AgentX] Unrecognized AGENTX_FAIL_MODE={raw!r}; expected 'open' or 'closed'. "
             f"Falling back to 'open' (fail-open) — fix the value to engage fail-closed."
         )
@@ -1307,7 +1311,7 @@ def _default_posture_for_rung():
     is a deliberately ORTHOGONAL axis; letting it decide posture too would mean one
     variable quietly changing two unrelated things.
     """
-    return "enforce" if (os.environ.get("AGENTX_API_KEY") or "").strip() else "audit"
+    return "enforce" if resolve_api_key() else "audit"
 
 
 # Returned by the deferred shield's delivery when the block body itself threw (fail-open,
@@ -1407,7 +1411,7 @@ def _keyed_shield_defers(enforcement_level):
     if not _env_flag_is_true("AGENTX_SHIELD_ASKS_GATEWAY"):
         return False
     return (enforcement_level != "audit"
-            and bool((os.environ.get("AGENTX_API_KEY") or "").strip()))
+            and bool(resolve_api_key()))
 
 
 def _resolve_enforcement(override=None, *, keyless_door=False):
@@ -1474,7 +1478,7 @@ def _resolve_enforcement(override=None, *, keyless_door=False):
             # configuration mistake, in the middle of the developer's own tool output.
             global _POSTURE_CONFLICT_WARNED
             if not _POSTURE_CONFLICT_WARNED:
-                logger.warning(
+                _print_banner(
                     "[AgentX] AGENTX_POSTURE=%r and AGENTX_ENFORCEMENT=%r disagree. Using "
                     "'enforce' (the stricter of the two). Set only AGENTX_POSTURE.",
                     _new, _old)
@@ -1502,7 +1506,7 @@ def _resolve_enforcement(override=None, *, keyless_door=False):
     if raw in ("audit", "enforce"):
         return raw
     if not _ENFORCEMENT_WARNED:
-        logger.warning(
+        _print_banner(
             # 🔴 THE ADVICE INVERTED WITH THE DEFAULT. This used to end "fix the value to run
             # in audit (non-blocking) mode", which now tells the reader to work for what they
             # would get by setting nothing. The only reason to set this variable any more is
@@ -1763,6 +1767,10 @@ _session_stats = {
     # distinction, so "has anyone seen us catch something in their OWN code" was unanswerable.
     # See _note_own_agent_block. Rides the pulse as a coarse boolean; never an agent NAME.
     "own_agent_block": False,
+    # True once this process ran `agentx demo`. Every counter beside it moves on the demo
+    # exactly as it does on a developer's own agent, so without this the pulse cannot say
+    # which of the two it is reporting. Set by cli._mark_demo_session; a coarse boolean.
+    "demo_session": False,
     "would_blocks": 0,                 # <-- AUDIT posture (AGENTX_ENFORCEMENT=audit): count of catches that WOULD have blocked but were recorded-and-let-through. Distinct from intercepts (an audit install is NOT "protected"): would_blocks>0 with intercepts==0 = an install EVALUATING, not yet enforcing. Rides the pulse as a coarse count. See _resolve_enforcement / _audit_and_proceed.
     # 🔴 THE REASON THERE ARE TWO OF THESE. `would_blocks` above is gated on
     # `not _is_demo_agent(...)` so our own scripted traffic cannot pollute the funnel -- right
@@ -2803,7 +2811,7 @@ def _print_agentx_summary():
         # is the misconfiguration that is silent everywhere else.
         # Both config branches below are reachable only when nothing was carried, by the rule
         # above, so neither can contradict a count.
-        if not _carried and not (os.environ.get("AGENTX_API_KEY") or "").strip():
+        if not _carried and not resolve_api_key():
             print(" 🔀 Shield asks gateway:   OFF |  set, but no API key: nothing to ask")
         elif not _carried:
             # The one zero that needs a pointer: keyed, switched on, and nothing deferred. The
@@ -5313,7 +5321,9 @@ def _detect_destructive_sql(normalized):
 # `.internal`/`.localhost` suffix rule), so a bare numeric id in a payload
 # (`WHERE id = 2852039166`) is never coerced -> no false positive. (Dotted-octal like
 # 0177.0.0.1 is NOT decoded -- ipaddress rejects leading-zero octets; same limit as the gateway.)
-_SSRF_URL_RE = re.compile(r"\b[a-z][a-z0-9+.\-]*://([^\s/'\"<>]+)", re.IGNORECASE)
+# The pattern (`_SSRF_URL_RE`) and the host extraction (`url_hosts`) live in `statement.py`,
+# where the ledger reads the same hosts; both are imported at the top of this file, and
+# `_SSRF_URL_RE` is the name the gateway's copy is compared against.
 
 
 # Integer host decoding is an inet_aton IPv4 behaviour, so the decode is bounded to the 32-bit
@@ -5365,14 +5375,7 @@ def _detect_ssrf_encoded(raw):
     reserved / unspecified address in ANY encoding. URL-context-only (never a bare token),
     so a numeric literal elsewhere in the payload cannot false-trip it. ``raw`` is the
     already-stringified payload from evaluate_call_keyless."""
-    if "://" not in raw:            # cheap guard: skip the regex on the common no-URL case
-        return False
-    for m in _SSRF_URL_RE.finditer(raw):
-        netloc = m.group(1).split("@")[-1]
-        if netloc.startswith("["):            # bracketed IPv6: [::1]:port
-            host = netloc[1:].split("]")[0]
-        else:
-            host = netloc.split(":")[0]
+    for host in url_hosts(raw):
         ip = _coerce_ip_keyless(host)
         if ip is None:
             continue
@@ -5854,7 +5857,7 @@ def _top_level_statements(raw):
     ⚠️ SPLIT ON THE MASKED VIEW, SLICED FROM THE RAW ONE. Strings are blanked and parenthesised
     groups masked before the boundary search, so a `;` inside a literal and a UNION inside a
     subquery do not split; the slices themselves come from the untouched payload, so each caller
-    still derives its own views (`_sql_views`) from real text.
+    still derives its own views from real text.
 
     ⚠️ A comment-hidden boundary (`-- ; drop`) DOES split here, and that direction is deliberate:
     an extra split can only ever remove an exemption from a statement that did not earn it, never
@@ -5935,30 +5938,6 @@ def _sql_tables(text):
 
 
 _IDENTIFIER_QUOTE_CHARS = str.maketrans("", "", "`[]\"")
-
-
-def _sql_views(raw):
-    """The TWO views of a payload, derived once, so no call site picks its own.
-
-    🔴 THE DEFECT THIS EXISTS TO END. A code review measured six bypasses in one change, and all
-    six were the same mistake: the new rule read a DIFFERENTLY NORMALISED view than the sibling
-    detector it was modelled on, and every divergence failed OPEN. The substring rule it replaced
-    matched RAW text, so each divergence lost a catch the crude version had:
-
-        SELECT email, ssn FROM users -- WHERE id=1   the `--` read as a real WHERE, exempted
-        psql -c "SELECT email FROM users"            strings blanked first, so nothing was found
-
-    One view per QUESTION, never per call site:
-      • STRUCTURE -- where the projection and the tables are. Block comments removed; `--` LEFT
-        INTACT, because stripping it is fail-OPEN and demonstrably was: `--` is far more often a
-        shell long-flag than a SQL comment, so `psql --command "SELECT * FROM config"` had its
-        whole query eaten and sailed through.
-      • EXEMPTION -- may this read be let go. BOTH comment styles removed, so an appended
-        `-- WHERE id=1` or `-- LIMIT 0` can never buy an exemption it did not earn.
-
-    The asymmetry is the point and it is directional: a comment may never CREATE an exemption, and
-    may never HIDE structure."""
-    return _strip_block_comments_only(raw), _strip_sql_comments(raw)
 
 
 def _has_top_level_limit_zero(s):
@@ -7303,6 +7282,59 @@ _REVERSE_SHELL_POLICY = {
 }
 
 
+# The Outbound Allowlist: an agent whose allowlist a person adopted may send
+# requests only to the hosts on it (`rules.allowlist_miss`, `.agentx/allowlist.json`). It was
+# built on this door first, so its id is in the `22222222-` space (see the Destructive Shell
+# row for why that space exists); the gateway now enforces the same file under the same id. Category deliberately OFF the pulse vocab, like Reverse Shell
+# Egress: the block fires and coaches, no coarse pulse tag is emitted, and no pulse-receiver
+# change is needed. The challenge sentence is built per call, so it can name the host.
+_ID_OUTBOUND_ALLOWLIST = "22222222-2222-2222-2222-222222222107"
+_OUTBOUND_ALLOWLIST_POLICY = {
+    "id": _ID_OUTBOUND_ALLOWLIST,
+    "name": "Outbound Allowlist",
+    "category": "OUTBOUND_ALLOWLIST",
+    "blocked_intents": [],
+    "socratic_prompt": "This call goes to a site that is not on this agent's outbound allowlist.",
+    "preferred_alternative": (
+        "Use a site this agent is already allowed to reach. If this one is needed, a person "
+        "approves it in agentx review or adds it to the project's allowlist.json."
+    ),
+}
+
+
+def _allowlist_file_problem(miss):
+    """The file, and what is wrong with it when known: a JSON error alone names no file."""
+    path, error = miss.get("path"), miss.get("error")
+    return "%s: %s" % (path, error) if path and error else (path or error or "unknown")
+
+
+def _allowlist_decision(miss):
+    """The keyless decision for an `allowlist_miss`, with a challenge naming what was missed."""
+    decision = _keyless_decision(_OUTBOUND_ALLOWLIST_POLICY)
+    reason = miss.get("reason")
+    if reason == "unlisted":
+        decision["challenge_text"] = (
+            "This call goes to %s, which is not on this agent's outbound allowlist."
+            % miss.get("host"))
+    elif reason == "unreadable_host":
+        decision["challenge_text"] = (
+            "This call goes to an address no site name could be read from, and this agent "
+            "may only reach the sites on its outbound allowlist.")
+        # Not the policy's "a person approves it in agentx review": review proposes only hosts
+        # it could read, so this address can never be offered there.
+        decision["preferred_alternative"] = (
+            "Use a plainly written https:// address on a site this agent may reach. A name "
+            "with non-ASCII letters must be written in its xn-- form.")
+    else:
+        decision["challenge_text"] = (
+            "The outbound allowlist file cannot be read, so no outbound call is allowed until "
+            "a person fixes it (%s)." % _allowlist_file_problem(miss))
+        # Not the policy's "use a site this agent is already allowed to reach": while the file
+        # is damaged, no site is.
+        decision["preferred_alternative"] = "A person needs to fix or remove the allowlist file."
+    return decision
+
+
 def _keyless_decision(policy):
     """Build the normalized keyless decision dict from a matched policy."""
     policy_id = policy.get("id", "POL-LOCAL")
@@ -7319,7 +7351,7 @@ def _keyless_decision(policy):
 
 def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="action",
                           table_copies=None, arguments=None, tool_name=None,
-                          name_leads=False, declared_args=None):
+                          name_leads=False, declared_args=None, agent_id=None):
     """Keyless Layer-0 detection — the SINGLE home shared by the @agentx_protect
     decorator and the ``agentx-mcp`` stdio proxy so the two paths can never drift.
 
@@ -7569,6 +7601,19 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
     #    when no policy token matched, so it never overrides a specific policy's coaching.
     if not benign_catalog and _detect_destructive_sql(haystack):
         return _keyless_decision(_MASS_DESTRUCTIVE_POLICY)
+
+    # 3) Outbound allowlist: LAST, so a floor above that recognises the call
+    #    keeps its own name and coaching, and this one speaks only for a call nothing else
+    #    stopped. Reads `full`, EVERY argument, not the declared-statement text: a URL in an
+    #    argument the vocabulary does not know (`webhook=`, `to=`) is still somewhere the call
+    #    can send data, and an agent a person limited may reach only the listed sites. The
+    #    ledger and the review proposals keep the narrower reading, so a URL in a note is never
+    #    proposed as a site. Only when the door passed the agent and the arguments.
+    if agent_id is not None and isinstance(arguments, dict):
+        from .rules import allowlist_miss
+        miss = allowlist_miss(agent_id, destination_url_hosts(full))
+        if miss:
+            return _allowlist_decision(miss)
 
     return None
 
@@ -7882,7 +7927,7 @@ def _would_block_narration(head, body):
 
 
 def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, category,
-                        narration=None, arguments=None):
+                        narration=None, arguments=None, dest_args=None):
     """The RECORD half of the audit route, split out so EVERY audit path writes the same
     evidence in the same shape (the rich-context sites below and the `_audit_release`
     backstop alike). Records honestly:
@@ -7937,7 +7982,9 @@ def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, c
     # kind as the `in_audit=True` literal this path already carries.
     log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, WOULD_BLOCK_STATUS,
                  arg_names=names, amount=amount, target_class=target_class,
-                 quantity=quantity, posture="audit")
+                 quantity=quantity, posture="audit",
+                 dest_hosts=db_module._dest_hosts_value(
+                     tool_name, arguments if dest_args is None else dest_args))
     # Best-effort narration: a broken/closed stdout must NOT raise out of here, or the
     # caller's `except Exception` (the Layer-0 shield's) would swallow it and fall through
     # to the gateway path, double-counting this one call. The record above already stood.
@@ -7994,6 +8041,38 @@ def _bound_arguments(sig, args, kwargs):
         return mapped
     except (TypeError, ValueError):
         return kwargs or {}
+
+
+def _destination_arguments(sig, args, kwargs):
+    """`_bound_arguments` plus every parameter DEFAULT the call did not pass: the text the
+    sites a call reaches are read from (`dest_hosts`, on the ledger and on the wire). Pure;
+    never raises.
+
+    A default web address is where the call really goes, so it is a destination even though
+    nobody typed it. Kept apart from `_bound_arguments` on purpose:
+    that map feeds the argument NAMES the inventory records and `agentx review` compares, and a
+    default turning up there would read as a new argument on every tool that has one."""
+    mapped = dict(_bound_arguments(sig, args, kwargs))
+    if sig is None:
+        return mapped
+    # Defaults only when the call BINDS. `_bound_arguments` falls back to the keyword arguments
+    # when it cannot bind (a signature another decorator rewrote), and filling a default there
+    # would put the default address where the call passed a different one positionally.
+    try:
+        sig.bind_partial(*(args or ()), **(kwargs or {}))
+    except (TypeError, ValueError):
+        return mapped
+    try:
+        for name, param in sig.parameters.items():
+            if (name in mapped or name in ("self", "cls")
+                    or param.default is inspect.Parameter.empty
+                    or param.kind in (inspect.Parameter.VAR_POSITIONAL,
+                                      inspect.Parameter.VAR_KEYWORD)):
+                continue
+            mapped[name] = param.default
+    except Exception:
+        pass
+    return mapped
 
 
 def _inventory_due(outcome):
@@ -8135,7 +8214,7 @@ def _adopted_rule_outcome_keyless(agent_id, tool_name, arguments):
 
 
 def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, description=None,
-                      unsized_write=False):
+                      unsized_write=False, dest_args=None):
     """P-92: record ONE call we had NO opinion about. Best-effort; never raises.
 
     🔴 `unsized_write` IS THE ONE EXCEPTION TO THE SENTENCE ABOVE, AND IT IS NOT AN OPINION
@@ -8173,7 +8252,7 @@ def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, descri
                     matched_rule=matched, uncompared_rule=uncompared,
                     row_cap=row_cap_for_arguments(arguments),
                     reversibility=reversibility_for_arguments(arguments),
-                    unsized_write=unsized_write)
+                    unsized_write=unsized_write, dest_arguments=dest_args)
     except Exception:
         # Deliberately silent, unlike the would-block narration. This runs on EVERY passing
         # call, so a per-call complaint would turn one broken ledger into thousands of lines
@@ -8183,7 +8262,7 @@ def _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit, descri
 
 
 def _audit_and_proceed(trace_id, agent_id, tool_name, policy_id, policy_name, category,
-                       arguments=None):
+                       arguments=None, dest_args=None):
     """AUDIT posture: record what WOULD have blocked, then let the original call proceed
     unchanged (returns an _ExecuteTool directive the wrapper shell runs).
 
@@ -8194,7 +8273,7 @@ def _audit_and_proceed(trace_id, agent_id, tool_name, policy_id, policy_name, ca
     QUALITY of the record, that one owns the CONTROL-FLOW property, and they are different
     concerns with different failure modes."""
     _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, category,
-                        arguments=arguments)
+                        arguments=arguments, dest_args=dest_args)
     # recorded=True: this call has its WOULD_BLOCK row already. The release gate must not
     # also file it as routine traffic on the way past.
     return _ExecuteTool(recorded=True)
@@ -8235,7 +8314,8 @@ _AUDIT_SUPPRESSIBLE_RAISES = _AUDIT_SUPPRESSIBLE_VERDICTS + _AUDIT_RELEASED_FAUL
 _SYSTEM_ERROR_PREFIX = "AgentX System Error:"
 
 
-def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, description=None):
+def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, description=None,
+                   dest_args=None):
     """THE gate that makes watch-only TOTAL instead of a list of four fixed cases.
 
     The guarantee is one sentence — *in audit, no verdict of ours alters control flow or
@@ -8294,7 +8374,8 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
                 # for why the two postures must not share one counter.
                 _record_inventory(trace_id, agent_id, tool_name, arguments, in_audit=True,
                                   description=description,
-                                  unsized_write=_unsized_write_of(outcome))
+                                  unsized_write=_unsized_write_of(outcome),
+                                  dest_args=dest_args)
             return outcome
         _record_would_block(
             trace_id, agent_id, tool_name, "local-dlp", "Local DLP (PII scrub)",
@@ -8303,7 +8384,7 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
                 f"Would have scrubbed {outcome.scrub_targets} from '{tool_name}' output:",
                 f"{_audit_scope_phrase()}, so the result was returned unchanged and "
                 "recorded"),
-            arguments=arguments)
+            arguments=arguments, dest_args=dest_args)
         # recorded=True on every path that just wrote a would-block row, including the two
         # that return straight to the caller and cannot re-enter the clean branch today.
         # The flag is the invariant "a call has one row"; leaving it off here would make
@@ -8344,7 +8425,7 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
         # logger AS WELL as the summary counter, not instead of it: this is an operator
         # action item, it belongs on the ops-alertable channel next to the fail-open banner,
         # and the exception message we would otherwise discard is the actionable part.
-        logger.warning(
+        _print_banner(
             "[AgentX] AUDIT: '%s' could not be evaluated (%s). The call RAN and is recorded "
             "as a FAULT, not a detection — it is NOT in your audit findings. An unevaluated "
             "call is not a clean one; fix this before trusting the report.",
@@ -8378,7 +8459,7 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
             f"Would have stopped '{tool_name}':",
             f"{policy_name}. {_audit_scope_phrase()}, so it ran and control returned to "
             "your code unchanged"),
-        arguments=arguments)
+        arguments=arguments, dest_args=dest_args)
     return _ExecuteTool(recorded=True)
 
 
@@ -8421,7 +8502,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
         if _p != _e:
             # Not a warning that can be missed in a log: this decides whether a tool is
             # defended, and the two spellings were handed conflicting instructions.
-            logger.warning(
+            _print_banner(
                 "[AgentX] '%s' was given posture=%r AND enforcement=%r, which disagree. "
                 "Using 'enforce' (the stricter of the two). Pass only posture=.",
                 agent_id, posture, enforcement)
@@ -8970,7 +9051,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     return _audit_and_proceed(
                         current_trace_id, agent_id, func_name, policy_id, policy_name,
                         matched_policy.get("category") or _POLICY_ID_TO_CATEGORY.get(policy_id),
-                        arguments=_bound_arguments(_func_sig, args, kwargs))
+                        arguments=_bound_arguments(_func_sig, args, kwargs),
+                        dest_args=_destination_arguments(_func_sig, args, kwargs))
 
                 # BUILD #2 — org-reframe swap on the Layer-0 local-shield path
                 # too (the offline path a keyworded block like DROP TABLE takes;
@@ -9036,7 +9118,11 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                               target_class=_blocked_shape[2],
                               quantity=_blocked_shape[3], posture="enforce",
                               challenge_issued=_delivered_coaching(
-                                  challenge_text, ls_safe_path))
+                                  challenge_text, ls_safe_path),
+                              # Where the stopped call was headed: the denial evidence a
+                              # reviewer asks for. Read by `audit`, never by a proposal.
+                              dest_hosts=db_module._dest_hosts_value(
+                                  func_name, _destination_arguments(_func_sig, args, kwargs)))
 
                 # The fallback cases say so BEFORE the block line, so the console reads
                 # cause then effect: the gateway allowed it / was unreachable, and then
@@ -9207,7 +9293,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     matched_policy = evaluate_call_keyless(
                         query, table_copies=_run_copies,
                         arguments=shield_args if reflect_err is None else None,
-                        tool_name=func_name)
+                        tool_name=func_name, agent_id=agent_id)
 
                     if matched_policy and _keyed_shield_defers(enforcement_level):
                         # A keyed enforce run carries the match to the gateway instead of
@@ -9321,6 +9407,11 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # context-scoped override key use), so what an operator configures a
                 # limit against is what they see in `agentx review`.
                 tool=func_name,
+                # The sites this door records for the call, so the gateway records the
+                # same ones instead of rebuilding them from the flattened `query`. The same
+                # reader, on the same arguments, as every ledger row's `dest_hosts`.
+                dest_hosts=db_module.destination_hosts(
+                    func_name, _destination_arguments(_func_sig, args, kwargs)),
                 session_tokens=session_tokens_total,
                 session_cost_usd=session_cost_total,
                 budget_pool_id=resolved_pool_id,
@@ -9570,7 +9661,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         eval_res.get("policy_id", "POL-UNKNOWN"),
                         eval_res.get("policy_triggered", "Unknown Policy"),
                         _POLICY_ID_TO_CATEGORY.get(eval_res.get("policy_id")),
-                        arguments=_bound_arguments(_func_sig, args, kwargs))
+                        arguments=_bound_arguments(_func_sig, args, kwargs),
+                        dest_args=_destination_arguments(_func_sig, args, kwargs))
                 _incr("intercepts")
                 # P-107, the gateway twin of the note at the keyless block above.
                 _note_own_agent_block(agent_id)
@@ -9641,7 +9733,9 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                               target_class=_blocked_shape[2],
                               quantity=_blocked_shape[3], posture="enforce",
                               challenge_issued=_delivered_coaching(
-                                  challenge_text, _gateway_safe_path))
+                                  challenge_text, _gateway_safe_path),
+                              dest_hosts=db_module._dest_hosts_value(
+                                  func_name, _destination_arguments(_func_sig, args, kwargs)))
 
                 print(f"🛑 [AgentX SDK] Policy '{policy_name}' violated. Routing challenge instruction string.")
                 
@@ -9680,7 +9774,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         # forbids exactly this — the rule was written down and then not
                         # applied one function away.
                         "audit-release", "Circuit Breaker (runaway loop)", None,
-                        arguments=_bound_arguments(_func_sig, args, kwargs))
+                        arguments=_bound_arguments(_func_sig, args, kwargs),
+                        dest_args=_destination_arguments(_func_sig, args, kwargs))
 
                 _incr("circuit_breakers_tripped")
                 print(f"🛑 [AgentX SDK] Circuit Breaker threshold met. Killing loop natively.")
@@ -9727,14 +9822,15 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         # without reopening the decision.
                         eval_res.get("policy_triggered") or "Human Approval Required",
                         eval_res.get("category"),
-                        arguments=_bound_arguments(_func_sig, args, kwargs))
+                        arguments=_bound_arguments(_func_sig, args, kwargs),
+                        dest_args=_destination_arguments(_func_sig, args, kwargs))
 
                 # Track human escalation counters state natively in the session stats for accurate summary reporting
                 _incr("human_escalations")
 
                 receipt_id = eval_res.get("receipt_id")
                 
-                api_key = os.environ.get("AGENTX_API_KEY")
+                api_key = resolve_api_key()
                 headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
                 
                 # 🔴 THE DEADLINE GOES ON THE SCREEN, AND IT IS SETTABLE. This waited 120
@@ -10067,7 +10163,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     _record_inventory(trace_id_var.get(), agent_id, _func_name,
                                       _bound_arguments(_func_sig, args, kwargs),
                                       in_audit=False, description=_func_doc,
-                                      unsized_write=_unsized_write_of(outcome))
+                                      unsized_write=_unsized_write_of(outcome),
+                                      dest_args=_destination_arguments(_func_sig, args, kwargs))
                 return outcome
             try:
                 outcome = _decide(args, kwargs, call_state)
@@ -10080,7 +10177,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # would split one tool across two names in `agentx insights`.
             return _audit_release(outcome, trace_id_var.get(), agent_id, _func_name,
                                   arguments=_bound_arguments(_func_sig, args, kwargs),
-                                  description=_func_doc)
+                                  description=_func_doc,
+                                  dest_args=_destination_arguments(_func_sig, args, kwargs))
 
         def _remember_copy_on_run(call_state):
             """Record a same-server copy now that the tool is about to run. Called ONLY from

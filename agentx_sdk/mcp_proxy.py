@@ -111,7 +111,7 @@ try:
     from agentx_sdk.db import (init_db, log_intercept, log_self_correction, record_call,
                                WOULD_BLOCK_STATUS,
                                read_novelty, advance_watermark, format_novelty_item, top_novelty,
-                               current_call_shape, _call_shape,
+                               current_call_shape, _call_shape, _dest_hosts_value,
                                WATERMARK_SESSION,
                                record_mcp_roster, MCP_DRIFT_POLICY_NAME)
 finally:
@@ -1878,10 +1878,15 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # The argument names travel with the flattened text, so the shield reads a statement
         # only where the tool declared one (`_STATEMENT_ARG_NAMES`), and the tool name stays
         # in front (name_leads) for the verb-in-the-name case this door owns.
+        # The allowlist is a project's file, so this door reads it only when the host named
+        # the project -- the same gate `_match_adopted_rule_mcp` uses for adopted rules.
+        # Without it, `rules.json`'s path follows whatever directory the host launched us in.
+        from .overrides import explicit_project_dir
         decision = evaluate_call_keyless(
             flat_payload, table_copies=_table_copies,
             arguments=params.get("arguments"), tool_name=name, name_leads=True,
-            declared_args=session_stats.get("_tool_declared", {}).get(str(name)))
+            declared_args=session_stats.get("_tool_declared", {}).get(str(name)),
+            agent_id=_MCP_AGENT_ID if explicit_project_dir() else None)
         if decision is None:
             _remember_table_copy(_table_copies, flat_payload)
     except Exception as err:
@@ -2019,6 +2024,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                     tool_key, params.get("arguments"), session_stats)
                 record_call(inv_trace, "mcp_proxy", tool_key, params.get("arguments"),
                             stats=session_stats,
+                            declared_args=session_stats.get("_tool_declared", {}).get(str(tool_key)),
                             in_audit=session_stats.get("_enforcement") == "audit",
                             description=(session_stats.get("_tool_desc") or {}).get(tool_key),
                             matched_rule=matched, uncompared_rule=uncompared,
@@ -2070,7 +2076,10 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 log_intercept(wb_trace, "mcp_proxy", tool_key,
                               decision.get("policy_id"), decision.get("policy_name"), WOULD_BLOCK_STATUS,
                               arg_names=names, amount=amount, target_class=target_class,
-                              quantity=quantity, posture="audit")
+                              quantity=quantity, posture="audit",
+                              dest_hosts=_dest_hosts_value(
+                                  tool_key, params.get("arguments"),
+                                  session_stats.get("_tool_declared", {}).get(str(tool_key))))
             except Exception:
                 pass
             _flush_mcp_roster(session_stats)
@@ -2177,7 +2186,10 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                           decision.get("policy_id"), decision.get("policy_name"), "CHALLENGED",
                           posture="enforce",
                           challenge_issued=(_delivered_coaching(ch, safe)
-                                            if req_id is not None else None))
+                                            if req_id is not None else None),
+                          dest_hosts=_dest_hosts_value(
+                              tool_key, params.get("arguments"),
+                              session_stats.get("_tool_declared", {}).get(str(tool_key))))
         except Exception:
             pass
         # A stopped call is still a call the agent made: the roster's numerator exists.
@@ -2824,6 +2836,11 @@ def main(argv=None):
         # together. Same reachability rule as --review / --insights above.
         _reader_globals("execute_audit", argv[1:])
         return 0
+    if argv and argv[0] == "--feedback":
+        # Same reachability rule as the readers above: `agentx feedback` is not on PATH
+        # under uvx.
+        _reader_globals("execute_feedback", argv[1:])
+        return 0
     # 🔴 THE BARE WORD IS THE NATURAL TYPO. Every one of the four commands above has an
     # `agentx <word>` twin on the SDK door (no dashes), so a reader switching doors -- or
     # copy-pasting a snippet meant for the other one -- types `agentx-mcp audit` out of
@@ -2835,7 +2852,7 @@ def main(argv=None):
     # server's own args (`agentx-mcp npx -y @modelcontextprotocol/server-x ...`), so a
     # single bare word matching one of our own subcommand names is not a call shape any
     # real wrap uses.
-    if len(argv) == 1 and argv[0] in ("demo", "review", "insights", "audit"):
+    if len(argv) == 1 and argv[0] in ("demo", "review", "insights", "audit", "feedback"):
         sys.stderr.write(
             "[agentx-mcp] unknown command '%s'. Did you mean '--%s'?\n"
             "  uvx agentx-mcp --%s\n" % (argv[0], argv[0], argv[0])

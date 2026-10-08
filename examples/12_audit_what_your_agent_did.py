@@ -78,6 +78,7 @@ except ImportError:
 #     the argument NAMES the agent passed   (never the values)
 #     the SURFACE it touched                (DB / HTTP / FS / SHELL / CLOUD / -)
 #     the size of any AMOUNT passed         (a bucket: ">=1,000", never the figure)
+#     the SITE any web address pointed at   (the host alone, never the full address)
 #
 # So an agent that behaves perfectly still produces a report. That is the point: you find
 # out what your agent does on an ordinary day, including the calls we had no opinion about.
