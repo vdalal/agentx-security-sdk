@@ -86,6 +86,9 @@ setup(
         "Source": "https://github.com/vdalal/agentx-security-sdk",
     },
     packages=find_packages(include=["agentx_sdk", "agentx_sdk.*"]),
+    # The evidence file's words (`agentx evidence`): data, not code, so it is named here or it
+    # would be left out of the wheel.
+    package_data={"agentx_sdk": ["evidence_words.json"]},
     install_requires=[
         "requests>=2.25.0",
     ],

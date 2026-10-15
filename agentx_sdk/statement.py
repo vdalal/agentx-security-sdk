@@ -123,6 +123,11 @@ def _coerce_arg_value(value):
 
 
 def _statement_text(arguments, tool_name=None, head=None, declared=None):
+    """The declared statement text of one call, joined. See `_statement_parts`."""
+    return " ".join(_statement_parts(arguments, tool_name=tool_name, head=head, declared=declared))
+
+
+def _statement_parts(arguments, tool_name=None, head=None, declared=None):
     """The text the grammar-reading floors may read for ONE call: `head` (the proxy puts
     the tool name in front, the decorator does not), then the values of the arguments whose
     NAME declares a statement, in argument order, or whose name is in `declared` (what the
@@ -138,7 +143,8 @@ def _statement_text(arguments, tool_name=None, head=None, declared=None):
     TEXT, which is not built. An undeclared dict is walked for the same reason (a nested
     `params.sql` is read); an undeclared list of strings is prose and is not. Returns
     "" when nothing is declared, so a call made of prose reads as empty to every rail rather
-    than as a sentence to scan.
+    than as a sentence to scan. (`_statement_parts` returns the same texts as a list, empty
+    when nothing is declared; `_statement_text` joins it.)
 
     One fallback, and it is still a declaration: a tool whose own NAME carries one of the
     tokens (`run_sql`, `execute_query`, `shell_exec`) and declares no argument by name has
@@ -209,7 +215,9 @@ def _statement_text(arguments, tool_name=None, head=None, declared=None):
             for v in arguments.values():
                 if isinstance(v, str):
                     _append(v)
-    return " ".join(parts)
+    # A list, one text per declared value: a reader that must not let one argument's value
+    # complete another's (a command beside a `directory`) reads them apart.
+    return parts
 
 
 # A host is read only from inside an explicit scheme://URL, never from a bare token, so a

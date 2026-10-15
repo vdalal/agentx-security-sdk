@@ -149,6 +149,9 @@ def _rules_in_force_lines():
         mine = None
     if n_ours is None and mine is None:
         return []
+    # Everything armed beyond the built-ins, from the evidence file's own list, so these rows
+    # and that file cannot disagree (step-2 walk; reviews 1 and 2).
+    beyond = _armed_beyond_or_none()
     # "Rules here", not "Rules in force here": on a keyless install the reader's rules are
     # matched and recorded, never blocked, and the clause under them says so; a header
     # claiming force over them was contradicted four lines down (founder walk).
@@ -158,7 +161,57 @@ def _rules_in_force_lines():
     if n_ours is not None:
         lines.append(row % ("%d built-in polic%s, ours" % (n_ours, "y" if n_ours == 1 else "ies"),
                             "customize the coaching:  agentx policies"))
-    if mine is not None:
+        # The count is the catalog `agentx policies` lists, switched off or not; one switched
+        # off in the policies file is named, or this row reads as all of them in force while
+        # the evidence file lists it off (review 2).
+        # With the evidence file's reason, which says when its checks still run: a rule switched
+        # off is said to be partly off wherever it is listed.
+        # The condition is said too: this screen opens with "let through" (review 3).
+        for o in (beyond or {}).get("off") or []:
+            lines.append(_wrap("%s: %s A stop applies only when blocking is on."
+                               % (o["name"], o["why"]), "        • ", width=75))
+        # The two built-in checks that are not policies `agentx policies` lists. Without this
+        # row the screen counted 6 where the evidence file on the same machine listed 8 (walk).
+        # Pointed at `agentx audit`, where this screen's opener already says the floor's list
+        # is (review: two pointers for one list).
+        try:
+            from .evidence import builtin_checks
+            n_checks = len(builtin_checks())
+            lines.append(row % ("%d built-in check%s, ours" % (n_checks,
+                                                               "" if n_checks == 1 else "s"),
+                                "what they watch for:  agentx audit"))
+        except Exception:
+            pass
+    # What the policies file arms beyond the shipped rules. Armed, and on no line here, while
+    # the evidence file listed it (step-2 walk). One source: `evidence.armed_beyond_builtin`.
+    from_file = beyond["from_file"] if beyond else None
+    if from_file is None:
+        lines.append("     ⚠️  Could not read what your policies file adds.")
+    elif from_file:
+        n_own = sum(1 for r in from_file if r["own"])
+        # "policies file", not "your policies file": the row's column is 28 wide. A file that
+        # only adds words has no rules of its own to count (review: it read "0 rules").
+        lines.append(row % ("%d rule%s from policies file" % (n_own, "" if n_own == 1 else "s")
+                            if n_own else "words from policies file",
+                            "see what it adds:  agentx policies"))
+        # The file's own rules first, the count's subject, then words it added to ours.
+        for r in sorted(from_file, key=lambda r: not r["own"]):
+            lines.append("        • %s" % (r["name"] if r["own"]
+                                           else "words added to %s" % r["name"]))
+    # The rules you added, read through the same state the evidence file reports. A file that
+    # was damaged or would not open read as "0 rules you added" over rules that exist and are
+    # ignored; an earlier import file under the same name holds none, and its fix is a rename.
+    adopted_state = ((beyond or {}).get("sources") or {}).get("adopted_rules")
+    # No guessed cause: an OS refusal can be a lock, a permission or a folder (review).
+    unread_adopted = {"damaged": "the file is damaged, so none of them applies until it is fixed",
+                      "could not open": ("the system would not open the file, so none of them "
+                                         "applies until it can be opened"),
+                      "could not read": ("their store could not be read, so any you added there "
+                                         "do not apply until it can be")}.get(adopted_state)
+    if unread_adopted:
+        lines.append(_wrap("⚠️  Could not read the rules you added: %s." % unread_adopted,
+                           "     ", width=75))
+    elif mine is not None:
         if mine:
             lines.append(row % ("%d rule%s you added, yours"
                                 % (len(mine), "" if len(mine) == 1 else "s"),
@@ -176,9 +229,30 @@ def _rules_in_force_lines():
             # sharing a 105-column line. The path gets its own line, whole.
             try:
                 from .rules import _rules_file_path
-                _clause = _rule_armed_clause(plural=len(mine) > 1)
-                lines.append(_wrap("%s%s." % (_clause[:1].upper(), _clause[1:]), "        ",
-                                   width=75))
+                # Said of the rules switched ON only: under a rule marked off it
+                # read "it is matched and recorded here", and nothing matches an off rule (the
+                # keyless matcher skips it, the gateway loads it switched off).
+                on = [r for r in mine if r.get("active", True)]
+                n_off = len(mine) - len(on)
+                if on:
+                    _clause = _rule_armed_clause(plural=len(on) > 1)
+                    if n_off:
+                        _clause = "the %s switched on: %s" % (
+                            "ones" if len(on) > 1 else "one", _clause)
+                    lines.append(_wrap("%s%s." % (_clause[:1].upper(), _clause[1:]), "        ",
+                                       width=75))
+                if n_off:
+                    many = n_off > 1
+                    if on:
+                        lead = "The ones marked off" if many else "The one marked off"
+                    else:
+                        lead = "They are off" if many else "It is off"
+                    # The lever named, not "until it is switched back on": no command switches
+                    # an adopted rule on (`--undo` removes it), so the file below is the way
+                    # (review of 2e32ba7f).
+                    lines.append(_wrap('%s ("active": false in the file below): nothing matches '
+                                       "or enforces %s." % (lead, "them" if many else "it"),
+                                       "        ", width=75))
                 lines.append("        Commit this file to share %s:"
                              % ("them" if len(mine) > 1 else "it"))
                 lines.append("        %s" % os.path.abspath(_rules_file_path()))
@@ -187,6 +261,23 @@ def _rules_in_force_lines():
         else:
             lines.append(row % ("0 rules you added, yours",
                                 "%s proposes them from your agent's calls" % _review_cmd()))
+            if adopted_state == "earlier import file":
+                lines.append(_wrap("Your rules file holds an org import file from an earlier "
+                                   "version, so no rules were added. Move it to .agentx/import.json "
+                                   "in your project, which agentx import reads.", "        ",
+                                   width=75))
+    # The outbound allowlist is a rule in force too, one per agent it limits, as the evidence
+    # file lists it; status left it out of these counts, and said nothing when it could not be
+    # read, which stops every call to a site (review).
+    if beyond and beyond["allowlist_error"]:
+        lines.append(_wrap("⚠️  Could not read your outbound allowlist, so every call to a site "
+                           "is stopped until it is fixed (recorded only, while watching).",
+                           "     ", width=75))
+    elif beyond and beyond["allowlist"]:
+        n_agents = len(beyond["allowlist"])
+        lines.append(row % ("%d agent%s on your allowlist" % (n_agents,
+                                                              "" if n_agents == 1 else "s"),
+                            "the sites each may reach:  agentx evidence"))
     return lines
 
 
@@ -1781,12 +1872,20 @@ def _print_coaching_effectiveness(verbose=False):
     # below: the section rendered nothing, on a ledger that had data, with no error anywhere.
     # Every other reader on this screen does the same lazy import for the same reason.
     from . import db as db_module
+    # Claude Code hook blocks are left out of the comparison: each of its calls is recorded on
+    # its own, so a later safer call is never joined to the block and every rate would read 0%
+    # (walk: "2 blocks · 0 recovered (0%)"). Counted, and said, rather than shown as a zero.
+    from .hook import AGENT_ID as _HOOK_AGENT
     try:
-        data = db_module.get_coaching_effectiveness(exclude_agents=list(_OUR_AGENT_IDS))
+        data = db_module.get_coaching_effectiveness(
+            exclude_agents=list(_OUR_AGENT_IDS) + [_HOOK_AGENT])
+        _theirs = db_module.get_coaching_effectiveness(exclude_agents=list(_OUR_AGENT_IDS))
     except Exception:
         return
     attributed = data.get("attributed") or 0
     unattributed = data.get("unattributed") or 0
+    hook_n = ((_theirs.get("attributed") or 0) + (_theirs.get("unattributed") or 0)
+              - attributed - unattributed)
 
     # 🔴 TWO TOTALS ON ONE SCREEN NEED A BRIDGE, OR THE SMALLER ONE READS AS A BUG. The
     # section above this prints every block (38 on the founder's ledger) and footnotes the
@@ -1799,16 +1898,24 @@ def _print_coaching_effectiveness(verbose=False):
     try:
         _all = db_module.get_coaching_effectiveness()
         excluded_n = ((_all.get("attributed") or 0) + (_all.get("unattributed") or 0)
-                      - attributed - unattributed)
+                      - (_theirs.get("attributed") or 0) - (_theirs.get("unattributed") or 0))
     except Exception:
         excluded_n = 0
 
-    if not attributed and not unattributed:
+    if not attributed and not unattributed and not hook_n:
         # No blocks at all. The sections around this one already say so, and repeating it
         # here would be a third voice saying "nothing yet" on one screen.
         return
 
     print("  WHICH COACHING WAS SHOWN, AND WHETHER THE AGENT CAME BACK")
+    if hook_n:
+        _print_wrapped("%s from Claude Code %s not compared here: AgentX does not record "
+                       "whether the agent came back after a block there."
+                       % (_plural(hook_n, "block"), "is" if hook_n == 1 else "are"), "    ")
+    if not attributed and not unattributed:
+        _print_coaching_exclusion_note(excluded_n)
+        print("")
+        return
     if not attributed:
         # The honest empty state, and the one nearly every existing install lands on.
         # 🔴 SCOPED TO THIS READOUT AND ITS RECORD, because a flat "none can be compared" is
@@ -3509,10 +3616,41 @@ def _print_posture_command(posture, indent="      "):
     # cross-module sharing now guards the two shells rather than two screens. Two copies of a
     # two-shell rule is still how one of them drifts.
     # Imported inside the function like every other decorators use in this file.
-    from .decorators import posture_command_lines
-    for line in posture_command_lines(posture, indent):
-        print(line)
+    # A record holding Claude Code hook calls gets the Claude Code form: that variable is read
+    # where `claude` starts, and such a reader may have no `your_agent.py` at all. The Python
+    # form stays beside it whenever any other door wrote to the record.
+    if _claude_code_reader():
+        from .hook import posture_command_lines as claude_code_lines
+        for line in claude_code_lines(posture, indent):
+            print(line)
+    if not _claude_code_only():
+        from .decorators import posture_command_lines
+        for line in posture_command_lines(posture, indent):
+            print(line)
 
+
+# Which doors wrote the record the current screen reads (`db.door_counts`), set at the top of
+# `agentx audit` and `agentx insights`. None on every other screen, which keeps the Python wording.
+_SCREEN_DOORS = None
+
+
+def _set_screen_doors():
+    global _SCREEN_DOORS
+    try:
+        from .db import door_counts
+        _SCREEN_DOORS = door_counts()
+    except Exception:
+        _SCREEN_DOORS = None
+
+
+def _claude_code_reader():
+    """The record holds calls the Claude Code hook screened."""
+    return bool(_SCREEN_DOORS and _SCREEN_DOORS.get("claude_code"))
+
+
+def _claude_code_only():
+    """Every row of theirs came through the Claude Code hook."""
+    return _claude_code_reader() and not _SCREEN_DOORS.get("code")
 
 def _print_enforce_command(indent="      "):
     """Kept as the name every enforce call site already uses. Thin on purpose."""
@@ -3605,6 +3743,11 @@ def _print_concentration(novelty):
         return
     share = novelty["busiest_calls"] / float(novelty["total_calls"])
     if share < _CONCENTRATION_SHARE:
+        return
+    # A coding agent's shell carries most of what it does, so "Bash ran 19 of your 35" says
+    # nothing a Claude Code reader did not know (walk).
+    from .hook import SCREENED_SHELL_TOOLS
+    if _claude_code_reader() and novelty["busiest"] in SCREENED_SHELL_TOOLS:
         return
     # Counted over the developer's OWN rows, both halves. `inventory["total_calls"]` on the
     # line above includes our demo's, so dividing one by the other would produce a share of
@@ -4930,8 +5073,9 @@ def _record_status(path, tables):
     from . import chain
     if not path or not os.path.exists(path):
         return None
+    from .db import read_only_uri
     try:
-        conn = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path), uri=True)
+        conn = sqlite3.connect(read_only_uri(path), uri=True)
     except sqlite3.Error as err:
         return {"journaled": True, "intact": None, "error": str(err)}
     try:
@@ -4980,7 +5124,8 @@ def _record_check_head(path, want, tag="ledger"):
         return ("  🚨 Entry #%d cannot be checked: no record at %s. Either it was removed, "
                 "or it lives elsewhere (check %s)." % (seq, os.path.abspath(path or "."), where),
                 3)
-    conn = sqlite3.connect("file:%s?mode=ro" % os.path.abspath(path), uri=True)
+    from .db import read_only_uri
+    conn = sqlite3.connect(read_only_uri(path), uri=True)
     try:
         have = chain.link_at(conn, seq)
         try:
@@ -5090,6 +5235,7 @@ def _execute_audit_screen(args=None):
     collapsing them would lose the only distinction that makes this worth running.
     """
     _reset_demo_row_note()          # new screen: the attribution note may speak once
+    _set_screen_doors()
     from . import db as db_module
     from . import pulse as pulse_module
     from .db import (get_call_inventory, get_call_log, get_retention_status,
@@ -5640,7 +5786,13 @@ def _execute_audit_screen(args=None):
     # through this exact rendering and sums the terms and the footnote against the header.
     _split = _totals.get("reversibility") or {}
     _unlabelled = _totals.get("reversibility_unlabelled") or 0
-    if _totals.get("reversibility_readable") and (sum(_split.values()) + _unlabelled):
+    # Not for a Claude Code reader when not one call could be sized: a command line never
+    # states its own size, so the line read "0, 0, 0, N could not tell" (walk). A record with
+    # one sized call, or with any other door's calls, keeps the whole line.
+    _sized = sum(_split.get(_v, 0) for _v in _REVERSIBILITY_LABELS if _v != _REV_UNKNOWN)
+    _nothing_sized = _claude_code_only() and not _sized and not _unlabelled
+    if _totals.get("reversibility_readable") and (sum(_split.values()) + _unlabelled) \
+            and not _nothing_sized:
         # Keyed off the four constants and `_LABEL_WORDS`, never off literals: the words used to
         # be spelled here and again on the insights screen, and the two spellings drifted.
         _terms = ["%s %s" % (f"{_split.get(_value, 0):,}", _label_word(_value))
@@ -6436,7 +6588,49 @@ def _execute_audit_screen(args=None):
         # of what their agent actually ran, and notice `refund_customer` is not on our side.
         _print_wrapped("The built-in floor watches for: %s."
                        % _joined_phrase([why for _name, why in coverage]))
-        if keyed:
+        # Your own rules arm more than the built-in floor, and the line below called the list
+        # closed over them: with a team's rule in the policies file, the screen said anything
+        # outside the list runs unchecked (step-2 walk), and the same over an adopted rule or an
+        # allowlist (review). One source: `evidence.armed_beyond_builtin`, the evidence file's.
+        beyond = _armed_beyond_or_none()
+        # Which sources were read: the evidence file's `rule_sources`, one answer for every
+        # screen (each screen used to decide "could not read" its own way).
+        from .evidence import SOURCE_OK
+        labels = (("policies_file", "your policies file"), ("adopted_rules", "the rules you added"),
+                  ("outbound_allowlist", "your outbound allowlist"))
+        sources = (beyond or {}).get("sources") or {}
+        unread = (["your own rules"] if beyond is None else
+                  [label for key, label in labels if sources.get(key) not in SOURCE_OK])
+        # Named beside a failed read too (founder's call): a reader told only what could not
+        # be read cannot tell that the team's rule is still checked.
+        own = [] if beyond is None else [label for label, armed in (
+            ("your policies file", beyond["from_file"]), ("the rules you added", beyond["adopted"]),
+            ("your outbound allowlist", beyond["allowlist"])) if armed and label not in unread]
+
+        def _listed(items, word="and"):
+            return items[0] if len(items) == 1 else "%s %s %s" % (", ".join(items[:-1]), word,
+                                                                  items[-1])
+        if unread:
+            _print_wrapped("Could not read %s, so this may not be the whole list."
+                           % _listed(unread, "or"))
+        if own:
+            # A list, not a sentence whose verb agrees with it ("Rules you added add", review
+            # 2). No pointer through the MCP door: it has no `agentx evidence` (the
+            # reachability gate's class), and the fact stands without one.
+            _print_wrapped("Also checked: %s%s" % (
+                _listed(own), "." if MCP_ENTRY
+                else " (agentx evidence lists every rule in force)."))
+        if unread and keyed:
+            # No "runs unchecked" over a failed read: what that source holds is not known.
+            _print_wrapped("Your gateway checks more than %s." % ("these" if own else "this list"))
+        elif unread:
+            pass                        # the line above already says the list may be short
+        elif own and keyed:
+            _print_wrapped("Your gateway checks more than these. Anything none of them cover "
+                           "runs unchecked.")
+        elif own:
+            _print_wrapped("Anything none of these cover runs unchecked.")
+        elif keyed:
             # Do NOT tell a paying user their agent is unwatched outside this list: their
             # gateway is the thing this screen cannot see. Read it aloud before changing it --
             # the first version of this ("anything it does not cover either is outside what
@@ -6526,6 +6720,13 @@ def _execute_audit_screen(args=None):
         # picture -- now sits in the one sentence, joined by "so" rather than left for the
         # reader to derive. Founder, on the pair: "Repetitive? Why do we need the second
         # sentence?" Nothing in the suite pinned the removed line, so nothing went red.
+        # The Claude Code hook is not a wrap: it is started for shell commands and MCP calls
+        # only, so that is its blind spot, and there is no tool function to wrap (walk).
+        if _claude_code_reader():
+            _print_wrapped("From Claude Code, only shell commands and MCP calls are checked "
+                           "and listed here; its file edits, file reads and web fetches are "
+                           "not.")
+    if not MCP_ENTRY and not _claude_code_only():
         print("  Only wrapped tools appear here, so this is not all your agent did.")
         # 🔴 THE ONE LIMIT ON THIS SCREEN THE READER CAN ACT ON, SO IT NOW SAYS HOW. It
         # stated the blind spot and stopped, which is the shape of a caveat rather than a
@@ -6705,6 +6906,7 @@ def execute_insights(args=None):
     silently becoming a live security challenge.
     """
     _reset_demo_row_note()          # new screen: the attribution note may speak once
+    _set_screen_doors()
     verbose = bool(args) and any(a in ("-v", "--verbose") for a in args)
 
     # 🔴 RESOLVED HERE, BEFORE THE SCREEN PRINTS ANYTHING. Same reason `execute_audit` states
@@ -7354,7 +7556,7 @@ def execute_insights(args=None):
                 # `rule_list`, so rules existed by construction; it is gated on `printed_seqs`
                 # now, which coaching candidates also fill.
                 if rule_list:
-                    print("       author a rule:  agentx adopt --rule --action <a> --desc \"…\"")
+                    print("       author a rule:  agentx adopt --rule --action <tool> --desc \"…\"")
                 print(f"       or review {_covers}:   {_review_cmd()}")
             else:
                 print(f"  ▶ Review {_covers}, one key each:   {_review_cmd()}")
@@ -7366,7 +7568,7 @@ def execute_insights(args=None):
                     print(f"       or adopt a specific one:  agentx adopt <#>{example}")
                     print("       tweak first:  agentx adopt <#> --edit        write your own:  agentx customize \"<policy>\" --text \"…\"")
                     if rule_list:
-                        print("       author a rule:  agentx adopt --rule --action <a> --desc \"…\"")
+                        print("       author a rule:  agentx adopt --rule --action <tool> --desc \"…\"")
             print()
         # WHERE it lands differs by door, so this sentence cannot be one string. The Python door
         # anchors the store to your project root precisely so you can commit it; the MCP door has
@@ -7583,7 +7785,7 @@ def _adopt_usage_exit():
     print("   ...add --name \"...\"  to name a rule yourself. Without it a rule proposed from")
     print("      your calls is named after the tool and its argument names, nothing else.")
     print("   Write your own coaching:  agentx customize \"<policy name or id>\" --text \"...\"")
-    print("   agentx adopt --rule --action <a> --desc \"...\"  author a detection RULE from scratch")
+    print("   agentx adopt --rule --action <tool> --desc \"...\"  author a detection RULE from scratch")
     print("   ...optional: --effect <CAT> --indicators \"a,b\" --challenge \"...\" --name \"...\"")
     print("   The <#> is the number shown by `agentx insights` (one sequence over both kinds).")
     print("=" * 75)
@@ -7940,6 +8142,14 @@ def _print_your_rules_table(db_module, rule_matches):
                     "%s call%s had no %s we could read" % (f"{skipped:,}", "" if skipped == 1 else "s",
                                                             argument))
             print("    %-30s  %s" % (_fit(clause, 30), _fit(note, 36)))
+    # Every rule off: the sentence below described matching under a table where nothing can
+    # match (the audit sibling of status's off-rule wording). Same words as status; the file
+    # is the path on the title line above.
+    if all(not r.get("active", True) for r in armed):
+        print('  Off ("active": false in the file above): nothing matches or')
+        print("  enforces %s. Remove one:  %s --undo" % ("it" if len(armed) == 1 else "them",
+                                                     _review_cmd()))
+        return
     # The same sentence about blocking as everywhere else this feature speaks, once.
     print("  Recorded, not blocked: the SDK matches the shape of a rule, and only a")
     print("  gateway judges the meaning. Remove one:  %s --undo" % _review_cmd())
@@ -8123,11 +8333,25 @@ def _adopt_rule_or_exit(candidate, **kw):
         sys.exit(1)
 
 
-# Common vocabularies the gateway recognizes — used only for a soft hint when a
-# hand-authored rule uses an unusual value. Custom values are still accepted (the
-# policy engine matches on whatever string is stored), so this never blocks.
+# `--action` means a different thing on each door, so the hint below names both. On this machine
+# a rule matches a call to the tool with exactly this name (`rules.match_adopted_rule`). A gateway
+# that reads the file never compares it with a tool name: it uses the value only to narrow the
+# rule, to the calls it files under `execute_database_query` or `fetch_url` (its policy loop's
+# surface filter; see `_GATEWAY_SURFACE_OF`), and any other value narrows nothing. These names
+# LOOK like the action to type and match no tool of that name here, which is why they get the
+# hint. The old
+# hint warned on every OTHER value, a tool's name included, and said a rule "matches only if the
+# gateway emits that exact target_action": wrong on both doors.
 _RULE_ACTIONS = ("execute_database_query", "fetch_url", "execute_shell",
                  "send_message", "write_file", "other")
+# What a gateway checks such a rule against. NOT "database queries": the gateway files a call
+# under `execute_database_query` whenever it carries text and declares no kind of action
+# (`effective_action`, gateway ~14934; the SDK sends every call's text as `query` and declares a
+# kind only for a URL fetch or an explicit `action=`), so that value reaches most calls. The
+# first cut of this hint said "database queries" (its own scoped review).
+_GATEWAY_SURFACE_OF = {"execute_database_query": "the calls it files as database queries, which "
+                                                 "include most calls that are not URL fetches",
+                       "fetch_url": "the calls it files as URL fetches"}
 _RULE_EFFECTS = ("DESTRUCTION", "EXFILTRATION", "SSRF", "SECRET_READ",
                  "WILDCARD_PII", "SUPPLY_CHAIN", "OTHER")
 
@@ -8180,10 +8404,14 @@ def _author_rule(args):
         _adopt_usage_exit()
 
     # Soft hints only — never block a custom value.
-    if action not in _RULE_ACTIONS:
-        print(f"   ⚠️  --action '{action}' isn't one of the common actions "
-              f"({', '.join(_RULE_ACTIONS)}). Stored as-is; it matches only if the "
-              f"gateway emits that exact target_action.")
+    if action in _RULE_ACTIONS:
+        print(_wrap(f"⚠️  On this machine a rule matches calls to the tool with exactly this "
+                    f"name, so '{action}' matches only a tool named {action}. To match one of "
+                    f"your tools, pass its name as `agentx audit` lists it.", "   "))
+        if action in _GATEWAY_SURFACE_OF:
+            print(_wrap(f"A gateway that reads this file never compares '{action}' with a "
+                        f"tool name: it checks the rule against "
+                        f"{_GATEWAY_SURFACE_OF[action]}.", "      "))
     if effect and effect not in _RULE_EFFECTS:
         print(f"   ⚠️  --effect '{effect}' isn't one of {', '.join(_RULE_EFFECTS)}. "
               f"Stored as-is (used for the rule's label).")
@@ -8597,9 +8825,10 @@ def _policies_json_payload():
         _load_error = ("could not determine whether the rules file loaded: %s: %s"
                        % (type(_probe_failed).__name__, _probe_failed))
     _enforced_ids = {str(p.get("id")) for p in (_dec.LOCAL_POLICY_KEYWORDS or [])}
+    _structural_ids = _dec.structural_policy_ids()
 
     policies = list_customizable_policies()
-    return {
+    doc = {
         "schema": _POLICIES_SCHEMA,
         # Named, for the reason on _POLICIES_SCHEMA: two surfaces, two vocabularies, and no
         # comparison between them is supportable.
@@ -8644,6 +8873,13 @@ def _policies_json_payload():
                 # `enforced` says whether the rule runs at all. A row can be listed,
                 # uncustomized, and switched off.
                 "enforced": str(p["id"]) in _enforced_ids,
+                # 🔴 "OFF" IS ONLY HALF OF IT FOR SOME RULES. Switched off in the file, a rule's
+                # trigger words stop; the built-in checks that report under its name do not
+                # (measured: Customer Privacy Shield off, `SELECT email, phone FROM customers`
+                # is still stopped under that name). `enforced: false` alone told a reviewer
+                # the control was gone.
+                "built_in_checks_still_run": (str(p["id"]) not in _enforced_ids
+                                              and str(p["id"]) in _structural_ids),
                 "customized": p["customized"],
                 "challenge": p["active_challenge"] or p["default_challenge"],
                 "safe_path": p["active_safe_path"] or p["default_safe_path"],
@@ -8670,6 +8906,38 @@ def _policies_json_payload():
             for p in policies
         ],
     }
+    # `policies` above stays the shipped, customizable rules (the evidence file reads it as
+    # that). What the policies file arms beyond them, a rule of its own or words added under a
+    # built-in, was on no list here while the check held it (step-2 walk). Read from the one
+    # source every screen uses; null, never [], when it could not be read.
+    try:
+        from .evidence import policies_file_rules
+        doc["from_your_policies_file"] = policies_file_rules(doc)
+    except Exception:
+        doc["from_your_policies_file"] = None
+    doc["from_your_policies_file_note"] = (
+        "Rules and words your policies file arms beyond the built-in rules above: \"own\" is "
+        "true for a rule of its own, false for words added under a built-in rule or check. "
+        "null means this could not be read.")
+    return doc
+
+
+def _armed_beyond_or_none():
+    """`evidence.armed_beyond_builtin()` for a screen: None when it could not be read."""
+    try:
+        from .evidence import armed_beyond_builtin
+        return armed_beyond_builtin()
+    except Exception:
+        return None
+
+
+def _policies_file_rules_or_none():
+    """`evidence.policies_file_rules()` for a screen: None when it could not be read."""
+    try:
+        from .evidence import policies_file_rules
+        return policies_file_rules()
+    except Exception:
+        return None
 
 
 def execute_policies(args=None):
@@ -8730,6 +8998,13 @@ def execute_policies(args=None):
         sys.exit(1)
 
     policies = list_customizable_policies()
+    from . import decorators as _dec
+    try:
+        _dec.current_policy_load_error()        # re-reads a policies file that has changed
+    except Exception:
+        pass
+    _enforced_ids = {str(p.get("id")) for p in (_dec.LOCAL_POLICY_KEYWORDS or [])}
+    _structural_ids = _dec.structural_policy_ids()
     print("\n🛡️  CUSTOMIZABLE FLOOR POLICIES        (keyless · no gateway, no key)")
     print("=" * 75)
     print("  These built-in floors block deterministically, offline. You can customize the")
@@ -8746,6 +9021,14 @@ def execute_policies(args=None):
         else:
             tag = ""
         print(f"\n  📋 {p['name']}{tag}")
+        # The screen used to list a switched-off rule exactly like a running one.
+        if str(p["id"]) not in _enforced_ids:
+            if str(p["id"]) in _structural_ids:
+                print(_wrap("Switched off in your policies file: its trigger words no longer "
+                            "stop calls, but built-in checks under this name still do.",
+                            "     ⏸  "))
+            else:
+                print("     ⏸  Switched off in your policies file: it blocks nothing.")
         challenge = p["active_challenge"] or p["default_challenge"]
         safe = p["active_safe_path"] or p["default_safe_path"]
         if challenge:
@@ -8762,6 +9045,22 @@ def execute_policies(args=None):
                 print(_wrap(s["challenge"], "       coaching: "))
             if s.get("safe_path"):
                 print(_wrap(s["safe_path"], "       safe path: "))
+
+    # What the policies file arms beyond the list above, in the evidence file's own sentences
+    # (one source: `evidence.policies_file_rules`). It was armed and on no screen (step-2 walk).
+    from_file = _policies_file_rules_or_none()
+    if from_file is None:
+        print("\n  ⚠️  Could not read what your policies file adds to these rules.")
+    elif from_file:
+        print("\n  FROM YOUR POLICIES FILE")
+        # Under a header about customizable built-ins and above "Customize one", so it says
+        # what customize does not reach; and the descriptions say what is stopped, so it says
+        # when, as the evidence file's note does (review).
+        print(_wrap("When blocking is on, these stop calls too. agentx customize changes "
+                    "coaching, not these words: they change in your policies file.", "  "))
+        for r in from_file:
+            print(f"\n  📄 {r['name']}")
+            print(_wrap(r["text"], "     "))
 
     print("\n" + "=" * 75)
     first = policies[0]["name"] if policies else "<name>"
@@ -12130,6 +12429,8 @@ def execute_audit_demo(closing=True):
     from .db import DEMO_AGENT_ID
     from .decorators import set_atexit_summary_quiet, set_audit_banner_quiet
 
+    global _SCREEN_DOORS
+    _SCREEN_DOORS = None            # the demo is a Python reader: no earlier screen's doors
     set_atexit_summary_quiet(True)
     set_audit_banner_quiet(True)
 
@@ -12368,6 +12669,9 @@ def _print_cli_usage(advanced=False):
     # in the other posture. It earns a line in the DEFAULT view for the same reason `audit`
     # does: it is the rung between them, and a rung nobody can find is not a rung.
     print("                ('demo --audit' runs the same agent in watch-only mode and fills the audit screen)")
+    # In the DEFAULT view: for a Claude Code user it is the whole of wiring us in, one command.
+    print("  hook        Check Claude Code's shell commands and MCP calls ('hook install' adds it to")
+    print("                this project's .claude/settings.local.json; watches until AGENTX_POSTURE=enforce)")
     # In the DEFAULT view, not --advanced, because it is the rung immediately after `demo`
     # and both demo footers now send the reader here. A command the on-ramp names and the
     # help screen hides is unfindable the moment that footer scrolls away.
@@ -12384,6 +12688,8 @@ def _print_cli_usage(advanced=False):
     print("  audit       %s" % AUDIT_COMMAND_DESCRIPTION)
     print("                ('audit --calls' lists them one call at a time; add '--json' for a program)")
     print("                (calls are recorded %s)" % RECORDING_UNIVERSAL)
+    print("  evidence    A file for your reviewer: rules in force, calls stopped or flagged, a record link")
+    print("                (writes agentx-evidence-<date>.json, or '--out FILE'; '--json' prints it)")
     print("  status      Local protection stats + armed policies (default; live view needs the gateway)")
     print("  review      One-key pass over pending blocks: adopt a safe-path, or label a block")
     print("                ('--stats' for a summary of every incident's outcome, not just what's pending)")
@@ -12434,7 +12740,10 @@ def _print_cli_usage(advanced=False):
         print("                  or a policy's standing rule: 'verdict --policy \"<name>\" <verdict>'.")
         print("                  '--clear' takes either one back")
         print("    mcp-insights  Review + adopt safe-paths from the keyless MCP wedge (sibling of insights)")
-        print("    policies      List the customizable floor policies + your active coaching ('--check' to validate)")
+        # Also lists what the policies file adds (step 2), so the line says so; the /docs CLI
+        # table carries the same words.
+        print("    policies      List the customizable floor policies + your active coaching ('--check' to validate),")
+        print("                  and what your policies file adds to them")
         print("    customize     Write a policy's coaching, by name or ID: 'customize \"<name>\" --text ...' (or --edit)")
         print("    import        Load coaching + verdicts a teammate wrote, from .agentx/import.json ('check' or 'apply')")
         print("\n  Team & org sync")
@@ -12457,6 +12766,12 @@ def _print_cli_usage(advanced=False):
 
 
 def main():
+    # 🔴 `agentx hook` RUNS BEFORE EVERYTHING ELSE HERE. Claude Code reads the hook's stdout as
+    # its answer, so the banner, the staleness notice and the ledger migration below would
+    # either corrupt that answer or cost every tool call. The hook owns its own output.
+    if sys.argv[1:2] == ["hook"]:
+        from .hook import main as _hook_main
+        sys.exit(_hook_main(sys.argv[2:]))
     # One CLI invocation, one gateway probe. The memo on `_is_keyless_context` is
     # module-level, so it would otherwise persist across in-process calls (the tests drive
     # `execute_*` directly, many times, with different env). Clearing at the real entry
@@ -12611,6 +12926,9 @@ def main():
         execute_import(args[1:])
     elif command == "policies":
         execute_policies(args[1:])
+    elif command == "evidence":
+        from .evidence import main as _evidence_main
+        sys.exit(_evidence_main(args[1:]))
     elif command == "customize":
         execute_customize(args[1:])
     elif command == "demo":

@@ -5,6 +5,7 @@ import sqlite3
 import threading
 import time
 import os
+import pathlib
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -253,6 +254,38 @@ def _our_agents_clause(negate=False):
     if negate:
         return "(agent_id IS NULL OR agent_id NOT IN (%s))" % marks, list(OUR_AGENT_IDS)
     return "agent_id IN (%s)" % marks, list(OUR_AGENT_IDS)
+
+
+def read_only_uri(path):
+    """A read-only SQLite URI for `path`, escaped by pathlib: built by hand as
+    "file:%s?mode=ro", a folder named `p#1` lost everything from the `#` on."""
+    return pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+
+
+def door_counts(db_path=None):
+    """The reader's own rows (ours excluded), split by the door that wrote them, or None when
+    the ledger cannot be read.
+
+    {"claude_code": rows the Claude Code hook wrote, "code": every other row of theirs}
+
+    The audit screen picks its instructions from it: a Claude Code reader turns blocking on
+    where they start `claude`, and has no tool function to wrap."""
+    from .hook import AGENT_ID
+    path = db_path or DB_PATH
+    if not os.path.exists(path):
+        return {"claude_code": 0, "code": 0}
+    theirs, params = _our_agents_clause(negate=True)
+    sql = ("SELECT COALESCE(SUM(agent_id IS ?), 0), COALESCE(SUM(agent_id IS NOT ?), 0) "
+           "FROM event_log WHERE %s" % theirs)
+    try:
+        conn = sqlite3.connect(read_only_uri(path), uri=True)
+        try:
+            row = conn.execute(sql, [AGENT_ID, AGENT_ID] + params).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    return dict(zip(("claude_code", "code"), row))
 
 
 def is_our_agent(agent_id):

@@ -498,6 +498,89 @@ def _note_first_block(session_stats, state=None):
         pass
 
 
+def notice_lines(integration="decorator"):
+    """The one-time transparency notice, as lines. One home for the words: printed by
+    `_show_notice`, and shown in the Claude Code window by the hook door, whose stdout at
+    session end nobody sees."""
+    # DOOR-AWARE. This is the FIRST thing a new install ever prints, and it ran on both
+    # surfaces while naming `agentx demo` -- a command an MCP user does not have, because
+    # uvx and pipx install the `agentx-mcp` script only. So the very first sentence AgentX
+    # said to an MCP user was an instruction that fails. `integration` is the same coarse
+    # value the pulse already carries, so this needs no new signal.
+    _try_it = ("uvx agentx-mcp --demo" if integration == "mcp" else "agentx demo")
+    return [
+        " AgentX shares ANONYMOUS usage by default — SDK version, OS, and",
+        " block COUNTS only. Never your code, queries, or data.",
+        " Opt out anytime:  AGENTX_TELEMETRY=off",
+        f" New here? Try:  {_try_it}   ·   Questions/feedback: {DISCORD_URL}",
+    ]
+
+
+def _mark_notice_shown(state):
+    state["notice_shown"] = True
+    _ensure_identity(state)
+    _save_state(state)
+
+
+def take_notice_if_due(integration):
+    """The notice text if this install still owes it (telemetry on by default and never
+    shown), marked shown as it is returned; else None. For a door that shows the text itself.
+
+    Claude Code runs hooks in parallel, so two calls at the start of a first session can both
+    read "not shown yet". Only the one that wins an exclusive create of a claim file beside
+    pulse.json returns the text. A claim older than a minute is stale (pulse.json was reset
+    since, or the winner died before marking it shown) and is taken over, so it can never hide
+    the notice for good. Known limit, accepted: just after a stale claim, with three first
+    calls in parallel, a fresh claim being put back leaves a moment with none, and a third call
+    can show the notice a second time. Never raises."""
+    try:
+        state = _load_state()
+        if (telemetry_enabled(state) and _is_default_on(state)
+                and not state.get("notice_shown", False) and _claim_notice()):
+            _mark_notice_shown(state)
+            return "\n".join(line.strip() for line in notice_lines(integration))
+    except Exception:
+        pass
+    return None
+
+
+_NOTICE_CLAIM_STALE_S = 60
+
+
+def _claim_notice():
+    claim = str(_PULSE_FILE) + ".notice-claim"
+    for _ in range(3):
+        try:
+            Path(claim).parent.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            return True
+        except FileExistsError:
+            pass
+        try:
+            if time.time() - os.path.getmtime(claim) < _NOTICE_CLAIM_STALE_S:
+                return False
+            # Two processes can both judge the claim stale. Moving it aside is a rename only
+            # one of them wins; the age is checked again on the file actually moved, so a
+            # fresh claim another process just made is put back, never taken.
+            aside = "%s.%s" % (claim, uuid.uuid4().hex)
+            os.rename(claim, aside)
+        except FileNotFoundError:
+            continue                          # gone already: try to create it again
+        except OSError:
+            return False
+        try:
+            if time.time() - os.path.getmtime(aside) < _NOTICE_CLAIM_STALE_S:
+                try:
+                    os.rename(aside, claim)
+                except OSError:
+                    os.remove(aside)          # a newer claim is in place; that one stands
+                return False
+            os.remove(aside)
+        except OSError:
+            return False
+    return False
+
+
 def _show_notice(state=None, integration="decorator"):
     """Print the one-time transparency notice for a default-on install and mark it
     shown (``notice_shown`` in ~/.agentx/pulse.json) so it never repeats. This is the
@@ -508,20 +591,10 @@ def _show_notice(state=None, integration="decorator"):
         if state is None:
             state = _load_state()
         print("\n" + "─" * 60)
-        print(" AgentX shares ANONYMOUS usage by default — SDK version, OS, and")
-        print(" block COUNTS only. Never your code, queries, or data.")
-        print(" Opt out anytime:  AGENTX_TELEMETRY=off")
-        # DOOR-AWARE. This is the FIRST thing a new install ever prints, and it ran on both
-        # surfaces while naming `agentx demo` -- a command an MCP user does not have, because
-        # uvx and pipx install the `agentx-mcp` script only. So the very first sentence AgentX
-        # said to an MCP user was an instruction that fails. `integration` is the same coarse
-        # value the pulse already carries, so this needs no new signal.
-        _try_it = ("uvx agentx-mcp --demo" if integration == "mcp" else "agentx demo")
-        print(f" New here? Try:  {_try_it}   ·   Questions/feedback: {DISCORD_URL}")
+        for line in notice_lines(integration):
+            print(line)
         print("─" * 60)
-        state["notice_shown"] = True
-        _ensure_identity(state)
-        _save_state(state)
+        _mark_notice_shown(state)
     except Exception:
         pass
 
@@ -845,9 +918,10 @@ def on_session_end(session_stats):
         pass
 
 
-# Integration surface that emitted the pulse — a closed 2-value enum (same privacy
+# Integration surface that emitted the pulse — a closed 3-value enum (same privacy
 # class as mode / block_category): the @agentx_protect decorator (the in-process
-# path, default) vs the agentx-mcp stdio proxy. Names HOW the install integrates,
+# path, default), the agentx-mcp stdio proxy, or the Claude Code hook (`agentx hook`,
+# one pulse per Claude Code session). Names HOW the install integrates,
 # never identity. KEEP IN SYNC with the JS mirror in ui/app/api/pulse/route.ts.
 #
 # The receiver accepts a THIRD value this module never emits: "ts", sent by the TypeScript
@@ -855,7 +929,7 @@ def on_session_end(session_stats):
 # the route's set is a superset of this one, on purpose, and
 # sdk_tests/test_ts_sdk_matches_python.py pins both directions: the TS field list equals
 # _ALLOWED_KEYS / _ALLOWED_SESSION_KEYS below, and the route accepts every emitter.
-_INTEGRATION_VOCAB = frozenset({"decorator", "mcp"})
+_INTEGRATION_VOCAB = frozenset({"decorator", "mcp", "hook"})
 
 
 def _integration(session_stats):

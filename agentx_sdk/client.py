@@ -712,7 +712,7 @@ class AgentXClient:
             return {"status": "ERROR", "message": f"AgentX unexpected error: {e}"}
 
     def register_incident(self, agent_id, query, chain_of_thought, policy_id,
-                          policy_name, challenge_issued, trace_id=None):
+                          policy_name, challenge_issued, trace_id=None, tool=None):
         """
         Park a CHALLENGED incident for an offline (Layer 0 keyword shield) block —
         FIRE-AND-FORGET, off the response path (issue #3).
@@ -753,6 +753,11 @@ class AgentXClient:
             "challenge_issued": challenge_issued,
             "trace_id": trace_id
         }
+        # The tool's own name, as `evaluate_intent` sends it, and only when there is one, so a
+        # caller that passes none sends today's payload (without it a keyword-shield block
+        # reached the gateway's evidence as "Tool: not recorded").
+        if tool:
+            payload["tool"] = str(tool)
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
@@ -848,19 +853,19 @@ class AgentXClient:
                 # once-per-session line is exactly when the one example matters most.
                 if not getattr(self, "_park_refusal_announced", False):
                     self._park_refusal_announced = True
-                    print("ℹ️ [LOCAL KEYWORD SHIELD] Parked incidents were refused (403) for "
+                    print("ℹ️ [AgentX SDK] The gateway refused this block's record (403) for "
                           "receipt %s, so recovery is not being recorded. Either this gateway "
                           "does not accept parks (a shared one does not, by design) or something "
                           "in front of it refused the credential. Blocks still stand and are "
                           "still enforced locally; `agentx audit` reads your own ledger. Said "
                           "once per session." % receipt, file=sys.stderr)
             elif resp.status_code != 200:
-                print(f"⚠️ [LOCAL KEYWORD SHIELD] Async incident park rejected "
-                      f"({resp.status_code}) for receipt {receipt} — the block stood, "
+                print(f"⚠️ [AgentX SDK] The gateway refused this block's record "
+                      f"({resp.status_code}) for receipt {receipt}: the block stood, "
                       f"but recovery for this trace won't be recorded.", file=sys.stderr)
         except Exception as e:
-            print(f"⚠️ [LOCAL KEYWORD SHIELD] Async incident park failed "
-                  f"({type(e).__name__}) for receipt {receipt} — the block stood, "
+            print(f"⚠️ [AgentX SDK] Could not send this block's record to the gateway "
+                  f"({type(e).__name__}) for receipt {receipt}: the block stood, "
                   f"but recovery for this trace won't be recorded.", file=sys.stderr)
 
     def drain_pending_parks(self, timeout=3.0):

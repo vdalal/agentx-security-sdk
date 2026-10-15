@@ -7,6 +7,8 @@ import time
 import functools
 import uuid
 import requests
+import ntpath
+import posixpath
 import re
 import logging
 import warnings
@@ -30,7 +32,7 @@ from .client import AgentXClient
 # ⚠️ `_name_tokens` is deliberately NOT imported here. This module has its own, which returns a
 # LIST and splits letter<->digit runs; `statement._name_tokens` returns a SET and does not. The
 # difference is load-bearing in both directions -- see the warning in `statement._name_tokens`.
-from .statement import _STATEMENT_ARG_NAMES, _coerce_arg_value, _statement_text  # noqa: F401
+from .statement import _STATEMENT_ARG_NAMES, _coerce_arg_value, _statement_text, _statement_parts  # noqa: F401
 from .statement import _SSRF_URL_RE, url_hosts, destination_url_hosts  # noqa: F401
 from .db import (init_db, ensure_ledger_current, log_intercept, get_lifetime_stats,
                  log_self_correction, get_retention_status, format_ratio, retention_is_failing,
@@ -3887,9 +3889,16 @@ _BUILTIN_POLICY_KEYWORDS = [
         "id": _ID_DESTRUCTIVE_SHELL,
         "name": "Destructive Shell Command",
         "category": "DESTRUCTIVE_ACTION",
-        "blocked_intents": ["rm -rf /", "rm -rf ~", "rm -rf --no-preserve-root", "rm -fr /", ":(){", "mkfs", "of=/dev/sd", "of=/dev/nvme", "| bash", "|bash"],
-        "socratic_prompt": "This is an irreversible, system-level shell command: a recursive delete of a root or home path, a disk overwrite, or a downloaded script piped straight into a shell.",
-        "preferred_alternative": "Scope any delete to a specific relative subdirectory, never / or ~. Download a script to a file and review it before running, instead of piping it into bash.",
+        # No `rm`, `mkfs` or `of=/dev/...` words: a substring like `rm -rf /` also matched
+        # `rm -rf /tmp/build`, and `mkfs` matched `man mkfs`. `_detect_host_destruction` reads a
+        # delete by its flags and target and a disk write by its target and flow, which stops
+        # every spelling those words did and none of the scoped deletes or image files.
+        "blocked_intents": [":(){", "| bash", "|bash"],
+        "socratic_prompt": "This is an irreversible, system-level command: a recursive delete of the root, a home folder, a drive or a system folder, formatting or wiping a disk or drive, writing raw onto a disk, a fork bomb, or a downloaded script piped straight into a shell.",
+        # The last sentence is for the shapes with no narrower form (a disk format, a raw write
+        # to a device, a fork bomb): the first two gave them nothing to do. The gateway's own
+        # floor for them already sends the agent to a person.
+        "preferred_alternative": "Scope any delete to a folder inside the project or a temp folder, never the root, a home folder, a drive or a system folder. Download a script to a file and review it before running, instead of piping it into bash. Formatting, wiping or writing raw onto a disk has no narrower form: if it really has to happen, ask a person to run it.",
         # NOT tagged with a reversible_transform: this policy's blocked_intents are
         # heterogeneous (rm, mkfs, disk-overwrite, fork-bomb, pipe-to-bash), so a single
         # "move to trash" steer would misdescribe most of them. Reversibility-first coaching
@@ -3948,10 +3957,18 @@ _REVERSIBLE_ALTERNATIVES = {
     # those three shapes, so the steer named the action as something it was not. Naming
     # shapes is what made it action-SPECIFIC while the comment called it action-general. The
     # clause is gone; what remains is the reversibility steer, which is true of every case.
+    #
+    # 🔴 IT ALSO SAID "back up or snapshot the data first", AND NO BACKUP UNLOCKS THE
+    # CALL. On the hook walk an agent put the backup and the DROP in one command, as told, and
+    # was stopped; through a shell, backing up a table of personal data (`CREATE TABLE
+    # users_bak AS SELECT * FROM users`) is stopped too. A way out that does not exist is not
+    # coaching. What does pass is a
+    # deleted or status flag set by a condition naming the rows, so that stays, and the agent
+    # is told where the rest goes: to a person.
     "soft_delete": (
-        "Prefer a reversible form you can undo: back up or snapshot the data first, or "
-        "stage the change behind a deleted or status flag you can revert, so it can be "
-        "restored rather than lost."
+        "Prefer a reversible form you can undo: stage the change behind a deleted or status "
+        "flag you can revert, so it can be restored rather than lost. A backup taken first "
+        "does not make this call pass; if all of it really has to go, ask a person to run it."
     ),
 }
 
@@ -4046,7 +4063,21 @@ def builtin_policy_catalog():
 # P-98 failure mode verbatim, in our own guard against P-98. The list is complete today; the
 # gap is that nothing proves it stays so, and the honest comment says which half is enforced.
 _HARM_CLASS_PHRASING = {
-    "DESTRUCTIVE_ACTION": "destroying data or infrastructure",
+    # Not "destroying data or infrastructure": `terraform destroy`, `kubectl delete namespace`
+    # and `aws s3 rm --recursive` all pass this door (measured), so "infrastructure"
+    # claimed a cover the screen then calls "the whole list". Says what is checked.
+    # THE RULE, after three rewrites that each enumerated differently and each overclaimed (an
+    # outcome: `rm -fr ~`, `mke2fs`, dd onto `/dev/xvda` pass; a shell: the check reads command
+    # text, so `rm -rf /` typed in PowerShell IS stopped): name the COMMANDS and what they are
+    # aimed at, never a shell or an outcome, and say only some spellings are covered. No inner
+    # semicolon: the screen joins these phrases with semicolons.
+    # `rm`, the Windows deletes and the disk tools are read by their flags and target
+    # (`_detect_host_destruction`), so the "(only some spellings of each)" hedge came off; the
+    # commands are still NAMED, per the rule above, and cloud teardown is still not among them.
+    "DESTRUCTIVE_ACTION": ("whole-table SQL drops and deletes, a recursive rm, rd or Remove-Item "
+                           "aimed at the root, a home folder, a drive or a system folder, and dd, "
+                           "cat, cp, tee, mkfs, wipefs, shred, sgdisk, blkdiscard, parted, "
+                           "Format-Volume or format aimed at a disk or drive"),
     # No "(SSRF)" here: the policy NAME beside it already carries the acronym, and printing
     # it twice on one line is the tell of two strings written without reading the row.
     "NETWORK_TRAVERSAL": "reaching internal-only network addresses",
@@ -4403,6 +4434,13 @@ def load_local_policy_keywords(seed_dir=".agentx"):
                 # `_merge_pulled_over_floor` drops the matching floor id and adds nothing.
                 if not is_active:
                     policies.append({"id": pid, "is_active": False})
+                # An explicit `true` with no words of its own still has a job: undoing an off an
+                # earlier row of this file made to a SHIPPED rule (the merge restores the shipped
+                # row). Forwarded as a bare marker, and only for a shipped id, so an unknown id
+                # cannot arm an empty rule. A row WITH words forwards its `true` below.
+                elif (not intents and p.get("is_active") is True
+                      and pid in {str(s.get("id")) for s in _BUILTIN_POLICY_KEYWORDS}):
+                    policies.append({"id": pid, "is_active": True})
 
                 # Only arm active rules that actually carry blocked intents. Both operands
                 # are now VALIDATED, so a falsy value here is a real "no rule", not a
@@ -4463,6 +4501,13 @@ def load_local_policy_keywords(seed_dir=".agentx"):
                             pulled_tid if pulled_tid
                             else (seed.get("reversible_transform") if seed else None)),
                     })
+                    # An explicit `is_active: true` is forwarded, and only an explicit one (a row
+                    # with no words forwards it as a marker, above): it is what lets the merge
+                    # restore a shipped rule this same file switched off earlier ("silence cannot
+                    # undo an off" holds, since an absent flag sends nothing). Without it, a file
+                    # saying off and then on left the rule off.
+                    if p.get("is_active") is True:
+                        policies[-1]["is_active"] = True
             # 🔴 WAS `if policies: return policies` -- the whole of BACKLOG P-49 in one line.
             # A pulled file REPLACED the shipped floor, so `agentx pull` silently removed
             # protection a bare `pip install` had given the user. The floor is the BASE now
@@ -5467,6 +5512,352 @@ def _detect_reverse_shell(raw):
     if _REVSHELL_CONNECT_RE.search(s) and _REVSHELL_DUP2_STDIO_RE.search(s):
         return True
     return False
+
+
+# Host and whole-tree destruction, read for its STRUCTURE. PORTED from the gateway's
+# `detect_fs_bulk_delete` (its text branch) and `detect_host_destruction`, not written again:
+# the flat Destructive Shell Command tokens matched exact spellings, so `rm -r -f /`,
+# `rm -rf $HOME`, `Remove-Item -Recurse -Force C:\` and `dd of=/dev/xvda` passed this door while
+# the gateway stopped them. KEEP IN SYNC with those gateway functions; the gateway image cannot
+# import this package, so the two copies are held together by one shared corpus of commands
+# driven through both doors, never by reading them side by side. Cloud teardown (the gateway's
+# `detect_destructive_cloud_verb`) is deliberately NOT ported: it is ordinary in a test
+# environment, so it belongs to a hold for a person, which this door has no one to ask.
+_FS_DANGEROUS_TARGET_RE = re.compile(
+    r"""^(?:
+        / | /\* | /\.\*
+      | ~ | ~/ | ~/\*
+      | ~[A-Za-z_][\w.-]*/?\*?
+      | \$\{?HOME\}?/?\*?
+      | /(?:home|Users)/?\*? | /(?:home|Users)/[^/\s]+/?\*?
+      | %USERPROFILE%\\?\*? | %HOMEPATH%\\?\*?
+      | \$env:(?:USERPROFILE|HOMEPATH|SystemRoot|windir)\\?\*?
+      | \$env:(?:HOMEDRIVE|SystemDrive)\\?\*?
+      | /(?:etc|var|usr|bin|sbin|lib|lib64|boot|root|sys|proc|dev)(?:/.*)?
+      | [A-Za-z]:\\?\*?
+      | [A-Za-z]:\\(?:Windows|Program\ Files(?:\ \(x86\)?)?)(?:\\.*)?
+      | [A-Za-z]:\\Users(?:\\[^\\]+)?\\?\*?
+      | %SystemRoot%.* | %WINDIR%.*
+      | \\\*?
+      | \*
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+# A named folder INSIDE a system temp area. The name is plain: a wildcard in it (`/var/tmp/*`,
+# `?*`, `[a-z]*`, `.*`, `!(keep)`) is all of the temp area, and a variable or a substitution
+# (`$BUILD_DIR`, `$(cat name)`, a backtick) may be empty, which is all of it too.
+_FS_TEMP_SUBPATH_RE = re.compile(r"^/(?:private/)?var/(?:tmp|folders)/[^/*?\[{$`!()]+(?:/.*)?$", re.IGNORECASE)
+_RM_RECURSIVE_RE = re.compile(
+    r"\brm\b(?P<flags>(?:\s+-{1,2}\S+)+)\s+(?P<targets>[^\n|;&]+)", re.IGNORECASE)
+_RMTREE_CALL_RE = re.compile(
+    r"\b(?:shutil\.)?(?:rmtree|removedirs)\s*\(\s*['\"]?(?P<path>[^'\")]+)", re.IGNORECASE)
+_FIND_DELETE_RE = re.compile(
+    r"\bfind\b\s+(?P<path>\S+)[^\n|;&]*?-delete\b", re.IGNORECASE)
+_WIN_RECURSIVE_DELETE_RE = re.compile(
+    r"\b(?:del|rd|rmdir)\b(?P<flags>(?:\s+/\S+)+)\s+(?P<targets>[^\n|;&]+)", re.IGNORECASE)
+_PS_REMOVE_ITEM_RE = re.compile(
+    r"(?:\bRemove-Item|(?:^|[;&|({\n]|-(?:Command|c)\s+[\"']?)\s*(?:ri|rd|rmdir|del|erase|rm))\b(?P<rest>[^\n|;&]*?-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?\b[^\n|;&]*)",
+    re.IGNORECASE)
+_FORK_BOMB_RE = re.compile(r":\s*\(\s*\)\s*\{")
+# DESTROYING A DISK, READ BY ITS TARGET AND ITS FLOW, NOT BY THE TOOL'S NAME. One sentence: the
+# bytes go onto a raw disk. Two structural parts carry it, and a third that cannot be structural:
+#   TARGET (scope): `_RAW_DISK`, a whole block device or one of its partitions, on Linux, macOS
+#     and Windows. The harmless sinks (/dev/null, /dev/zero, a tty) are not in it: it names the
+#     device FAMILIES rather than excluding sinks, so a new sink cannot become a block.
+#   FLOW: the disk is where the bytes GO (`of=`, a `>` or `>>` redirection, `tee`, the
+#     destination of `cp`), whatever tool sends them. A disk the bytes come FROM
+#     (`if=/dev/sda`, `cat /dev/sda | gzip`) is a read and runs.
+#   WHAT A TOOL DOES TO A DISK HANDED TO IT (`mkfs /dev/sdb1` writes, `lsblk /dev/sdb1` reads)
+#     is not in the shape, so it is a list: the tools that rewrite what they are given, each
+#     with the flag or sub-command that makes it a write where it also has a read form. Still
+#     gated on a raw-disk target, so formatting an image FILE (`mkfs.ext4 disk.img`) and naming
+#     the tool (`man mkfs`) run.
+_RAW_DISK = (
+    r"(?:/dev/(?:sd[a-z]+|hd[a-z]+|vd[a-z]+|xvd[a-z]+|nvme\d+(?:n\d+)?|mmcblk\d+|loop\d+"
+    r"|r?disk\d+|md\d+|dm-\d+|nbd\d+|mapper/[\w.-]+|disk/by-[a-z]+/[\w.:@+-]+)(?:p?\d+|s\d+)*"
+    r"|\\\\\.\\(?:PhysicalDrive\d+|[A-Za-z]:))(?![\w/-])")
+_DISK_DESTINATION_RE = re.compile(
+    r"""(?:\bof\s*=\s*|>{1,2}\s*|\btee\s+(?:-{1,2}[\w-]+\s+)*|\bcp\s+(?:-{1,2}[\w-]+\s+)*(?!-)\S+\s+)["']?"""
+    + _RAW_DISK, re.IGNORECASE)
+_DISK_OPERAND_RE = re.compile(r"""(?:^|[\s'"=(])["']?""" + _RAW_DISK, re.IGNORECASE)
+_DISK_REWRITE_TOOL_RE = re.compile(
+    r"\b(?P<tool>mk(?:fs(?:\.\w+)?|e2fs|swap|dosfs|ntfs|exfatfs)|wipefs|shred|blkdiscard|sgdisk"
+    r"|sfdisk|parted|cryptsetup|badblocks|nvme)\b(?P<rest>[^\n|;&]*)", re.IGNORECASE)
+# A tool with a read form writes only with one of these.
+_DISK_REWRITE_ONLY_WHEN = {
+    "wipefs": re.compile(r"(?:^|\s)(?:--all\b|-[a-z]*a[a-z]*\b)", re.IGNORECASE),
+    "parted": re.compile(r"\b(?:mklabel|mktable|mkpart|rm|resizepart|rescue)\b", re.IGNORECASE),
+    "cryptsetup": re.compile(r"\b(?:luksFormat|erase|luksErase)\b", re.IGNORECASE),
+    "badblocks": re.compile(r"(?:^|\s)-[a-z]*w", re.IGNORECASE),
+    "nvme": re.compile(r"^\s+(?:format|sanitize)(?![\w-])", re.IGNORECASE),   # the subcommand, not --output-format
+}
+# A tool that writes, unless it carries one of these (wipefs --no-act or -n is a dry run).
+_DISK_REWRITE_NOT_WHEN = {
+    "wipefs": re.compile(r"(?:^|\s)(?:--no-act\b|-[a-z]*n[a-z]*\b)", re.IGNORECASE),
+}
+# A tool that writes by default reads only when every flag it carries is one of these.
+_DISK_READ_ONLY_FLAGS = {
+    "sgdisk": re.compile(r"-[pivl]|--(?:print|info|verify|list)", re.IGNORECASE),
+    "sfdisk": re.compile(r"-[ldJsVg]|--(?:list|dump|json|show-size|verify|show-geometry)"),
+}
+# Windows, where the target is a drive letter or a disk number rather than a path. Counted only
+# where they RUN: first in the text, after a command separator, a pipe, a script block, `cmd /c`
+# or `powershell -Command`, so a sentence that names them ("I ran Format-Volume yesterday") and
+# `Get-Help Format-Volume` do not match. cmd's `format X:` also counts anywhere with a switch
+# (`/q`, `/fs:ntfs`), which prose never has. diskpart reads its commands from what is piped in,
+# so it counts when a wipe command flows into it (`(echo select disk 1 & echo clean) | diskpart`).
+_WIN_DISK_WIPE_RE = re.compile(
+    r"""(?:^|[;&|({]|\bcmd(?:\.exe)?\s+/[ck]|\s-Command\s+["']?)\s*(?:Format-Volume|Clear-Disk|Remove-Partition)\b""",
+    re.IGNORECASE)
+_CMD_FORMAT_RE = re.compile(
+    r"""(?:(?:^|[;&|]|\bcmd(?:\.exe)?\s+/[ck])\s*format\s+[A-Za-z]:(?=[\s/"']|$)
+         | (?<![-\w.])format\s+[A-Za-z]:\s*/[A-Za-z])""",
+    re.IGNORECASE | re.VERBOSE)
+_DISKPART_WIPE_RE = re.compile(
+    r"\b(?:clean|format|delete\s+(?:partition|volume|disk))\b[^|\n]*\|\s*diskpart\b", re.IGNORECASE)
+
+
+def _destroys_a_disk(text):
+    """True when `text` writes onto a raw disk: a raw disk as the destination of any write, a
+    disk-rewriting tool handed a raw disk, or a Windows format or wipe that runs. See the
+    comment above `_RAW_DISK` for what each part reads."""
+    if _DISK_DESTINATION_RE.search(text):
+        return True
+    for m in _DISK_REWRITE_TOOL_RE.finditer(text):
+        tool, rest = m.group("tool").lower(), m.group("rest")
+        if not _DISK_OPERAND_RE.search(rest):
+            continue
+        key = "mkfs" if tool.startswith("mk") else tool
+        only_when = _DISK_REWRITE_ONLY_WHEN.get(key)
+        if only_when is not None and not only_when.search(rest):
+            continue
+        not_when = _DISK_REWRITE_NOT_WHEN.get(key)
+        if not_when is not None and not_when.search(rest):
+            continue
+        read_flags = _DISK_READ_ONLY_FLAGS.get(key)
+        if read_flags is not None:
+            flags = re.findall(r"(?:^|\s)(-{1,2}[\w-]+)", rest)
+            if flags and all(read_flags.fullmatch(f) for f in flags):
+                continue
+        return True
+    return bool(_WIN_DISK_WIPE_RE.search(text) or _CMD_FORMAT_RE.search(text)
+                or _DISKPART_WIPE_RE.search(text))
+
+
+def _fs_path_is_relative(p):
+    """A path that means nothing until a working folder is known: not rooted at `/`, a drive, a
+    home (`~`, `$HOME`), an environment variable or a network share."""
+    return bool(p) and not (p.startswith(("/", "\\", "~", "$", "%"))
+                            or re.match(r"[A-Za-z]:", p))
+
+
+# A PATH IS JUDGED BY WHERE IT LANDS. A well-known location written
+# as a variable is first replaced by a stand-in for where it points, so `..`, a relative target
+# and the patterns below all work on one spelling: a home is `/home/_home` or
+# `C:\Users\_home`, the Windows folder `C:\Windows`, the system drive `C:`. The working folder
+# written as `$(pwd)`, `` `pwd` `` or `$PWD` is `.`. Mirror of the gateway's copy.
+_FS_KNOWN_PLACES = (
+    # Followed by `\`, a home is a Windows one (`~\projects`, `$HOME\Downloads` in PowerShell).
+    (re.compile(r"^~(?=\\)"), r"C:\\Users\\_home"),
+    (re.compile(r"^~([A-Za-z_][\w.-]*)(?=\\)"), r"C:\\Users\\\1"),
+    (re.compile(r"^\$(?:\{HOME\}|HOME)(?=\\)"), r"C:\\Users\\_home"),
+    (re.compile(r"^~(?=[/\\]|$)"), "/home/_home"),
+    (re.compile(r"^~([A-Za-z_][\w.-]*)(?=[/\\]|$)"), r"/home/\1"),
+    (re.compile(r"^\$(?:\{HOME\}|HOME)(?=[/\\]|$)"), "/home/_home"),
+    (re.compile(r"^(?:%(?:USERPROFILE|HOMEPATH)%|\$env:(?:USERPROFILE|HOMEPATH))(?=[/\\]|$)", re.I),
+     r"C:\\Users\\_home"),
+    (re.compile(r"^(?:%(?:SystemRoot|WINDIR)%|\$env:(?:SystemRoot|windir))(?=[/\\]|$)", re.I),
+     r"C:\\Windows"),
+    (re.compile(r"^(?:%(?:SystemDrive|HOMEDRIVE)%|\$env:(?:SystemDrive|HOMEDRIVE))(?=[/\\]|$)", re.I), "C:"),
+    # Windows temp, app-data and program folders: always set there, so never read as empty (an
+    # empty one would make `Remove-Item -Recurse $env:TEMP\*` the root of the drive). Not
+    # `$TMPDIR`: unset on most Linux machines, where `rm -rf $TMPDIR/*` is `rm -rf /*`.
+    (re.compile(r"^(?:%(?:TEMP|TMP)%|\$env:(?:TEMP|TMP))(?=[/\\]|$)", re.I), r"C:\\Users\\_home\\AppData\\Local\\Temp"),
+    (re.compile(r"^(?:%LOCALAPPDATA%|\$env:LOCALAPPDATA)(?=[/\\]|$)", re.I), r"C:\\Users\\_home\\AppData\\Local"),
+    (re.compile(r"^(?:%APPDATA%|\$env:APPDATA)(?=[/\\]|$)", re.I), r"C:\\Users\\_home\\AppData\\Roaming"),
+    (re.compile(r"^(?:%ProgramFiles%|\$env:ProgramFiles)(?=[/\\]|$)", re.I), r"C:\\Program Files"),
+)
+_FS_PWD_RE = re.compile(r"^(?:\$\(\s*pwd\s*\)|`\s*pwd\s*`|\$\{?PWD\}?|~\+|\$[Pp][Ww][Dd](?=\\))(?=[/\\]|$)")
+# A command substitution other than the working folder (`$(cat t)`, a backtick `date`):
+# collapsed to one unknown variable before a delete's targets are split.
+_FS_BACKTICK_SUB_RE = re.compile(r"`(?!\s*pwd\s*`)[^`]*`")
+
+
+def _fs_collapse_substitutions(text):
+    """Each `$(...)` other than `$(pwd)` becomes `$__SUB`, matched by its brackets so a nested
+    one (`$(dirname $(pwd))`) is one word; an unclosed one is left as written. Mirror of the
+    gateway's copy."""
+    out, i = [], 0
+    while i < len(text):
+        if not text.startswith("$(", i):
+            out.append(text[i])
+            i += 1
+            continue
+        depth, j = 1, i + 2
+        while j < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+        if depth:
+            out.append(text[i:])
+            break
+        out.append(text[i:j] if re.fullmatch(r"\s*pwd\s*", text[i + 2:j - 1]) else "$__SUB")
+        i = j
+    return _FS_BACKTICK_SUB_RE.sub("$__SUB", "".join(out))
+# A working folder a relative target can be resolved inside: one that says where it is, after
+# the places above are replaced. `.`, `app`, a bare drive (`C:`), a network share or an unknown
+# variable do not, so a target beside them is judged as written (`rm -rf *` stays stopped).
+_FS_ROOTED_FOLDER_RE = re.compile(r"^(?:/|[A-Za-z]:[\\/])")
+# A target that is only a variable (`$1`, `"$TARGET"`, `${X}`, `$@`): where it points is unknown,
+# so it is not "a target of its own" and the working folder is read as well. `$HOME` and `$PWD`
+# are places. A command substitution (`$(cat t)`, a backtick) is unknown too
+# (`_fs_target_is_unknown`).
+_FS_VARIABLE_ONLY_RE = re.compile(
+    r"^\$(?:\{(?!(?:HOME|PWD)\})[A-Za-z_]\w*\}|(?!(?:HOME|PWD)\b)[A-Za-z_]\w*|\d+|[@*#?])$")
+# A cmd.exe switch (`/s`, `/q`, `/a:h`): an option, not a path.
+_WIN_SWITCH_RE = re.compile(r"^/[A-Za-z?](?::\S*)?$")
+# A segment that is only a PowerShell or cmd variable (`$env:OUT_DIR`, `${env:X}`, `%BUILD%`).
+# The well-known ones are places (`_FS_KNOWN_PLACES`), replaced before this is asked.
+_FS_WIN_VARIABLE_RE = re.compile(r"^(?:\$env:[A-Za-z_]\w*|\$\{env:[A-Za-z_]\w*\}|%[A-Za-z_]\w*%)$", re.I)
+
+
+def _fs_words(text):
+    """`text` split into words as the shell splits it: a quoted part (`"C:\\Program Files\\x"`)
+    stays in its word, quotes kept for the reader to drop. Mirror of the gateway's copy."""
+    text = str(text or "")
+    words = re.findall(r"""(?:"[^"]*"|'[^']*'|[^\s"'])+""", text)
+    # Also every word split on spaces alone: a quote that CLOSES a wrapper (`bash -c "rm -rf /" >
+    # "out.log"`) would otherwise open a word running to the next quote (`/ > out.log`). The
+    # danger check reads both, as it reads a substitution both raw and collapsed.
+    return words + [w for w in text.split() if w not in words]
+# Targets that are the working folder itself, or everything in it.
+_FS_WHOLE_FOLDER_TARGETS = frozenset((".", "./", ".\\", "*", "./*", ".\\*"))
+
+
+def _fs_tidy_path(p):
+    """Drop `.` segments and doubled separators (`~/.` is `~/`, `%USERPROFILE%\\.\\` is
+    `%USERPROFILE%\\`), keeping a leading `//` or `\\\\` and every `..`."""
+    p = re.sub(r"(?<=[/\\])\.(?=[/\\]|$)", "", p)
+    return re.sub(r"(?<=[^/\\])([/\\])[/\\]+", r"\1", p)
+
+
+def _fs_place(p):
+    """`p` with a well-known location variable replaced by where it points (`_FS_KNOWN_PLACES`)
+    and the working folder written as `$(pwd)` replaced by `.`; quotes dropped as the shell
+    drops them. Anything else is returned as written."""
+    p = str(p or "").strip().replace('"', "").replace("'", "")
+    p = re.sub(r"\$\{env:([A-Za-z_]\w*)\}", r"$env:\1", p, flags=re.I)
+    p = re.sub(r"\$\{HOME:[^}]*\}", "$HOME", p)
+    p = _FS_PWD_RE.sub(".", p)
+    for pattern, place in _FS_KNOWN_PLACES:
+        p, n = pattern.subn(place, p)
+        if n:
+            break
+    return p
+
+
+def _fs_if_empty(token):
+    """The target as the shell runs it when every unknown variable in it is empty: a path
+    segment that is only a variable (`_FS_VARIABLE_ONLY_RE`) is dropped, so `$X/*` is `/*`,
+    `$PWD/$X` is `./` and `$X` is nothing; `build-$X` keeps its text."""
+    t = _fs_place(token)
+    return "".join("" if _FS_VARIABLE_ONLY_RE.match(seg) or _FS_WIN_VARIABLE_RE.match(seg) else seg
+                   for seg in re.split(r"([/\\])", t))
+
+
+def _fs_target_is_unknown(token):
+    """A target that names nothing once its unknown variables are empty (`$1`, `$(cat t)`): not
+    "a target of its own", so the working folder is read as the target."""
+    return not _fs_if_empty(token).strip()
+
+
+def _fs_is_whole_folder(token):
+    """The target is the working folder itself, or everything in it (`.`, `./.`, `.//`, `*`,
+    `./*`, `$(pwd)`)."""
+    t = _fs_tidy_path(_fs_place(_fs_if_empty(token)).strip("`()"))
+    return (t.rstrip("/\\") or t) in _FS_WHOLE_FOLDER_TARGETS
+
+
+def _is_dangerous_fs_target(path, cwd=None):
+    """A whole-scope delete target: a root, a home folder, a system folder, a bare wildcard.
+    With `cwd`, the folder the command runs in, a relative target is judged where it lands:
+    `build` in `C:\\Users\\dev\\app` is a project folder, `./*` in `/` is `/*`. Mirror of the
+    gateway's `_is_dangerous_fs_target`."""
+    # A target written inside code or a subshell carries its punctuation (`os.system('rm -rf
+    # /')` gives `/')`, `$(rm -rf /)` gives `/)`), and `//` or a trailing `/.` is the root
+    # spelled differently. Strip and collapse before matching.
+    raw = str(path or "").strip()
+    # The working folder written as `$(pwd)` is a place, read before the punctuation strip below
+    # would cut it to `$(pwd`.
+    if _FS_PWD_RE.match(raw.replace('"', "").replace("'", "")):
+        raw = _fs_place(raw)
+    p = raw.strip("'\"`()[]{};,").strip()
+    # The shell drops quotes inside a word (`"$HOME"/../*`, `~/".."/*`), and `${HOME:?}` is
+    # `$HOME` that refuses to be empty; a home, the Windows folder or the system drive written
+    # as a variable lands where it points (`_fs_place`).
+    p = _fs_place(p)
+    # A relative target lands inside the working folder; judge the path it lands on. Only a
+    # folder that says where it is (`_FS_ROOTED_FOLDER_RE`, after `_fs_place`); beside any
+    # other, the target is judged as written.
+    folder = _fs_place(str(cwd or "").strip().strip("'\""))
+    if folder and _fs_path_is_relative(p) and _FS_ROOTED_FOLDER_RE.match(folder):
+        windows = bool(re.match(r"[A-Za-z]:", folder)) or "\\" in folder
+        p = (ntpath.join(folder, p) if windows else posixpath.join(folder, p))
+    p = _fs_tidy_path(p)
+    # A drive path with `..` lands elsewhere too (`C:\Users\dev\app\..\..` is `C:\Users`, and a
+    # home climbed out of, `%USERPROFILE%\..`, is `C:\Users`).
+    if re.match(r"[A-Za-z]:[\\/]", p):
+        p = ntpath.normpath(p)
+    if p.startswith("/"):
+        # `//`, `/.` and `..` are other spellings of where the path lands: `/tmp/..` is the
+        # root, `/var/tmp/../lib/postgresql` is /var/lib/postgresql. Resolve them first, so the
+        # temp-folder exception below cannot be walked out of.
+        p = posixpath.normpath(re.sub(r"/{2,}", "/", p))
+    # A folder inside the system temp areas is scratch space, not a system folder: /var/tmp/x
+    # and macOS's per-user temp under /var/folders (what the block's own coaching offers).
+    if not p or _FS_TEMP_SUBPATH_RE.match(p):
+        return False
+    return bool(_FS_DANGEROUS_TARGET_RE.match(p))
+
+
+def _delete_targets(text, raw=False):
+    """The targets of every recursive delete in one text (rm -r, rmtree, find -delete, rd /s,
+    Remove-Item -Recurse), switches left out (`-rf`, `--`, `--no-preserve-root`, `/s`, `/q`):
+    a switch is an option, not a path, so `rd /s /q` names no target of its own. Empty when
+    the text names no recursive delete with a target. Mirror of the gateway's
+    `_delete_targets_gw`."""
+    # `raw=False` collapses each command substitution to one unknown word first, so
+    # `$(cat target.txt)` is one target; the raw reading keeps a delete written INSIDE one
+    # (`echo $(rm -rf /)`), which collapsing would erase. The danger check reads both.
+    text = re.sub(r"\\\r?\n", " ", str(text or ""))
+    text = text if raw else _fs_collapse_substitutions(text)
+    targets = []
+    for m in _RM_RECURSIVE_RE.finditer(text):
+        if re.search(r"-\w*r|--recursive|--dir", m.group("flags"), re.IGNORECASE):
+            targets += [t for t in _fs_words(m.group("targets")) if not t.startswith("-")]
+    targets += [m.group("path") for m in _RMTREE_CALL_RE.finditer(text)]
+    targets += [m.group("path") for m in _FIND_DELETE_RE.finditer(text)]
+    for m in _WIN_RECURSIVE_DELETE_RE.finditer(text):
+        if re.search(r"/s\b", m.group("flags"), re.IGNORECASE):
+            targets += [t for t in _fs_words(m.group("targets")) if not _WIN_SWITCH_RE.match(t)]
+    for m in _PS_REMOVE_ITEM_RE.finditer(text):
+        targets += [t for t in _fs_words(m.group("rest")) if not t.startswith("-")]
+    return targets
+
+
+def _detect_host_destruction(raw, cwd=None):
+    """True for a recursive delete of a whole-scope target or a command that destroys the
+    machine without deleting a path (a disk format or wipe, a raw write onto a block device, a
+    fork bomb). The text branches of the gateway's `detect_fs_bulk_delete` and
+    `detect_host_destruction`, in that order. A scoped delete (`rm -rf ./build`) and a write to
+    a sink (`of=/dev/null`) do not match. `cwd` is the folder the command runs in, when the
+    call names one: a relative delete target is judged where it lands."""
+    text = str(raw or "")
+    if not text:
+        return False
+    if any(_is_dangerous_fs_target(tok, cwd) or _is_dangerous_fs_target(_fs_if_empty(tok), cwd)
+           for tok in _delete_targets(text) + _delete_targets(text, raw=True)):
+        return True
+    return bool(_destroys_a_disk(text) or _FORK_BOMB_RE.search(text))
 
 
 def _is_catalog_token(token):
@@ -7227,6 +7618,16 @@ _FS_BOUNDARY_POLICY = _BUILTIN_BY_ID[_ID_FS_BOUNDARY]
 # regardless of session state or a pulled policy. Same pattern as _SSRF_POLICY above.
 _DESTRUCTIVE_SHELL_POLICY = _BUILTIN_BY_ID[_ID_DESTRUCTIVE_SHELL]
 
+
+def structural_policy_ids():
+    """The ids `evaluate_call_keyless`'s built-in checks report a stop under. Those checks run
+    whatever the policies file says, so a rule switched off there still stops calls under its
+    name when its id is here; the screens that list rules say so rather than calling it off.
+    `test_structural_policy_ids_match_the_evaluator` reads the evaluator to keep this whole."""
+    return {str(p["id"]) for p in (
+        _DESTRUCTIVE_SHELL_POLICY, _SSRF_POLICY, _FS_BOUNDARY_POLICY, _WILDCARD_READ_POLICY,
+        _CUSTOMER_PRIVACY_POLICY, _SECRET_COLUMN_READ_POLICY, _MASS_DESTRUCTIVE_POLICY)}
+
 # The Invisible-Unicode carrier builtin, used to attribute the structural
 # carrier floor. Structural-ONLY: no keyword rails (blocked_intents is empty), so it is
 # never token-scanned — `_detect_invisible_unicode` is its only trigger. Same policy_id
@@ -7336,7 +7737,11 @@ def _allowlist_decision(miss):
 
 
 def _keyless_decision(policy):
-    """Build the normalized keyless decision dict from a matched policy."""
+    """Build the normalized keyless decision dict from a matched policy. The policy is first
+    resolved to the row in force for its id (`_loaded_or_builtin`), so a policies file that
+    rewrites a rule's challenge or safe path reaches every stop under that rule: a word match
+    and every built-in structural check alike."""
+    policy = _loaded_or_builtin(policy)
     policy_id = policy.get("id", "POL-LOCAL")
     return {
         "policy_id": policy_id,
@@ -7347,6 +7752,121 @@ def _keyless_decision(policy):
         "category": policy.get("category") or _POLICY_ID_TO_CATEGORY.get(policy_id),
         "preferred_alternative": _effective_safe_path(policy),
     }
+
+
+# The arguments that say where a command runs. A delete is read WITHOUT them and its relative
+# targets are judged inside them (`_command_folders`); reading the folder as one more thing to
+# delete stopped every Windows delete beside `cwd="C:\Users\..."`.
+_CWD_ARG_TOKENS = frozenset(("cwd", "cd", "chdir", "dir", "directory", "workdir", "wd", "folder"))
+
+
+def _is_folder_arg(name):
+    """An argument that says where a command runs (`cwd`, `directory`, `run_dir`): any word of
+    its name is a folder word. Mirror of the gateway's `_is_folder_arg_gw`."""
+    return bool(set(re.split(r"[^a-z0-9]+", str(name).lower())) & _CWD_ARG_TOKENS)
+
+
+def _each_in_front(arguments):
+    """The call's arguments once per argument, that one moved to the front and the rest after it
+    in the call's order. A joined text read in the call's order alone misses a command listed
+    after its target (`device="/dev/sda", program="mkfs.ext4"` reads `/dev/sda mkfs.ext4`, a
+    tool with no operand). Guessing which argument is the command from its name was an
+    enumeration that leaked (`program`, `executable`, `run_dir`); reading each one in front
+    needs no names. Mirror of the gateway's `_each_in_front_gw`."""
+    keys = list(arguments)
+    return [dict([(k, arguments[k])] + [(o, arguments[o]) for o in keys if o != k]) for k in keys]
+
+
+def _joined_each_in_front(arguments):
+    """Every argument value joined, once per argument in front (see `_each_in_front`)."""
+    out = []
+    for order in _each_in_front(arguments):
+        values = (_coerce_arg_value(v) for v in order.values())
+        out.append(" ".join(v for v in values if v))
+    return out
+
+
+def _command_texts(arguments, tool_name, name_leads, declared_args, raw):
+    """The texts the host-destruction check reads for one call: with no arguments, the query;
+    else each declared argument on its own and, once per argument in front, the declared
+    arguments joined. See the comment at the call site."""
+    if not isinstance(arguments, dict):
+        return [raw]
+    head = tool_name if name_leads else None
+    texts = [t for t in _statement_parts(arguments, tool_name=tool_name, head=head,
+                                         declared=declared_args) if t]
+    for order in _each_in_front(arguments):
+        texts.append(_statement_text(order, tool_name=tool_name, head=head,
+                                     declared=declared_args))
+    return [t for t in dict.fromkeys(texts) if t]
+
+
+def _command_folders(arguments):
+    """The call's working-folder arguments, split out: (the arguments without them, their
+    values). Empty values when the call names no folder."""
+    if not isinstance(arguments, dict):
+        return arguments, []
+    rest = {k: v for k, v in arguments.items() if not _is_folder_arg(k)}
+    folders = [f for f in (_coerce_arg_value(v) for k, v in arguments.items()
+                           if _is_folder_arg(k)) if f]
+    return rest, folders
+
+
+def _deletes_destroy_with_folders(texts, folders):
+    """A recursive delete in `texts` (read without the folder arguments) that is whole-scope
+    where it runs: its relative targets judged inside each working folder. A command that names
+    NO target of its own (`command="rm -rf"` or `"rd /s /q"`, `dir="/"`) deletes the folder
+    itself, so then the folder is read as the target; a target that is only a variable (`$1`)
+    points nowhere known, so it does not count as one. A folder argument's value is also read
+    on its own: a path deletes nothing, a command in it (`dir_cmd="rm -rf /"`) is read."""
+    for folder in folders or [None]:
+        if any(_is_dangerous_fs_target(tok, folder) or _is_dangerous_fs_target(_fs_if_empty(tok), folder)
+               for t in texts for tok in _delete_targets(t) + _delete_targets(t, raw=True)):
+            return True
+    if any(_detect_host_destruction(f) for f in folders):
+        return True
+    # A target that IS the working folder (`.`, `./*`) deletes the folder itself, so the folder
+    # is judged too, as written: it matters when the folder could not be resolved (`C:`).
+    tokens = [tok for t in texts for tok in _delete_targets(t)]
+    if folders and any(_fs_is_whole_folder(tok) for tok in tokens):
+        if any(_is_dangerous_fs_target(f) for f in folders):
+            return True
+    # Named targets: any that still names something with its unknown variables empty.
+    named = [tok for tok in tokens if not _fs_target_is_unknown(tok)]
+    if folders and not named:
+        return any(_detect_host_destruction(t + " " + f) for t in texts for f in folders)
+    return False
+
+
+def _loaded_or_builtin(policy):
+    """This policy with the wording in force for its id: the challenge and safe path of the
+    loaded row for the same id when the loaded policies carry one, field by field, so a field
+    the file leaves empty keeps the shipped text rather than blanking the block. The id,
+    category and NAME stay the policy's own: a check's own stops keep the check's name even when
+    a file files words under its id (the evidence file's record depends on it).
+
+    A check with a message of its OWN always keeps it, whole: two checks
+    share an id with the Secrets rule (`_WILDCARD_READ_POLICY`, `_SECRET_COLUMN_READ_POLICY`) and
+    word their own stops. Taking the loaded row's text there gave them the generic Secrets text
+    on a fresh install, and again after `agentx pull` (the cloud's Secrets row is worded apart),
+    and a field-by-field take gave a mixed message. The cost: a rewrite of the Secrets rule does
+    not reach those two checks."""
+    pid = policy.get("id")
+    if pid is None:
+        return policy
+    fields = ("socratic_prompt", "preferred_alternative")
+    shipped = _BUILTIN_BY_ID.get(str(pid), {})
+    # A check that IS its rule (no shipped keyword row, as Reverse Shell Egress) takes a rewrite.
+    if shipped and any(policy.get(f) != shipped.get(f) for f in fields):
+        return policy
+    for loaded in LOCAL_POLICY_KEYWORDS:
+        if loaded is not policy and loaded.get("id") == pid:
+            merged = dict(policy)
+            for field in fields:
+                if loaded.get(field):
+                    merged[field] = loaded[field]
+            return merged
+    return policy
 
 
 def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="action",
@@ -7519,6 +8039,36 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
     #      normalized haystack and is word-boundary anchored, so `| shuf` / `| sha256sum` /
     #      `| ssh` never trip it. Attributed to the Destructive Shell Command builtin.
     if _PIPE_TO_SHELL_RE.search(haystack):
+        return _keyless_decision(_DESTRUCTIVE_SHELL_POLICY)
+
+    # 1a2b) Structural host and whole-tree destruction: `rm` read by its flags and
+    #       target, the Windows and PowerShell deletes, disk formats and wipes, raw writes onto
+    #       a block device. Ported from the gateway (see `_detect_host_destruction`). Runs on
+    #       the RAW statement text so quoting and `$HOME` survive. Attributed to the same
+    #       Destructive Shell Command builtin as the flat tokens it backstops.
+    #       It reads each declared argument on its own AND the declared arguments joined:
+    #       on its own, `command="rm -rf node_modules"` is not completed by a folder beside it;
+    #       joined, a command written as a list (`["rm", "-rf", "/"]`) or split over arguments
+    #       (`command="rm -rf", path="/"`) is still one command. An argument that says WHERE to
+    #       run (`cwd`, `directory`) is not one more thing to delete: a delete is read without
+    #       it and its relative targets are judged inside it (`./*` in `/` is `/*`, stopped;
+    #       `build` in `C:\Users\dev\app` runs). Read as a second target, it stopped every
+    #       Windows delete beside a working folder.
+    #       A disk write is also read on EVERY argument joined, folders included, as sent
+    #       (`full`) and once per argument in front: split over names that declare nothing
+    #       (`program="mkfs.ext4"`, `device="/dev/sda"`, in either order) it is still one
+    #       command, which main stopped on the `mkfs` word. The accepted cost: a message or note
+    #       that quotes a disk command with its disk ("never run dd of=/dev/sda on prod") is
+    #       stopped too.
+    command_texts = _command_texts(arguments, tool_name, name_leads, declared_args, raw)
+    delete_args, folders = _command_folders(arguments)
+    delete_texts = (_command_texts(delete_args, tool_name, name_leads, declared_args, raw)
+                    if folders else command_texts)
+    if _deletes_destroy_with_folders(delete_texts, folders) or any(
+            _destroys_a_disk(t) or _FORK_BOMB_RE.search(t) for t in command_texts) or (
+            full is not raw and (_destroys_a_disk(full)
+                                 or any(_destroys_a_disk(t)
+                                        for t in _joined_each_in_front(arguments)))):
         return _keyless_decision(_DESTRUCTIVE_SHELL_POLICY)
 
     # 1a3) Structural reverse-shell / raw-socket C2 egress: a bash /dev/tcp device, a netcat
@@ -9151,9 +9701,12 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     policy_id=policy_id,
                     policy_name=policy_name,
                     challenge_issued=challenge_text,
-                    trace_id=current_trace_id
+                    trace_id=current_trace_id,
+                    # The tool that tried, as `evaluate_intent` sends it: without it
+                    # these rows read "Tool: not recorded" in the gateway's evidence.
+                    tool=func_name
                 )
-                effective_receipt = registered_receipt or f"local-keyword-shield-{policy_id}"
+                effective_receipt = registered_receipt or f"local-check-{policy_id}"
                 if registered_receipt:
                     # The park is fire-and-forget (issue #3): the POST runs off
                     # this block path, so a slow/down control plane never delays
@@ -9161,7 +9714,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     # is committed under, drained at session end. Best-effort —
                     # if the park fails, _post_incident warns asynchronously
                     # (the block itself already stood regardless).
-                    print(f"🧾 [LOCAL KEYWORD SHIELD] Incident park dispatched (async, best-effort — off the block path). Receipt: {effective_receipt}")
+                    print(f"🧾 [AgentX SDK] Sending this block to your gateway's record in the background; the block does not wait for it. Receipt: {effective_receipt}")
                 else:
                     print("📝 [AgentX SDK] Recorded locally (no key needed).")
 

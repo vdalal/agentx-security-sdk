@@ -240,12 +240,15 @@ def _allowed_call_rows(db_path=None):
     # the drift this helper was extracted to prevent.
     excluded = [a for a in _db.OUR_AGENT_IDS if a]
     frag, frag_params = _db._exclude_agents_fragment(excluded)
+    from .hook import AGENT_ID as _HOOK_AGENT, SCREENED_SHELL_TOOLS as _HOOK_SHELL
 
     # ONE grouped pass. The per-tool pattern this deliberately avoids was measured at 20,013
     # queries on a wide ledger; the fix named there is to fold into the group, not add to it.
+    # The last column says whether every call to the tool came through the Claude Code hook.
     sql = (
         "SELECT tool_name, MAX(quantity), COUNT(*), "
-        "GROUP_CONCAT(DISTINCT arg_names), GROUP_CONCAT(DISTINCT target_class) "
+        "GROUP_CONCAT(DISTINCT arg_names), GROUP_CONCAT(DISTINCT target_class), "
+        "MIN(agent_id IS ?) "
         "FROM event_log "
         "WHERE status = ? AND tool_name IS NOT NULL AND tool_name != ''" + frag +
         " GROUP BY tool_name "
@@ -258,7 +261,7 @@ def _allowed_call_rows(db_path=None):
         conn = sqlite3.connect(path)
         try:
             rows = conn.execute(
-                sql, tuple([_db.INVENTORY_STATUS] + list(frag_params))).fetchall()
+                sql, tuple([_HOOK_AGENT, _db.INVENTORY_STATUS] + list(frag_params))).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
@@ -275,8 +278,14 @@ def _allowed_call_rows(db_path=None):
     # calls" line counts -- and deliberately NOT the "60 calls across 8 tools" header, which is
     # ledger-wide. An earlier version of this comment claimed it matched the header; it does
     # not, and on a ledger holding demo traffic the two differ by exactly our rows.
-    total_calls = sum(int(c or 0) for _, _, c, _, _ in rows)
+    total_calls = sum(int(r[2] or 0) for r in rows)
     distinct_tools = len(rows)
+    # 🔴 THEN, AND ONLY FOR CANDIDACY, NOT A CLAUDE CODE SHELL TOOL. Its one argument is the
+    # whole command text, so the only rule its shape supports is "every shell command": adopted
+    # on the walk ledger, it matched `ls`, `git status` and `echo hi` alike. Dropped after the
+    # totals, so "out of N allowed calls" still counts the shell calls the screen counted, and
+    # an MCP tool beside them is not treated as the only tool. MCP calls keep their proposals.
+    rows = [r[:5] for r in rows if not (r[5] and r[0] in _HOOK_SHELL)]
     return rows, total_calls, distinct_tools
 
 
@@ -499,6 +508,55 @@ def _rules_file_path(path=None):
     return os.path.join(_anchored_root(), DEFAULT_RULES_FILE)
 
 
+class EarlierImportFileError(ValueError):
+    """`.agentx/rules.json` holds the org import file of an earlier version, not adopted rules.
+    Its own class so a reader can tell it from a damaged file without matching message text:
+    nothing was adopted, and the fix is a rename, not a repair."""
+
+
+def _source_state(err):
+    """The state word for a source that raised on read (the evidence file's `rule_sources`)."""
+    if isinstance(err, EarlierImportFileError):
+        return "earlier import file"
+    # An OS error does not say why (a lock, a permission, a folder where the file should be),
+    # so the state does not guess (review: "locked" was claimed for all three).
+    if isinstance(err, OSError):
+        return "could not open"
+    return "damaged"
+
+
+def adopted_rules_state(path=None):
+    """Whether the adopted rules could be read: "read", "no file", or why not ("damaged",
+    "could not open", "earlier import file", "could not read" for a store that would not open).
+    READS, NEVER WRITES, like `adopted_rule_count_or_none`, which cannot tell these cases apart."""
+    p = _rules_file_path(path)
+    if not os.path.exists(p):
+        store = _store_beside(p, path)
+        rows = _policy_db_rule_rows(store)
+        if rows is None:
+            return "could not read"
+        # A store that opened is READ even when it holds no rules (review: it said "no file").
+        return "read" if rows or os.path.exists(_policy_db_path(store)) else "no file"
+    try:
+        _read_rules_file(p)
+        return "read"
+    except Exception as err:
+        return _source_state(err)
+
+
+def allowlist_state(path=None):
+    """Whether the outbound allowlist could be read: "read", "no file", "damaged" or
+    "could not open"."""
+    p = _allowlist_file_path(path)
+    if not os.path.exists(p):
+        return "no file"
+    try:
+        _read_allowlist_doc(p)
+        return "read"
+    except Exception as err:
+        return _source_state(err)
+
+
 def _read_rules_file(p):
     """The rules in the file, as stored. Raises on a file that exists and cannot be read as this
     file's shape; returns [] for a file that does not exist. The distinction is deliberate: an
@@ -511,7 +569,7 @@ def _read_rules_file(p):
             and ({"reframes", "verdicts"} & set(doc)):
         # The org-brain seed under its old name. Every reader that lists rules would warn on
         # every command without saying what to do; this says it once, where the reader looks.
-        raise ValueError("%s is an org import file from an earlier version (coaching/verdicts); "
+        raise EarlierImportFileError("%s is an org import file from an earlier version (coaching/verdicts); "
                          "move it to .agentx/import.json, which `agentx import` reads, and this "
                          "name is free for your adopted rules" % p)
     if not isinstance(doc, dict) or not isinstance(doc.get("rules"), list):
@@ -778,6 +836,22 @@ def remove_rule(rule_id, path=None):
 
 
 _MATCH_CACHE = {}   # path -> ((mtime_ns, size), rules)
+
+
+def switched_off_adopted_rules(path=None):
+    """The adopted rules marked off, READ ONLY, from the source `_armed_adopted_rules` reads (the
+    file, else the store beside it, never moving rows). The evidence file's `rules_off`: it listed
+    only armed adopted rules, so a rule marked off was in neither list while status showed it.
+    Never raises: [] when the source cannot be read, which `rule_sources` says."""
+    p = _rules_file_path(path)
+    try:
+        if os.path.exists(p):
+            rows = _read_rules_file(p)
+        else:
+            rows = _policy_db_rule_rows(_policy_db_path(_store_beside(p, path))) or []
+    except Exception:
+        return []
+    return [r for r in rows if not r.get("active", True)]
 
 
 def _armed_adopted_rules(path=None):
