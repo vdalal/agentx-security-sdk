@@ -59,7 +59,7 @@ def _read_version():
 
 
 # Safely read README.md if it exists, otherwise use a default string
-long_description = "Runtime firewall for AI agents - blocks catastrophic tool calls and self-heals the run."
+long_description = "Runtime firewall for AI agents - watches every tool call, and once switched on blocks the catastrophic ones and tells the agent a safe path."
 if os.path.exists("README.md"):
     with open("README.md", "r", encoding="utf-8") as fh:
         long_description = fh.read()
@@ -69,7 +69,7 @@ setup(
     version=_read_version(),
     author="AgentX Core Team",
     author_email="founders@agentx-core.com",
-    description="Runtime firewall for AI agents - blocks catastrophic tool calls and self-heals the run.",
+    description="Runtime firewall for AI agents - watches every tool call, and once switched on blocks the catastrophic ones and tells the agent a safe path.",
     keywords="ai-agents, agent-security, llm-security, ai-firewall, prompt-injection, "
              "guardrails, llm-guardrails, agent-guardrails, tool-use, autonomous-agents, "
              "mcp, ai-safety, self-healing",

@@ -105,6 +105,25 @@ def builtin_checks():
     return (dec._INVISIBLE_UNICODE_POLICY, dec._REVERSE_SHELL_POLICY)
 
 
+def moved_while_off():
+    """The one built-in check that keeps stopping calls under ANOTHER rule's name while a policies
+    file switches its own rule off: the named-column PII floor, Customer Privacy Shield to
+    Secrets and PII Exfiltration. {"off_id", "off_line", "to_id", "to_name", "to_line"} while
+    that rule is off here, else None. Every surface listing the rules says it (the screens, the
+    evidence file, `agentx policies --json`), so none reads as if the read now runs: the rule
+    that is off says where its read went, and the rule that stops it says it does."""
+    from . import decorators as dec
+    to = dec._pii_bulk_read_policy()
+    off = dec._CUSTOMER_PRIVACY_POLICY
+    if str(to["id"]) == str(off["id"]):
+        return None
+    return {"off_id": str(off["id"]),
+            "off_line": "Bulk reads of customer data are still stopped, under %s." % to["name"],
+            "to_id": str(to["id"]), "to_name": to["name"],
+            "to_line": "With %s switched off, it also stops a bulk read of customer data, for "
+                       "example SELECT email, phone FROM customers." % off["name"]}
+
+
 def policies_file_rules(doc=None):
     """What `.agentx/policies.json` arms beyond the shipped rules and words, in this file's own
     sentences: [{"id", "name", "text"}], a rule of the file's own (`own: True`) or words added
@@ -171,7 +190,7 @@ def armed_beyond_builtin(doc=None):
             "sources": rule_sources(),
             "allowlist": allowlist, "allowlist_error": allow_error,
             # Built-in policies switched off in the file, with this file's reason (which says
-            # when built-in checks under the name still stop calls): listed off here,
+            # where a read the rule stopped is stopped now, `moved_while_off`): listed off here,
             # still counted among "built-in policies" on status (review 2).
             "off": [{"name": o["name"], "why": o["why"]} for o in off]}
 
@@ -188,6 +207,7 @@ def _rules(local_descriptions, doc=None):
         doc = _policies_json_payload()
     in_force, off, rows, from_file = [], [], [], []
     held = {str(p.get("id")): p for p in (dec.LOCAL_POLICY_KEYWORDS or [])}
+    moved = moved_while_off()
 
     def entry(pid, name, category, kind, description):
         # `applies_to` has no local source (see `not_on_this_door`): present and null, so a
@@ -204,11 +224,14 @@ def _rules(local_descriptions, doc=None):
             # and read "and word list" (walk).
             words_held = bool((held.get(pid) or {}).get("blocked_intents"))
             added = _added_sentence(pid, held.get(pid), p["name"], "rule", dec)
+            description = _with(local_descriptions.get(pid), added)
+            if moved and pid == moved["to_id"]:
+                description = ("%s %s" % (description or "", moved["to_line"])).strip()
             in_force.append(entry(p["id"], p["name"], p.get("category"),
                                   ("built-in check and word list" if words_held
                                    else "built-in check")
                                   + (", your coaching wording" if p["customized"] else ""),
-                                  _with(local_descriptions.get(pid), added)))
+                                  description))
             rows.append(["rule", pid, held.get(pid)])
             if added:
                 from_file.append({"id": p["id"], "name": p["name"], "text": added, "own": False})
@@ -218,8 +241,10 @@ def _rules(local_descriptions, doc=None):
                                "Built-in checks that report under this rule's name still stop "
                                "calls."})
         else:
-            off.append({"id": p["id"], "name": p["name"],
-                        "why": "Switched off in your policies file."})
+            why = "Switched off in your policies file."
+            if moved and pid == moved["off_id"]:
+                why = "%s %s" % (why, moved["off_line"])
+            off.append({"id": p["id"], "name": p["name"], "why": why})
     for det in builtin_checks():
         # A policies-file row under a check's own id arms its words too (the loop below skips
         # it): named in the kind, the description and the fingerprint (review). The row keeps
@@ -286,6 +311,15 @@ def _rules(local_descriptions, doc=None):
     return in_force, off, rows, doc["shield"]["load_error"], allow_error, allowlist, from_file
 
 
+def _not_run_or_opinion_clause():
+    """db's "had an opinion" clause widened by REFUSED: the population this file lists and
+    counts as stopped or held. One helper, so the list and its count cannot disagree."""
+    from . import db
+    sql, params = db._had_an_opinion_clause()
+    return ("(%s OR status IS ? OR status IS ?)" % sql,
+            list(params) + [db.REFUSED_STATUS, db.HALTED_STATUS])
+
+
 def _ledger(db_path, verdicts):
     """(stopped rows, sites_since, sites undated, readable). The sites' period is read over the
     rows `db.get_destinations` counts (a site named, an allowed status), never the whole ledger."""
@@ -293,13 +327,15 @@ def _ledger(db_path, verdicts):
     if not os.path.exists(db_path):
         return [], None, False, True
     try:
-        conn = sqlite3.connect(db.read_only_uri(db_path), uri=True)
+        conn = db.calls_view(sqlite3.connect(db.read_only_uri(db_path), uri=True))
     except sqlite3.Error:
         return None, None, False, False
     try:
         # db's own "had an opinion" clause, so a legacy row with no status counts here exactly
         # as it does in every count db makes (a `NOT IN` drops a NULL status).
-        opinion_sql, opinion_params = db._had_an_opinion_clause()
+        # PLUS the calls refused for want of a verdict: not an opinion, but a call this machine
+        # did not run, which is what this list is for. Same widening in `_opinion_counts`.
+        opinion_sql, opinion_params = _not_run_or_opinion_clause()
         rows = conn.execute(
             "SELECT id, timestamp, agent_id, tool_name, policy_name, status, posture "
             "FROM event_log WHERE %s ORDER BY timestamp DESC, id DESC LIMIT ?" % opinion_sql,
@@ -308,7 +344,8 @@ def _ledger(db_path, verdicts):
         conn.close()
         return None, None, False, False
     try:
-        ran = tuple(db._NOT_AN_OPINION_STATUSES)
+        # The statuses that RAN, not "no opinion": a REFUSED call had no opinion and did not run.
+        ran = tuple(db.RAN_WITHOUT_OPINION_STATUSES)
         sites_oldest, sites_undated = conn.execute(
             "SELECT MIN(timestamp), SUM(timestamp IS NULL) FROM event_log "
             "WHERE dest_hosts IS NOT NULL AND status IN (%s)" % ",".join("?" * len(ran)),
@@ -332,24 +369,31 @@ def _ledger(db_path, verdicts):
 
 
 def _opinion_counts(db_path):
-    """(stopped, ran while watching) over the WHOLE record, or None when it cannot be read. The
-    listed calls are the newest few hundred, so counting them said "0 stopped" over a record
-    whose one stopped call was older than the list (review)."""
+    """(stopped, held, not run, halted, ran while watching) over the WHOLE record, or None when it
+    cannot be read. The listed calls are the newest few hundred, so counting them said
+    "0 stopped" over a record whose one stopped call was older than the list (review).
+
+    HELD and REFUSED are their own counts, never "stopped": the file names them in their own
+    words ("Held for a person, not approved"; "Not run: no verdict could be had"), and a
+    refusal is not an objection, so a "stopped" count that took them in said otherwise in the
+    one line printed beside the file (review)."""
     from . import db
     if not os.path.exists(db_path):
-        return 0, 0
+        return 0, 0, 0, 0, 0
     try:
-        conn = sqlite3.connect(db.read_only_uri(db_path), uri=True)
+        conn = db.calls_view(sqlite3.connect(db.read_only_uri(db_path), uri=True))
         try:
-            sql, params = db._had_an_opinion_clause()
-            total, ran = conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(status IS 'WOULD_BLOCK'), 0) FROM event_log "
-                "WHERE %s" % sql, tuple(params)).fetchone()
+            sql, params = _not_run_or_opinion_clause()
+            total, ran, held, refused, halted = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(status IS 'WOULD_BLOCK'), 0), "
+                "COALESCE(SUM(status IS ?), 0), COALESCE(SUM(status IS ?), 0), "
+                "COALESCE(SUM(status IS ?), 0) FROM event_log WHERE %s" % sql,
+                (db.HELD_STATUS, db.REFUSED_STATUS, db.HALTED_STATUS) + tuple(params)).fetchone()
         finally:
             conn.close()
     except sqlite3.Error:
         return None
-    return total - ran, ran
+    return total - ran - held - refused - halted, held, refused, halted, ran
 
 
 def _record_head(db_path):
@@ -378,7 +422,7 @@ def build(db_path=None):
     fingerprint = hashlib.sha256(_canonical([version, sorted(fp_rows, key=_canonical)])
                                  .encode("utf-8")).hexdigest()
     stopped, sites_since, sites_undated, readable = _ledger(db_path, w["verdicts"])
-    sites = db.get_destinations(db_path, statuses=db._NOT_AN_OPINION_STATUSES) if readable \
+    sites = db.get_destinations(db_path, statuses=db.RAN_WITHOUT_OPINION_STATUSES) if readable \
         else None
     head, intact = _record_head(db_path)
     could_not_read = [name for name, value in (("stopped_or_held_calls", stopped),
@@ -415,6 +459,8 @@ def build(db_path=None):
         "rules_load_error": load_error,
         "rules_in_force": in_force,
         "rules_in_force_note": notes["rules_in_force"],
+        # What the SQL checks do not promise, said once.
+        "sql_checks_note": notes["sql_checks"],
         # Adopted rules marked off too: listed nowhere, they made this file's count
         # differ from status's, which lists them marked off. Not in `armed_beyond_builtin`'s
         # "off", which status prints under the built-in policies. The reason names no file: on
@@ -431,6 +477,15 @@ def build(db_path=None):
         "stopped_or_held_calls_note": notes["stopped_or_held_calls"],
         "sites_recorded": sites,
         "sites_recorded_note": notes["sites_recorded"],
+        # What MCP servers changed in their tools. Not calls, so in no list of calls above, and
+        # still here: a reviewer asks whether a tool changed under the agent.
+        "server_changes": [
+            # `held_then`, the name `agentx audit --json` gives the same fact: the record says
+            # what pinning did at the time, never whether the tool is held now.
+            {"tool": e["tool"], "what": db.SERVER_EVENT_WORDS[e["kind"]], "at": _iso(e["at"]),
+             "held_then": e["held"]}
+            for e in db.get_server_events(db_path)],
+        "server_changes_note": notes["server_changes"],
         "outbound_allowlist": allowlist,
         "outbound_allowlist_note": notes["outbound_allowlist"],
         "rule_sources": rule_sources(),
@@ -454,6 +509,10 @@ def main(args=None):
     args = list(args or [])
     doc = build()
     text = json.dumps(doc, indent=2, ensure_ascii=False)
+    # C1 control characters (U+0080-U+009F) are not escaped by json.dumps, and a server-chosen
+    # tool name can carry one: written raw, `cat` of the file would run it as a terminal code.
+    # They can only sit inside strings, where \u escapes are valid JSON.
+    text = re.sub(r"[\x80-\x9f]", lambda m: "\\u%04x" % ord(m.group()), text)
     if "--json" in args:
         print(text)
         return 0
@@ -481,7 +540,17 @@ def main(args=None):
         # A call flagged while watching RAN: counting it as "stopped" overclaimed (walk: 13
         # "stopped or held", of which 10 ran). Each kind is counted under its own words, over
         # the whole record, not the listed few hundred.
-        calls = "%d stopped, %d flagged while watching (they ran)" % counts
+        stopped, held, refused, halted, watched = counts
+        # Held and not-run calls only when there are some, so the familiar line is unchanged
+        # for every ledger without them.
+        calls = "%d stopped" % stopped
+        if held:
+            calls += ", %d held for a person (not approved)" % held
+        if refused:
+            calls += ", %d not run (no verdict)" % refused
+        if halted:
+            calls += ", %d halted (a runaway loop)" % halted
+        calls += ", %d flagged while watching (they ran)" % watched
     print("Wrote %s: %d rules in force, %d switched off, %s."
           % (out_path, len(doc["rules_in_force"]), len(doc["rules_off"]), calls))
     # The one value the reader is told to keep and check later, so it is printed, not left at

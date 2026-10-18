@@ -9,6 +9,8 @@ policies file, adopted rules, outbound allowlist and their own coaching.
     agentx hook post-tool-use    after a watched call the rules would stop, tell the agent
     agentx hook session-end      close the session: send the usage pulse, drop the counters
     agentx hook install          add both hooks to this project's .claude/settings.local.json
+    agentx hook install --enforce  the same, blocking in every session (--watch switches back)
+    agentx hook uninstall        remove them again (the record is kept)
 
 WHAT IT SCREENS: shell commands (the Bash and PowerShell tools) and MCP tool calls
 (`mcp__<server>__<tool>`), and the hook is registered for those tools only. Other tools (Read,
@@ -19,8 +21,10 @@ POSTURE: the shared resolver, as a door with no gateway behind it, so watching i
     Code's own flow decides; a call the rules would stop is recorded as WOULD_BLOCK, runs, and
     the developer is shown one line saying so (`systemMessage`). The agent is told only after
     the call has run (`post-tool-use`), so the note cannot change what it did.
-  * enforcing (AGENTX_POSTURE=enforce): the call is denied with the rule's coaching as the
-    reason, and recorded as CHALLENGED. A deny from a hook applies in every permission mode.
+  * enforcing (`agentx hook install --enforce`, saved in the hook command so it holds in every
+    session; or AGENTX_POSTURE=enforce where `claude` starts, for that session): the call is
+    denied with the rule's coaching as the reason, and recorded as CHALLENGED. A deny from a
+    hook applies in every permission mode. A variable that is set wins over the saved setting.
   A value AgentX does not know resolves to enforce, as on every door, and on this door the
   warning is shown in the Claude Code window, where the developer can see it.
 
@@ -52,6 +56,7 @@ _HOOK_MODULE = "-m agentx_sdk.hook"
 # ---- reading the event ---------------------------------------------------------------------
 # Shared with the after-the-call note, which Claude Code runs as a plain file without this
 # package (see `_hook_note`), so the two read events and find records the same way.
+from . import _hook_note
 from ._hook_note import (read_event as _read_event, project_dir as _project_dir,
                          session_dir as _session_dir, call_record_name as _call_record_name,
                          post_tool_use)
@@ -80,33 +85,33 @@ def _call_parts(tool_name, tool_input):
 
 # ---- posture -------------------------------------------------------------------------------
 
-def _posture():
+def _posture(installed=None):
+    """The posture for this call. A variable set where `claude` started wins, as on every door;
+    with none set, the posture `agentx hook install --enforce` wrote into the hook command
+    (`installed`) applies, so blocking holds in every session without exporting anything."""
     from .decorators import _resolve_enforcement
+    env_set = bool((os.environ.get("AGENTX_POSTURE") or "").strip())
+    if not env_set and installed in ("audit", "enforce"):
+        return installed
     return _resolve_enforcement(None, keyless_door=True)
 
 
 def posture_command_lines(posture, indent="      "):
-    """How to start Claude Code at a posture, in both shells. Claude Code passes its own
-    environment to the hook, so the variable is set where `claude` starts. In PowerShell it
-    stays set for the rest of that window."""
-    return [
-        "%sAGENTX_POSTURE=%s claude          # Claude Code, mac/linux" % (indent, posture),
-        '%s$env:AGENTX_POSTURE="%s"; claude  # Claude Code, PowerShell' % (indent, posture),
-    ]
+    """How to put Claude Code at a posture. The install line saves it in the hook command, so
+    it holds in every session; a variable exported where `claude` starts only lasts that window,
+    which is why blocking used to be lost on the next start."""
+    flag = "--enforce" if posture == "enforce" else "--watch"
+    return ["%sagentx hook install %s   # Claude Code, every session from now on"
+            % (indent, flag)]
 
 
 def _posture_warning():
     """The resolver's warning for a posture it does not know, in words for this window, or None.
 
     The resolver prints it to stderr, which Claude Code discards for a hook, so a developer who
-    typed AGENTX_POSTURE=watch got enforce with nothing on screen. Same rules as the resolver:
-    a value outside audit/enforce, or the two variable names disagreeing, resolve to enforce."""
-    new = (os.environ.get("AGENTX_POSTURE") or "").strip().lower()
-    old = (os.environ.get("AGENTX_ENFORCEMENT") or "").strip().lower()
-    if new and old and new != old:
-        return ("AgentX: AGENTX_POSTURE=%s and AGENTX_ENFORCEMENT=%s disagree, so it is "
-                "blocking (enforce). Set only AGENTX_POSTURE." % (new, old))
-    value = new or old
+    typed AGENTX_POSTURE=watch got enforce with nothing on screen. Same rule as the resolver:
+    a value outside audit/enforce resolves to enforce."""
+    value = (os.environ.get("AGENTX_POSTURE") or "").strip().lower()
     if value and value not in ("audit", "enforce"):
         return ("AgentX: posture '%s' is not a value AgentX knows, so it is blocking (enforce). "
                 "To watch without blocking, set AGENTX_POSTURE=audit; to block, "
@@ -197,13 +202,18 @@ def _watching_notice(decision, tool):
     # Names the variable only when one is set: "(AGENTX_POSTURE=audit)" with nothing set read
     # as a setting the developer had made (walk).
     why = "the default"
-    for var in ("AGENTX_POSTURE", "AGENTX_ENFORCEMENT"):
-        if (os.environ.get(var) or "").strip():
-            why = "%s=%s" % (var, os.environ[var].strip())
-            break
-    return ("AgentX would have stopped this %s call (%s). Watching (%s), so it ran; it is "
-            "recorded for agentx audit. To block calls like this, start Claude Code with "
-            "AGENTX_POSTURE=enforce." % (tool, name, why))
+    if (os.environ.get("AGENTX_POSTURE") or "").strip():
+        why = "AGENTX_POSTURE=%s" % os.environ["AGENTX_POSTURE"].strip()
+    if why == "the default":
+        how = ("To block calls like this in every session, run agentx hook install --enforce "
+               "in this project.")
+    else:
+        # A variable set where `claude` started is what made this watch, and it wins over an
+        # enforcing install, so the install command would change nothing (review).
+        how = ("To block calls like this, start Claude Code without %s (agentx hook install "
+               "--enforce keeps blocking on in every session)." % why)
+    return ("AgentX would have stopped this %s call (%s). Watching (%s), so AgentX lets it through; it is "
+            "recorded for agentx audit. %s" % (tool, name, why, how))
 
 
 def _with_message(answer, messages):
@@ -257,8 +267,12 @@ def decide(event, posture=None):
         once.append(("policy-load", "AgentX: your policy file could not be read, so only the "
                      "built-in rules are applied and your own are NOT: %s" % load_err))
 
+    # The call runs on the developer's own machine: its own server is not an SSRF target
+    # (`decorators._LOOPBACK_RAILS`).
+    own_machine = {"project": project}
     decision = decorators.evaluate_call_keyless(query, arguments=arguments, tool_name=name,
-                                                name_leads=name_leads, agent_id=AGENT_ID)
+                                                name_leads=name_leads, agent_id=AGENT_ID,
+                                                own_machine=own_machine, own_tool_door=True)
     answer = None
     challenge = None
     if decision is not None:
@@ -348,8 +362,9 @@ def _record(event, project, posture, tool_key, arguments, decision, challenge, r
                              challenge_issued=challenge, **shape)
 
 
-def pre_tool_use(stdin=None, stdout=None):
-    """Read one event, print a decision or nothing. Always exits 0 (fail open)."""
+def pre_tool_use(stdin=None, stdout=None, installed=None):
+    """Read one event, print a decision or nothing. Always exits 0 (fail open). `installed` is
+    the posture `agentx hook install --enforce` wrote into the command, if any."""
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
     event = None
@@ -359,11 +374,19 @@ def pre_tool_use(stdin=None, stdout=None):
         if event is not None:
             # Work in the project Claude Code named, so its rules and records are the ones used.
             os.chdir(_project_dir(event))
-            answer = decide(event)
+            answer = decide(event, posture=_posture(installed))
             decided = True           # counted by decide(); a failed write below is not a 2nd count
             if answer is not None:
                 stdout.write(json.dumps(answer))
                 stdout.flush()
+            # Once per session, after the answer is out: old sessions that never closed are
+            # cleared here too, since a developer who always kills the window never reaches
+            # session-end. Only after a screened call, which has already made the session's
+            # folder: a call this door does not read leaves nothing in the project.
+            project = _project_dir(event)
+            folder = _session_dir(project, event.get("session_id"))
+            if os.path.isdir(folder) and _first_in_session(project, event, "prune"):
+                _prune_stale_sessions(project, keep=folder)
             return 0
     except Exception:
         if decided:
@@ -395,41 +418,50 @@ def session_end(stdin=None):
             return 0
         project = _project_dir(event)
         folder = _session_dir(project, event.get("session_id"))
-        _adopt_unattributed(project, folder)
-        paths = []
-        records = _read_session(folder, paths)
-        # Oldest first, so the session's posture and block category are its latest call's.
-        records.sort(key=lambda r: r.get("at") if isinstance(r.get("at"), (int, float)) else 0)
-        if not records:
-            _remove(folder, paths)
-            return 0
-        screened = [r for r in records if r.get("screened")]
-        audit = [r for r in screened if r.get("posture") == "audit"]
-        categories = [r.get("category") for r in records if r.get("category")]
-        postures = [r.get("posture") for r in records if r.get("posture")]
-        stats = {
-            "integration": "hook",
-            "posture": postures[-1] if postures else None,
-            "total_calls": len(screened),
-            "intercepts": sum(1 for r in records if r.get("intercept")),
-            "critical_blocks": sum(1 for r in records if r.get("intercept")),
-            "would_blocks": sum(1 for r in records if r.get("would_block")),
-            "shield_failopens": sum(int(r.get("shield_failopens") or 0) for r in records),
-            # The audit rung counts what was WATCHED: clean calls in audit posture, and the
-            # distinct tools seen while watching. An enforcing session is not an audit run.
-            "audit_calls": sum(1 for r in audit if r.get("clean")),
-            "audit_tools": len({r.get("tool") for r in audit}),
-            "rule_matches": sum(1 for r in records if r.get("rule_match")),
-            "block_category": categories[-1] if categories else None,
-            # A coding agent's call is always the developer's own agent, never our demo.
-            "own_agent_block": any(r.get("intercept") for r in records),
-        }
-        from . import pulse
-        pulse.on_session_end(stats)
-        _remove(folder, paths)
+    except Exception:
+        return 0
+    try:
+        _send_session_pulse(project, folder)
     except Exception:
         pass
+    _prune_stale_sessions(project, keep=folder)
     return 0
+
+
+def _send_session_pulse(project, folder):
+    """Sum the session's call files into one usage pulse, then remove them."""
+    _adopt_unattributed(project, folder)
+    paths = []
+    records = _read_session(folder, paths)
+    # Oldest first, so the session's posture and block category are its latest call's.
+    records.sort(key=lambda r: r.get("at") if isinstance(r.get("at"), (int, float)) else 0)
+    if not records:
+        _remove(folder, paths)
+        return
+    screened = [r for r in records if r.get("screened")]
+    audit = [r for r in screened if r.get("posture") == "audit"]
+    categories = [r.get("category") for r in records if r.get("category")]
+    postures = [r.get("posture") for r in records if r.get("posture")]
+    stats = {
+        "integration": "hook",
+        "posture": postures[-1] if postures else None,
+        "total_calls": len(screened),
+        "intercepts": sum(1 for r in records if r.get("intercept")),
+        "critical_blocks": sum(1 for r in records if r.get("intercept")),
+        "would_blocks": sum(1 for r in records if r.get("would_block")),
+        "shield_failopens": sum(int(r.get("shield_failopens") or 0) for r in records),
+        # The audit rung counts what was WATCHED: clean calls in audit posture, and the
+        # distinct tools seen while watching. An enforcing session is not an audit run.
+        "audit_calls": sum(1 for r in audit if r.get("clean")),
+        "audit_tools": len({r.get("tool") for r in audit}),
+        "rule_matches": sum(1 for r in records if r.get("rule_match")),
+        "block_category": categories[-1] if categories else None,
+        # A coding agent's call is always the developer's own agent, never our demo.
+        "own_agent_block": any(r.get("intercept") for r in records),
+    }
+    from . import pulse
+    pulse.on_session_end(stats)
+    _remove(folder, paths)
 
 
 def _adopt_unattributed(project, folder):
@@ -472,6 +504,33 @@ def _remove(folder, paths):
 
 
 _STALE_TMP_SECONDS = 30
+# A session Claude Code never closed (a killed window, a crash) never runs session-end, so its
+# folder would stay forever. A week untouched is far past any live session.
+_STALE_SESSION_SECONDS = 7 * 24 * 3600
+
+
+def _prune_stale_sessions(project, keep=None):
+    """Remove session folders untouched for _STALE_SESSION_SECONDS, never `keep` (the calling
+    session's own). A folder's time moves with every call file written into it, so a live
+    session's folder is never old. Never raises: pruning is housekeeping, not the check."""
+    import shutil
+    try:
+        root = os.path.join(project, _hook_note.SESSIONS_DIR)
+        # Never the shared no-session folder either: it holds fail-open counts the next
+        # session-end has not summed yet, however old they are.
+        keep = {os.path.abspath(k) for k in (keep, _session_dir(project, None)) if k}
+        cutoff = time.time() - _STALE_SESSION_SECONDS
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            try:
+                if (os.path.abspath(path) in keep or os.path.islink(path)
+                        or not os.path.isdir(path) or os.path.getmtime(path) > cutoff):
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
+    except Exception:
+        pass
 
 
 def _drop_leftovers(folder, prefix=None):
@@ -495,10 +554,78 @@ def _drop_leftovers(folder, prefix=None):
 
 # ---- install -------------------------------------------------------------------------------
 
+_ISOLATION_FLAGS = ("-I", "-P")
+_isolation_flag_found = []
+
+
+def _isolation_flag():
+    """The flag that keeps the project folder off the check's import path, or "" when this
+    Python has none that still finds AgentX.
+
+    🔴 `-m` puts the folder Claude Code starts the hook in (the project) first on the import
+    path, so a `json.py` the agent writes there shadows the module the check imports, and the
+    agent has switched the check off. `-I` stops that, but it also drops the user's own
+    site-packages, where `pip install --user` puts AgentX, and there the check would never
+    start at all. So it is measured, not assumed: `-I` when this Python still imports the hook
+    with it, else `-P` (Python 3.11+, which drops only the folder). Asked once per process.
+
+    A probe that could not RUN (a timeout, a spawn error) is not a flag that does not work: it
+    is kept in `_isolation_probe_failed`, so install says to try again rather than to move to
+    a virtual environment (review)."""
+    if not _isolation_flag_found:
+        import subprocess
+        import tempfile
+        found = ""
+        for flag in _ISOLATION_FLAGS:
+            if flag == "-P" and sys.version_info < (3, 11):
+                continue
+            try:
+                ran = subprocess.run([sys.executable, flag, "-c", "import agentx_sdk.hook"],
+                                     cwd=tempfile.gettempdir(), capture_output=True, timeout=30)
+            except Exception as err:
+                _isolation_probe_failed.append(type(err).__name__)
+                continue
+            if ran.returncode == 0:
+                found = flag
+                break
+        _isolation_flag_found.append(found)
+    return _isolation_flag_found[0]
+
+
+_isolation_probe_failed = []
+
+
 def _hook_command(*args):
     """The command Claude Code runs: this interpreter, so the hook finds this install."""
     exe = sys.executable.replace("\\", "/")
-    return " ".join(['"%s"' % exe, _HOOK_MODULE] + list(args))
+    return " ".join(['"%s"' % exe] + ([_isolation_flag()] if _isolation_flag() else [])
+                    + [_HOOK_MODULE] + list(args))
+
+
+def _is_isolated(command):
+    """True when an AgentX hook command starts Python with a flag that keeps the project
+    folder off its import path."""
+    head = str(command or "").replace("\\", "/").split(_HOOK_MODULE)[0].split()
+    return any(flag in head for flag in _ISOLATION_FLAGS)
+
+
+def unisolated_check(project=None):
+    """True when <project>'s installed AgentX check (PreToolUse) starts Python without the
+    flag, so a file the agent writes in the project can switch it off. Reads the file only:
+    no probe, because status runs it every time and the Python that would be asked is this
+    one, not the one the command names (review). Never raises."""
+    try:
+        project = os.path.abspath(project or os.getcwd())
+        settings, err = _read_settings(os.path.join(project, ".claude", "settings.local.json"))
+        if err or not settings:
+            return False
+        return any(_is_ours(h) and _HOOK_MODULE in str(h.get("command") or "")
+                   and not _is_isolated(h.get("command"))
+                   for e in (settings.get("hooks") or {}).get("PreToolUse") or []
+                   if isinstance(e, dict)
+                   for h in (e.get("hooks") or []) if isinstance(h, dict))
+    except Exception:
+        return False
 
 
 # The after-the-call note runs as a plain file, so the package (and its check) never loads.
@@ -597,21 +724,141 @@ def _git_state(project, relative):
         return None
 
 
+# What every screened call writes into the project folder: the path git is asked about, and
+# the .gitignore line that covers it (the database's -wal and -shm files sit beside it). Only
+# the session folder is named, never `.agentx/` whole: the policies file the team shares
+# lives there too.
+_RECORD_PATHS = ((".agentx.db", ".agentx.db", ".agentx.db*"),
+                 (".agentx/hook-sessions", ".agentx/hook-sessions/session/call.json",
+                  ".agentx/hook-sessions/"))
+
+
+def _record_state(project, tracked, probe):
+    """git's view of one record path. `tracked` is asked about first, as a pathspec, so a
+    committed file anywhere under the session folder counts; `probe` is a file inside it,
+    because check-ignore on the bare folder name misses a `folder/` pattern."""
+    state = _git_state(project, tracked)
+    return state if state in (None, "committed") else _git_state(project, probe)
+
+
+def _record_note(project):
+    """What install says about the files the hook writes into `project`, and in a git
+    repository where they are not ignored, the .gitignore lines to add."""
+    text = ("Each checked call is recorded in this folder: .agentx.db (with .agentx.db-wal and "
+            ".agentx.db-shm beside it), and small per-session files under "
+            ".agentx/hook-sessions/, removed when the session ends.\n")
+    states = [(_record_state(project, tracked, probe), tracked, line)
+              for tracked, probe, line in _RECORD_PATHS]
+    missing = [line for state, _, line in states if state in ("not ignored", "committed")]
+    if missing:
+        text += ("git does not ignore them here. Add %s to .gitignore:\n%s"
+                 % ("this line" if len(missing) == 1 else "these lines",
+                    "".join("    %s\n" % line for line in missing)))
+    # Only the paths git tracks: naming an untracked one makes `git rm` fail on its pathspec
+    # and untrack nothing.
+    committed = [tracked for state, tracked, _ in states if state == "committed"]
+    if committed:
+        text += ("The record is tracked by git here. To stop tracking it and keep your copy:\n"
+                 "    git rm -r --cached %s\n" % " ".join(committed))
+    return text
+
+
+def _interpreter_note():
+    """The hook command names this Python by its path, so a moved or rebuilt environment breaks
+    every call; Claude Code shows that as a non-blocking error and runs the call unchecked."""
+    return ("The hook runs this Python: %s. If it is moved, or its virtual environment rebuilt, "
+            "calls go unchecked until you run agentx hook install again (agentx status says "
+            "when). Each shell command and MCP call starts it once, about 0.3 seconds on our "
+            "test machine.\n" % sys.executable)
+
+
+def missing_hook_paths(project=None):
+    """(path, event) for each file an installed AgentX hook in
+    <project>/.claude/settings.local.json runs that no longer exists (its Python, or the note
+    file beside the package), with the Claude Code event whose command names it, so a screen
+    can say which part stopped. Empty when it is not installed, or all are there. Reads only,
+    never raises."""
+    import re
+    try:
+        project = os.path.abspath(project or os.getcwd())
+        settings, err = _read_settings(os.path.join(project, ".claude", "settings.local.json"))
+        if err or not settings:
+            return []
+        missing = []
+        for name in _HOOK_EVENTS:
+            for entry in (settings.get("hooks") or {}).get(name) or []:
+                inner = entry.get("hooks") if isinstance(entry, dict) else None
+                for h in inner if isinstance(inner, list) else []:
+                    if not _is_ours(h):
+                        continue
+                    for path in re.findall(r'"([^"]+)"', str(h.get("command") or "")):
+                        if not os.path.exists(path) and (path, name) not in missing:
+                            missing.append((path, name))
+        return missing
+    except Exception:
+        return []
+
+
+_BACKUP_SUFFIX = ".agentx-backup"
+
+
 def _write_settings(path, settings):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    """Write `settings`, backing the file up beside itself first. An empty object removes the
+    file instead: `{}` says nothing Claude Code needs, and uninstall left one behind in a
+    project that had no settings before install (cold install), and is not backed up: all
+    that was removed is AgentX's own. Returns the backup's path, or None when none was
+    written."""
+    if not settings:
+        if os.path.exists(path):
+            os.remove(path)
+        return None
+    backup = None
     if os.path.exists(path):
-        with open(path, encoding="utf-8") as src, \
-                open(path + ".agentx-backup", "w", encoding="utf-8") as dst:
+        backup = path + _BACKUP_SUFFIX
+        with open(path, encoding="utf-8") as src, open(backup, "w", encoding="utf-8") as dst:
             dst.write(src.read())
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(settings, fh, indent=2)
         fh.write("\n")
+    return backup
 
 
-def _wanted_hooks():
+def _backup_note(project, backup):
+    """Name the backup a write left, and in a git repository where it is not ignored, the
+    .gitignore line for it: a copy of the file holding this machine's Python path, untracked,
+    that no screen mentioned (cold install)."""
+    if not backup:
+        return ""
+    relative = ".claude/settings.local.json" + _BACKUP_SUFFIX
+    text = "The file as it was before is kept at %s.\n" % backup
+    git = _git_state(project, relative)
+    if git == "not ignored":
+        text += ("git does not ignore it here, and it can hold this machine's Python path. "
+                 "Add this line to .gitignore:\n    %s\n" % relative)
+    elif git == "committed":
+        text += ("It is tracked by git here. To stop tracking it and keep your copy:\n"
+                 "    git rm --cached %s\nThen add this line to .gitignore:\n    %s\n"
+                 % (relative, relative))
+    return text
+
+
+def _installed_enforcing(hooks):
+    """True when the PreToolUse check AgentX installed carries `--posture enforce`."""
+    return any(_is_ours(h) and "--posture enforce" in str(h.get("command") or "")
+               for e in (hooks.get("PreToolUse") or []) if isinstance(e, dict)
+               for h in (e.get("hooks") or []) if isinstance(h, dict))
+
+
+def _wanted_hooks(posture=None):
+    """`posture="enforce"` writes the setting into the check's command line, so it blocks in
+    every session with nothing exported. Watching writes the plain command, which is what every
+    earlier install wrote."""
+    check = (_hook_command("pre-tool-use", "--posture", "enforce") if posture == "enforce"
+             else _hook_command())
     return {
         "PreToolUse": {"matcher": HOOK_MATCHER,
-                       "hooks": [{"type": "command", "command": _hook_command()}]},
+                       "hooks": [{"type": "command", "command": check}]},
         "PostToolUse": {"matcher": HOOK_MATCHER,
                         "hooks": [{"type": "command", "command": _note_command()}]},
         "SessionEnd": {"hooks": [{"type": "command", "command": _hook_command("session-end"),
@@ -619,9 +866,14 @@ def _wanted_hooks():
     }
 
 
-def install(project=None, out=None):
+def install(project=None, out=None, posture=None):
     """Add the PreToolUse, PostToolUse and SessionEnd hooks to
     <project>/.claude/settings.local.json.
+
+    `posture="enforce"` (`agentx hook install --enforce`) installs the check so it blocks in
+    every session; `posture="audit"` (`--watch`) switches it back; None keeps what is installed
+    (watching on a first install). A variable set where `claude` starts still wins for that
+    session.
 
     The local file is the developer's own: the hook command names this machine's Python, so it
     must not land in the team's committed settings.json, and install never writes that file
@@ -647,26 +899,57 @@ def install(project=None, out=None):
         out.write("Not installed: %s. Fix it and run this again; nothing was changed.\n" % err)
         return 1
 
-    wanted = _wanted_hooks()
     hooks = local.get("hooks") or {}
+    if posture is None and _installed_enforcing(hooks):
+        # Plain `install` keeps an enforcing install enforcing: only `--watch` switches it
+        # back. The shared-settings advice below says "run agentx hook install again", and that
+        # used to drop the developer back to watching without a word (review).
+        posture = "enforce"
+    # 🔴 A probe that could not RUN is not a reason to rewrite. Without this a timeout on a
+    # reinstall wrote the check back WITHOUT the flag the earlier install had (review round 2).
+    # Kept only from a command that runs THIS Python: another interpreter's flag can be one
+    # this one rejects (`-P` before 3.11 exits 2, which Claude Code reads as "deny" on every
+    # call) or one it cannot start the check under (scoped review).
+    kept_flag = None
+    if not _isolation_flag() and _isolation_probe_failed:
+        this_exe = '"%s"' % sys.executable.replace("\\", "/")
+        # By prefix, never by token: a path with a space (C:/Users/John Smith/...) splits.
+        kept_flag = next((flag for e in hooks.get("PreToolUse") or [] if isinstance(e, dict)
+                          for h in (e.get("hooks") or []) if isinstance(h, dict) and _is_ours(h)
+                          for cmd in [str(h.get("command") or "").replace("\\", "/")]
+                          if cmd.startswith(this_exe + " ")
+                          for flag in _ISOLATION_FLAGS
+                          if flag in cmd[len(this_exe):].split(_HOOK_MODULE)[0].split()
+                          and not (flag == "-P" and sys.version_info < (3, 11))),
+                         None)
+        if kept_flag:
+            _isolation_flag_found[:] = [kept_flag]
+    wanted = _wanted_hooks(posture)
     # Installed means exactly our entries, one per event: the current ones, and no stale copy
     # beside them (a stale copy screens every call twice).
     already = _count_ours(hooks) == len(wanted) and all(
         any(isinstance(e, dict) and e.get("matcher") == w.get("matcher")
             and e.get("hooks") == w["hooks"] for e in hooks.get(name, []))
         for name, w in wanted.items())
+    if posture == "enforce":
+        mode_text = ("Blocking: a call the rules would stop is denied, and Claude is told why "
+                     "and what to do instead, in every session. To go back to watching: "
+                     "agentx hook install --watch")
+    else:
+        mode_text = ("Watching: a call the rules would stop still runs, shows you a line saying "
+                     "so, and is recorded. To block those calls in every session: "
+                     "agentx hook install --enforce")
     if already:
-        out.write("Already installed in %s.\n" % local_path)
+        out.write("Already installed in %s. %s\n" % (local_path, mode_text))
     else:
         _drop_ours(hooks)
         for name, w in wanted.items():
             hooks.setdefault(name, []).append(w)
         local["hooks"] = hooks
-        _write_settings(local_path, local)
+        backup = _write_settings(local_path, local)
         out.write("Installed in %s. Claude Code now asks AgentX before each shell command and "
-                  "MCP call. Watching is the default: nothing is blocked until "
-                  "AGENTX_POSTURE=enforce, and a call the rules would stop still runs, shows you "
-                  "a line saying so, and is recorded. See them all: agentx audit\n" % local_path)
+                  "MCP call. %s. See them all: agentx audit\n" % (local_path, mode_text))
+        out.write(_backup_note(project, backup))
     shared_hooks = shared.get("hooks") or {}
     if _count_ours(shared_hooks):
         # Says what is doubled, by which entry is copied: the CHECK records every call twice; the
@@ -696,7 +979,85 @@ def install(project=None, out=None):
                   "committed. To stop tracking it and keep your copy:\n"
                   "    git rm --cached .claude/settings.local.json\n"
                   "Then add this line to .gitignore:\n    .claude/settings.local.json\n")
+    out.write(_record_note(project))
+    out.write(_interpreter_note())
+    if kept_flag:
+        out.write("Could not check how to keep the project folder off the check's import path "
+                  "(%s), so the %s the earlier install used is kept.\n"
+                  % (_isolation_probe_failed[0], kept_flag))
+    elif not _isolation_flag() and _isolation_probe_failed:
+        out.write("Could not check how to keep the project folder off the check's import path "
+                  "(%s), so a file the agent writes there could switch the check off. Run "
+                  "agentx hook install again.\n" % _isolation_probe_failed[0])
+    elif not _isolation_flag():
+        out.write("This Python cannot start the check with the project folder off its import "
+                  "path (AgentX is installed where -I does not look, and -P needs Python "
+                  "3.11), so a file the agent writes there could switch the check off. To "
+                  "close that, install AgentX in a virtual environment and run agentx hook "
+                  "install from it.\n")
     return 0
+
+
+def uninstall(project=None, out=None):
+    """Remove AgentX's hooks from <project>/.claude/settings.local.json, leaving everything
+    else in the file as it was (backed up beside itself first). The team's settings.json is
+    never edited: an AgentX entry there is reported for the developer to remove. The record
+    (`.agentx.db`, `.agentx/`) is kept: it is the developer's, and `agentx audit` still reads it."""
+    out = out or sys.stdout
+    project = os.path.abspath(project or os.getcwd())
+    local_path = os.path.join(project, ".claude", "settings.local.json")
+    shared_path = os.path.join(project, ".claude", "settings.json")
+    local, err = _read_settings(local_path)
+    if err:
+        out.write("Not removed: %s. Fix it and run this again; nothing was changed.\n" % err)
+        return 1
+    hooks = local.get("hooks") or {}
+    removed = _drop_ours(hooks)
+    if removed:
+        if hooks:
+            local["hooks"] = hooks
+        else:
+            local.pop("hooks", None)
+        backup = _write_settings(local_path, local)
+        out.write("Removed AgentX from %s%s. Claude Code no longer asks AgentX before tool "
+                  "calls in this project. Your record is kept: agentx audit still reads it.\n"
+                  % (local_path, "" if local else ", which held nothing else, so it was deleted"))
+        out.write(_backup_note(project, backup) if local else _older_backup_note(local_path))
+    else:
+        out.write("AgentX is not installed in %s; nothing was changed.\n" % local_path)
+    shared, err = _read_settings(shared_path)
+    if not err and _count_ours(shared.get("hooks") or {}):
+        out.write("%s (the team's shared settings) also has an AgentX hook, which this does not "
+                  "edit. Remove the entries that run 'agentx_sdk.hook' or "
+                  "'agentx_sdk/_hook_note.py' from that file.\n" % shared_path)
+    return 0
+
+
+def _older_backup_note(local_path):
+    """When uninstall deleted the settings file, a backup an earlier install wrote beside it
+    can still hold AgentX's hooks and this machine's Python path (review: install, install
+    again, uninstall left one, unnamed). Deleted when AgentX's entries are all it holds, else
+    named."""
+    backup = local_path + _BACKUP_SUFFIX
+    if not os.path.exists(backup):
+        return ""
+    held, err = _read_settings(backup)
+    if not err:
+        hooks = held.get("hooks") or {}
+        _drop_ours(hooks)
+        if not hooks:
+            held.pop("hooks", None)
+        if not held:
+            try:
+                os.remove(backup)
+                return ""
+            except OSError:
+                pass
+    text = ("An older copy of the file is still at %s; delete it if you do not need it.\n"
+            % backup)
+    # The advice `_backup_note` gives, minus its first line: this copy can hold the Python path.
+    project = os.path.dirname(os.path.dirname(local_path))
+    return text + _backup_note(project, backup).split("\n", 1)[1]
 
 
 def _is_terminal(stream):
@@ -714,7 +1075,25 @@ def main(argv=None):
     if sub == "post-tool-use":
         return post_tool_use()
     if sub == "install":
-        return install(argv[1] if len(argv) > 1 else None)
+        rest = argv[1:]
+        flags = [a for a in rest if a.startswith("--")]
+        dirs = [a for a in rest if not a.startswith("--")]
+        unknown = [f for f in flags if f not in ("--enforce", "--watch")]
+        if unknown or ("--enforce" in flags and "--watch" in flags) or len(dirs) > 1:
+            sys.stderr.write(_USAGE)
+            return 1
+        return install(dirs[0] if dirs else None,
+                       posture=("enforce" if "--enforce" in flags
+                                else "audit" if "--watch" in flags else None))
+    if sub == "uninstall":
+        rest = argv[1:]
+        if len(rest) > 1 or any(a.startswith("--") for a in rest):
+            sys.stderr.write(_USAGE)
+            return 1
+        return uninstall(rest[0] if rest else None)
+    if sub in ("-h", "--help", "help"):
+        sys.stdout.write(_USAGE)
+        return 0
     if sub == "" and _is_terminal(sys.stdin):
         # A person typed it. Claude Code always pipes the event, so waiting on a terminal for
         # JSON would look like a hang.
@@ -722,11 +1101,29 @@ def main(argv=None):
                          "To add it to this project:  agentx hook install\n")
         return 0
     if sub in ("", "pre-tool-use"):
-        return pre_tool_use()
-    sys.stderr.write("usage: agentx hook [pre-tool-use | post-tool-use | session-end | "
-                     "install [DIR]]\n")
+        installed = None
+        if argv[1:3] == ["--posture", "enforce"]:
+            installed = "enforce"
+        return pre_tool_use(installed=installed)
+    sys.stderr.write(_USAGE)
     # 1, never 2: to Claude Code a PreToolUse exit of 2 means "block this call".
     return 1
+
+
+_USAGE = (
+    "usage: agentx hook install [DIR] [--enforce | --watch]\n"
+    "       agentx hook uninstall [DIR]\n"
+    "\n"
+    "  install            Add AgentX to this project's Claude Code settings. It\n"
+    "                     watches: a call the rules would stop runs and is recorded.\n"
+    "  install --enforce  The same, but such calls are blocked in every session.\n"
+    "  install --watch    Switch an enforcing install back to watching.\n"
+    "  uninstall [DIR]    Remove AgentX's hooks from this project's settings (your\n"
+    "                     record is kept).\n"
+    "\n"
+    "Claude Code runs the other forms itself:\n"
+    "  pre-tool-use, post-tool-use, session-end.\n"
+)
 
 
 if __name__ == "__main__":

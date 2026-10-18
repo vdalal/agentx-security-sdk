@@ -1034,7 +1034,7 @@ def build_payload(session_stats, state, first_block_ever=None):
             "human_escalations": int(session_stats.get("human_escalations", 0)),
             "self_corrections": int(session_stats.get("self_corrections", 0)),
             # AUDIT posture: catches that WOULD have blocked but were recorded-and-let-
-            # through (AGENTX_ENFORCEMENT=audit). A DISTINCT coarse count from intercepts
+            # through (AGENTX_POSTURE=audit). A DISTINCT coarse count from intercepts
             # so the funnel sees a new honest activation state: would_blocks>0 with
             # had_block False = an install EVALUATING (running audit), not yet enforcing.
             # Never identity/payload, same privacy class as the other counts.

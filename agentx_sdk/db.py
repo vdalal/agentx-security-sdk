@@ -165,8 +165,37 @@ INVENTORY_STATUS = "ALLOWED"
 # side of that rule without an edit. Do not "fix" that by naming it anywhere in prune.
 UNSIZED_WRITE_STATUS = "UNSIZED"
 
-# The statuses that are NOT us having formed an opinion about a call: routine traffic, and an
-# observation. Every count whose SENTENCE says we objected has to leave both out.
+# THE TWO "DID NOT RUN" STATUSES BESIDE CHALLENGED: one row per call whatever happened to it,
+# the rule the TS SDK records by (protect.ts `refused` / `notApproved`, same words). Before
+# these, a call that ended without running and without a CHALLENGED row left NOTHING, so a run
+# whose stops were all holds or outages printed a summary that understated them, or none.
+#
+# HELD: a person was asked and did not approve (denied, dismissed, no answer in time, or the
+# gateway refused to report the answer). A policy held it, so it IS an opinion: it counts where
+# CHALLENGED counts as "stopped". `policy_name` is the policy that held it.
+#
+# REFUSED: no verdict could be had, so the call was not run (fail-closed, a key or address
+# error, an answer the client does not know, the offline loop breaker, an unreadable policy
+# file under strict loading). NOT an opinion: nothing objected to the call, so it must never
+# read as "tripped a policy". `policy_name` carries the reason, in TS's words.
+#
+# ⚠️ "HELD" ALSO NAMES a `label_safe_path` value in the incident store (overrides.py
+# `_SAFE_PATH_VOCAB`). Different store, different column; the ledger status is never compared
+# with that one.
+HELD_STATUS = "HELD"
+REFUSED_STATUS = "REFUSED"
+
+# HALTED: a runaway-loop breaker stopped the call (the local shield's breaker, the gateway's
+# loop abort, whether repeated stops or repeated identical allowed calls, the offline breaker,
+# the MCP runaway call-volume ceiling). One row per call, so a halt is recorded, and under its OWN word on both
+# SDKs, because each nearer word is false of it. Not a policy block
+# (CHALLENGED): every block reader then asked "was this block right?", counted it toward
+# recovery and ranked "Circuit Breaker" as a policy (review rounds 1-2). Not REFUSED: its screens
+# say "AgentX could not get a verdict", and the gateway's loop abort IS a verdict. Treated by
+# the readers like REFUSED: not an opinion, its own counts and words, never reviewed.
+HALTED_STATUS = "HALTED"
+# The statuses that are NOT us having formed an opinion about a call: routine traffic, an
+# observation, and a refusal. Every count whose SENTENCE says we objected has to leave them out.
 #
 # 🔴 STATED AS AN EXCLUSION, NOT AS A POSITIVE LIST, AND THAT IS DELIBERATE. `status IS NOT
 # 'ALLOWED'` is TRUE for a NULL status in SQLite, so today's "flagged" counts include the
@@ -174,7 +203,13 @@ UNSIZED_WRITE_STATUS = "UNSIZED"
 # ('CHALLENGED', 'RECOVERED', 'WOULD_BLOCK')` would read better and would silently drop those
 # rows from counts they have always been in -- a behaviour change on every upgraded ledger,
 # arriving as a tidy-up. So the new status is excluded by name beside the old one.
-_NOT_AN_OPINION_STATUSES = (INVENTORY_STATUS, UNSIZED_WRITE_STATUS)
+#
+# 🔴 TWO SETS, BECAUSE REFUSED SPLIT ONE. Before REFUSED, "no opinion" and "the call ran" were the
+# same two statuses, and evidence.py read this tuple as its RAN set. A refused call had no
+# opinion AND did not run, so a reader asking "did it run" uses `RAN_WITHOUT_OPINION_STATUSES`,
+# and one asking "did we object" uses this.
+RAN_WITHOUT_OPINION_STATUSES = (INVENTORY_STATUS, UNSIZED_WRITE_STATUS)
+_NOT_AN_OPINION_STATUSES = RAN_WITHOUT_OPINION_STATUSES + (REFUSED_STATUS, HALTED_STATUS)
 
 
 def _had_an_opinion_clause():
@@ -278,7 +313,7 @@ def door_counts(db_path=None):
     sql = ("SELECT COALESCE(SUM(agent_id IS ?), 0), COALESCE(SUM(agent_id IS NOT ?), 0) "
            "FROM event_log WHERE %s" % theirs)
     try:
-        conn = sqlite3.connect(read_only_uri(path), uri=True)
+        conn = calls_view(sqlite3.connect(read_only_uri(path), uri=True))
         try:
             row = conn.execute(sql, [AGENT_ID, AGENT_ID] + params).fetchone()
         finally:
@@ -345,6 +380,127 @@ def _connection(path=None):
             conn.close()
         except Exception:
             pass
+
+
+# --- WHAT IS A CALL ------------------------------------------------------------------
+#
+# The status of a row that records something an MCP SERVER did, not a call the agent made:
+# agentx-mcp writes one when a server changes a tool it offers, or first lists a tool whose
+# description looks like it hides instructions. The row carries the tool's name, so before this
+# status existed every reader counted it as a call ("2 calls" over one), asked whether its
+# "block" was right, and put it in the evidence file's stopped calls. Whether the tool was held
+# for approval is in `posture` ('enforce' held, 'audit' trusted as it is).
+SERVER_EVENT_STATUS = "SERVER_EVENT"
+
+# Never a `DELETE FROM event_log`: a subquery is not a table, and a delete is about the file.
+_FROM_EVENT_LOG_RE = re.compile(r"(?<!DELETE )\bFROM\s+event_log\b")
+
+
+def _server_event_where():
+    """The rows that record what a server did. Rows written before SERVER_EVENT_STATUS carry a
+    call's status, and are known by who wrote them and the rule they were filed under: the proxy
+    filed nothing else under those names (a call it refuses because its tool is held is filed
+    under its own name). Old rows are recognised here, never rewritten: the record is meant to
+    stay as it was written.
+
+    Literals, not parameters: every value is our own constant, and a parameter inside a subquery
+    would shift the position of every `?` in the query around it. No NULL can reach the answer
+    (`IS`, `COALESCE`), so `NOT` of it is exact."""
+    pins = ", ".join("'%s'" % name.replace("'", "''") for name in MCP_PIN_POLICY_NAMES)
+    return ("(status IS '%s' OR (agent_id IS '%s' AND COALESCE(policy_name, '') IN (%s)))"
+            % (SERVER_EVENT_STATUS, MCP_PROXY_AGENT_ID, pins))
+
+
+def _calls_subquery():
+    """`FROM <the ledger's calls>`, aliased back to `event_log` so the query around it reads the
+    same."""
+    return ("FROM (SELECT * FROM event_log WHERE NOT %s) AS event_log" % _server_event_where())
+
+
+# What each kind of server event is, in the words every screen and the evidence file use.
+SERVER_EVENT_WORDS = {"changed": "changed since first seen",
+                      "suspicious": "may hide instructions",
+                      "either": "changed or suspicious"}
+
+
+def get_server_events(path=None):
+    """What MCP servers did to their tools, newest event per tool, oldest first. Never raises.
+
+    ``[{"tool", "kind": "changed" | "suspicious" | "either", "held": True | False | None,
+    "at": epoch}]``. `held` is what pinning did at the time (None for a row from before the two
+    events had their own names, which also wrote every row as held whatever the setting)."""
+    out = {}
+    if not os.path.exists(path or DB_PATH):
+        return []
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(
+                "SELECT tool_name, policy_name, posture, timestamp, id FROM event_log WHERE %s "
+                "AND tool_name IS NOT NULL ORDER BY id" % _server_event_where()
+            ).fetchall()
+    except Exception:
+        return []
+    kinds = {MCP_DRIFT_POLICY_NAME: "changed", MCP_POISON_POLICY_NAME: "suspicious"}
+    for tool, policy, posture, at, row_id in rows:
+        # Kept whatever the name: a server that names a tool with an escape byte must not make
+        # its own change vanish (review). Screens print it through `shown_tool_name`.
+        if not isinstance(tool, str) or not tool:
+            continue
+        kind = kinds.get(policy, "either")
+        out[tool] = {"tool": tool, "kind": kind, "at": at, "id": row_id,
+                     "held": None if kind == "either" else posture == "enforce"}
+    # In the order they were written: two events in one second are told apart by the row.
+    return sorted(out.values(), key=lambda e: e["id"])
+
+
+def calls_only(sql):
+    """`sql` with every `FROM event_log` reading the agent's calls only."""
+    return _FROM_EVENT_LOG_RE.sub(lambda _m: _calls_subquery(), sql)
+
+
+class _CallsCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, sql, *params):
+        self._cursor.execute(calls_only(sql), *params)
+        return self
+
+    def __iter__(self):
+        return iter(self._cursor)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _CallsConnection:
+    """A connection whose reads see the agent's calls and nothing else. Every reader that counts,
+    lists or judges calls opens the ledger through `_calls_connection` or `calls_view`;
+    `sdk_tests/test_server_events_are_not_calls.py` fails on a reader that does not. Readers about
+    the FILE (retention, trimming, readability) keep `_connection`: a server event takes space."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, *params):
+        return _CallsCursor(self._conn.execute(calls_only(sql), *params))
+
+    def cursor(self):
+        return _CallsCursor(self._conn.cursor())
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def calls_view(conn):
+    """Wrap a connection opened elsewhere (a read-only URI) so its reads see calls only."""
+    return _CallsConnection(conn)
+
+
+@contextmanager
+def _calls_connection(path=None):
+    with _connection(path) as conn:
+        yield _CallsConnection(conn)
 
 
 # --- THE HOT WRITE PATH (P-112 enforce half) ------------------------------------------
@@ -1835,12 +1991,36 @@ def get_proposable_destinations(allowlist_policy_id, path=None):
         (INVENTORY_STATUS, UNSIZED_WRITE_STATUS, WOULD_BLOCK_STATUS, allowlist_policy_id), path)
 
 
+def get_proposable_tools(path=None):
+    """{agent_id: {tool_name: calls}} a tool allowlist may be PROPOSED from: calls that ran with
+    no objection (`ALLOWED`, `UNSIZED`). Never raises; {} for no ledger.
+
+    A call a floor objected to (`WOULD_BLOCK`, a block) is never counted: offering its tool as
+    one to allow would turn the floor's catch into the agent's permission."""
+    out = {}
+    if not os.path.exists(path or DB_PATH):
+        return out
+    try:
+        with _calls_connection(path) as conn:
+            rows = conn.execute(
+                "SELECT agent_id, tool_name, COUNT(*) FROM event_log "
+                "WHERE tool_name IS NOT NULL AND tool_name != '' AND status IN (?, ?) "
+                "GROUP BY agent_id, tool_name",
+                (INVENTORY_STATUS, UNSIZED_WRITE_STATUS)).fetchall()
+    except Exception:
+        return out
+    for agent, tool, calls in rows:
+        per_agent = out.setdefault(agent or "", {})
+        per_agent[str(tool)] = per_agent.get(str(tool), 0) + int(calls or 0)
+    return out
+
+
 def _destinations_where(where, params, path=None):
     out = {}
     if not os.path.exists(path or DB_PATH):
         return out
     try:
-        with _connection(path) as conn:
+        with _calls_connection(path) as conn:
             rows = conn.execute(
                 "SELECT agent_id, dest_hosts, COUNT(*) FROM event_log "
                 "WHERE dest_hosts IS NOT NULL AND %s "
@@ -1983,7 +2163,11 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
             # that decides a sentence has to be the counter that sentence is ABOUT, same rule as
             # get_ledger_census's `interceptions`". That is the rule -- and applying it to the
             # census and not here is what left it half-done.
+            #
+            # Nor is what a server did to a tool: a trimmed server event is not an older block
+            # record dropped (it is still a row, so the trim itself takes it like any other).
             _catch_sql, _catch_params = _had_an_opinion_clause()
+            _catch_sql = "(%s AND NOT %s)" % (_catch_sql, _server_event_where())
             blocks = 0
 
             # Capture the oldest timestamp we are about to destroy BEFORE destroying it --
@@ -2328,7 +2512,7 @@ def get_ledger_census(path=None):
 
     🔴 THE DEFECT THIS EXISTS TO PREVENT. The status screen chose between "here are your
     blocks" and "nothing is here" from `get_lifetime_stats`, which counts only CHALLENGED
-    and RECOVERED. Under AGENTX_ENFORCEMENT=audit the ledger fills with WOULD_BLOCK rows
+    and RECOVERED. Under AGENTX_POSTURE=audit the ledger fills with WOULD_BLOCK rows
     that query cannot see, so a ledger holding four audited rows printed "no blocks remain
     in this ledger" while the retention line beside it reported rows_kept: 4. Reproduced
     end to end.
@@ -2355,6 +2539,12 @@ def get_ledger_census(path=None):
               # `_ledger_totals` because the status screen reads THIS reader and must not send a
               # developer who has one to go and wrap a tool.
               "observed": 0,
+              # Calls that did not run for want of a verdict (REFUSED); same reason as above.
+              "refused": 0,
+              # Calls held for a person and not approved (HELD).
+              "held": 0,
+              # Calls a loop breaker halted (HALTED).
+              "halted": 0,
               # 🔴 OUR OWN DEMO'S ROWS, COUNTED IN THE SAME PASS. `agentx demo --audit` writes
               # four ALLOWED rows and one WOULD_BLOCK into the reader's real ledger, and
               # `agentx status` reads this census to say what "your agent" did. The audit
@@ -2372,7 +2562,7 @@ def get_ledger_census(path=None):
     if not os.path.exists(path or DB_PATH):
         return census
     try:
-        with _connection(path) as conn:
+        with _calls_connection(path) as conn:
             cursor = conn.cursor()
             # Bound HERE, in the function that uses them. The first cut of this change read
             # these from a sibling reader's locals -- a NameError on every `agentx status`
@@ -2405,16 +2595,19 @@ def get_ledger_census(path=None):
                                 THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status = 'RECOVERED' AND {ours} THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END),
                        SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END)
                   FROM event_log
             """.format(ours=_ours_sql, opinion=_op_sql), (WOULD_BLOCK_STATUS, *_op_params,
                   WOULD_BLOCK_STATUS, *_ours_params,
                   INVENTORY_STATUS, *_ours_params,
                   *_ours_params, *_ours_params, INVENTORY_STATUS,
-                  UNSIZED_WRITE_STATUS))
+                  UNSIZED_WRITE_STATUS, REFUSED_STATUS, HELD_STATUS, HALTED_STATUS))
             (total, episodes, would, recovered, intercepted,
              would_demo, inv_demo, episodes_demo, recovered_demo, inventory,
-             observed) = cursor.fetchone()
+             observed, refused, held, halted) = cursor.fetchone()
             census["total_rows"] = total or 0
             # 🔴 COUNTED, NOT DERIVED, AND THE SUBTRACTION IT REPLACES WAS ABOUT TO GO WRONG.
             # Two screens read "routine calls" as `total_rows - interceptions`, which was exactly
@@ -2439,6 +2632,17 @@ def get_ledger_census(path=None):
             # under it. Widening the emptiness verdict was the tempting fix and it would have
             # removed the empty-state disclosure from two other screens that are correctly empty.
             census["observed"] = observed or 0
+            # Calls that did not run because no verdict could be had. Not a catch (so not in
+            # `interceptions`, and `ledger_empty_reason` is unchanged, as for `observed`), but a
+            # ledger holding only these is one whose owner HAS wrapped a tool: `agentx status`
+            # reads this so it does not tell them to go and wrap one.
+            census["refused"] = refused or 0
+            # Calls held for a person and not approved. They ARE in `interceptions` (a policy
+            # held them), but in neither `block_episodes` nor `would_blocks`, and no insights
+            # reader renders them: status and insights read this to point at the per-call screen.
+            census["held"] = held or 0
+            # Calls a loop breaker halted (HALTED): not a catch, like `refused`.
+            census["halted"] = halted or 0
             census["block_episodes"] = episodes or 0
             census["would_blocks"] = would or 0
             census["recoveries"] = recovered or 0
@@ -2503,8 +2707,10 @@ def get_unprotected_tools(path=None, exclude_agents=None):
     """
     excluded = [a for a in (exclude_agents or []) if a]
     frag, frag_params = _exclude_agents_fragment(excluded)
+    # What a server did to a tool is not a call (it listed a tool the agent never called as
+    # "ran WITHOUT being defended"); the calls-only connection leaves it out, here as everywhere.
     try:
-        with _connection(path or DB_PATH) as conn:
+        with _calls_connection(path or DB_PATH) as conn:
             return [(row[0], row[1]) for row in conn.execute(
                 "SELECT tool_name, COUNT(*) FROM event_log "
                 "WHERE posture = 'audit' AND tool_name IS NOT NULL AND tool_name != ''"
@@ -2523,7 +2729,7 @@ def posture_coverage(path=None):
     """
     out = {"audit": 0, "enforce": 0, "unknown": 0}
     try:
-        with _connection(path or DB_PATH) as conn:
+        with _calls_connection(path or DB_PATH) as conn:
             for posture, n in conn.execute(
                     "SELECT posture, COUNT(*) FROM event_log GROUP BY posture"):
                 key = posture if posture in ("audit", "enforce") else "unknown"
@@ -2590,11 +2796,12 @@ def get_call_inventory(path=None, limit=25):
              "distinct_tools": 0, "readable": True, "flagged_total": 0,
              "would_block_total": 0, "unclassified_total": 0, "flagged_from_demo": 0,
              "inventory_from_demo": 0, "viewable_total": 0, "would_block_from_demo": 0,
-             "stopped_from_demo": 0, "totals": _empty_totals()}
+             "stopped_from_demo": 0, "held_total": 0, "refused_total": 0, "halted_total": 0,
+             "totals": _empty_totals()}
     if not os.path.exists(path or DB_PATH):
         return empty
     try:
-        with _connection(path) as conn:
+        with _calls_connection(path) as conn:
             cursor = conn.cursor()
             # 🔴 THE LEGACY RETRY IS THE SAME ONE `log_intercept` KEEPS FOR ITS INSERT, AND
             # FOR THE SAME REASON. Naming a newer column unconditionally makes this whole
@@ -2676,13 +2883,18 @@ def get_call_inventory(path=None, limit=25):
                 _tool_op_sql, _tool_op_params = _had_an_opinion_clause()
                 cursor.execute(
                     "SELECT SUM(CASE WHEN " + _tool_op_sql + " THEN 1 ELSE 0 END), "
+                    "       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END), "
+                    "       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END), "
                     "       SUM(CASE WHEN status IS ? THEN 1 ELSE 0 END) "
                     "  FROM event_log "
                     " WHERE tool_name IS ? AND " + _not_ours_sql,
-                    (*_tool_op_params, UNSIZED_WRITE_STATUS, name, *_not_ours_params))
-                _flag_row = cursor.fetchone() or (0, 0)
+                    (*_tool_op_params, UNSIZED_WRITE_STATUS, REFUSED_STATUS, HALTED_STATUS,
+                     name, *_not_ours_params))
+                _flag_row = cursor.fetchone() or (0, 0, 0, 0)
                 flagged = _flag_row[0] or 0
                 observed = _flag_row[1] or 0
+                refused = _flag_row[2] or 0
+                halted = _flag_row[3] or 0
                 tools.append({
                     "tool": name, "calls": calls, "max_amount": amount or 0.0,
                     # The counted-quantity twin of max_amount. Kept a SEPARATE key rather than
@@ -2695,6 +2907,11 @@ def get_call_inventory(path=None, limit=25):
                     # piece 3). Its own key rather than folded into `flagged`, because
                     # "flagged" on this screen means we objected and here we did not.
                     "observed": observed,
+                    # Calls on THIS tool that did not run for want of a verdict (REFUSED). Its
+                    # own key for the same reason: nothing objected to them.
+                    "refused": refused,
+                    # Calls on THIS tool a loop breaker halted (HALTED).
+                    "halted": halted,
                     # 🔴 THE PER-TOOL SPLIT, SO A ROW CAN BE RECONCILED WHERE IT IS READ. The
                     # screen-level note says "21 of those came from AgentX's own demo or examples",
                     # which is a total across every tool -- so a reader looking at `run_sql 26`
@@ -2911,6 +3128,16 @@ def get_call_inventory(path=None, limit=25):
                 ("CHALLENGED", "RECOVERED", WOULD_BLOCK_STATUS))
             viewable_total = cursor.fetchone()[0] or 0
 
+            # Calls held for a person and not approved. In `flagged_total` (a policy held them)
+            # and NOT in `viewable_total` (insights does not show them), so without their own
+            # count the audit screen's `flagged - viewable` remainder called them rows "from a
+            # ledger older than this version". The per-call screen lists them.
+            cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS ?", (HELD_STATUS,))
+            held_total = cursor.fetchone()[0] or 0
+            # And the calls that did not run for want of a verdict, for the same screen.
+            refused_total = _shared["refused"]
+            halted_total = _shared["halted"]
+
             return {
                 "tools": tools,
                 "total_calls": total or 0,
@@ -2924,6 +3151,9 @@ def get_call_inventory(path=None, limit=25):
                 "stopped_from_demo": stopped_from_demo,
                 "unclassified_total": unclassified_total,
                 "viewable_total": viewable_total,
+                "held_total": held_total,
+                "refused_total": refused_total,
+                "halted_total": halted_total,
                 "flagged_from_demo": flagged_from_demo,
                 "inventory_from_demo": inventory_from_demo,
                 # Handed over rather than discarded. It was computed here and thrown away,
@@ -2977,11 +3207,47 @@ _ROSTER_MAX_NAMES = 500
 # "never called".
 _ROSTER_MAX_NAME_LEN = 200
 
-# The policy name the proxy writes a drift/poison row under. Defined HERE because the roster
-# reader must exclude those rows from "called": they carry the drifted tool's name and the
-# proxy's agent id, but the agent did not call anything. The proxy imports it from here so
-# the writer and the reader cannot spell it two ways.
-MCP_DRIFT_POLICY_NAME = "MCP Tool Description Drift"
+# The policy names the proxy writes its tool-pin rows under. Defined HERE because readers must
+# exclude those rows from "called": they carry the tool's name and the proxy's agent id, but
+# the agent did not call anything. The proxy imports them from here so the writer and the
+# readers cannot spell them two ways.
+#
+# Two events, two names: a tool whose definition changed since it was first seen or approved,
+# and a tool whose description, the first time it is seen, carries what looks like hidden
+# instructions (nothing changed).
+MCP_DRIFT_POLICY_NAME = "MCP Tool Definition Changed"
+MCP_DRIFT_DISPLAY_NAME = "MCP tool changed since first seen"
+MCP_POISON_POLICY_NAME = "MCP Tool Description Poisoning"
+MCP_POISON_DISPLAY_NAME = "MCP tool description hides instructions"
+# Rows written before the split carry this one name for BOTH events and cannot be told apart,
+# so they are shown under a name true of either.
+MCP_LEGACY_PIN_POLICY_NAME = "MCP Tool Description Drift"
+MCP_LEGACY_PIN_DISPLAY_NAME = "MCP tool description check"
+MCP_PIN_POLICY_NAMES = (MCP_DRIFT_POLICY_NAME, MCP_POISON_POLICY_NAME,
+                        MCP_LEGACY_PIN_POLICY_NAME)
+# A CALL the agent made to a tool that is held for approval, refused. A real call, so it is NOT
+# in the names above: those mark what the server did, and `_calls_subquery` leaves them out.
+MCP_HELD_CALL_POLICY_NAME = "MCP Tool Held For Approval"
+MCP_HELD_CALL_DISPLAY_NAME = "MCP tool held until you approve it"
+_SHOWN_NAMES = {MCP_DRIFT_POLICY_NAME: MCP_DRIFT_DISPLAY_NAME,
+                MCP_POISON_POLICY_NAME: MCP_POISON_DISPLAY_NAME,
+                MCP_LEGACY_PIN_POLICY_NAME: MCP_LEGACY_PIN_DISPLAY_NAME,
+                MCP_HELD_CALL_POLICY_NAME: MCP_HELD_CALL_DISPLAY_NAME}
+
+
+def shown_policy_name(name):
+    """A stored policy name as a screen prints it."""
+    return _SHOWN_NAMES.get(name, name)
+
+
+def stored_policy_name(typed):
+    """The way back: a name a person typed from a screen, as the ledger stores it. Without it,
+    a name copied off the screen matched no stored row."""
+    text = str(typed or "").strip().lower()
+    for stored, shown in _SHOWN_NAMES.items():
+        if text == shown.lower():
+            return stored
+    return typed
 
 # The agent id the MCP proxy writes every row under. Only its rows count against the roster:
 # the roster describes ITS server, and a Python-door tool that happens to share a name with
@@ -2998,7 +3264,21 @@ MCP_PROXY_AGENT_ID = "mcp_proxy"
 _ROSTER_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
-def record_mcp_roster(server_key, names, path=None, only_if_present=False):
+def shown_tool_name(name):
+    """A server-chosen tool name as a screen may print it: each control byte as "?", cut to the
+    roster's length bound with "...". For display only; the record keeps the name as written."""
+    text = _ROSTER_CONTROL_RE.sub("?", str(name or ""))
+    return text if len(text) <= _ROSTER_MAX_NAME_LEN else text[:_ROSTER_MAX_NAME_LEN - 3] + "..."
+
+
+def is_printable_tool_name(name):
+    """A server-chosen tool name safe to print on a screen: text, no control byte, not past the
+    roster's length bound. The roster's rule, for every screen that prints such a name."""
+    return (isinstance(name, str) and bool(name) and not _ROSTER_CONTROL_RE.search(name)
+            and len(name) <= _ROSTER_MAX_NAME_LEN)
+
+
+def record_mcp_roster(server_key, names, path=None, only_if_present=False, replaces=None):
     """Write the newest advertised tool list for one wrapped server. Best-effort, never raises.
 
     NEVER CREATES THE STORE. The proxy calls this on every menu it sees, but writes only for
@@ -3040,13 +3320,17 @@ def record_mcp_roster(server_key, names, path=None, only_if_present=False):
                 # Asked BEFORE the CREATE, so a never-called server's no-call session leaves
                 # the ledger byte-for-byte as it was: no row, and no empty table either.
                 try:
-                    row = conn.execute("SELECT 1 FROM mcp_tool_roster WHERE server_key = ?",
-                                       (str(server_key),)).fetchone()
+                    row = conn.execute("SELECT 1 FROM mcp_tool_roster WHERE server_key IN (?, ?)",
+                                       (str(server_key), str(replaces or server_key))).fetchone()
                 except sqlite3.OperationalError:
                     row = None          # no table: no server has a row
                 if row is None:
                     return False
             conn.execute(_CREATE_MCP_ROSTER_SQL)
+            if replaces and replaces != server_key:
+                # The same server's row under the id an earlier version gave it, which spelled
+                # a path argument as typed: kept, it would be counted as a second server.
+                conn.execute("DELETE FROM mcp_tool_roster WHERE server_key = ?", (str(replaces),))
             conn.execute(
                 "INSERT OR REPLACE INTO mcp_tool_roster (server_key, tools, total, ts) "
                 "VALUES (?, ?, ?, ?)",
@@ -3080,7 +3364,7 @@ def get_mcp_roster(path=None):
     if not os.path.exists(path or DB_PATH):
         return empty
     try:
-        with _connection(path) as conn:
+        with _calls_connection(path) as conn:
             cursor = conn.cursor()
             try:
                 cursor.execute("SELECT server_key, tools, total, ts FROM mcp_tool_roster")
@@ -3100,8 +3384,9 @@ def get_mcp_roster(path=None):
             cursor.execute(
                 "SELECT DISTINCT tool_name FROM event_log "
                 "WHERE agent_id IS ? AND tool_name IS NOT NULL "
-                "AND (policy_name IS NULL OR policy_name IS NOT ?)",
-                (MCP_PROXY_AGENT_ID, MCP_DRIFT_POLICY_NAME))
+                "AND (policy_name IS NULL OR policy_name NOT IN (%s))"
+                % ",".join("?" * len(MCP_PIN_POLICY_NAMES)),
+                (MCP_PROXY_AGENT_ID,) + MCP_PIN_POLICY_NAMES)
             ran = {r[0] for r in cursor.fetchall()}
         servers = []
         for server_key, tools_json, total, ts in roster_rows:
@@ -3133,6 +3418,7 @@ def get_mcp_roster(path=None):
 #: Every count a sentence about this ledger can rest on, and the ONLY place they are
 #: computed. Both audit views and both output shapes read these, so they cannot disagree.
 _LEDGER_TOTAL_KEYS = ("rows", "inventory", "flagged", "observed", "observed_excluding_ours",
+                      "refused", "halted", "refused_excluding_ours", "halted_excluding_ours",
                       "unclassified", "ours",
                       "distinct_tools", "window_start", "unsized_writes")
 
@@ -3154,6 +3440,7 @@ def _empty_totals():
     out = dict.fromkeys(_LEDGER_TOTAL_KEYS, 0)
     out["window_start"] = None
     out["unsized_readable"] = False
+    out["refused_reasons_excluding_ours"] = []
     # The four-label split of the inventory. A dict rather than four keys, so the
     # `--json` document carries the label set as one object, and `False` for the same
     # reason `unsized_readable` is: an unopened ledger has not said the split is all zero.
@@ -3256,6 +3543,36 @@ def _ledger_totals(cursor):
         tuple([UNSIZED_WRITE_STATUS] + _not_ours_params))
     observed_theirs = cursor.fetchone()[0] or 0
 
+    # Calls that did not run because no verdict could be had (REFUSED). Out of `flagged` (they
+    # tripped nothing), so the partition gains a fifth term:
+    # `inventory + flagged + observed + refused + unclassified == rows`. Ledger-wide for the same
+    # reason `observed` is: it is a term in that equality.
+    cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS ?", (REFUSED_STATUS,))
+    refused = cursor.fetchone()[0] or 0
+    # A sixth term for the same reason: HALTED is out of `flagged` too.
+    # `inventory + flagged + observed + refused + halted + unclassified == rows`.
+    cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS ?", (HALTED_STATUS,))
+    halted = cursor.fetchone()[0] or 0
+    # The reader's own of each, for a sentence about what THEIR agent did: our examples can
+    # write both (a loop-breaker example, an example run with the gateway down).
+    cursor.execute(
+        "SELECT COUNT(*) FROM event_log WHERE status IS ? AND " + _not_ours,
+        tuple([REFUSED_STATUS] + _not_ours_params))
+    refused_theirs = cursor.fetchone()[0] or 0
+    cursor.execute(
+        "SELECT COUNT(*) FROM event_log WHERE status IS ? AND " + _not_ours,
+        tuple([HALTED_STATUS] + _not_ours_params))
+    halted_theirs = cursor.fetchone()[0] or 0
+    # WHY their calls got no verdict, as recorded (the gateway down, a refused key...). No other
+    # human screen shows it, so the audit screen prints it when it is all the reader has.
+    # Newest first, every distinct one: the screen shows three and says how many more, so the
+    # reason the reader can act on (often the latest) is never the one silently dropped.
+    cursor.execute(
+        "SELECT policy_name FROM event_log WHERE status IS ? AND policy_name IS NOT NULL"
+        " AND " + _not_ours + " GROUP BY policy_name ORDER BY MAX(id) DESC",
+        tuple([REFUSED_STATUS] + _not_ours_params))
+    refused_reasons_theirs = [r[0] for r in cursor.fetchall() if r[0]]
+
     cursor.execute("SELECT COUNT(*) FROM event_log WHERE status IS NULL")
     unclassified = cursor.fetchone()[0] or 0
 
@@ -3331,6 +3648,9 @@ def _ledger_totals(cursor):
 
     return {"rows": rows or 0, "inventory": inventory, "flagged": flagged,
             "observed": observed, "observed_excluding_ours": observed_theirs,
+            "refused": refused, "halted": halted,
+            "refused_excluding_ours": refused_theirs, "halted_excluding_ours": halted_theirs,
+            "refused_reasons_excluding_ours": refused_reasons_theirs,
             "unclassified": unclassified, "ours": ours,
             "distinct_tools": distinct_tools or 0, "window_start": window_start,
             "unsized_writes": unsized, "unsized_readable": unsized_readable,
@@ -3350,7 +3670,7 @@ def get_ledger_totals(path=None):
     if not os.path.exists(path or DB_PATH):
         return empty
     try:
-        with _connection(path) as conn:
+        with _calls_connection(path) as conn:
             out = _ledger_totals(conn.cursor())
             out["readable"] = True
             return out
@@ -3404,7 +3724,7 @@ def get_rule_match_summary(path=None):
         return empty
     uncompared_by_id = {}
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             rows = conn.execute(
                 "SELECT tool_name, policy_id, policy_name, COUNT(*) FROM event_log "
                 "WHERE status IS ? AND policy_id LIKE 'rule-%' "
@@ -3467,7 +3787,7 @@ def get_call_log(path=None, limit=50, offset=0):
     if not os.path.exists(path or DB_PATH):
         return empty
     try:
-        with _connection(path) as conn:
+        with _calls_connection(path) as conn:
             cursor = conn.cursor()
             # Counted over the WHOLE ledger, never from the page below. Same rule this
             # module already states for the grouped reader: a sentence about the ledger is
@@ -3853,7 +4173,7 @@ def current_call_shape(path=None):
         return {}
     shape = {}
     try:
-        with _connection(path) as conn:
+        with _calls_connection(path) as conn:
             cursor = conn.cursor()
             not_ours_sql, not_ours_params = _our_agents_clause(negate=True)
             cursor.execute(
@@ -4883,6 +5203,7 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
                 "tokens_saved, time_saved_mins")
     _values = (time.time(), trace_id, agent_id, tool_name, policy_id, policy_name, status,
                tokens, time_saved)
+    row_id = None
     try:
         # 🔴 THE PERSISTENT HANDLE, NOT `_connection()`. Once the default posture records, this
         # runs inside every protected tool call, where opening a connection per write costs
@@ -4975,8 +5296,10 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
                         cursor.execute(
                             "INSERT INTO event_log (%s) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
                             % _COLUMNS, _values)
-                    _journal(conn, [cursor.lastrowid])
+                    _inserted = cursor.lastrowid
+                    _journal(conn, [_inserted])
                     conn.commit()
+                    row_id = _inserted
                 finally:
                     # 🔴 ROLL BACK BEFORE RESTORING, OR THE RESTORE CANNOT RUN AT ALL. SQLite
                     # refuses the pragma inside an open transaction -- verbatim, "Safety level
@@ -5027,13 +5350,20 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
     _writes_since_prune += 1
     if _writes_since_prune >= _PRUNE_EVERY_WRITES:
         prune_ledger()
+    # The row's id, so a keyless block can name ITS row (`local-<id>`, the evidence file's
+    # `ledger_id`) instead of the rule. None when the write did not land.
+    return row_id
 
-def get_lifetime_stats():
-    """Calculates cumulative stats and identifies the Top Offender using V2 Schema."""
+def get_lifetime_stats(exclude_ours=False):
+    """Calculates cumulative stats and identifies the Top Offender using V2 Schema.
+
+    `exclude_ours=True` leaves out AgentX's own demo and example agents (`OUR_AGENT_IDS`), as
+    the review screens do: the session summary's "On record" recovery counted `agentx demo`'s
+    scripted recovery as the user's (cold-install audit)."""
     if not os.path.exists(DB_PATH):
         return None
 
-    with _connection() as conn:
+    with _calls_connection() as conn:
         cursor = conn.cursor()
 
         # A "challenge episode" is any row that was ever a challenge — still-open
@@ -5043,9 +5373,11 @@ def get_lifetime_stats():
         # mirrors the dashboard's per-session model (recovered is a subset of
         # challenged). ALLOWED/other rows never participate.
         CHALLENGE_EPISODE = "status IN ('CHALLENGED', 'RECOVERED')"
+        ours_sql, ours_params = _our_agents_clause(negate=True) if exclude_ours else ("1=1", [])
 
         # 1. Total challenge episodes (still-open + recovered)
-        cursor.execute(f"SELECT COUNT(*) FROM event_log WHERE {CHALLENGE_EPISODE}")
+        cursor.execute(f"SELECT COUNT(*) FROM event_log WHERE {CHALLENGE_EPISODE} AND {ours_sql}",
+                       ours_params)
         total_intercepts = cursor.fetchone()[0] or 0
 
         # 🔴 REMOVED: total_critical, total_tokens, total_time.
@@ -5063,7 +5395,8 @@ def get_lifetime_stats():
         # on log_intercept above.
 
         # 2. Total Self-Corrections (recovered episodes — the recovery numerator)
-        cursor.execute("SELECT COUNT(*) FROM event_log WHERE status = 'RECOVERED'")
+        cursor.execute(f"SELECT COUNT(*) FROM event_log WHERE status = 'RECOVERED' AND {ours_sql}",
+                       ours_params)
         total_recoveries = cursor.fetchone()[0] or 0
 
         # 3. Top Offender (Select policy_name, Group by policy_id)
@@ -5103,7 +5436,7 @@ def get_recent_blocks(limit=1):
     if not os.path.exists(DB_PATH):
         return []
     try:
-        with _connection() as conn:
+        with _calls_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
@@ -5203,7 +5536,7 @@ def _grouped_policy_rows(path, status_clause, exclude_agents, extra_select=""):
     params = list(frag_params)
     sel_extra = (", " + extra_select) if extra_select else ""
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 f"""
@@ -5426,7 +5759,7 @@ def get_coaching_effectiveness(path=None, exclude_agents=None):
     episode = "status IN ('CHALLENGED', 'RECOVERED')" + frag
     recorded = "challenge_issued IS NOT NULL AND TRIM(challenge_issued) != ''"
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             cursor = conn.cursor()
             cursor.execute(
                 f"""
@@ -5489,7 +5822,7 @@ def get_coaching_effectiveness(path=None, exclude_agents=None):
 
 def get_would_block_summary(path=None, exclude_agents=None):
     """Aggregate the AUDIT-posture ledger: how many times each policy WOULD have blocked
-    while running under AGENTX_ENFORCEMENT=audit (status WOULD_BLOCK), most-frequent first.
+    while running under AGENTX_POSTURE=audit (status WOULD_BLOCK), most-frequent first.
 
     This is the report that earns the enforce decision: a developer runs AgentX
     non-blocking in staging for a week, then `agentx insights` shows exactly what audit
@@ -5529,7 +5862,7 @@ def get_would_block_summary(path=None, exclude_agents=None):
     # already accepts, and for the same reason: a handful of distinct policies, not a
     # per-call cost.
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             cursor = conn.cursor()
             for pname, pid, wb, tools in rows:
                 arg_names, classes, max_amount = [], [], 0.0
@@ -5602,14 +5935,22 @@ def _ensure_ledger_verdict_columns(conn):
             conn.execute("ALTER TABLE event_log ADD COLUMN %s TEXT" % name)
 
 
-# 🔴 THE MCP DOOR TURNS THIS OFF, AND THE FLAG IS HERE SO THE COUNT AND THE LIST AGREE.
-# On that door `agentx review` already offers ONE verdict per policy from the MCP corpus
-# (`cli._mcp_review_items`), and `db.DB_PATH` is the MCP ledger, so per-block items from it
-# would ask the same person the same question twice on the one screen where re-asking costs
-# the most. `mcp_proxy._point_stores_at_mcp_home` clears this beside the three stores it
-# repoints. It gates every reader below, including the count the atexit nudge prints, so the
-# nudge cannot promise blocks the walk will not show.
+# The gate on every per-block ledger reader below, including the count the atexit nudge prints,
+# so the nudge cannot promise blocks the walk will not show. On every door now, the MCP door
+# included: that door once turned it off so a block was not asked about beside the policy-level
+# verdict `cli._mcp_review_items` offers, but that verdict comes from the opt-in harvest corpus,
+# so a default MCP install was asked about nothing. `_mcp_review_items` now skips its policy
+# question for a policy whose blocks are asked here. Kept as a flag so a caller (a test) can
+# still switch the per-block read off.
 PER_BLOCK_LEDGER_REVIEW = True
+
+
+# Stops review never asks about: a call refused because its MCP tool is held for approval.
+# AgentX did not judge that call, so "was this block right?" has no answer a rule can learn
+# from; approving the tool (`agentx-mcp --approve-changes`) is the decision. Still a block in
+# every count and rate. A literal, so it adds no `?` to the queries it joins.
+_NOT_JUDGED = (" AND COALESCE(policy_name, '') IS NOT '%s'"
+               % MCP_HELD_CALL_POLICY_NAME.replace("'", "''"))
 
 
 def _ledger_verdict_where(labelled, has_labels, incident_attached):
@@ -5626,6 +5967,7 @@ def _ledger_verdict_where(labelled, has_labels, incident_attached):
     count uses the same clause so the two never disagree. Not applied to the labelled read:
     a ledger row carrying a verdict got it through this path."""
     ours, params = _our_agents_clause(negate=True)
+    ours += _NOT_JUDGED
     if labelled:
         # 🔴 NO STATUS CLAUSE, the same rule the incident store's labelled read states: a
         # verdict, once given, stays visible whatever happens to the row afterwards. This
@@ -5649,7 +5991,7 @@ def _attach_incident_store(conn, incident_db, ledger_path):
     """ATTACH the incident store as ``inc`` when it is a different, existing file with an
     ``incidents`` table that carries the two join columns. Returns whether it did. The MCP
     door points AGENTX_INCIDENT_DB at the ledger file itself; that is the same file, so no
-    attach (and that door is gated off above anyway)."""
+    attach."""
     if not incident_db or not os.path.exists(incident_db):
         return False
     try:
@@ -5672,14 +6014,14 @@ def list_ledger_blocks_by_verdict_state(limit, labelled, path=None, incident_db=
     """``(rows, more_exist)`` -- ledger blocks WITHOUT a verdict (``labelled=False``) or
     WITH one, newest first, the LIMIT spent on rows that QUALIFY (the rule the incident read states), read one
     past the limit so ``more_exist`` is a fact and not a guess. Each row is a dict of the
-    row's columns. Missing ledger / locked / no `status` column / the MCP door ->
+    row's columns. Missing ledger / locked / no `status` column / the gate off ->
     ``([], False)``; a ledger predating the verdict columns has nothing labelled and
     everything pending. ``incident_db`` is the store whose parked blocks are skipped."""
     p = path or DB_PATH
     if not PER_BLOCK_LEDGER_REVIEW or not os.path.exists(p):
         return [], False
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             has_status, has_labels = _ledger_verdict_columns_present(conn)
             if not has_status or (labelled and not has_labels):
                 return [], False
@@ -5699,12 +6041,12 @@ def list_ledger_blocks_by_verdict_state(limit, labelled, path=None, incident_db=
 def count_ledger_awaiting_verdict(path=None, incident_db=None):
     """The EXACT number of ledger blocks with no verdict yet, the SAME clause as the
     pending read so the nudge and the walk agree. A ``COUNT(*)``, cheap enough for the
-    atexit nudge. 0 on a missing or unreadable ledger, and on the MCP door."""
+    atexit nudge. 0 on a missing or unreadable ledger, or with the gate off."""
     p = path or DB_PATH
     if not PER_BLOCK_LEDGER_REVIEW or not os.path.exists(p):
         return 0
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             has_status, has_labels = _ledger_verdict_columns_present(conn)
             if not has_status:
                 return 0
@@ -5724,7 +6066,7 @@ def ledger_verdict_stats(path=None, incident_db=None):
     incident twin), so ``unlabeled`` equals what the walk will ask. Shape:
     ``{"TRUE_POSITIVE": n, ..., "unlabeled": n, "total": n}``. Off-vocab values count as
     unlabeled rather than raising: a stats screen must never fail on one odd row. All zero
-    on a missing or unreadable ledger, and on the MCP door."""
+    on a missing or unreadable ledger, or with the gate off."""
     from .overrides import _VERDICT_VOCAB    # function-local: overrides imports this module
     out = {v: 0 for v in sorted(_VERDICT_VOCAB)}
     out["unlabeled"] = 0
@@ -5733,7 +6075,7 @@ def ledger_verdict_stats(path=None, incident_db=None):
     if not PER_BLOCK_LEDGER_REVIEW or not os.path.exists(p):
         return out
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             has_status, has_labels = _ledger_verdict_columns_present(conn)
             if not has_status:
                 return out
@@ -5804,11 +6146,11 @@ def list_ledger_policies(path=None):
     if not os.path.exists(p):
         return []
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             marks = ",".join("?" for _ in REVIEWABLE_LEDGER_STATUSES)
             return [tuple(r) for r in conn.execute(
-                "SELECT DISTINCT policy_id, policy_name FROM event_log WHERE status IN (%s) "
-                "AND (policy_id IS NOT NULL OR policy_name IS NOT NULL)" % marks,
+                ("SELECT DISTINCT policy_id, policy_name FROM event_log WHERE status IN (%s) "
+                 "AND (policy_id IS NOT NULL OR policy_name IS NOT NULL)" % marks) + _NOT_JUDGED,
                 list(REVIEWABLE_LEDGER_STATUSES))]
     except Exception:
         return []
@@ -5822,7 +6164,7 @@ def ledger_has_block(trace_id, policy_id, path=None):
     if not trace_id or not policy_id or not os.path.exists(p):
         return False
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             marks = ",".join("?" for _ in REVIEWABLE_LEDGER_STATUSES)
             row = conn.execute(
                 "SELECT 1 FROM event_log WHERE trace_id = ? AND policy_id = ? AND "
@@ -5839,12 +6181,12 @@ def ledger_block_is_pending(trace_id, policy_id, path=None, incident_db=None):
     labelled=False, with the incident store attached) narrowed to the one block, so a
     sentence that promises "will be asked about" is derived from the reader that decides
     it and not from a second reading of the row. Evaluate it AFTER the delete it describes.
-    False on a missing or unreadable ledger, and on the MCP door."""
+    False on a missing or unreadable ledger, or with the gate off."""
     p = path or DB_PATH
     if not PER_BLOCK_LEDGER_REVIEW or not trace_id or not policy_id or not os.path.exists(p):
         return False
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             has_status, has_labels = _ledger_verdict_columns_present(conn)
             if not has_status:
                 return False
@@ -5867,7 +6209,7 @@ def list_ledger_declared_verdicts(path=None):
     if not os.path.exists(p):
         return []
     try:
-        with _connection(p) as conn:
+        with _calls_connection(p) as conn:
             _has_status, has_labels = _ledger_verdict_columns_present(conn)
             if not has_labels:
                 return []

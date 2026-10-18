@@ -164,8 +164,8 @@ def _rules_in_force_lines():
         # The count is the catalog `agentx policies` lists, switched off or not; one switched
         # off in the policies file is named, or this row reads as all of them in force while
         # the evidence file lists it off (review 2).
-        # With the evidence file's reason, which says when its checks still run: a rule switched
-        # off is said to be partly off wherever it is listed.
+        # With the evidence file's reason, which says where a read the rule stopped is stopped
+        # now (`evidence.moved_while_off`): one sentence wherever the rule is listed.
         # The condition is said too: this screen opens with "let through" (review 3).
         for o in (beyond or {}).get("off") or []:
             lines.append(_wrap("%s: %s A stop applies only when blocking is on."
@@ -279,6 +279,83 @@ def _rules_in_force_lines():
                                                               "" if n_agents == 1 else "s"),
                             "the sites each may reach:  agentx evidence"))
     return lines
+
+
+def _print_hook_health():
+    """Say so when this project's Claude Code hook points at a Python (or file) that is gone.
+    Claude Code treats the failed start as a non-blocking error and runs the call unchecked, so
+    nothing else on screen would show that the check is off. Also when an earlier install
+    started the check without the flag that keeps the project folder off its import path.
+    Prints nothing when all is well."""
+    try:
+        from .hook import missing_hook_paths, unisolated_check
+        missing = missing_hook_paths(os.getcwd())
+        unisolated = not missing and unisolated_check(os.getcwd())
+    except Exception:
+        return
+    if unisolated:
+        print()
+        # Not "installed by an earlier version": a Python with no flag to give writes the
+        # same command today (review).
+        _print_wrapped("⚠️  Claude Code's AgentX hook in this project starts Python with the "
+                       "project folder on its import path, so a file the agent writes here "
+                       "could switch the check off. Fix: agentx hook install (if it says this "
+                       "Python cannot, install AgentX in a virtual environment)")
+        return
+    if not missing:
+        return
+    paths = []
+    for path, _event in missing:
+        if path not in paths:
+            paths.append(path)
+    events = {event for _path, event in missing}
+    # Said by what actually stops: only a broken PreToolUse command leaves calls unchecked. A
+    # missing note file stops only the after-the-call note; a broken SessionEnd only the
+    # session's closing count.
+    if "PreToolUse" in events:
+        effect = "its shell commands and MCP calls are not being checked"
+    elif "PostToolUse" in events:
+        effect = ("calls are still checked, but after a watched call the rules would stop, "
+                  "Claude is not told")
+    else:
+        effect = "calls are still checked, but sessions are not closed out"
+    print()
+    _print_wrapped("⚠️  Claude Code's AgentX hook in this project runs %s, which no longer "
+                   "%s, so %s. Fix: agentx hook install"
+                   % (" and ".join(paths), "exists" if len(paths) == 1 else "exist", effect))
+
+
+def _print_held_tools():
+    """Say so when agentx-mcp's tool pinning is holding a tool for approval: its calls are
+    refused until someone approves it, and nothing else on this screen would show that. Read
+    from the pins files, so it is true now. Prints nothing when none is held."""
+    try:
+        from . import db as db_module
+        from .mcp_proxy import held_tools
+        # Once per name: the same tool held under two servers is one name on every surface.
+        names = [db_module.shown_tool_name(name)
+                 for name in dict.fromkeys(name for _server, name in held_tools() if name)]
+    except Exception:
+        return
+    if not names:
+        return
+    print()
+    one = len(names) == 1
+    _print_wrapped("⚠️  agentx-mcp is holding %s for approval (%s), because a server changed "
+                   "%s or described %s in a way that may hide instructions. Calls to %s are "
+                   "refused until you check %s and run: uvx agentx-mcp --approve-changes (a "
+                   "server already running keeps refusing until your MCP client restarts it)"
+                   % ("1 tool" if one else "%d tools" % len(names), _fit_names(names, 40),
+                      *(("it",) * 4 if one else ("them",) * 4)))
+
+
+def _shown_policy(name):
+    """A stored policy name as a person reads it (one stored name is our jargon). Never raises."""
+    try:
+        from .db import shown_policy_name
+        return shown_policy_name(name)
+    except Exception:
+        return name
 
 
 def _render_offline_dashboard(gateway_url, mode="local"):
@@ -398,6 +475,8 @@ def _render_offline_dashboard(gateway_url, mode="local"):
             print("   -> @agentx_protect needs no gateway: it stops what the built-in")
             print("      floor watches for, offline, with no key. Wrap a tool and that")
             print("      applies from its next call. The list is on %s." % _audit_cmd())
+    _print_hook_health()
+    _print_held_tools()
 
     # 🔴 "THIS MACHINE" WAS FALSE, AND TWO RUNS PROVE IT. `DB_PATH` is ".agentx.db",
     # RELATIVE, resolved against the working directory (db.py documents that as deliberate
@@ -431,7 +510,9 @@ def _render_offline_dashboard(gateway_url, mode="local"):
     if census.get("block_episodes", 0) > 0:
         intercepts = census["block_episodes"]
         recoveries = census["recoveries"]
-        top_offender = (stats or {}).get("top_offender") or "None"
+        # The name a screen shows, never the stored one (agentx-mcp's pin rows are stored
+        # under internal names).
+        top_offender = _shown_policy((stats or {}).get("top_offender")) or "None"
         print("\n📊 WHAT WAS RECORDED (no gateway needed):")
         if ledger_path:
             print(_ledger_path_line(ledger_path))
@@ -505,7 +586,7 @@ def _render_offline_dashboard(gateway_url, mode="local"):
         # answer P-76 exists to prevent, arriving through the working directory instead of a
         # path bug. Naming the file turns a wrong statement into a checkable one.
         # 🔴 THE BRANCH IS CHOSEN FROM THE CENSUS, NOT FROM get_lifetime_stats. That query
-        # counts only CHALLENGED and RECOVERED, so under AGENTX_ENFORCEMENT=audit a ledger
+        # counts only CHALLENGED and RECOVERED, so under AGENTX_POSTURE=audit a ledger
         # full of WOULD_BLOCK rows landed here and announced that nothing remained in it --
         # while the retention line beside it reported rows_kept: 4. Reproduced end to end.
         # The query that DECIDES what to say has to be the one the sentence is ABOUT.
@@ -557,7 +638,10 @@ def _render_offline_dashboard(gateway_url, mode="local"):
                                           pronoun="these"):
                     # Re-indented to this screen's 3-space body, not the audit screen's 2.
                     print("   " + _ln.strip())
-        elif reason == "trimmed":
+        # `retention` too, not `reason` alone: a ledger holding a HELD row (or a status-less
+        # legacy row) reads "not_empty" from `ledger_empty_reason`, never "trimmed", and the
+        # "yet" below then sat over "Older block records dropped" (review round 2).
+        elif reason == "trimmed" or (retention and retention.get("blocks_dropped")):
             print("\n📊 WHAT WAS RECORDED: no blocks remain in this ledger.")
         else:
             print("\n📊 WHAT WAS RECORDED: no blocks recorded in this ledger yet.")
@@ -718,6 +802,23 @@ def _render_offline_dashboard(gateway_url, mode="local"):
                 # reader moving between them should not have to notice that.
                 print("   %s waiting for your verdict:   %s"
                       % (_plural(census.get("observed", 0), "write"), _review_cmd()))
+            elif census.get("refused", 0) > 0 or census.get("held", 0) > 0 \
+                    or census.get("halted", 0) > 0:
+                # The same wrong next step a third and fourth time: a ledger whose only rows are
+                # calls that did not run (no verdict, or held and not approved) belongs to
+                # someone who HAS wrapped a tool. Say what happened, in the audit screen's
+                # words, and point at the one screen that lists them (insights does not).
+                _held_n, _n = census.get("held", 0), census.get("refused", 0)
+                if _held_n:
+                    print("   %s held for a person and not approved."
+                          % _plural(_held_n, "call"))
+                if _n:
+                    print("   %s did not run: AgentX could not get a verdict for %s."
+                          % (_plural(_n, "call"), "it" if _n == 1 else "them"))
+                if census.get("halted", 0):
+                    print("   %s halted as a runaway loop."
+                          % _plural(census["halted"], "call"))
+                print("   Call by call:   %s" % _audit_calls_cmd())
             else:
                 print("   Wrap a tool with @agentx_protect (or one line in mcp.json) and run your")
                 print("   agent. Your catches and streak show up here.")
@@ -858,12 +959,21 @@ def _self_corrections_line(pivots, recoverable):
     return "%s recovered (of the blocks it could come back from)" % format_ratio(hits, could_have)
 
 
+def _remote_json(res):
+    """`res.json()` from a gateway or the control plane, with control bytes removed from every
+    string in it (`decorators.clean_remote_json`). Every screen here prints text from these
+    answers, so it is cleaned where it is parsed, once. Raises exactly as `res.json()` does,
+    so each caller's existing handling of an unparseable body is unchanged."""
+    from .decorators import clean_remote_json
+    return clean_remote_json(res.json())
+
+
 def _tenant_usage(gateway_url, headers):
     """`GET /v1/usage` when it names a tenant, else None. Never raises. A hosted gateway shared
     by several keys answers `/v1/telemetry` for its owner only, so this is what a tenant reads."""
     try:
         res = requests.get(f"{gateway_url}/v1/usage", headers=headers, timeout=2.0)
-        body = res.json() if res.status_code == 200 else None
+        body = _remote_json(res) if res.status_code == 200 else None
     except Exception:
         return None
     if isinstance(body, dict) and isinstance(body.get("tenant"), str) and body["tenant"]:
@@ -949,12 +1059,14 @@ def execute_status_inspection(gateway_url, api_key, mode="local"):
         print("=" * 75)
         sys.exit(1)
 
-    telemetry = telemetry_res.json()
-    policies_data = policy_res.json()
+    telemetry = _remote_json(telemetry_res)
+    policies_data = _remote_json(policy_res)
 
     print(f"\n📊 LIVE GATEWAY STATUS        (reasoning engine · {gateway_url})")
     print("=" * 75)
     print("  What the gateway has intercepted this run, and the policies armed right now.")
+    _print_hook_health()
+    _print_held_tools()
     print(f"\n  🛑 Intercepts:               {telemetry.get('intercepts', 0)}")
     print(f"  🧠 Socratic challenges:      {telemetry.get('socratic_nudges_issued', 0)}")
     print(f"  🚨 Human escalations (HITL): {telemetry.get('human_escalations_required', 0)}")
@@ -1095,7 +1207,7 @@ def execute_policy_pull(control_plane_url, api_key):
             print("=" * 75)
             sys.exit(1)
 
-        payload = response.json() or {}
+        payload = _remote_json(response) or {}
         policies = payload.get("policies", [])
         # `payload_sync_active` is the plane telling us WHY there is nothing to send, and
         # the old code discarded it. Same shape as the contribution push (BACKLOG P-41):
@@ -1226,7 +1338,7 @@ def execute_vector_seed_compilation(gateway_url, api_key, output_dir=None):
             print(f"❌ Error: Gateway rejected policy synchronization request with code: {response.status_code}")
             sys.exit(1)
             
-        policies_payload = response.json()
+        policies_payload = _remote_json(response)
         policies_list = policies_payload.get("policies", [])
         
         if not policies_list:
@@ -1352,7 +1464,7 @@ def execute_contribution_push(gateway_url, control_plane_url, api_key, env):
     if res.status_code == 403:
         # A hosted gateway shared with others refuses this on purpose and says why.
         try:
-            why = res.json().get("message")
+            why = _remote_json(res).get("message")
         except Exception:
             why = None
         print(f"ℹ️  {why} Nothing was shared." if why
@@ -1364,7 +1476,7 @@ def execute_contribution_push(gateway_url, control_plane_url, api_key, env):
         print("=" * 75)
         return
 
-    body = res.json()
+    body = _remote_json(res)
     contributions = body.get("contributions", [])
     fields = body.get("fields", [])
 
@@ -1433,7 +1545,7 @@ def execute_contribution_push(gateway_url, control_plane_url, api_key, env):
             # under one name in the same function. Nothing reads the outer one after this
             # point today, which is exactly what makes the shadow a trap for the next edit.
             try:
-                resp_body = post.json() or {}
+                resp_body = _remote_json(post) or {}
             except ValueError:
                 resp_body = {}
             accepted = resp_body.get("accepted")
@@ -1714,8 +1826,8 @@ def _print_strays(census):
     if not strays:
         return
     print("")
-    print("  ⚠️  Other incident stores exist in this project, and this readout is NOT")
-    print("      reading them:")
+    print("  ⚠️  Other records of blocks and their outcomes exist in this project, and")
+    print("      this readout is NOT reading them:")
     for s in strays:
         # Scale the unit. A 24 KB store printed as "0.0 MB" reads as empty, which is the
         # same false-empty impression this whole warning exists to correct.
@@ -1737,6 +1849,7 @@ from .db import OUR_AGENT_IDS as _OUR_AGENT_IDS
 # it in three places (the status word, the review question, the audit sentence) and three
 # string literals are three chances to spell it differently.
 from .db import UNSIZED_WRITE_STATUS as _UNSIZED
+from .db import HELD_STATUS as _HELD, REFUSED_STATUS as _REFUSED, HALTED_STATUS as _HALTED
 from .db import (REVERSIBILITY_READ_ONLY as _REV_READ_ONLY,
                  REVERSIBILITY_BOUNDED as _REV_BOUNDED,
                  REVERSIBILITY_DESTRUCTIVE as _REV_WHOLE_TABLE,
@@ -1762,10 +1875,11 @@ from .db import (REVERSIBILITY_READ_ONLY as _REV_READ_ONLY,
 # as `destructive`, the same word as `DROP TABLE users`. "unbounded" is the sibling of
 # "bounded", says exactly what was measured, and promises nothing either way.
 # Measured and held by `sdk_tests/test_decision_corpus_reversibility.py`.
+# Plain words, not the label names: "bounded", "unbounded" and "16 could not tell" were ours.
 _LABEL_WORDS = {_REV_READ_ONLY: "read-only",
-                _REV_BOUNDED: "bounded",
-                _REV_WHOLE_TABLE: "unbounded",
-                _REV_UNKNOWN: "could not tell"}
+                _REV_BOUNDED: "scoped",
+                _REV_WHOLE_TABLE: "whole-table",
+                _REV_UNKNOWN: "not classified"}
 
 
 def _label_word(stored):
@@ -1951,7 +2065,7 @@ def _print_coaching_effectiveness(verbose=False):
         # block is noise, and the reader can only tell that from the n.
         print("    %s · %d recovered (%d%%)   %s"
               % (_plural(blocks, "block"), recoveries,
-                 round(w["recovery_rate"] * 100), w["policy_name"]))
+                 round(w["recovery_rate"] * 100), db_module.shown_policy_name(w["policy_name"])))
         text = (w.get("coaching") or "").strip().replace("\n", " ")
         excerpt = text if (verbose or len(text) <= _COACHING_EXCERPT) \
             else text[:_COACHING_EXCERPT].rstrip() + "..."
@@ -2116,7 +2230,7 @@ def _print_local_blocks_section(census=None):
         # future reader ends up defending a property the ledger no longer has.
         #
         # 🔴 AND A ZERO HAS A SECOND MEANING THIS SECTION USED TO TALK OVER. Under
-        # AGENTX_ENFORCEMENT=audit the floor MATCHES and deliberately does not stop, so the
+        # AGENTX_POSTURE=audit the floor MATCHES and deliberately does not stop, so the
         # ledger holds WOULD_BLOCK rows and no blocks. Printing "the floor has not stopped
         # anything here" above a section that then lists 47 audited catches is a
         # contradiction on one screen, and `agentx demo` is the wrong next step for someone
@@ -2198,6 +2312,26 @@ def _print_local_blocks_section(census=None):
                 print("  stopped anything here. It does NOT mean your agents ran clean: it")
                 print("  lists catches, not activity. What your agent actually did:")
                 print("     %s" % _audit_cmd())
+            # Calls that did not run and that this screen cannot list: held for a person and
+            # not approved, or refused for want of a verdict. Said here, or a reader whose only
+            # stop was a denied hold is told nothing was stopped and offered a demo.
+            try:
+                _c = get_ledger_census() or {}
+            except Exception:
+                _c = {}
+            if _c.get("held") or _c.get("refused") or _c.get("halted"):
+                _parts = []
+                if _c.get("held"):
+                    _parts.append("%s held for a person and not approved"
+                                  % _plural(_c["held"], "call"))
+                if _c.get("refused"):
+                    _parts.append("%s not run for want of a verdict"
+                                  % _plural(_c["refused"], "call"))
+                if _c.get("halted"):
+                    _parts.append("%s halted as a runaway loop" % _plural(_c["halted"], "call"))
+                print("")
+                print(_wrap("This screen does not list %s. Call by call:  %s"
+                            % (" or ".join(_parts), _audit_calls_cmd()), "  ", width=75))
             print("")
             # 🔴 THE MCP DOOR NEEDS A DIFFERENT SENTENCE, not the same one with a
             # different command in it. `uvx agentx-mcp --demo` pins its ledger into a
@@ -2248,7 +2382,8 @@ def _print_local_blocks_section(census=None):
 
     print("  %s recorded, by policy:" % _plural(total, "block"))
     for r in rows:
-        line = "     %4dx   %s" % (r["blocks"], r["policy_name"] or "unattributed")
+        line = "     %4dx   %s" % (r["blocks"],
+                                   _shown_policy(r["policy_name"]) or "unattributed")
         if r["recoveries"] and _all_ours:
             line += "   (%d recovered)" % r["recoveries"]
         elif r["recoveries"]:
@@ -2455,9 +2590,18 @@ def _print_recovery_section(census, verbose=False):
         # run that has a gateway store on disk with nothing in it: the sentence is true of
         # THIS store and false of the local ledger, and it never said which one it meant.
         # Same fix as the census branch: name the record. No referent to anything on screen.
-        print("  There is nothing to have recovered from in this gateway store: it has")
-        print("  no blocks in it. Blocks your keyless shield recorded live in the local")
-        print("  ledger and are not counted on this line.")
+        # ⚠️ NOT "THIS STORE HAS NO BLOCKS". On agentx-mcp the store read here IS the ledger
+        # file, and the coaching readout just printed "3 blocks" from it: what is empty is
+        # only the gateway's after-the-block record. Say that, and when the readout counted
+        # blocks, say whose record those came from.
+        if _readout.strip():
+            _print_wrapped("The blocks counted in this section are from this machine's own "
+                           "record. Whether the run went on to finish after each one is "
+                           "recorded only by an AgentX gateway, and none has recorded any here.")
+        else:
+            _print_wrapped("No AgentX gateway has recorded what happened after a block here "
+                           "(whether the run went on to finish), so there is no recovery "
+                           "rate to show.")
         _print_strays(census)
         print("=" * 75)
         return
@@ -2494,8 +2638,8 @@ def _print_recovery_section(census, verbose=False):
     # that idiom here without checking THIS function's census carries the key -- it does not,
     # and 25 backend tests said so with a KeyError. The store is named in words instead, which
     # needs no key, and --verbose still has the path.
-    print("  The counts below come from the incident store, not the block")
-    print("  ledger at the top of this screen, so they will not add up to it.")
+    print("  The counts below come from the record of blocks and their outcomes, not")
+    print("  the block ledger at the top of this screen, so they will not add up to it.")
     print("")
 
     # Blocks written before we started watching what came next. They cannot have recovered, so
@@ -3643,6 +3787,60 @@ def _set_screen_doors():
         _SCREEN_DOORS = None
 
 
+def _print_refused_reasons(totals):
+    """The recorded reason the reader's calls got no verdict. Printed on the audit screen,
+    because the per-call screen shows a refused row with no reason at all, so a pointer there
+    would send a stuck reader to a screen that cannot unstick them (review).
+
+    Each reason the SDK records is said in the reader's words (the recorded names are ours:
+    "Fail-Closed (Reasoning Engine Unavailable)" told a founder walk nothing to fix); one we
+    do not know prints as recorded. Returns how many distinct reasons there are."""
+    import textwrap
+    reasons = [_REFUSED_REASON_WORDS.get(str(r), str(r))
+               for r in (totals.get("refused_reasons_excluding_ours") or [])]
+    if len(reasons) == 1:
+        print(textwrap.fill("AgentX recorded why: %s." % reasons[0], width=75,
+                            initial_indent="  ", subsequent_indent="  "))
+    elif reasons:
+        print("  AgentX recorded why, newest first:")
+        for r in reasons[:3]:
+            print(textwrap.fill(r, width=75, initial_indent="    ", subsequent_indent="      "))
+        if len(reasons) > 3:
+            # `--all`: the per-call JSON is the newest 50 rows otherwise, and an older reason
+            # would not be in it (review).
+            print("    +%d more:  %s --calls --all --json" % (len(reasons) - 3, _audit_cmd()))
+    return len(reasons)
+
+
+# The reasons a call is recorded as not run (REFUSED), as the SDK and agentx-mcp write them,
+# in words a reader can act on. Keys are the exact recorded strings (client.py causes,
+# decorators.py / mcp_proxy.py `_mark_not_run` / `_record_unrun_call`).
+# 🔴 EACH SAYS ONLY WHAT THE RECORD PROVES. The first wording named one cause per reason and
+# was false for most rows: Fail-Closed is also written with no key at all, a timeout, or our
+# gateway's 503; a 401/403/407 is recorded whether or not our gateway sent it (the client
+# checks no header there); an unknown answer can come from a service that is not ours (review).
+_REFUSED_REASON_WORDS = {
+    "Fail-Closed (Reasoning Engine Unavailable)":
+        "no verdict could be had from a gateway (none set up, none reachable, or it "
+        "answered with an error), and AGENTX_FAIL_MODE=closed refuses a call that cannot be "
+        "checked",
+    "Invalid AgentX API Key":
+        "the gateway, or something in front of it, did not accept your AGENTX_API_KEY",
+    "Gateway refused the request": "the gateway, or something in front of it, refused the request",
+    "Gateway address unusable": "AGENTX_GATEWAY_URL is not an address AgentX can use",
+    "Request could not be built":
+        "the request to the gateway could not be built (an unusual character in "
+        "AGENTX_API_KEY is one cause)",
+    "Unrecognised gateway answer":
+        "what answered at AGENTX_GATEWAY_URL did not send an AgentX verdict; check the "
+        "address, or update the SDK if it is your gateway",
+    # Not named by path: it can be the project's, a pulled one, or agentx-mcp's.
+    "Policy file unreadable":
+        "your AgentX policy file could not be read, and with blocking on a call is refused "
+        "until it can be",
+}
+
+
 def _claude_code_reader():
     """The record holds calls the Claude Code hook screened."""
     return bool(_SCREEN_DOORS and _SCREEN_DOORS.get("claude_code"))
@@ -3861,7 +4059,7 @@ def _rule_gate_pass_lines():
     if not _mcp_door_knows_its_project():
         # The per-user MCP door reads no rules at all; "Adopt one" would hand it a command
         # that is read-only there. The way out is the one the proposals paragraph names.
-        lines.append("   This door reads no rules until your MCP config names the project:")
+        lines.append("   agentx-mcp reads no rules until your MCP config names the project:")
         lines.append("   AGENTX_PROJECT_DIR in the server's env.")
     elif adopted:
         try:
@@ -3908,8 +4106,10 @@ def _ci_verdict(db_module, opts, rows_total):
             return 2, ["❌ --require-calls: this ledger holds no calls, so there is nothing to "
                        "judge.",
                        "   Nothing has been recorded in  %s" % db_module.DB_PATH,
-                       "   Either the agent did not run, or its tools are not wrapped with "
-                       "@agentx_protect."]
+                       ("   Either no MCP client ran, or its servers are not started through "
+                        "agentx-mcp." if MCP_ENTRY else
+                        "   Either the agent did not run, or its tools are not wrapped with "
+                        "@agentx_protect.")]
         if opts.get("fail_on_rule_match"):
             # The one question the pass branch asks, asked here too: on the per-user MCP
             # door no rule is read, so a match row in that ledger (an older version's, or a
@@ -3969,6 +4169,11 @@ _CALL_STATUS_LABELS = {
     # 12 characters exactly, the same ceiling "ran, flagged" was written to, and it uses the
     # screen's own shipped vocabulary for this population ("writes we could not size").
     _UNSIZED: "ran, unsized",
+    # Neither ran. The TS SDK's words for the same two statuses (report.ts), so the two
+    # doors' per-call screens read alike.
+    _HELD: "held",
+    _REFUSED: "not run",
+    _HALTED: "halted",
 }
 # Not a status: a MARKER on the status cell of an ALLOWED row whose policy_id is a `rule-`
 # id. It ran, and it was the shape of a rule the developer adopted. The first cut folded
@@ -4005,6 +4210,10 @@ _CALL_STATUS_MEANINGS = {
     # could not tell. A reader who takes this for a softer flag will read the next screen's
     # question ("was this worth flagging?") as being about a block that never happened.
     "ran, unsized": "ran, unsized = ran; nothing in the statement caps how many rows it hits.",
+    "held": "held = held for a person, who did not approve it; it did not run.",
+    # ⚠️ No "AgentX objected" here either: nothing objected; no verdict could be had.
+    "not run": "not run = AgentX could not get a verdict for it, so it did not run.",
+    "halted": "halted = AgentX stopped it as a runaway loop; it did not run.",
     "unrecorded": "unrecorded = written before the verdict was kept; no claim either way.",
 }
 
@@ -4288,6 +4497,83 @@ def _would_block_tools(db_module, expected=None):
         return {}
 
 
+def _server_event_rows(db_module):
+    """What the audit says MCP servers did: ``(rows, any_held, advise_hold)``. Never raises.
+
+    Each row is ``(tool, what, when, state)``. `state` is read NOW from the pins files for a
+    held tool ("held"), and from the record otherwise: "trusted" (pinning let it through as it
+    was), "held then" (held at the time, not held in any pins file this command can read: it
+    was approved, or the server stopped listing it, or it is held in a pins file named only in
+    the server's own config, which a terminal cannot see; "approved" claimed the first),
+    "recorded" (an older row that did not say). Ledger history alone told a reader to switch
+    pinning on after they had.
+
+    `advise_hold` is true when the newest change that says what pinning did was let through:
+    pinning was warn THEN. Whether it still is lives in the server's config, which a terminal
+    cannot read, so the advice says when, never "now"."""
+    try:
+        events = db_module.get_server_events() if hasattr(db_module, "get_server_events") else []
+    except Exception:
+        events = []
+    held = []
+    if events or MCP_ENTRY:
+        try:
+            from .mcp_proxy import held_tools
+            held = list(dict.fromkeys(name for _server, name in held_tools() if name))
+        except Exception:
+            held = []
+    rows = []
+    for e in events:
+        if e["tool"] in held:
+            state = "held"
+        elif e["held"] is None:
+            state = "recorded"
+        else:
+            state = "held then" if e["held"] else "trusted"
+        when = (datetime.fromtimestamp(e["at"]).strftime("%Y-%m-%d %H:%M")
+                if e.get("at") else "")
+        # Shown through `shown_tool_name`: the server chose these bytes (an escape sequence in a
+        # name would otherwise rewrite the screen).
+        rows.append((db_module.shown_tool_name(e["tool"]), db_module.SERVER_EVENT_WORDS[e["kind"]],
+                     when, state))
+    seen = {e["tool"] for e in events}
+    rows += [(db_module.shown_tool_name(name), "waiting for approval", "", "held")
+             for name in held if name not in seen]
+    known = [e for e in events if e["held"] is not None]
+    advise_hold = bool(known) and not known[-1]["held"]
+    return rows, bool(held), advise_hold
+
+
+def _print_server_events(db_module):
+    """A section of its own for what MCP servers did to their tools: these are not calls, so no
+    count of calls includes them, and the setting that holds them is not the posture."""
+    rows, any_held, advise_hold = _server_event_rows(db_module)
+    if not rows:
+        return
+    print("")
+    print("  " + "─" * 71)
+    print("  WHAT YOUR MCP SERVERS DID          (changes to their tools, not calls)")
+    for tool, what, when, state in rows[-8:]:
+        # A name too long for its column gets a line of its own, whole: half a tool name
+        # matches nothing the reader can search for.
+        if len(tool) > 18:
+            print("    %s" % _fit_names([tool], 71))
+            tool = ""
+        print("    %-18s %-25s %-17s%s" % (tool, what, when, state))
+    if len(rows) > 8:
+        print("    +%d earlier" % (len(rows) - 8))
+    if any(state == "recorded" for _t, _w, _d, state in rows[-8:]):
+        print("  recorded: an older version wrote it and did not say whether it was held.")
+    if any_held:
+        print("  A held tool's calls are refused. Once you have checked it:")
+        print("      uvx agentx-mcp --approve-changes")
+    if advise_hold:
+        print("  The newest change was let through: tool pinning was on warn then. To hold")
+        print("  the next one until you approve it, in your MCP config:")
+        print('      "env": { "AGENTX_MCP_TOOL_PINNING": "block" }')
+        print("      (beside that server's \"command\" and \"args\")")
+
+
 def _audit_share_payload(payload):
     """The `--share` document: the `--json` one with this machine's fingerprints removed.
 
@@ -4472,6 +4758,28 @@ def _audit_json_payload(db_module, opts, inventory=None, log=None):
         if totals.pop("readable", True) is False:
             payload["ledger"]["readable"] = False
             return payload
+        # What MCP servers did to their tools: not calls, so in no total, and the same section
+        # the screen prints. `held_then` is what pinning did at the time (null: not recorded).
+        # `held_now` is read from the pins files, as the screen's "held" is: a program needs to
+        # know a tool's calls are being refused now, not only what pinning did then (review).
+        try:
+            events = db_module.get_server_events()
+            held = set()
+            if events or MCP_ENTRY:                   # the screen's own rule, so they agree
+                try:
+                    from .mcp_proxy import held_tools
+                    held = {name for _server, name in held_tools() if name}
+                except Exception:
+                    held = set()
+            payload["server_events"] = [
+                {"tool": e["tool"], "what": db_module.SERVER_EVENT_WORDS[e["kind"]],
+                 "at": _iso(e["at"]), "held_then": e["held"], "held_now": e["tool"] in held}
+                for e in events] + [
+                {"tool": name, "what": "waiting for approval", "at": None, "held_then": None,
+                 "held_now": True}
+                for name in sorted(held - {e["tool"] for e in events})]
+        except Exception:
+            pass
         # 🔴 `ledger.window_start` IS A FACT ABOUT THE FILE, SO IT COMES FROM THE LEDGER-WIDE
         # READ IN BOTH VIEWS. Built from `source` alone it was the grouped reader's own
         # MIN(timestamp) over INVENTORY rows only, so a ledger whose oldest row is a BLOCK
@@ -4682,9 +4990,12 @@ def _print_destinations(db_module):
         dests = {}
     if not dests:
         # An upgraded ledger: calls from before this version carry no site, so the section
-        # would be absent with nothing to say why. Said once, only when a web tool exists.
+        # would be absent with nothing to say why. Said once, only when one of the reader's own
+        # agents called a web tool: our demo's calls alone made a fresh ledger say it (cold
+        # install).
         try:
-            web = any("http" in (t.get("classes") or []) or "url" in str(t.get("arg_names"))
+            web = any(t.get("agents") and ("http" in (t.get("classes") or [])
+                                           or "url" in str(t.get("arg_names")))
                       for t in (db_module.get_call_inventory(limit=None).get("tools") or []))
         except Exception:
             web = False
@@ -4693,7 +5004,9 @@ def _print_destinations(db_module):
             print("  calls made before it show none.")
             print("")
         return
-    print("  Sites your agents sent requests to (host only, never the full address):")
+    # Read from every call that RAN, flagged ones too: it prints under the "tripped nothing"
+    # count, and a host only a flagged call reached (169.254.169.254) read as a clean call's.
+    print("  Sites reached by calls that ran, flagged ones too (host only):")
     width = min(max(len(a) for a in dests), 20)
     for agent in sorted(dests):
         ranked = sorted(dests[agent].items(), key=lambda hn: (-hn[1], hn[0]))
@@ -4831,14 +5144,23 @@ def _print_call_log(db_module, log, opts):
     _ran_clean = log["totals"]["inventory"]
     _tripped = log["totals"]["flagged"]
     _unsized = log["totals"]["observed"]
-    if (_tripped or _unsized) and \
-            _ran_clean + _tripped + _unsized == log["totals"]["rows"]:
+    # A fifth term for the same reason `_unsized` became the fourth: without it the equality
+    # below is false on any ledger holding a REFUSED row, and the whole sentence vanishes.
+    _refused = log["totals"].get("refused", 0)
+    _halted = log["totals"].get("halted", 0)
+    if (_tripped or _unsized or _refused or _halted) and \
+            _ran_clean + _tripped + _unsized + _refused + _halted == log["totals"]["rows"]:
         _parts = ["%d ran with no objection" % _ran_clean]
         if _tripped:
             _parts.append("%d tripped a policy" % _tripped)
         if _unsized:
             # "could not be sized", never "flagged": nothing objected to these.
             _parts.append("%d could not be sized" % _unsized)
+        if _refused:
+            # Nothing objected to these either; they never ran.
+            _parts.append("%d did not run for want of a verdict" % _refused)
+        if _halted:
+            _parts.append("%d halted as a runaway loop" % _halted)
         print("  Of those, %s."
               % (", ".join(_parts[:-1]) + " and " + _parts[-1] if len(_parts) > 1
                  else _parts[0]))
@@ -5064,7 +5386,7 @@ def _record_stores():
     from . import db as db_module
     from .overrides import _incident_db_path
     return [("Call ledger", db_module.DB_PATH, db_module.CHAIN_TABLES),
-            ("Incident store", _incident_db_path(None), {"incidents": "receipt_id"})]
+            ("Record of blocks", _incident_db_path(None), {"incidents": "receipt_id"})]
 
 
 def _record_status(path, tables):
@@ -5454,9 +5776,44 @@ def _execute_audit_screen(args=None):
         # developer's, and must still stop us claiming the ledger is empty.
         _obs_all = (inventory.get("totals") or {}).get("observed") or 0
         _obs_theirs = (inventory.get("totals") or {}).get("observed_excluding_ours") or 0
-        if inventory["flagged_total"] or _obs_all:
+        # A third population this branch has to name, for the reason the observation one was
+        # added: a ledger holding only REFUSED rows is in none of the other counts, and fell to
+        # "No calls recorded yet" over calls the reader's agent made.
+        _ref_all = (inventory.get("totals") or {}).get("refused") or 0
+        # And a fourth, the same way: calls a loop breaker halted (HALTED).
+        _halt_all = (inventory.get("totals") or {}).get("halted") or 0
+        # Proof the reader has wired AgentX in: any row of THEIRS, whatever became of the call.
+        # Our demo's and examples' rows are excluded (that reader has wired nothing; example 04
+        # writes HALTED, an example run with the gateway down writes REFUSED). Read by the setup
+        # steps below, which are only for a reader who has not.
+        _totals = inventory.get("totals") or {}
+        _ref_theirs = _totals.get("refused_excluding_ours") or 0
+        _other_theirs = bool(
+            (inventory["flagged_total"] - (inventory.get("flagged_from_demo") or 0)) > 0
+            or _obs_theirs or (_totals.get("halted_excluding_ours") or 0))
+        _theirs_on_record = bool(_ref_theirs or _other_theirs)
+        # Every row of theirs is a call that got no verdict (a refused key, a gateway down, an
+        # unreadable policy file): running again "as usual" only adds more of them.
+        _only_refused_theirs = bool(_ref_theirs and not _other_theirs)
+        if inventory["flagged_total"] or _obs_all or _ref_all or _halt_all:
             print("  Nothing here yet. This screen lists the calls AgentX had no objection")
-            if inventory["flagged_total"] and _obs_all:
+            if _ref_all or _halt_all:
+                # Their own lines rather than more clauses in the sentences below, which stay
+                # word for word what they were.
+                _lead = "to. "
+                if _ref_all:
+                    print("  to. %s on record did not run: AgentX could not get a verdict for"
+                          % _plural(_ref_all, "call"))
+                    print("  %s." % ("it" if _ref_all == 1 else "them"))
+                    _lead = ""
+                if _halt_all:
+                    print("  %s%s halted as a runaway loop."
+                          % (_lead, _plural(_halt_all, "call")))
+                _rest = [w for w, n in (("tripped a policy", inventory["flagged_total"]),
+                                        ("could not be sized", _obs_all)) if n]
+                if _rest:
+                    print("  The rest %s." % " or ".join(_rest))
+            elif inventory["flagged_total"] and _obs_all:
                 print("  to. Every call on record either tripped a policy or is a write")
                 print("  AgentX could not size.")
             elif _obs_all:
@@ -5482,6 +5839,9 @@ def _execute_audit_screen(args=None):
                 # Every observation on record is ours. Say so rather than printing a count of
                 # the reader's writes that is really a count of our demo's.
                 print("  The only unsized writes on record came from AgentX's own demo.")
+            if _ref_all or _halt_all:
+                # Each such call's reason is on the per-call screen.
+                print("  Call by call:  %s" % _audit_calls_cmd())
             # Nested, NOT a sibling `if`: the `else` far below is the genuinely-empty ledger and
             # has to answer the OUTER question. Written flat first, which silently re-attached
             # that else to this condition and sent a ledger holding only observations back to
@@ -5495,11 +5855,20 @@ def _execute_audit_screen(args=None):
                 # That reader filters on CHALLENGED / RECOVERED / WOULD_BLOCK, so any other
                 # legacy status string still routes someone to a screen that will not show it.
                 viewable = inventory["viewable_total"]
+                _held_n = int(inventory.get("held_total") or 0)
                 if viewable > 0:
                     print("  %s on record. See them:  %s"
                           % (_plural(viewable, "call"),
                              "uvx agentx-mcp --insights" if MCP_ENTRY else "agentx insights"))
-                else:
+                if _held_n:
+                    # Insights cannot show these; the per-call screen can.
+                    # The pointer only when the refused line above did not already give it:
+                    # one per screen.
+                    print("  %s held for a person and not approved.%s"
+                          % (_plural(_held_n, "call"),
+                             "" if (_ref_all or _halt_all)
+                             else "  Call by call:  %s" % _audit_calls_cmd()))
+                if not viewable and not _held_n:
                     print("  %s on record, from a ledger older than this version, so there is"
                           % _plural(inventory["flagged_total"], "call"))
                     print("  nothing left to show about them.")
@@ -5569,7 +5938,10 @@ def _execute_audit_screen(args=None):
             # have ... restart your client" (founder walk, the enforce session). A reader who
             # has done the one thing we ask must not be asked to do it again; what they are
             # owed is the sentence about the calls this screen WILL show.
-            if inventory["flagged_total"]:
+            if _only_refused_theirs:
+                print("  Fix %s, then use the server again."
+                      % ("those" if _print_refused_reasons(_totals) > 1 else "that"))
+            elif _theirs_on_record:
                 print("  Use the server as usual, then run this again.")
             else:
                 print("  AgentX writes this down for any server it fronts. In your mcp.json,")
@@ -5598,24 +5970,36 @@ def _execute_audit_screen(args=None):
             # One clause, three screens: decorators.RECORDING_CLAUSE. This screen is where
             # the wording came from; it is imported rather than repeated so the help screen
             # and the docs page cannot drift away from it, which they already had.
-            from .decorators import RECORDING_CLAUSE
-            print("  AgentX %s." % RECORDING_CLAUSE)
-            print("  If you have not wrapped a tool yet:")
-            _print_wrap_snippet()
-            # 🔴 THE CHEAP STEP, AND IT IS NOW GENUINELY OPTIONAL RATHER THAN THE WAY IN.
-            # `agentx demo --audit` fills this screen without the reader writing a line, which
-            # is worth offering -- but it is no longer the difference between seeing rows and
-            # seeing nothing, so it comes after their own step rather than before it.
-            #
-            # ⚠️ NO `reason != "unreadable"` GUARD, BECAUSE THIS BRANCH CANNOT SEE THAT READER.
-            # It carried one, copied from the arm this replaced. That arm sat above the
-            # unreadable check; this one sits BELOW it (`elif reason == "unreadable"` returns
-            # first), so the condition was always true and read as a protection that was not
-            # doing anything. The rule it encoded is real -- next to a ledger we could not
-            # read, telling someone to write MORE rows into it is advice about a file we
-            # cannot see -- and it is enforced by the branch order, which is where it belongs.
-            print("")
-            _print_audit_offer()
+            # 🔴 ONLY WHEN NOTHING OF THEIRS IS ON RECORD, the MCP branch's rule above and the
+            # TS report's: a refused, halted, stopped or unsized call of theirs is proof a tool
+            # is wrapped, so the snippet and the demo offer asked them to do it again (founder
+            # walk). Our demo's rows do not count: that reader has wrapped nothing yet.
+            if _theirs_on_record:
+                if _only_refused_theirs:
+                    print("  Fix %s, then run your agent again."
+                          % ("those" if _print_refused_reasons(_totals) > 1 else "that"))
+                else:
+                    print("  Run your agent as usual, then run this again.")
+                print("")
+            else:
+                from .decorators import RECORDING_CLAUSE
+                print("  AgentX %s." % RECORDING_CLAUSE)
+                print("  If you have not wrapped a tool yet:")
+                _print_wrap_snippet()
+                # 🔴 THE CHEAP STEP, AND IT IS NOW GENUINELY OPTIONAL RATHER THAN THE WAY IN.
+                # `agentx demo --audit` fills this screen without the reader writing a line, which
+                # is worth offering -- but it is no longer the difference between seeing rows and
+                # seeing nothing, so it comes after their own step rather than before it.
+                #
+                # ⚠️ NO `reason != "unreadable"` GUARD, BECAUSE THIS BRANCH CANNOT SEE THAT READER.
+                # It carried one, copied from the arm this replaced. That arm sat above the
+                # unreadable check; this one sits BELOW it (`elif reason == "unreadable"` returns
+                # first), so the condition was always true and read as a protection that was not
+                # doing anything. The rule it encoded is real -- next to a ledger we could not
+                # read, telling someone to write MORE rows into it is advice about a file we
+                # cannot see -- and it is enforced by the branch order, which is where it belongs.
+                print("")
+                _print_audit_offer()
 
         # 🔴 NOT ON THE UNREADABLE BRANCH. Everywhere else this screen is saying "you have no
         # data yet", and a picture of the format helps. There it is saying "we could not read
@@ -5640,6 +6024,10 @@ def _execute_audit_screen(args=None):
                 _print_your_rules_table(db_module, db_module.get_rule_match_summary())
             except Exception:
                 pass
+
+        # A server can change a tool before the agent calls anything: no call, still a change.
+        if reason != "unreadable":
+            _print_server_events(db_module)
 
         print("=" * 75)
         # The empty screen is still a screen the gate ran over; its verdict goes last too.
@@ -5689,6 +6077,15 @@ def _execute_audit_screen(args=None):
     # would mean printing a second number here derived from `flagged_total` minus the demo's
     # share minus the unclassified -- arithmetic invented at the call site, on the screen whose
     # defect is invented arithmetic. Four words cost nothing and cannot be wrong.
+    # The whole count first when some calls tripped a policy, in the words and numbers
+    # `--calls` opens with: "1 call that tripped nothing" alone, beside a `--calls` screen
+    # saying "2 calls", read as two screens disagreeing about one session.
+    _all = inventory.get("totals") or {}
+    if (_all.get("rows") or 0) > inventory["total_calls"]:
+        _print_wrapped("%s across %s%s, one line each on %s."
+                       % (_plural(_all["rows"], "call"),
+                          _plural(_all.get("distinct_tools") or 0, "tool"),
+                          _since_phrase(_all.get("window_start")), _audit_cmd() + " --calls"))
     print("  %s that tripped nothing, across %s%s"
           % (_plural(inventory['total_calls'], "call"),
              _plural(inventory['distinct_tools'], "tool"),
@@ -6216,7 +6613,7 @@ def _execute_audit_screen(args=None):
             # line whose job is telling someone which of their arguments we are talking about.
             # `_wrap` returns ONE already-wrapped STRING, not a list of lines. Iterating it
             # walks characters and prints one per line, which is what the first version did.
-            print(_wrap(_rule_line(_p), "     #%s  " % _p.get("seq", "?"), width=75))
+            print(_wrap(_rule_line(_p, gateway_clause=True), "     #%s  " % _p.get("seq", "?"), width=75))
         print("")
         # NO COMMAND ON THIS LINE. The screen already carries exactly one `agentx insights`
         # CTA, and a test asserts that count is 1 -- the house rule being one clear actionable
@@ -6302,6 +6699,9 @@ def _execute_audit_screen(args=None):
     print("  " + "─" * 71)
     flagged = inventory["flagged_total"]
     would_block = inventory["would_block_total"]
+    # One "Call by call" pointer per screen (the rule stated at its print site below): the
+    # refused line after this block offers it only when the block did not.
+    _pointed_calls = False
     if flagged:
         # 🔴 WHOSE CALLS, IN THE SENTENCE WITH THE COUNT. This block used to print the count,
         # then what became of them, then a pointer, and only THEN "All 2 came from AgentX's
@@ -6328,7 +6728,10 @@ def _execute_audit_screen(args=None):
         # RECOVERED / WOULD_BLOCK), so viewable minus audited IS what was stopped, in the
         # same terms as the screen the reader is being sent to.
         stopped = max(0, inventory["viewable_total"] - would_block)
-        older = max(0, flagged - inventory["viewable_total"])
+        # HELD rows are in `flagged` and not in `viewable_total`; they get their own line, so
+        # they come out of the legacy remainder rather than being called "older".
+        held = int(inventory.get("held_total") or 0)
+        older = max(0, flagged - inventory["viewable_total"] - held)
         # Which of the stopped ones were ours: counted by the ledger over the same two
         # statuses `stopped` is (`stopped_from_demo`), never derived. The first cut derived
         # it as `flagged_from_demo - would_block_from_demo`, and `flagged_from_demo` counts
@@ -6377,12 +6780,16 @@ def _execute_audit_screen(args=None):
                         "  ", width=75))
         if would_block:
             print(_wrap("%d ran %s." % (would_block, _ran_why), "  ", width=75))
+        if held:
+            # The TS SDK's words for the same rows (wrap.ts).
+            print(_wrap("%d %s held for a person and not approved." % (held, _was(held)),
+                        "  ", width=75))
         if older:
             # Said rather than folded into either number: these rows carry no status, so
             # neither "stopped" nor "recorded" is true of them, and no per-call view can
             # show them. "The other" only when there IS another -- on a ledger that is
             # entirely legacy rows it would be describing the whole count.
-            lead = "The other %d" % older if (stopped or would_block) else "%d" % older
+            lead = "The other %d" % older if (stopped or would_block or held) else "%d" % older
             print("  %s %s from a ledger older than this version, so there is"
                   % (lead, "are" if older != 1 else "is"))
             print("  nothing left to show about them.")
@@ -6394,12 +6801,34 @@ def _execute_audit_screen(args=None):
         # legacy-only ledger has nothing viewable), and not when the loud block below is
         # about to hand over the same command with the row's tool and policy on it: one
         # pointer per screen, and that one carries more.
-        if inventory["viewable_total"] and not _their_would_blocks:
+        if (inventory["viewable_total"] or held) and not _their_would_blocks:
             print("  Call by call:  %s" % _audit_calls_cmd())
+            _pointed_calls = True
     else:
         # The clean-ledger arm, recast the same way: their agent is the subject, and there is
         # no "above was blocked" half to drop because nothing was flagged at all.
         print("  Nothing your agent did tripped a policy.")
+    # Not a policy trip, so outside both arms: a call that could not get a verdict did not
+    # run, whatever else the ledger holds. TS's words (wrap.ts), and the per-call screen lists
+    # them with their reason.
+    _refused_n = int(inventory.get("refused_total") or 0)
+    _halted_n = int(inventory.get("halted_total") or 0)
+    _lines = []
+    if _refused_n:
+        _lines.append("%s did not run: AgentX could not get a verdict for %s." % (
+            _plural(_refused_n, "call"), "it" if _refused_n == 1 else "them"))
+    if _halted_n:
+        # A loop breaker's halt, in its own words: not a policy trip, not a missing verdict.
+        _lines.append("%s halted as a runaway loop."
+                      % _plural(_halted_n, "call"))
+    if _lines:
+        # Not when the reader's own would-blocks get the loud block below, which hands over the
+        # same screen (`--calls --all`): one pointer per screen (review round 2). On the last
+        # line, so two of these lines still carry one pointer between them.
+        if not _pointed_calls and not _their_would_blocks:
+            _lines[-1] += " Call by call:  %s" % _audit_calls_cmd()
+        for _l in _lines:
+            print(_wrap(_l, "  ", width=75))
 
     # --- THE ENFORCE ASK, BESIDE THE EVIDENCE THAT EARNS IT --------------------------------
     #
@@ -6484,14 +6913,33 @@ def _execute_audit_screen(args=None):
         # them what we objected to. With only the tool, a developer whose agent calls
         # `run_sql` fifty times a day learns nothing they did not know.
         _tools, _policies = ran_on.get("tools") or [], ran_on.get("policies") or []
+        # What a server did to its tools is not here: those rows are not calls, and the section
+        # below this one says what they were and which setting holds them.
         if _tools and _policies:
-            print("      On %s, tripping %s."
-                  % (_fit_names(_tools, 18), _fit_names(_policies, 26)))
+            _shown = [_shown_policy(p) for p in _policies]
+            _line = "      On %s, tripping %s." % (_fit_names(_tools, 18), _fit_names(_shown, 26))
+            if len(_line) <= 75:
+                print(_line)
+            else:
+                # One name per line, each fitted to the fence, up to four.
+                print("      On %s, tripping:" % _fit_names(_tools, 50))
+                for _name in _shown[:4]:
+                    print("        %s" % _fit_names([_name], 67))
+                if len(_shown) > 4:
+                    print("        +%d more" % (len(_shown) - 4))
         elif _tools:
             print("      On %s." % _fit_names(_tools, 40))
         print("      Listed as \"%s\":  %s --calls --all" % (_ran_label, _audit_cmd()))
-        print("")
-        _print_enforce_command()
+        # 🔴 ONLY TO A READER WHO IS WATCHING NOW, the quiet form's gate below. These rows are
+        # history: a reader who watched last week and enforces today still has them, and was
+        # told to start enforcing. The MCP door cannot see mcp.json, so it keeps the command
+        # under the same conditional lead-in the quiet form and insights use.
+        if _ambient_posture == "audit" or MCP_ENTRY:
+            print("")
+            if MCP_ENTRY:
+                print("      If this server should block calls, not just record them, add")
+                print("      this to its entry in mcp.json:")
+            _print_enforce_command()
         # ⚠️ THE TRAILING `print("")` WENT WITH THE SENTENCE IT WAS SEPARATING. It sat here to
         # put a gap between the command and the two lines below it; those lines are gone, so
         # it became a stray blank before the next section. A separator outliving the thing it
@@ -6536,6 +6984,8 @@ def _execute_audit_screen(args=None):
         #
         # The block is now: what happened, the evidence, the command. Nothing else.
         pass
+
+    _print_server_events(db_module)
 
     # 🔴 WHAT WE WATCH FOR, STATED SO THE READER CAN DO THE JOIN THEMSELVES.
     #
@@ -6678,7 +7128,7 @@ def _execute_audit_screen(args=None):
     # silence, the same failure the quiet-session screen was fixed for, one screen over.
     #
     # 🔴 AND THE FIX FOR IT SHIPPED THE WRONG ROUTE. It named the
-    # per-tool pin `enforcement="audit"`, which BEATS AGENTX_ENFORCEMENT and never expires:
+    # per-tool pin `enforcement="audit"`, which BEATS AGENTX_POSTURE and never expires:
     # a reader who took that advice made the tool non-blocking for good, and the "to block
     # instead of watching" CTA at the bottom of THIS SAME SCREEN cannot undo it. Verified by
     # running it -- variable set to enforce, pinned tool still ran `rm -rf /`. The env route
@@ -6940,7 +7390,7 @@ def execute_insights(args=None):
     store = load_overrides(warn=True)   # surface a corrupt store instead of showing an empty one
     active = store.get("overrides", {})
 
-    # --- AUDIT posture report: what AGENTX_ENFORCEMENT=audit WOULD have blocked ---
+    # --- AUDIT posture report: what AGENTX_POSTURE=audit WOULD have blocked ---
     # Printed FIRST and unconditionally (even when there are no learned safe-paths yet),
     # because an install evaluating in audit mode has would-block rows but usually no
     # recoveries. This is the report that earns the enforce decision: what audit caught,
@@ -7005,7 +7455,7 @@ def execute_insights(args=None):
         print(f"  {_plural(audit['total'], 'action')} recorded and let through, "
               "by policy:")
         for row in audit["policies"]:
-            print(f"     {row['would_blocks']:>4}x   {row['policy_name']}")
+            print(f"     {row['would_blocks']:>4}x   {_shown_policy(row['policy_name'])}")
             # Same question, same answer, on the audited half: these are the calls that RAN.
             for _ln in _tools_line(row.get("tools")):
                 print(_ln)
@@ -7160,7 +7610,8 @@ def execute_insights(args=None):
             # The gateway link is printed once, at the end of the screen.
             print("   • A safe-path is the revised call an agent made after a block, kept so")
             print("     the next agent is coached to it. The ones this screen shows come from")
-            print("     the gateway's incident store, and no gateway has written one here.")
+            print("     the gateway's record of blocks and their outcomes, and no gateway")
+            print("     has written one here.")
         elif census["complied"] == 0:
             print("   • No self-corrections recorded — no agent has recovered from a")
             print("     block yet. Safe-paths are harvested only from recoveries.")
@@ -7268,8 +7719,8 @@ def execute_insights(args=None):
         # reader can only conclude our screens disagree. A zero has to earn its meaning: these two
         # are unread, and the screen now says which.
         if census["exists"]:
-            print(f"     safe paths come from the incident store, not this")
-            print(f"     machine's block ledger above:")
+            print(f"     safe paths come from the record of blocks and their outcomes,")
+            print(f"     not this machine's block ledger above:")
             print(f"     {census['path']}")
         else:
             # 🔴 THE BRIDGE BELONGS ON BOTH BRANCHES, AND IT WAS ON ONE. The `exists` branch above
@@ -7405,6 +7856,7 @@ def execute_insights(args=None):
             # this READER only ever knew the first source's shape. The old string stays as the
             # last resort for a row carrying neither.
             label = rule.get("policy_violated")
+            # No gateway clause here: this screen prints `_rule_armed_clause` under the list.
             desc = _rule_line(rule)
             if label:
                 line = f"{label}   (action={rule['target_action']} · effect={rule['effect_category']})"
@@ -7646,9 +8098,9 @@ def execute_insights(args=None):
             # mcp_recovery_candidates() and is a SEPARATE list from `harvest`; this body renders
             # harvest/active only, so those safe-paths appear nowhere above. Point at the command
             # that actually reads that corpus rather than claiming they were shown.
-            print(f"\n  Also: {len(mcp_flat)} safe-path(s) from your keyless MCP wedge → {_review_cmd()}")
+            print(f"\n  Also: {len(mcp_flat)} safe-path(s) from agentx-mcp → {_review_cmd()}")
         else:
-            print(f"\n  Also: {len(mcp_flat)} safe-path(s) from your keyless MCP wedge → agentx mcp-insights")
+            print(f"\n  Also: {len(mcp_flat)} safe-path(s) from agentx-mcp → agentx mcp-insights")
     # P-18. Distinct from the `mcp_flat` line above, which counts CANDIDATES harvested from
     # the MCP wedge; this counts safe-paths already ADOPTED into the per-user MCP store, which
     # this reader never resolves. Fires only when that store has entries, so it stays quiet
@@ -7676,7 +8128,7 @@ def execute_mcp_insights():
     _harvest, _reframe, _rules, mcp_flat = _collect_candidates()
     active = load_overrides(warn=True).get("overrides", {})
 
-    print("\n🧠 SAFE PATHS FROM YOUR MCP WEDGE        (keyless · local to this machine)")
+    print("\n🧠 SAFE PATHS FROM AGENTX-MCP            (keyless · local to this machine)")
     print("=" * 75)
     print("  When an agent recovered from a block on agentx-mcp, AgentX saved the safe SHAPE")
     print("  (value-free: action + scope, never a query or payload). Adopt one and AgentX")
@@ -8166,6 +8618,8 @@ def _expect_or_exit(expect, actual):
     if not expect:
         return
     names = [n for n in (actual if isinstance(actual, (list, tuple)) else [actual]) if n]
+    # The screen's name for a stored one counts too: it is the one a script copied.
+    names += [_shown_policy(n) for n in names]
     if any(str(n).strip().lower() == expect.strip().lower() for n in names):
         return
     got = " / ".join(sorted({str(n) for n in names})) or "something with no name"
@@ -8826,6 +9280,8 @@ def _policies_json_payload():
                        % (type(_probe_failed).__name__, _probe_failed))
     _enforced_ids = {str(p.get("id")) for p in (_dec.LOCAL_POLICY_KEYWORDS or [])}
     _structural_ids = _dec.structural_policy_ids()
+    from .evidence import moved_while_off
+    _moved = moved_while_off()
 
     policies = list_customizable_policies()
     doc = {
@@ -8873,13 +9329,22 @@ def _policies_json_payload():
                 # `enforced` says whether the rule runs at all. A row can be listed,
                 # uncustomized, and switched off.
                 "enforced": str(p["id"]) in _enforced_ids,
-                # 🔴 "OFF" IS ONLY HALF OF IT FOR SOME RULES. Switched off in the file, a rule's
-                # trigger words stop; the built-in checks that report under its name do not
+                # 🔴 "OFF" WAS ONLY HALF OF IT FOR ONE RULE. Switched off in the file, a rule's
+                # trigger words stop; a built-in check reporting under its name would not
                 # (measured: Customer Privacy Shield off, `SELECT email, phone FROM customers`
-                # is still stopped under that name). `enforced: false` alone told a reviewer
-                # the control was gone.
+                # was still stopped under that name, until that check moved to an always-on
+                # rule while it is off). No switchable rule has such a check today;
+                # this field says so if one ever does, since `enforced: false` alone would tell
+                # a reviewer the control was gone.
                 "built_in_checks_still_run": (str(p["id"]) not in _enforced_ids
                                               and str(p["id"]) in _structural_ids),
+                # The other half of that: a rule switched off whose read is still stopped under
+                # another rule's name (`evidence.moved_while_off`) names that rule here, or
+                # `enforced: false` reads as the read now running (review). Null on every other
+                # row, so a program finds the same keys on every row.
+                "still_stopped_under": (_moved["to_name"]
+                                        if _moved and str(p["id"]) == _moved["off_id"]
+                                        else None),
                 "customized": p["customized"],
                 "challenge": p["active_challenge"] or p["default_challenge"],
                 "safe_path": p["active_safe_path"] or p["default_safe_path"],
@@ -9007,8 +9472,10 @@ def execute_policies(args=None):
     _structural_ids = _dec.structural_policy_ids()
     print("\n🛡️  CUSTOMIZABLE FLOOR POLICIES        (keyless · no gateway, no key)")
     print("=" * 75)
-    print("  These built-in floors block deterministically, offline. You can customize the")
-    print("  COACHING each one gives your agent on a block, by name:")
+    # Was "block deterministically": a fresh install only watches (cold-install audit).
+    print("  These built-in floors check every call, offline, and block once blocking is")
+    print("  on (AGENTX_POSTURE=enforce). You can customize the COACHING each one gives")
+    print("  your agent on a block:")
     print("       agentx customize \"<name>\" --text \"...\"        (or --edit to open your editor)")
 
     for p in policies:
@@ -9028,7 +9495,14 @@ def execute_policies(args=None):
                             "stop calls, but built-in checks under this name still do.",
                             "     ⏸  "))
             else:
-                print("     ⏸  Switched off in your policies file: it blocks nothing.")
+                # Its read is still stopped under another rule: said here, or "blocks nothing"
+                # reads as if the read now runs (walk).
+                from .evidence import moved_while_off
+                moved = moved_while_off()
+                print(_wrap("Switched off in your policies file: it blocks nothing."
+                            + (" " + moved["off_line"]
+                               if moved and str(p["id"]) == moved["off_id"] else ""),
+                            "     ⏸  "))
         challenge = p["active_challenge"] or p["default_challenge"]
         safe = p["active_safe_path"] or p["default_safe_path"]
         if challenge:
@@ -9109,7 +9583,24 @@ def _policy_store_check():
         print("=" * 75)
         return False
 
-    print(f"\n  ✅ parses. {len(policies)} policy/policies armed.")
+    # The same search the shield makes, so the line names the file it read, or says there was
+    # none: with no file it said "parses" under a header naming one (cold install).
+    from .decorators import _policy_search_paths
+    found = next((p for p in _policy_search_paths(".agentx", "policies.json")
+                  if os.path.exists(p)), None)
+    print()
+    if found:
+        print(_wrap("✅ %s parses. %s armed." % (os.path.abspath(found),
+                                                _plural(len(policies), "policy", "policies")),
+                    "  ", width=75))
+    else:
+        # The emoji in the prefix: `_wrap` collapses the two spaces it needs (it renders
+        # narrow), and the override check's line below this one carries two.
+        # No "agentx pull writes one": without a key that command fails (review), and the
+        # header above already names it. "policies", the word `agentx status` counts them by.
+        print(_wrap("No policies file here, so the %s armed. Nothing to fix."
+                    % _plural(len(policies), "built-in policy is", "built-in policies are"),
+                    "  ℹ️  ", width=75))
     print("=" * 75)
     return True
 
@@ -9254,9 +9745,12 @@ def _field(label):
 
 
 def _print_review_item(n, total, it):
-    label = it.get("policy_violated") or it.get("policy_id") or "policy"
+    label = _shown_policy(it.get("policy_violated")) or it.get("policy_id") or "policy"
     if it["kind"] == "allowlist":
         _print_allowlist_item(n, total, it)
+        return
+    if it["kind"] == "tool_allowlist":
+        _print_tool_allowlist_item(n, total, it)
         return
     if it["kind"] == "rule":
         # 🔴 THE ARMING DISCLOSURE LIVES ON THE ITEM, NOT BEHIND THE PROMPT. `agentx adopt <#>`
@@ -9286,7 +9780,7 @@ def _print_review_item(n, total, it):
         return
     if it.get("mcp"):
         print(f"\n[{n}/{total}] VERDICT · {label}")
-        print("   policy-level verdict for the keyless-MCP wedge (no per-block receipt)")
+        print("   one verdict for the whole policy, from agentx-mcp (no per-block receipt)")
         return
     count = it.get("count") or 1
     header = f"VERDICT ({count} blocks)" if it["kind"] == "verdict_group" else "VERDICT"
@@ -9406,9 +9900,21 @@ def _mcp_review_items():
         _h, _r, _rules, mcp_flat = _collect_candidates()
     except Exception:
         return []
+    # The policies whose blocks the review already asks about one by one, from the ledger. The
+    # policy-level question below is skipped for them, so a policy is never asked twice.
+    asked_per_block = set()
+    try:
+        from . import db as _db
+        from .overrides import REVIEW_READ_CAP
+        _rows, _more = _db.list_ledger_blocks_by_verdict_state(REVIEW_READ_CAP, labelled=False)
+        for _row in _rows:
+            asked_per_block.update(v for v in (_row.get("policy_id"), _row.get("policy_name"))
+                                   if v)
+    except Exception:
+        pass
     out = []
     seen_adopt = set()
-    seen_verdict = set()
+    seen_verdict = set(asked_per_block)
     for m in mcp_flat:
         pid = m.get("policy_id")
         pviol = m.get("policy_violated")
@@ -9528,7 +10034,7 @@ def _gateway_destinations():
             return {}
         res = requests.get(f"{gateway_url}/v1/destinations",
                            headers={"Authorization": f"Bearer {api_key}"}, timeout=2.0)
-        agents = res.json().get("agents") if res.status_code == 200 else None
+        agents = _remote_json(res).get("agents") if res.status_code == 200 else None
     except Exception:
         agents = None
     if not isinstance(agents, dict):
@@ -9546,6 +10052,103 @@ def _gateway_destinations():
     return out
 
 
+def execute_allowlist(args, gateway_url, api_key):
+    """`agentx allowlist [status|push]`: the tools and sites each agent may use.
+
+    The list is written here, in `.agentx/allowlist.json` (git records who changed it), and
+    enforced by the gateway from the copy `push` stores for this key's customer. `status` (the
+    default) says whether the two are the same list.
+
+    ⚠️ Any holder of the key can push, including the agent's own process, which holds the same
+    key. A separate admin key is the fix; until then the gateway's copy is only as trustworthy as
+    every process holding the key."""
+    from . import rules as rules_mod
+    sub = (args[0].lower() if args else "status")
+    if sub not in ("status", "push"):
+        print("\n⚠️  Usage:")
+        print("   agentx allowlist          compare .agentx/allowlist.json with your gateway's copy")
+        print("   agentx allowlist push     send .agentx/allowlist.json to your gateway, for it to enforce")
+        print("=" * 75)
+        sys.exit(2)
+    shown = os.path.join(".agentx", rules_mod.DEFAULT_ALLOWLIST_FILE_NAME)
+    path = rules_mod._allowlist_file_path()
+    try:
+        agents = rules_mod.read_allowlist_agents()
+    except Exception as err:
+        print(f"\n❌ {shown} cannot be read, so nothing was sent: {err}")
+        print("=" * 75)
+        sys.exit(1)
+    local_fp = rules_mod.allowlist_fingerprint(agents) if os.path.exists(path) else None
+    if not api_key:
+        print("\n⚠️  No AGENTX_API_KEY, so there is no gateway copy to compare or send to.")
+        print("   Without a key, this machine's SDK limits each agent's sites from this file; the tool")
+        print("   lists in it take effect only at a gateway.")
+        print("=" * 75)
+        sys.exit(1 if sub == "push" else 0)
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    if sub == "push":
+        if local_fp is None:
+            print(f"\n📄 No {shown} yet, so there is nothing to send.")
+            print("   'agentx review' proposes each agent's tools and sites from what it ran.")
+            print("=" * 75)
+            sys.exit(1)
+        body = rules_mod.allowlist_push_document(agents)
+        try:
+            res = requests.put(f"{gateway_url}/v1/allowlist", json=body, headers=headers, timeout=5.0)
+        except Exception as err:
+            print(f"\n❌ Could not reach your gateway at {gateway_url}, so nothing was sent: {err}")
+            print("=" * 75)
+            sys.exit(1)
+        if res.status_code != 200:
+            try:
+                detail = _remote_json(res).get("detail") or res.text
+            except Exception:
+                detail = res.text
+            # A raw body is remote text too: cleaned, redacted and bounded like every other
+            # gateway body this SDK prints (a FastAPI 422's `detail` is a list, hence str()).
+            from .decorators import _sanitize_detail
+            detail = _sanitize_detail(str(detail), limit=300)
+            print(f"\n❌ Your gateway refused the list ({res.status_code}), so its copy is unchanged: {detail}")
+            print("=" * 75)
+            sys.exit(1)
+        got = _remote_json(res)
+        same = got.get("fingerprint") == local_fp
+        print(f"\n✅ Sent {shown} to {gateway_url}: {_plural(got.get('agents', len(agents)), 'agent')}.")
+        # An entry can limit tools, sites or both; a dimension it does not list is not limited.
+        # The site check reads full web addresses only, as the review item's clause says.
+        print("   From now on, for each list an entry has, that gateway stops the agent's calls outside")
+        print("   it: a tool not on its tool list, or a full web address (https://...) to a site not on")
+        print("   its site list.")
+        print(f"   Fingerprint {got.get('fingerprint')}" + (", the same as this file." if same else
+              f", but this file's is {local_fp}: run 'agentx allowlist' to compare."))
+        print("=" * 75)
+        sys.exit(0 if same else 1)
+
+    # status
+    try:
+        res = requests.get(f"{gateway_url}/v1/allowlist", headers=headers, timeout=3.0)
+        view = _remote_json(res) if res.status_code == 200 else None
+    except Exception:
+        view = None
+    print(f"\n📋 Allowlist: {shown}" + (f", fingerprint {local_fp}" if local_fp else " (no file yet)"))
+    if view is None:
+        print(f"   Your gateway at {gateway_url} could not be read, so it is unknown which list it enforces.")
+    elif not view.get("readable", True):
+        print(f"   Your gateway's copy cannot be read, so it is refusing every call: {view.get('error')}")
+    elif view.get("source") == "none":
+        print("   Your gateway holds no list, so it limits no agent's tools.")
+        if local_fp:
+            print("   ▶ agentx allowlist push")
+    elif view.get("fingerprint") == local_fp:
+        print(f"   Your gateway holds this same list ({view.get('source')}).")
+    else:
+        print(f"   Your gateway holds a DIFFERENT list ({view.get('source')}, fingerprint "
+              f"{view.get('fingerprint')}).")
+        print("   ▶ agentx allowlist push   (sends this file and replaces the gateway's copy)")
+    print("=" * 75)
+
+
 def _allowlist_review_items():
     """Sites each agent reached that its outbound allowlist does not cover yet, one item per
     agent. For an agent with no allowlist, adopting the item STARTS limiting it to
@@ -9561,8 +10164,9 @@ def _allowlist_review_items():
         return []
     from .db import get_proposable_destinations, is_demo_agent
     from .decorators import _ID_OUTBOUND_ALLOWLIST
+    from .rules import read_allowlist_agents, governing_entry, _ALLOWLIST_ANY_AGENT
     try:
-        current = read_allowlist()
+        entries_doc = read_allowlist_agents()
     except Exception as err:
         # Said here because nothing else on this screen would: a damaged file proposes
         # nothing, and an empty section would read as "nothing new to allow".
@@ -9579,9 +10183,13 @@ def _allowlist_review_items():
             mine[host] = max(mine.get(host, 0), calls)
     items = []
     for agent, hosts in sorted(reached.items()):
-        if not agent or is_demo_agent(agent):
+        if not agent or agent == _ALLOWLIST_ANY_AGENT or is_demo_agent(agent):
             continue
-        entries = current.get(agent)
+        # The list that governs this agent where it is enforced: its own entry, else `*`.
+        from .rules import _STAR_EXEMPT_DOOR_IDS
+        governs = governing_entry(entries_doc, agent,
+                                  star_applies=agent not in _STAR_EXEMPT_DOOR_IDS)
+        entries = governs.get("hosts") if governs else None
         new = sorted(((h, n) for h, n in hosts.items()
                       if not host_is_listed(h, entries or [])),
                      key=lambda hn: (-hn[1], hn[0]))
@@ -9590,6 +10198,163 @@ def _allowlist_review_items():
                           "limited": entries is not None,
                           "policy_id": None, "policy_violated": None})
     return items
+
+
+_SEEDED_FROM_STAR = ("   ℹ️  `%s` now has its own list, starting from the `*` entry's; a later "
+                     "change to `*` does not reach it.")
+
+
+def _seeded_from_star(agent_id):
+    """True when an adopt for `agent_id` will start its own entry from a copy of `*` (it has no
+    entry of its own and the file has a `*`). Never raises."""
+    try:
+        from .rules import read_allowlist_agents, _ALLOWLIST_ANY_AGENT
+        agents = read_allowlist_agents()
+        from .rules import _STAR_EXEMPT_DOOR_IDS
+        return (str(agent_id) not in agents and _ALLOWLIST_ANY_AGENT in agents
+                and str(agent_id) not in _STAR_EXEMPT_DOOR_IDS)
+    except Exception:
+        return False
+
+
+def _gateway_tools():
+    """{agent_id: {tool: calls}} the configured gateway recorded for this key's allowed calls
+    (`GET /v1/tools`), or {} with no key, no gateway, or any failure. Never raises. Every name is
+    read again with the file's own rule, and one that does not read back as itself is dropped: a
+    gateway can only narrow what is offered."""
+    env = load_env_file()
+    api_key = resolve_api_key(env) or ""
+    if not api_key:
+        return {}
+    from .rules import _tool_entry
+    gateway_url = resolve_env("AGENTX_GATEWAY_URL", "http://localhost:8000", overlay=env)
+    try:
+        if not _gateway_reachable(gateway_url=gateway_url):
+            return {}
+        res = requests.get(f"{gateway_url}/v1/tools",
+                           headers={"Authorization": f"Bearer {api_key}"}, timeout=2.0)
+        agents = _remote_json(res).get("agents") if res.status_code == 200 else None
+    except Exception:
+        agents = None
+    if not isinstance(agents, dict):
+        print("\n⚠️  Your gateway's list of tools could not be read; showing this machine's only.")
+        return {}
+    out = {}
+    for agent, tools in agents.items():
+        if not isinstance(tools, dict):
+            continue
+        for tool, calls in tools.items():
+            if (_tool_entry(tool) == tool and isinstance(calls, int)
+                    and not isinstance(calls, bool) and calls > 0):
+                out.setdefault(str(agent), {})[tool] = calls
+    return out
+
+
+def _tool_allowlist_review_items():
+    """Tools each agent called that its tool allowlist does not cover yet, one item per agent.
+    Adopting writes `.agentx/allowlist.json`; the GATEWAY enforces the list once a person sends
+    it there (`agentx allowlist push`). Most-called first, so a one-off tool (the shape an
+    injected call leaves) sits at the bottom where `[p]ick` can leave it out. Same door gate as
+    the site list. Without a key no gateway enforces a tool list, so a keyless developer is
+    offered only additions to a list they already keep, never a first one."""
+    if not _mcp_door_knows_its_project():
+        return []
+    # Not on the MCP door: agentx-mcp has no command that sends a list to the gateway, and
+    # `*` does not cover it, so an item there would end on a command its user does not have.
+    if MCP_ENTRY:
+        return []
+    has_key = bool(resolve_api_key(load_env_file()))
+    from .db import get_proposable_tools, is_demo_agent
+    from .rules import read_allowlist_agents, governing_entry, _ALLOWLIST_ANY_AGENT
+    try:
+        entries = read_allowlist_agents()
+    except Exception as err:
+        print("\n🚫 %s cannot be read, so no tools are proposed until it is fixed:"
+              % _fit_tail(_allowlist_file_path(), 40))
+        print(_wrap(str(err), "   "))
+        return []
+    ran = get_proposable_tools()
+    for agent, tools in _gateway_tools().items():
+        mine = ran.setdefault(agent, {})
+        for tool, calls in tools.items():
+            mine[tool] = max(mine.get(tool, 0), calls)
+    items = []
+    for agent, tools in sorted(ran.items()):
+        if not agent or agent == _ALLOWLIST_ANY_AGENT or is_demo_agent(agent):
+            continue
+        # The list that governs this agent where it is enforced: its own entry, else `*`.
+        from .rules import _STAR_EXEMPT_DOOR_IDS
+        governs = governing_entry(entries, agent, star_applies=agent not in _STAR_EXEMPT_DOOR_IDS)
+        listed = governs.get("tools") if governs else None
+        if listed is None and not has_key:
+            continue
+        new = sorted(((t, n) for t, n in tools.items() if t not in (listed or [])),
+                     key=lambda tn: (-tn[1], tn[0]))
+        if new:
+            items.append({"kind": "tool_allowlist", "agent_id": agent, "tools": new,
+                          "limited": listed is not None,
+                          "policy_id": None, "policy_violated": None})
+    return items
+
+
+def _tool_list_enforced_clause():
+    """When tools just allowed start being enforced. Only a gateway enforces a tool list, and a
+    keyless developer with a list of their own can still add to it in review."""
+    if resolve_api_key(load_env_file()):
+        return "your gateway enforces them after 'agentx allowlist push'"
+    return "no gateway enforces them until you set AGENTX_API_KEY and run 'agentx allowlist push'"
+
+
+def _print_tool_allowlist_item(n, total, it):
+    head = "MORE TOOLS" if it["limited"] else "TOOL ALLOWLIST"
+    print(f"\n[{n}/{total}] {head} · agent `{it['agent_id']}`")
+    print(_wrap(", ".join("%s (%s)" % (t, _plural(c, "call")) for t, c in it["tools"]),
+                _field("called:")))
+    if it["limited"]:
+        clause = "these join the tools this agent may call."
+    else:
+        clause = ("this agent may then call only the tools you allow. Your gateway stops any "
+                  "other once you send the list with 'agentx allowlist push'.")
+    print(_wrap(clause, _field("if allowed:")))
+
+
+def _walk_tool_allowlist_item(it):
+    """One tool-allowlist item's prompt. Returns how many tools were allowed. Raises
+    _ReviewQuit."""
+    from .rules import adopt_tool_allowlist
+    raw = input("   allow these tools? [y]es, all / [p]ick one by one / [n]o / [q]uit: ")
+    ans = raw.strip().lower()
+    if ans in _QUIT:
+        raise _ReviewQuit()
+    if ans in ("y", "yes"):
+        chosen = [t for t, _ in it["tools"]]
+    elif ans in ("p", "pick"):
+        chosen = []
+        for t, _ in it["tools"]:
+            sub = input(f"     allow {t}? [y]es / [n]o / [q]uit: ").strip().lower()
+            if sub in _QUIT:
+                raise _ReviewQuit()
+            if sub in ("y", "yes"):
+                chosen.append(t)
+    elif ans in ("n", "no"):
+        print("   – skipped")
+        return 0
+    else:
+        _skipped(ans, ["y", "p", "n", "q"])
+        return 0
+    if not chosen:
+        print("   – nothing allowed")
+        return 0
+    seeded = _seeded_from_star(it["agent_id"])
+    try:
+        adopt_tool_allowlist(it["agent_id"], chosen)
+    except ValueError as err:
+        print("   🚫 not allowed: %s" % err)
+        return 0
+    print("   ✓ allowed %s" % _plural(len(chosen), "tool"))
+    if seeded:
+        print(_SEEDED_FROM_STAR % it["agent_id"])
+    return len(chosen)
 
 
 def _print_allowlist_item(n, total, it):
@@ -9635,12 +10400,15 @@ def _walk_allowlist_item(it):
     if not chosen:
         print("   – nothing allowed")
         return 0
+    seeded = _seeded_from_star(it["agent_id"])
     try:
         adopt_allowlist(it["agent_id"], chosen)
     except ValueError as err:
         print("   🚫 not allowed: %s" % err)
         return 0
     print("   ✓ allowed %s" % _plural(len(chosen), "site"))
+    if seeded:
+        print(_SEEDED_FROM_STAR % it["agent_id"])
     return len(chosen)
 
 
@@ -9655,14 +10423,14 @@ def _print_review_stats():
     reconcile_safe_paths()                  # freshen derived safe-path labels before summarizing
     census = incident_db_census()
     stats = label_stats()
-    print("\n📊 Label channel — outcome summary")
+    print("\n📊 Your review verdicts, summed up")
     print("=" * 75)
     # `total` spans both notebooks, so a store that does not exist beside a ledger
     # holding blocks is NOT the empty state; only a zero is.
     if stats["total"] == 0:
         print("   No blocks recorded yet; nothing to summarize.")
         if not census["exists"]:
-            print(f"   (no incident store yet at {census['path']})")
+            print(f"   (no record of blocks and their outcomes yet at {census['path']})")
         print("=" * 75)
         return
     v, sp, h = stats["verdict"], stats["safe_path"], stats["harm"]
@@ -9902,7 +10670,7 @@ def _prompt_single_verdict(it):
         twin = _ledger_twin(it)
         delete_incident(it["receipt_id"])
         if twin:
-            print("   ✓ deleted from the incident store;")
+            print("   ✓ deleted from the record of blocks and their outcomes;")
             _say_copy_stays(1, 1 if _ledger_twin_will_be_asked(it) else 0)
         else:
             print("   ✓ deleted — removed from the local store, not just skipped")
@@ -10122,7 +10890,7 @@ def _note_that_the_two_doors_keep_separate_brains():
     print("   See them with:  uvx agentx-mcp --insights")
 
 
-def _rule_line(rule):
+def _rule_line(rule, gateway_clause=False):
     """The rule's own text plus the evidence for proposing it, as one line.
 
     🔴 THEY ARE STORED APART AND SHOWN TOGETHER, WHICH IS THE POINT. `adopt_rule` writes
@@ -10136,6 +10904,29 @@ def _rule_line(rule):
     """
     desc = rule.get("semantic_description") or ""
     ev = rule.get("evidence") or ""
+    # A rule proposed from a tool's plain calls is shown as what adopting it does, not as its
+    # stored text: "Calls to 'run_shell' with arguments named command" told the reader neither
+    # what the rule would catch nor what it would do. Only when the rule has no size threshold:
+    # a sized rule's text carries "(largest recorded size >= N)", and "every call" would drop
+    # it, so that text is shown as stored.
+    names = rule.get("arg_names")
+    tool = rule.get("target_action")
+    if (tool and isinstance(names, list) and desc.startswith("Calls to ")
+            and "largest recorded size" not in desc):
+        takes = (" (%s: %s)" % ("argument" if len(names) == 1 else "arguments",
+                                ", ".join(names))) if names else ""
+        desc = "Mark every call to '%s'%s in your record as matching this rule" % (tool, takes)
+        line = "%s (%s)" % (desc, ev) if ev else desc
+        # True as said only where the SDK is all there is. With a key or a gateway, the
+        # gateway arms the same rule by its meaning too, so "mark" alone undersold it. Only on
+        # the audit screen's proposals: insights, adopt and review print `_rule_armed_clause`
+        # near this line, which already says what a gateway does with it.
+        try:
+            if gateway_clause and not _is_keyless_context():
+                line += "; a gateway that reads this file also judges calls by what the rule means"
+        except Exception:
+            pass
+        return line
     return "%s (%s)" % (desc, ev) if ev else desc
 
 
@@ -10185,8 +10976,9 @@ def _rules_are_read_only_here():
         return []
     return [
         "  These are here to read. Adding one needs to know which project's rules to",
-        "  write into, and this door cannot tell. Name your project in the server's",
-        "  env in your MCP config, and they become adoptable here:",
+        "  write into, and agentx-mcp is not told which project it serves. Name your",
+        "  project in the server's env in your MCP config, and they become adoptable",
+        "  here:",
         "     AGENTX_PROJECT_DIR=/path/to/your-project",
         "     Claude Code: ${CLAUDE_PROJECT_DIR}  Cursor/VS Code: ${workspaceFolder}",
     ]
@@ -10368,9 +11160,9 @@ def _undo_adopted_rules():
         print("=" * 75)
         print("   This screen covers YOUR rules, proposed from your own calls and accepted")
         print("   by you.")
-        print("\n   Not from this door yet. Removing a rule means knowing which project's")
-        print("   rules to remove it from, and this door cannot tell. Name your project in")
-        print("   the server's env in your MCP config:")
+        print("\n   Not from agentx-mcp yet. Removing a rule means knowing which project's")
+        print("   rules to remove it from, and agentx-mcp is not told which project it")
+        print("   serves. Name your project in the server's env in your MCP config:")
         print("     AGENTX_PROJECT_DIR=/path/to/your-project")
         print("=" * 75)
         # 🔴 EVERY EXIT RETURNS A COUNT, NOT SOMETIMES A COUNT AND SOMETIMES None. The caller
@@ -10458,8 +11250,9 @@ def _undo_allowlists():
     `.agentx/allowlist.json`, a committed file."""
     if not _mcp_door_knows_its_project():
         return 0
+    from .rules import read_allowlist_agents
     try:
-        agents = read_allowlist()
+        entries = read_allowlist_agents()
     except Exception as err:
         print("\n🌐 OUTBOUND ALLOWLISTS")
         print("=" * 75)
@@ -10468,22 +11261,30 @@ def _undo_allowlists():
         print(_wrap(str(err), "   "))
         print("=" * 75)
         return 0
-    if not agents:
+    if not entries:
         return 0
-    print("\n🌐 OUTBOUND ALLOWLISTS")
+
+    def _what(e):
+        parts = []
+        if e.get("tools") is not None:
+            parts.append("may call: %s" % (", ".join(e["tools"]) or "no tool"))
+        if e.get("hosts") is not None:
+            parts.append("may reach: %s" % (", ".join(e["hosts"]) or "no site"))
+        return "; ".join(parts)
+    print("\n🌐 ALLOWLISTS")
     print("=" * 75)
     if not sys.stdin.isatty():
         print("\n📋 %s, listed only. Run this in a terminal to remove any:"
-              % _plural(len(agents), "agent limited", "agents limited"))
-        for agent, hosts in sorted(agents.items()):
-            print(_wrap(", ".join(hosts), "   %s: " % agent))
+              % _plural(len(entries), "agent limited", "agents limited"))
+        for agent, e in sorted(entries.items()):
+            print(_wrap(_what(e), "   %s: " % agent))
         print("=" * 75)
         return 0
     print("\n📋 %s. Nothing is removed unless you type y; Enter keeps."
-          % _plural(len(agents), "agent limited", "agents limited"))
+          % _plural(len(entries), "agent limited", "agents limited"))
     removed = 0
-    for agent, hosts in sorted(agents.items()):
-        print(_wrap(", ".join(hosts), "   %s may reach: " % agent))
+    for agent, e in sorted(entries.items()):
+        print(_wrap(_what(e), "   %s " % agent))
         try:
             raw = input("   stop limiting this agent? [y]es / [n]o / [q]uit: ")
         except (EOFError, KeyboardInterrupt):
@@ -10507,6 +11308,12 @@ def _undo_allowlists():
             print("   – kept")
     print("\n✓ %s." % (("%s no longer limited" % _plural(removed, "agent")) if removed
                        else "Nothing changed"))
+    if removed and resolve_api_key(load_env_file()):
+        # A gateway enforces the copy a person sent it, not this file. Keyless, there is no
+        # gateway copy; on the MCP door there is no push command to name. "If": a gateway beside
+        # the project reads this file itself, and one never sent a list has no copy.
+        print("   If you sent this list to your gateway, it keeps that copy until you send it again"
+              + ("." if MCP_ENTRY else ": agentx allowlist push"))
     print("=" * 75)
     return removed
 
@@ -10666,7 +11473,7 @@ def execute_review(args=None):
         # Blocks awaiting a verdict, MCP safe-paths, and the detection rules `insights` prints.
         # The rules were missing here for as long as they could only come from a judge.
         items = (verdict_items + _mcp_review_items() + _rule_review_items()
-                 + _allowlist_review_items())
+                 + _allowlist_review_items() + _tool_allowlist_review_items())
         if _page_of_more and "--recover" not in args:
             # Only when the VERDICT read was truncated, and never under --recover, where
             # blocks are not what is being listed.
@@ -10715,7 +11522,7 @@ def execute_review(args=None):
             # The path on a line of its own, fitted by its tail: with a temp-dir path this
             # parenthetical was one ~130-column line, wrapped by the terminal mid-word on the
             # founder's walk. Every line here now fits the 75 fence like the rest of the screen.
-            print("   (no incident store yet at %s;" % _fit_tail(census["path"], 45))
+            print("   (no record of blocks yet at %s;" % _fit_tail(census["path"], 45))
             # `agentx status` is a bare subcommand with no MCP form. It is informational, not
             # the loop, so on that door the sentence keeps its meaning and drops the command.
             if MCP_ENTRY:
@@ -10786,7 +11593,7 @@ def execute_review(args=None):
     # describe a population this screen is not showing.
     if undo_mode:
         print("   These are single blocks you judged one at a time.")
-    adopted = labeled = deleted = rules_added = sites_allowed = 0
+    adopted = labeled = deleted = rules_added = sites_allowed = tools_allowed = 0
     # 🔴 THE THIRD PASS NEEDED THE SAME FLAG AS THE OTHER TWO. Both undo passes gained one so
     # that quitting reads "Stopped" rather than "Nothing changed", which is the wording
     # reserved for a reader who saw everything and kept it. This walk kept falling through to
@@ -10799,6 +11606,9 @@ def execute_review(args=None):
                 # No default, Enter skips: the same rule as the rule item below, for the same
                 # reason. Allowing a site changes what gets stopped from the next call.
                 sites_allowed += _walk_allowlist_item(it)
+                continue
+            if it["kind"] == "tool_allowlist":
+                tools_allowed += _walk_tool_allowlist_item(it)
                 continue
             if it["kind"] == "rule":
                 # Straight to `adopt_rule`, not through `_adopt_rule_candidate`: that helper
@@ -11002,12 +11812,15 @@ def execute_review(args=None):
         _done.append(f"    {rules_added} {rule_word} added")
     if sites_allowed:
         _done.append(f"    {_plural(sites_allowed, 'site')} allowed, in .agentx/allowlist.json")
+    if tools_allowed:
+        _done.append(f"    {_plural(tools_allowed, 'tool')} allowed, in .agentx/allowlist.json; "
+                     + _tool_list_enforced_clause())
     if labeled:
         _done.append(f"    {labeled} block(s) settled: they stop coming back here")
     if deleted:
         # "the incident store", not "this ledger": the line above it may have just said a
         # locally recorded copy stays, and the call ledger is what "ledger" means on screen.
-        _done.append(f"    {deleted} block(s) deleted: gone from the incident store for good")
+        _done.append(f"    {deleted} block(s) deleted: gone from the record of blocks for good")
     if _done:
         print("\n✓ Review done.")
         for _ln in _done:
@@ -11240,6 +12053,8 @@ def _resolve_policy_target(ref):
     is True only when the ref matches a built-in policy OR a policy actually present in the
     local incident store or the call ledger — so a typo can't silently mint a junk standing
     rule when SETTING."""
+    from .db import stored_policy_name
+    ref = stored_policy_name(ref)                  # the name as screens show it -> as stored
     pid, pname = _resolve_policy_ref(ref)          # built-in name -> (id, name); else (ref, None)
     if pname is not None:
         return pid, pname, True
@@ -11264,7 +12079,7 @@ def _verdict_policy(ref, verdict, do_clear, force):
     flow can't close (a single-item correction moves only that row, and a quiet policy shows
     no items at all)."""
     pid, pname, known = _resolve_policy_target(ref)
-    label = pname or ref
+    label = _shown_policy(pname) if pname else ref
 
     if do_clear:
         if verdict is not None:
@@ -11305,7 +12120,7 @@ def _verdict_policy(ref, verdict, do_clear, force):
 
     # set / change
     if not known:
-        print(f"\n❌ No policy named or id '{ref}' in your catalog, incident store or call ledger.")
+        print(f"\n❌ No policy named or id '{ref}' in your catalog, record of blocks or call ledger.")
         print("   Check the exact name in `agentx review` / `agentx policies`.")
         print("=" * 75)
         sys.exit(1)
@@ -11478,7 +12293,7 @@ def execute_verdict(args):
         print(f"\n✓ Block {rid} marked {_verdict_phrase(verdict)}.")
         print("=" * 75)
     else:
-        print("\n❌ Could not record the verdict (incident store missing or not writable).")
+        print("\n❌ Could not record the verdict (the record of blocks is missing or not writable).")
         print("=" * 75)
         sys.exit(1)
 
@@ -11763,7 +12578,7 @@ def _block_attack_phrase(block):
             return _CATEGORY_PHRASE[category]
     except Exception:
         pass
-    name = (block.get("policy_name") or "").strip()
+    name = (_shown_policy(block.get("policy_name")) or "").strip()
     return f"a {name} action" if name else "an unsafe action"
 
 
@@ -11789,7 +12604,7 @@ def _render_block_card(block, note=None, inner=54):
         else "BLOCKED before it ran"
 
     rows = []
-    rows.append(("policy", block.get("policy_name") or "—"))
+    rows.append(("policy", _shown_policy(block.get("policy_name")) or "—"))
     tool = block.get("tool_name")
     if tool:
         rows.append(("tool", f"{tool}()"))
@@ -12307,8 +13122,8 @@ def execute_demo(closing=True):
         #
         # 🔴 "YOUR DATA DOES NOT LEAVE YOUR MACHINE", NOT "NOTHING LEFT YOUR MACHINE". The
         # blanket version is false and we know it is: this run emits the anonymous activation
-        # pulse at exit, and the floor makes a dependency-reputation call to the public
-        # registries. README's own "What leaves your machine" section names both. That
+        # pulse at exit. (The dependency-reputation call to the public registries is the
+        # gateway's, not this keyless run's.) README's "What leaves your machine" says so. That
         # correction was made on the landing page (ui/app/page.tsx twice) and never reached
         # the CLI, so the strongest form of the claim survived on the FIRST screen a stranger
         # sees -- the one place a privacy claim is least checkable and most load-bearing.
@@ -12318,7 +13133,9 @@ def execute_demo(closing=True):
         # "No LLM call" is gone from this line: the decorator's own two lines directly above
         # already said "(local check, no LLM)" and "(no key needed)", and the founder read
         # the same fact three times in four lines. The consequence stays.
-        print(" ✅ STOPPED before it ran. Your data did not leave your machine.")
+        # Not "Your data did not leave your machine": true (keyless sends nothing) but beside a
+        # DROP TABLE it read as an exfiltration stopped. The two lines below say what was kept.
+        print(" ✅ STOPPED before it ran.")
         print(f"      policy:   {getattr(blocked, 'policy', None)}")
         print("      The DROP TABLE never reached your database, and your agent was")
         print("      told what to do instead.")
@@ -12671,7 +13488,7 @@ def _print_cli_usage(advanced=False):
     print("                ('demo --audit' runs the same agent in watch-only mode and fills the audit screen)")
     # In the DEFAULT view: for a Claude Code user it is the whole of wiring us in, one command.
     print("  hook        Check Claude Code's shell commands and MCP calls ('hook install' adds it to")
-    print("                this project's .claude/settings.local.json; watches until AGENTX_POSTURE=enforce)")
+    print("                this project's .claude/settings.local.json; '--enforce' blocks)")
     # In the DEFAULT view, not --advanced, because it is the rung immediately after `demo`
     # and both demo footers now send the reader here. A command the on-ramp names and the
     # help screen hides is unfindable the moment that footer scrolls away.
@@ -12693,6 +13510,8 @@ def _print_cli_usage(advanced=False):
     print("  status      Local protection stats + armed policies (default; live view needs the gateway)")
     print("  review      One-key pass over pending blocks: adopt a safe-path, or label a block")
     print("                ('--stats' for a summary of every incident's outcome, not just what's pending)")
+    print("  allowlist   The tools and sites each agent may use, compared with your gateway's copy")
+    print("                ('allowlist push' sends .agentx/allowlist.json to your gateway)")
     print("  help        Show this message (also: -h, --help)")
     if not advanced:
         print("\n  More commands:  agentx help --advanced   (curation, floor tuning, org sync)")
@@ -12739,7 +13558,7 @@ def _print_cli_usage(advanced=False):
         print("    verdict       Record a verdict: 'verdict <receipt> --wrong | --accept-risk | --correct',")
         print("                  or a policy's standing rule: 'verdict --policy \"<name>\" <verdict>'.")
         print("                  '--clear' takes either one back")
-        print("    mcp-insights  Review + adopt safe-paths from the keyless MCP wedge (sibling of insights)")
+        print("    mcp-insights  Review + adopt safe-paths from agentx-mcp (sibling of insights)")
         # Also lists what the policies file adds (step 2), so the line says so; the /docs CLI
         # table carries the same words.
         print("    policies      List the customizable floor policies + your active coaching ('--check' to validate),")
@@ -12759,7 +13578,7 @@ def _print_cli_usage(advanced=False):
     print("       def your_tool(arg): ...")
     print("       out = your_tool(risky_input)")
     print("       if is_block(out):")
-    print("           revised = your_llm(out.challenge)   # coach the agent to a safe path")
+    print("           revised = your_llm(str(out))   # what was wrong and the safe path to take")
     print("           out = your_tool(revised, receipt_id=out.receipt_id)   # then retry")
     print("\n  Docs: https://agentx-core.com/docs   Gateway access: %s" % _gateway_url())
     print("=" * 75)
@@ -12827,7 +13646,10 @@ def main():
     # The rule is FLAT -- any `--json` anywhere in argv, not a list of commands known to
     # support it. A carve-out here would be a hole in the shape of the next command to grow
     # the flag, which is the shape this codebase keeps having to re-fix.
-    _chrome = sys.stderr if "--json" in sys.argv[1:] else sys.stdout
+    # A version request is machine output too: `agentx --version` stdout is the version alone,
+    # as `agentx-mcp --version` gives (cold-install walk).
+    _chrome = (sys.stderr if "--json" in sys.argv[1:]
+               or sys.argv[1:2] in (["--version"], ["version"]) else sys.stdout)
     print("🛡️  AgentX", file=_chrome)
     print("=" * 75, file=_chrome)
 
@@ -12950,8 +13772,14 @@ def main():
             execute_combined_demo()
     elif command == "share":
         execute_share(args[1:])
+    elif command == "allowlist":
+        execute_allowlist(args[1:], gateway_url, resolve_api_key(env) or "")
     elif command in ["status", "inspect"]:
         execute_status_inspection(gateway_url, api_key, mode)
+    elif command in ("--version", "version"):
+        # A stranger's first command after installing, and `agentx-mcp --version` already
+        # answers it; this one printed "Unknown command" and the whole help, exit 2.
+        print("agentx-security-sdk %s" % (_sdk_version() or "unknown"))
     elif command in ("help", "-h", "--help"):
         advanced = any(a.lower() in ("--advanced", "-a", "advanced", "all", "--all")
                        for a in args[1:])

@@ -258,7 +258,7 @@ def _allowed_call_rows(db_path=None):
         # after filtering, never before.
         "ORDER BY MAX(quantity) DESC, COUNT(*) ASC, tool_name ASC")
     try:
-        conn = sqlite3.connect(path)
+        conn = _db.calls_view(sqlite3.connect(path))
         try:
             rows = conn.execute(
                 sql, tuple([_HOOK_AGENT, _db.INVENTORY_STATUS] + list(frag_params))).fetchall()
@@ -1332,6 +1332,13 @@ def adopt_rule(candidate, *, challenge=None, name=None, path=None, only_when=Non
 #   {"version": 1, "agents": {"<agent_id>": {"hosts": ["api.github.com", "*.example.com"],
 #                                            "adopted_at": "…"}}}
 #
+# VERSION 2 adds an optional `"tools"` list per agent, the tools that agent may call, and
+# makes `"hosts"` optional. A key that is present limits that dimension; an absent key means not
+# limited; an empty list means nothing is allowed. The TOOL list is enforced by the gateway, from
+# the copy `agentx allowlist push` stores there; this file is where a
+# person writes it and git records who changed it. The writer emits version 2 only when an entry
+# needs it, because an SDK at 0.5.5 or older refuses an entry with no `"hosts"` (and so fails closed).
+#
 # Its own file beside `rules.json`, not a key inside it, for the reason that file gives for
 # keeping `import.json` apart: three concerns, three files. `rules.json` is also read strictly
 # by the gateway, and its writer rewrites the whole document, so a key it does not know would be
@@ -1351,7 +1358,23 @@ def adopt_rule(candidate, *, challenge=None, name=None, path=None, only_when=Non
 # is not yet protected from the agent.
 DEFAULT_ALLOWLIST_FILE_NAME = "allowlist.json"
 _ALLOWLIST_FILE_VERSION = 1
+_ALLOWLIST_FILE_VERSION_TOOLS = 2
 _ALLOWLIST_WILDCARD = "*."
+_TOOL_NAME_MAX_LEN = 200
+# An entry named `*` covers every agent the file does not name. The gateway applies it (an agent
+# picks its own id, so without it an agent could leave its list by sending another name); this
+# SDK's own site check reads only an agent's own entry.
+_ALLOWLIST_ANY_AGENT = "*"
+# The two doors that are the developer's own tools, not an agent the team ships: the Claude Code
+# hook and agentx-mcp. `*` is written for the team's agents, and these never reach a gateway, so
+# `*` does not cover them (a team's list for its bots used to block the developer's own `curl`).
+# The ENFORCEMENT exemption is by DOOR: those two pass `star_applies=False` (through the free
+# check's `own_tool_door`), because a name is whatever a decorator says, and a decorated agent
+# calling itself `mcp_proxy` must not leave `*` (review). These ids are used only by the review
+# screen and adopt, which read the ledger those doors wrote. An entry naming one of them
+# explicitly still applies. Pinned equal to `hook.AGENT_ID` and `mcp_proxy._MCP_AGENT_ID` by
+# sdk_tests/test_tool_allowlist_file.py.
+_STAR_EXEMPT_DOOR_IDS = frozenset({"claude_code_hook", "mcp_proxy"})
 
 
 def _allowlist_file_path(path=None):
@@ -1373,10 +1396,29 @@ def _allowlist_entry(raw):
     return entry if clean_host(entry) == entry else None
 
 
+def _agent_name_ok(agent):
+    """An agent name the gateway accepts: a string of 1 to `_TOOL_NAME_MAX_LEN` characters. The
+    same rule on both sides, or a file this SDK writes would be refused whole by a gateway."""
+    return isinstance(agent, str) and 0 < len(agent) <= _TOOL_NAME_MAX_LEN
+
+
+def _tool_entry(raw):
+    """One tool name as stored and compared (exact, case kept), or None when it is not one: a
+    string with no control characters and no surrounding space, at most `_TOOL_NAME_MAX_LEN`."""
+    if not isinstance(raw, str):
+        return None
+    if not raw or raw != raw.strip() or len(raw) > _TOOL_NAME_MAX_LEN:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return None
+    return raw
+
+
 def _read_allowlist_doc(p):
-    """{agent_id: {"hosts": [...], "adopted_at": ...}} as stored and validated. {} when the file
-    does not exist. Raises ValueError (or OSError) for a file that exists and cannot be read as
-    this shape: absent means none adopted, damaged must never read as none adopted."""
+    """{agent_id: {"hosts": [...] or None, "tools": [...] or None, "adopted_at": ...}} as stored
+    and validated; None means that dimension is not limited (version 2). {} when the file does not
+    exist. Raises ValueError (or OSError) for a file that exists and cannot be read as this shape:
+    absent means none adopted, damaged must never read as none adopted."""
     if not os.path.exists(p):
         return {}
     # `utf-8-sig`: Notepad and PowerShell's `Set-Content -Encoding UTF8` write a byte-order mark,
@@ -1389,18 +1431,42 @@ def _read_allowlist_doc(p):
                          % p)
     out = {}
     for agent, entry in agents.items():
-        hosts = entry.get("hosts") if isinstance(entry, dict) else None
-        if not isinstance(hosts, list):
-            raise ValueError("%s: agent %r has no \"hosts\" list" % (p, agent))
-        clean = []
-        for h in hosts:
-            e = _allowlist_entry(h)
-            if e is None:
-                raise ValueError("%s: agent %r lists %r, which is not a host (a name with "
-                                 "non-ASCII letters must be written in its xn-- form)"
-                                 % (p, agent, h))
-            clean.append(e)
-        out[str(agent)] = {"hosts": sorted(set(clean)),
+        if not _agent_name_ok(agent):
+            raise ValueError("%s: agent name %r must be 1 to %d characters"
+                             % (p, str(agent)[:40] + ("..." if len(str(agent)) > 40 else ""),
+                                _TOOL_NAME_MAX_LEN))
+        if not isinstance(entry, dict):
+            raise ValueError("%s: agent %r is not an object" % (p, agent))
+        if "hosts" not in entry and "tools" not in entry:
+            raise ValueError("%s: agent %r has neither a \"hosts\" nor a \"tools\" list"
+                             % (p, agent))
+        hosts, tools = entry.get("hosts"), entry.get("tools")
+        if "hosts" in entry and not isinstance(hosts, list):
+            raise ValueError("%s: agent %r has a \"hosts\" that is not a list" % (p, agent))
+        if "tools" in entry and not isinstance(tools, list):
+            raise ValueError("%s: agent %r has a \"tools\" that is not a list" % (p, agent))
+        clean = None
+        if hosts is not None:
+            clean = []
+            for h in hosts:
+                e = _allowlist_entry(h)
+                if e is None:
+                    raise ValueError("%s: agent %r lists %r, which is not a host (a name with "
+                                     "non-ASCII letters must be written in its xn-- form)"
+                                     % (p, agent, h))
+                clean.append(e)
+            clean = sorted(set(clean))
+        names = None
+        if tools is not None:
+            names = []
+            for t in tools:
+                e = _tool_entry(t)
+                if e is None:
+                    raise ValueError("%s: agent %r lists %r, which is not a tool name"
+                                     % (p, agent, t))
+                names.append(e)
+            names = sorted(set(names))
+        out[str(agent)] = {"hosts": clean, "tools": names,
                            "adopted_at": entry.get("adopted_at")}
     return out
 
@@ -1410,9 +1476,19 @@ def _write_allowlist_doc(p, agents):
     parent = os.path.dirname(p)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    doc = {"version": _ALLOWLIST_FILE_VERSION,
-           "agents": {a: {"hosts": sorted(set(e["hosts"])), "adopted_at": e.get("adopted_at")}
-                      for a, e in sorted(agents.items())}}
+    # Version 2 only when an entry needs it: an SDK at 0.5.5 or older refuses an entry with no
+    # "hosts", and a team sharing the file through git may not have upgraded every install.
+    needs_v2 = any(e.get("hosts") is None or e.get("tools") is not None for e in agents.values())
+    out = {}
+    for a, e in sorted(agents.items()):
+        entry = {"adopted_at": e.get("adopted_at")}
+        if e.get("hosts") is not None:
+            entry["hosts"] = sorted(set(e["hosts"]))
+        if e.get("tools") is not None:
+            entry["tools"] = sorted(set(e["tools"]))
+        out[a] = entry
+    doc = {"version": _ALLOWLIST_FILE_VERSION_TOOLS if needs_v2 else _ALLOWLIST_FILE_VERSION,
+           "agents": out}
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(doc, fh, indent=2, ensure_ascii=False, sort_keys=True)
@@ -1421,8 +1497,25 @@ def _write_allowlist_doc(p, agents):
 
 
 def read_allowlist(path=None):
-    """{agent_id: [entries]}. {} when there is no file; raises for a damaged one."""
-    return {a: e["hosts"] for a, e in _read_allowlist_doc(_allowlist_file_path(path)).items()}
+    """{agent_id: [host entries]} for the agents whose sites are limited. {} when there is no
+    file; raises for a damaged one. An agent with only a tool list is not here: its sites are not
+    limited."""
+    return {a: e["hosts"] for a, e in _read_allowlist_doc(_allowlist_file_path(path)).items()
+            if e["hosts"] is not None}
+
+
+def read_tool_allowlist(path=None):
+    """{agent_id: [tool names]} for the agents whose tools are limited (version 2). {} when there
+    is no file; raises for a damaged one."""
+    return {a: e["tools"] for a, e in _read_allowlist_doc(_allowlist_file_path(path)).items()
+            if e["tools"] is not None}
+
+
+def read_allowlist_agents(path=None):
+    """Every agent the file names, with what it limits: {agent_id: {"hosts", "tools",
+    "adopted_at"}}, None for a dimension not limited. For screens that must list a tools-only
+    agent too (`--undo`)."""
+    return _read_allowlist_doc(_allowlist_file_path(path))
 
 
 def adopt_allowlist(agent_id, hosts, path=None):
@@ -1430,6 +1523,8 @@ def adopt_allowlist(agent_id, hosts, path=None):
     agent) if it has none. Returns the agent's full list. Raises ValueError for a host that is
     not one, or for a damaged file, which is never overwritten."""
     agent_id = str(agent_id)
+    if not _agent_name_ok(agent_id):
+        raise ValueError("an agent name must be 1 to %d characters" % _TOOL_NAME_MAX_LEN)
     entries = []
     for h in hosts:
         e = _allowlist_entry(h)
@@ -1438,9 +1533,78 @@ def adopt_allowlist(agent_id, hosts, path=None):
         entries.append(e)
     p = _allowlist_file_path(path)
     agents = _read_allowlist_doc(p)
-    current = agents.get(agent_id) or {"hosts": [], "adopted_at": None}
-    merged = sorted(set(current["hosts"]) | set(entries))
-    agents[agent_id] = {"hosts": merged, "adopted_at": _now_iso()}
+    current = _entry_to_extend(agents, agent_id)
+    merged = sorted(set(current.get("hosts") or []) | set(entries))
+    agents[agent_id] = dict(current, hosts=merged, adopted_at=_now_iso())
+    _write_allowlist_doc(p, agents)
+    return merged
+
+
+def _entry_to_extend(agents, agent_id):
+    """The entry an adopt adds to: the agent's own, else a COPY of the `*` entry, else an empty
+    one. An agent's own entry replaces `*` whole where the list is enforced, so starting a new one
+    empty would drop every limit `*` gave that agent (its sites, its other tools)."""
+    own = agents.get(agent_id)
+    if own is not None:
+        return own
+    star = (None if str(agent_id) in _STAR_EXEMPT_DOOR_IDS
+            else agents.get(_ALLOWLIST_ANY_AGENT))
+    if star is not None:
+        return {"hosts": list(star["hosts"]) if star.get("hosts") is not None else None,
+                "tools": list(star["tools"]) if star.get("tools") is not None else None,
+                "adopted_at": None}
+    return {"hosts": None, "tools": None, "adopted_at": None}
+
+
+def governing_entry(agents, agent_id, star_applies=True):
+    """The entry that governs `agent_id` where the list is enforced: its own, else `*`, else
+    None. The gateway applies the same rule."""
+    entry = agents.get(str(agent_id))
+    if entry is not None or not star_applies:
+        return entry
+    return agents.get(_ALLOWLIST_ANY_AGENT)
+
+
+def allowlist_fingerprint(agents):
+    """A short, stable fingerprint of a parsed allowlist ({agent: {"hosts", "tools", ...}}), so a
+    developer can tell whether the list their gateway holds is the one in this repository.
+    🔴 THE GATEWAY COMPUTES THE SAME VALUE (`allowlist_fingerprint` there): canonical JSON of each
+    agent's hosts and tools (None when not limited), sorted keys, no spaces, sha256, first 16 hex
+    characters. `adopted_at` is left out: when a list was adopted is not what it allows."""
+    import hashlib
+    canon = {str(a): {"hosts": e.get("hosts"), "tools": e.get("tools")}
+             for a, e in agents.items()}
+    raw = json.dumps(canon, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def allowlist_push_document(agents):
+    """The body `agentx allowlist push` sends: the parsed file as version 2, a dimension that is
+    not limited left out (never sent as null), `adopted_at` dropped."""
+    return {"version": _ALLOWLIST_FILE_VERSION_TOOLS,
+            "agents": {a: {k: e[k] for k in ("hosts", "tools") if e.get(k) is not None}
+                       for a, e in sorted(agents.items())}}
+
+
+def adopt_tool_allowlist(agent_id, tools, path=None):
+    """Add `tools` to `agent_id`'s tool list, creating it (and so starting to limit that agent's
+    tools wherever the list is enforced) if it has none. Returns the agent's full tool list.
+    Raises ValueError for a name that is not one, or for a damaged file, which is never
+    overwritten. The agent's sites are left as they were."""
+    agent_id = str(agent_id)
+    if not _agent_name_ok(agent_id):
+        raise ValueError("an agent name must be 1 to %d characters" % _TOOL_NAME_MAX_LEN)
+    names = []
+    for t in tools:
+        e = _tool_entry(t)
+        if e is None:
+            raise ValueError("%r is not a tool name" % (t,))
+        names.append(e)
+    p = _allowlist_file_path(path)
+    agents = _read_allowlist_doc(p)
+    current = _entry_to_extend(agents, agent_id)
+    merged = sorted(set(current.get("tools") or []) | set(names))
+    agents[agent_id] = dict(current, tools=merged, adopted_at=_now_iso())
     _write_allowlist_doc(p, agents)
     return merged
 
@@ -1460,8 +1624,9 @@ _ALLOWLIST_CACHE = {}   # path -> ((mtime_ns, size), {agent: [entries]})
 
 
 def _armed_allowlist(path=None):
-    """{agent_id: [entries]}, re-read only when the file's (mtime, size) changes. {} when there
-    is no file. RAISES for a damaged one: the caller fails closed (see the block above)."""
+    """The whole parsed file ({agent_id: {"hosts", "tools", ...}}), re-read only when the file's
+    (mtime, size) changes. {} when there is no file. RAISES for a damaged one: the caller fails
+    closed (see the block above)."""
     p = _allowlist_file_path(path)
     try:
         st = os.stat(p)
@@ -1472,7 +1637,7 @@ def _armed_allowlist(path=None):
     cached = _ALLOWLIST_CACHE.get(p)
     if cached and cached[0] == key:
         return cached[1]
-    agents = read_allowlist(p)
+    agents = read_allowlist_agents(p)
     _ALLOWLIST_CACHE[p] = (key, agents)
     return agents
 
@@ -1489,7 +1654,7 @@ def host_is_listed(host, entries):
     return False
 
 
-def allowlist_miss(agent_id, raw_hosts, path=None):
+def allowlist_miss(agent_id, raw_hosts, path=None, star_applies=True):
     """Whether a call addressed to `raw_hosts` (as `statement.destination_url_hosts` reads them) may go
     ahead for `agent_id`. None when it may; otherwise a dict saying why:
 
@@ -1506,7 +1671,11 @@ def allowlist_miss(agent_id, raw_hosts, path=None):
         agents = _armed_allowlist(path)
     except Exception as err:
         return {"reason": "unreadable_file", "host": None, "path": p, "error": str(err)}
-    entries = agents.get(str(agent_id))
+    # The entry that governs this agent: its own, else `*` (the gateway's reading too). Reading
+    # only its own let a `*` site list stop nothing here, and with a key a call it stops was
+    # handed to a gateway that had never seen it (review of the deferral rule).
+    governs = governing_entry(agents, agent_id, star_applies=star_applies)
+    entries = governs.get("hosts") if governs else None
     if entries is None:
         return None
     from .db import clean_host

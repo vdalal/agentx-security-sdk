@@ -100,11 +100,28 @@ _STATEMENT_ARG_NAMES = frozenset((
 ))
 
 
+def _wire_value(value):
+    """ONE argument value in the shape the gateway is sent: a tuple, set or frozenset becomes a
+    list (a set sorted by `repr`, so two calls with the same set send the same text), anything
+    else as it is. Used by the flattened text below AND the decorator's `args`, so the gateway's
+    "is `query` exactly these arguments?" comparison sees the same value on both sides.
+
+    A tuple or set used to reach the gateway not at all: this function returned None for it, so
+    `crawl(urls=("https://x/",))` sent only a placeholder and no gateway check saw the address."""
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, (set, frozenset)):
+        return sorted(value, key=repr)
+    return value
+
+
 def _coerce_arg_value(value):
     """Coerce ONE argument value into the text the keyless keyword shield scans, or
     None to skip it. The single home for value flattening, shared by the decorator's
     arg loop and the agentx-mcp proxy's _flatten_call so the two feeders can't drift:
-    str as-is, bool/int/float stringified, dict/list as compact JSON."""
+    str as-is, bool/int/float stringified, dict/list (and a tuple or set, as a list) as
+    compact JSON."""
+    value = _wire_value(value)
     if isinstance(value, str):
         return value
     if isinstance(value, (bool, int, float)):   # bool is an int subclass; str() is identical
@@ -212,9 +229,15 @@ def _statement_parts(arguments, tool_name=None, head=None, declared=None):
             # both (`db="prod"` matches no rail, so nothing is lost). The first cut read
             # exactly one string and nothing when there were two, which lost the SQL floor
             # on that tool the moment it took a second string.
+            # A list of strings counts too: `run_sql(stmts=["DROP TABLE users"])` declared
+            # nothing on either door before. A dict is still walked by `_walk` only.
             for v in arguments.values():
                 if isinstance(v, str):
                     _append(v)
+                elif isinstance(v, (list, tuple)):
+                    for item in v:
+                        if isinstance(item, str):
+                            _append(item)
     # A list, one text per declared value: a reader that must not let one argument's value
     # complete another's (a command beside a `directory`) reads them apart.
     return parts

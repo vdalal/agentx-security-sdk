@@ -193,7 +193,7 @@ def _drive(run_proxy, stub_path, out, audit=False):
     # the reader nothing to do, which is the same dead end the scan CTA had.
     print("\n" + "-" * 68, file=out)
     if audit:
-        print(" Nothing was installed and no key was used. Both calls reached the", file=out)
+        print(" This demo used no server of yours and no key. Both calls reached the", file=out)
         print(" server, including the destructive one. That is what watch-only is.", file=out)
         print("", file=out)
         # The way back to blocking, named on the screen that just showed it switched off.
@@ -214,8 +214,9 @@ def _drive(run_proxy, stub_path, out, audit=False):
               file=out)
         print(" record you keep is the one from your own server, below.", file=out)
     else:
-        print(" Nothing was installed and no key was used. This is the free local check:", file=out)
-        print(" it stops the blatant destructive calls, not everything.", file=out)
+        print(" This demo used no server of yours and no key. What stopped the call", file=out)
+        print(" is the free local check: it stops the blatant destructive calls, not", file=out)
+        print(" everything.", file=out)
         print("", file=out)
         # 🔴 THE MIDDLE RUNG, AS A COMMAND. This door's ladder ran: --demo (a command),
         # then EDIT mcp.json AND RESTART YOUR CLIENT (a change in the reader's own repo),
@@ -247,8 +248,11 @@ def _drive(run_proxy, stub_path, out, audit=False):
         # "The env line is optional" arrived AFTER the snippet, and the snippet is what gets
         # copied. Blocking is what this screen demonstrated, so blocking is what its config
         # shows; watch-only is named under it as the option it is.
-        print(" Now do it on your own server. It blocks there the way it just did here.",
+        # "With the env line": without it a wrapped server only watches, so the bare promise
+        # "it blocks there" was false for the plain config (cold-install audit).
+        print(" Now do it on your own server. With the env line below, it blocks there",
               file=out)
+        print(" the way it just did here.", file=out)
     # The one sentence P-151 exists for, placed BEFORE the config rather than after it: the
     # reader needs to know what setting this buys before they paste it, not once they have.
     # It says only what the line above does not -- the clause already covers "blocks nothing",
@@ -326,8 +330,8 @@ def _drive(run_proxy, stub_path, out, audit=False):
         # "keep watching", not "keep blocking". Scope is unchanged -- one agentx-mcp process
         # wraps ONE server and `env` applies to its own block -- but what the untouched
         # servers DO is the opposite of what it was, and this sentence asserts it.
-        print(" The env line is optional. Add it per server block; the servers", file=out)
-        print(" you leave alone keep watching without blocking.", file=out)
+        print(" Leave the env line out and that server only watches. Add it per server", file=out)
+        print(" block; the servers you leave alone keep watching without blocking.", file=out)
     else:
         # The option, named AFTER the config that matches what they watched, in the clause
         # every other surface uses so the two doors cannot drift on what audit means.

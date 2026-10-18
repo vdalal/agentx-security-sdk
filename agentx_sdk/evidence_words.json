@@ -10,7 +10,10 @@
     "COMPLIED": "Agent changed course",
     "EXPIRED": "Held, no answer in time",
     "RECOVERED": "Blocked, agent told why, then a later call to the same tool ran",
-    "WOULD_BLOCK": "Would have been stopped; ran (watching)"
+    "WOULD_BLOCK": "Would have been stopped; ran (watching)",
+    "HELD": "Held for a person, not approved; did not run",
+    "REFUSED": "Not run: no verdict could be had",
+    "HALTED": "Halted as a runaway loop; did not run"
   },
   "after": {
     "APPROVED": "then approved by a person",
@@ -29,19 +32,22 @@
       "sites_recorded": "For each agent, each site with the number of allowed calls that named it, back to \"sites_since\" in records_kept.",
       "record_head": "The record's latest entry when this file was made. To check later that the record was not rewritten since, open the Evidence page with ?head=<this value> added to its address; it says whether that entry still matches.",
       "rule_sources": "Each place this gateway's rules come from, and whether it was read when this file was made. \"policy_store\" is the gateway's own rule store; \"rules_file\" is the file of rules a developer added on this gateway. \"read\"; \"no file\" (nothing there, so nothing from it); \"damaged\" (it exists and could not be understood); \"could not open\" (the system refused to open it). A state followed by \", earlier copy in force\" means the gateway could not read the file now and still uses the rules it last read from it, and those switched on are listed in rules_in_force; without an earlier copy, no rule from it is in force.",
-      "record_not_intact": "The record was changed outside AgentX since it was written, so it is not intact."
+      "record_not_intact": "The record was changed outside AgentX since it was written, so it is not intact.",
+      "sql_checks": "The SQL checks catch the common destructive and bulk-read shapes, not every spelling. Known ways past them: a WHERE hidden behind a comment (-- or #), a statement written with no spaces, two statements on one line, a LIMIT with a fraction, MERGE, COPY ... TO or INTO OUTFILE, SUM or AVG over one-row groups, and a statement the parser cannot read. To limit what an agent can reach whatever the spelling, give it only the tools it needs (a tool allowlist)."
     },
     "local": {
-      "about": "AgentX evidence from one developer's machine: the rules this machine's AgentX checks agent calls against, the rules switched off and what still runs, the calls it stopped or would have stopped while watching, the sites recorded for calls it allowed (a site can be missing, none is added), the outbound allowlist itself, and the record's latest entry. The calls' own text is not included. A list that is null could not be read when this file was produced; an empty list was read and holds nothing. Fields this machine has no source for are named in \"not_on_this_door\", never filled in.",
+      "about": "AgentX evidence from one developer's machine: the rules this machine's AgentX checks agent calls against, the rules switched off and what still runs, the calls it stopped or would have stopped while watching, the calls held for a person and not approved, the calls it did not run because no verdict could be had, the calls it halted as a runaway loop, the sites recorded for calls it allowed (a site can be missing, none is added), the outbound allowlist itself, and the record's latest entry. The calls' own text is not included. A list that is null could not be read when this file was produced; an empty list was read and holds nothing. Fields this machine has no source for are named in \"not_on_this_door\", never filled in.",
       "rules_in_force": "Each description says what the rule stops when blocking is on. While watching, a call it would stop runs, and is listed below as \"Would have been stopped; ran (watching)\".",
       "outbound_allowlist": "For each agent the allowlist limits, the only sites its calls may reach. {} means no agent is limited, so calls may reach any site. An agent listed with [] may reach no site. null means the allowlist file could not be read, and every call to a site is stopped.",
       "rule_sources": "Each place this machine's rules come from, and whether it was read when this file was made: \"read\"; \"no file\" (nothing there, so nothing from it); \"damaged\" (it exists and could not be understood); \"could not open\" (the system refused to open it); \"earlier import file\" (the rules file holds an import file from an earlier version, so no rules were added); \"could not read\" (it could not be looked at, so whether it holds rules is not known). A rule from a source that was not read is not in rules_in_force, except an allowlist that could not be read, which is listed there because it stops every call to a site. A policies file that could not be read stops every protected call in the default posture.",
       "who_can_change": "Anyone who can write this project's .agentx folder or its policies file. The fingerprint changes when the rules do; nothing here records who changed them.",
       "rules_fingerprint": "Changes when any rule in force, an adopted rule, the outbound allowlist or the SDK version changes. Compare it between two files from this machine to see whether the rules changed. It is not comparable with a hosted gateway's fingerprint.",
-      "stopped_or_held_calls": "For each call: \"verdict\" says in words what this machine did, and \"status\" is the value it recorded. A call stopped while watching ran, and is listed as \"Would have been stopped; ran (watching)\". \"ledger_id\" is the record's id for that call, so one call can be named exactly.",
+      "stopped_or_held_calls": "For each call: \"verdict\" says in words what this machine did, and \"status\" is the value it recorded. A call stopped while watching ran, and is listed as \"Would have been stopped; ran (watching)\". A call listed as \"Not run: no verdict could be had\" was not run because no check could answer for it, for example the gateway could not be reached with blocking set to fail closed, or the API key was refused; \"rule\" names the reason. \"ledger_id\" is the record's id for that call, so one call can be named exactly.",
+      "server_changes": "What an MCP server changed in the tools it offers, as agentx-mcp's tool pinning saw it: \"what\" is the change, and \"held_then\" says whether pinning held the tool for approval at the time (null for a record an older version wrote, which did not say). These are not calls: no list or count of calls in this file includes them.",
       "sites_recorded": "For each agent, each site with the number of allowed calls that named it.",
       "record_head": "The record's latest entry when this file was made. To check later that the record was not rewritten since, run in the same project: agentx audit --record --head <this value>",
-      "records_kept": "Records older than \"days\" are deleted. This machine has one limit for all its records together, not one per list, so \"max_stopped_or_held_calls\" and \"max_allowed_calls\" are the same number (\"max_rows_shared\"): past it, most allowed calls are deleted first, oldest first, and if that is not enough, the oldest records of any kind. The stopped or held list goes back to \"stopped_or_held_since\" and the sites to \"sites_since\"; a list named in \"period_unknown\" holds a call with no recorded date, so its period cannot be stated."
+      "records_kept": "Records older than \"days\" are deleted. This machine has one limit for all its records together, not one per list, so \"max_stopped_or_held_calls\" and \"max_allowed_calls\" are the same number (\"max_rows_shared\"): past it, most allowed calls are deleted first, oldest first, and if that is not enough, the oldest records of any kind. The stopped or held list goes back to \"stopped_or_held_since\" and the sites to \"sites_since\"; a list named in \"period_unknown\" holds a call with no recorded date, so its period cannot be stated.",
+      "sql_checks": "The SQL checks catch the common destructive and bulk-read shapes, not every spelling. Known ways past them: a WHERE hidden behind a comment (-- or #), a statement written with no spaces, two statements on one line, a LIMIT with a fraction, MERGE, COPY ... TO or INTO OUTFILE, SUM or AVG over one-row groups, and a statement the parser cannot read. To limit what an agent can reach whatever the spelling, give it only the tools it needs (a tool allowlist, which a gateway enforces when your agent runs with an API key; this machine's checks do not)."
     }
   },
   "record_checks": {
@@ -55,7 +61,7 @@
   },
   "not_on_this_door": {
     "local": {
-      "receipt_id": "This machine keeps no receipts; each call's \"ledger_id\" is given instead.",
+      "receipt_id": "Empty: this file holds only a gateway's receipts. Each call's \"ledger_id\" is given instead; from version 0.5.6, a Python agent stopped by this machine's check, with no gateway receipt, was given \"local-\" and that ledger_id as its receipt_id.",
       "applies_to": "This machine's rules read a call's text, not a list of which kinds of call they apply to, so there is nothing true to put here."
     }
   },
@@ -69,7 +75,7 @@
     },
     "local": {
       "11111111-1111-1111-1111-111111111101": "Stops SQL that destroys table data with nothing limiting it, for example DROP TABLE, TRUNCATE TABLE, and a DELETE or UPDATE with no WHERE clause. A change limited by a real WHERE clause is allowed. Only some spellings are recognised.",
-      "11111111-1111-1111-1111-111111111103": "Stops a call that names a loopback or cloud-metadata address, for example localhost, 127.0.0.1 or 169.254.169.254, a common path to a cloud's internal credentials. Only some spellings are recognised.",
+      "11111111-1111-1111-1111-111111111103": "Stops a call that names a loopback or cloud-metadata address, for example localhost, 127.0.0.1 or 169.254.169.254, a common path to a cloud's internal credentials. On Claude Code the developer's own machine (localhost, any 127.x address, ::1 or 0.0.0.0, in any spelling) is allowed; a cloud-metadata or private address is still stopped. Only some spellings are recognised.",
       "11111111-1111-1111-1111-111111111104": "Stops a call that reads credentials or sends data to a paste site, for example SELECT password or SELECT api_key, or a pastebin.com or webhook.site address. Only some spellings are recognised.",
       "11111111-1111-1111-1111-111111111102": "Stops a database read that returns customer personal data in bulk, for example SELECT email, phone FROM customers. Reading one person's record with WHERE id = ..., or with LIMIT 1, is allowed. Only some spellings are recognised.",
       "11111111-1111-1111-1111-111111111115": "Stops a file path that climbs two or more folders up (../../), or that reads a credentials file, for example an SSH key, AWS credentials, a .env file or /etc/shadow. Only some spellings are recognised.",

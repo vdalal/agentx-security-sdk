@@ -61,6 +61,7 @@ _real_stdout = sys.stdout
 sys.stdout = sys.stderr
 try:
     from agentx_sdk.decorators import (
+        MCP_POSTURE_ENV_LINE,
         _BLOCK_CATEGORY_VOCAB,
         _abstract_call,
         _apply_org_override,
@@ -109,20 +110,26 @@ try:
     # globals when CALLED, so binding the names early does not freeze the path that
     # _point_stores_at_mcp_home repoints at the per-user MCP ledger.
     from agentx_sdk.db import (init_db, log_intercept, log_self_correction, record_call,
-                               WOULD_BLOCK_STATUS,
+                               WOULD_BLOCK_STATUS, REFUSED_STATUS, HALTED_STATUS,
                                read_novelty, advance_watermark, format_novelty_item, top_novelty,
                                current_call_shape, _call_shape, _dest_hosts_value,
                                WATERMARK_SESSION,
-                               record_mcp_roster, MCP_DRIFT_POLICY_NAME)
+                               record_mcp_roster, MCP_DRIFT_POLICY_NAME, MCP_DRIFT_DISPLAY_NAME,
+                               MCP_POISON_POLICY_NAME, MCP_POISON_DISPLAY_NAME,
+                               MCP_HELD_CALL_POLICY_NAME, SERVER_EVENT_STATUS)
 finally:
     sys.stdout = _real_stdout
 
 _USAGE = (
     "usage: agentx-mcp <command> [args...]\n"
     "\n"
-    "Puts AgentX in front of an MCP server. Every tool call is checked first, and\n"
-    "the destructive ones are stopped before they run. Your agent is told what to\n"
-    "do instead, so it can fix the call and carry on.\n"
+    # 🔴 SAYS WATCH FIRST: a fresh wrap records and stops nothing. This line used to open with
+    # "the destructive ones are stopped", which is true only after the env line below.
+    "Puts AgentX in front of an MCP server. Every tool call is checked first. Out of\n"
+    "the box it watches: a call it would stop is recorded and still runs. Add\n"
+    "  " + (MCP_POSTURE_ENV_LINE % "enforce") + "\n"
+    "to the server's entry in mcp.json and the destructive ones are stopped before\n"
+    "they run, and your agent is told what to do instead.\n"
     "\n"
     # Every command here carries the `uvx` prefix and the mcp.json uses "command": "uvx",
     # matching ui/utils/mcp.ts. This screen is shown by `uvx agentx-mcp --help` -- to a reader
@@ -143,6 +150,10 @@ _USAGE = (
     "\n"
     "  uvx agentx-mcp --review     See what was stopped. Approve a fix your agent found,\n"
     "                              or mark a block right or wrong.\n"
+    "  uvx agentx-mcp --approve-changes\n"
+    "                              Accept a changed tool after you have checked it (with\n"
+    "                              AGENTX_MCP_TOOL_PINNING=block, a changed tool stays\n"
+    "                              blocked until you do).\n"
     # 🔴 SAME TWO CORRECTIONS AS THE --audit LINE BELOW, because it is the same door and the
     # same overclaim. "Your agents" covers servers the reader WRAPPED, not everything their
     # agents do; scoped to wrapped servers, which is what this reader actually reads.
@@ -1308,6 +1319,19 @@ def _pins_path():
     return os.path.join(_mcp_store_dir(), "mcp_tool_pins.json")
 
 
+# Where the pins file holds changes waiting for approval. A server key is 16 hex characters,
+# so this name can never collide with one.
+_PENDING_KEY = "_pending_approval"
+
+
+def _server_label(child_cmd):
+    """The wrapped server's command line, for a person to recognise in --approve-changes."""
+    try:
+        return " ".join(str(a) for a in (child_cmd or ()))[:200]
+    except Exception:
+        return ""
+
+
 def _server_key(child_cmd):
     """A stable id for the wrapped server = a short sha256 of its argv. A server
     invoked with different args pins separately -- a different launch is arguably a
@@ -1317,6 +1341,37 @@ def _server_key(child_cmd):
     except Exception:
         argv = ""
     return hashlib.sha256(argv.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _is_path_spelling(arg):
+    """A path: absolute, relative (`.`, `./x`), or a name that exists here. Never a switch:
+    `cmd /c` gave `/c`, which Python 3.12 on Windows calls absolute, and normalising it per
+    drive split one server in two. Relative spellings stay paths, so one command started in
+    two project folders (`server-filesystem .`) counts as two servers."""
+    if arg.startswith("-") or (arg.startswith("/") and len(arg) <= 3):
+        return False
+    try:
+        return (os.path.isabs(arg) or arg.startswith(("./", ".\\", "../", "..\\"))
+                or arg in (".", "..") or os.path.exists(arg))
+    except (OSError, ValueError):
+        return False
+
+
+def _roster_key(child_cmd):
+    """The server's id for the audit's count of servers: `_server_key` over the argv with each
+    path argument spelled one way (absolute, normalised, case folded where the system folds
+    it). The pin key keeps the raw argv; the count used it too, so one filesystem server
+    started as `C:/proj` and as `C:\\proj` read as two servers."""
+    try:
+        parts = []
+        for arg in child_cmd or ():
+            arg = str(arg)
+            if _is_path_spelling(arg):
+                arg = os.path.normcase(os.path.normpath(os.path.abspath(arg)))
+            parts.append(arg)
+        return _server_key(parts)
+    except Exception:
+        return _server_key(child_cmd)
 
 
 def _tool_fingerprint(tool):
@@ -1394,11 +1449,18 @@ class _ToolPins:
         except Exception:
             pass
 
-    def inspect(self, server_key, tools):
+    def inspect(self, server_key, tools, hold=False, label=None):
         """Compare a fresh tools/list result against the pinned manifest. Returns a
         list of (kind, tool_name) with kind in {'drift','poison'}. Records new
         fingerprints (TOFU) and persists. A brand-new tool is recorded, not drift.
-        Never raises."""
+        Never raises.
+
+        `hold=True` (block mode) keeps the APPROVED fingerprint of a changed tool and files
+        the new one under `_PENDING_KEY` instead, so the tool stays gated on every later run
+        until `agentx-mcp --approve-changes` accepts it. Re-pinning on sight let a changed tool
+        run, unwarned, from the second start on, while the README promised a gate "until you
+        re-verify it". Warn mode still re-pins: it is advisory, and warning on every start
+        about a change the user already saw would be noise."""
         events = []
         try:
             if not isinstance(tools, list):
@@ -1406,6 +1468,11 @@ class _ToolPins:
             pinned = self._manifest.get(server_key)
             first_sight = not isinstance(pinned, dict)
             pinned = dict(pinned) if isinstance(pinned, dict) else {}
+            pending_all = self._manifest.get(_PENDING_KEY)
+            pending_all = dict(pending_all) if isinstance(pending_all, dict) else {}
+            held = pending_all.get(server_key)
+            held = dict(held) if isinstance(held, dict) else {}
+            held_tools = dict(held.get("tools") or {})
             changed = False
             for tool in tools:
                 if not isinstance(tool, dict):
@@ -1418,42 +1485,151 @@ class _ToolPins:
                     # First sight of this tool -> content-scan for install poison (B),
                     # then pin. TOFU: a benign first listing is recorded silently.
                     if _description_poisoned(tool):
-                        events.append(("poison", name))
+                        if hold:
+                            # Block mode: never trusted on sight. Pinning it here let a tool
+                            # flagged as hiding instructions run, unwarned, from the next start
+                            # on; it waits for --approve-changes like a changed tool. Reported
+                            # once per definition; one already waiting is "held-poison".
+                            if held_tools.get(name) != fp:
+                                held_tools[name] = fp
+                                changed = True
+                                events.append(("poison", name))
+                            else:
+                                events.append(("held-poison", name))
+                            continue
+                        # Warn mode over a tool block mode already reported and held: trusted
+                        # now, but not reported a second time (same rule as a held change).
+                        if held_tools.get(name) != fp:
+                            events.append(("poison", name))
                 elif pinned.get(name) != fp:
                     # An already-approved tool changed its definition -> drift (A).
-                    events.append(("drift", name))
+                    if hold and name in pinned:
+                        # Held: reported as drift (a warning and a ledger row) only when this
+                        # definition is new; one already waiting is "held", which keeps the gate
+                        # closed without counting the same change again on every start (review).
+                        if held_tools.get(name) != fp:
+                            held_tools[name] = fp
+                            changed = True
+                            events.append(("drift", name))
+                        else:
+                            events.append(("held", name))
+                        continue
+                    # Warn mode over a change block mode already reported and held: accepted
+                    # now, but not counted a second time (review).
+                    if held_tools.get(name) != fp:
+                        events.append(("drift", name))
+                if name in held_tools:
+                    # Back to the approved definition (or newly pinned): nothing is pending.
+                    del held_tools[name]
+                    changed = True
                 if pinned.get(name) != fp:
                     pinned[name] = fp
                     changed = True
+            # A held tool the server no longer advertises is not waiting for anything: approving
+            # it later would approve a definition nobody offers (review).
+            listed = {t.get("name") for t in tools if isinstance(t, dict)}
+            for gone in [n for n in held_tools if n not in listed]:
+                del held_tools[gone]
+                changed = True
+            if held_tools:
+                pending_all[server_key] = {"server": label or held.get("server") or server_key,
+                                           "tools": held_tools}
+            else:
+                pending_all.pop(server_key, None)
             if changed or first_sight:
                 self._manifest[server_key] = pinned
+                if pending_all:
+                    self._manifest[_PENDING_KEY] = pending_all
+                else:
+                    self._manifest.pop(_PENDING_KEY, None)
                 self._persist()
         except Exception:
             return events
         return events
 
+    def pending(self):
+        """[(server label, tool name)] held and waiting for approval. Reads only. Never raises."""
+        out = []
+        try:
+            pending_all = self._manifest.get(_PENDING_KEY)
+            for server_key, held in (pending_all or {}).items():
+                if isinstance(held, dict):
+                    out += [(str(held.get("server") or server_key), name)
+                            for name in (held.get("tools") or {})]
+        except Exception:
+            return []
+        return out
 
-def _drift_coaching(tool_name):
+    def approve_pending(self):
+        """Accept every held change: its new fingerprint becomes the approved one. Returns
+        [(server label, tool name)] for what was approved. Never raises."""
+        approved = []
+        try:
+            pending_all = self._manifest.get(_PENDING_KEY)
+            if not isinstance(pending_all, dict):
+                return approved
+            for server_key, held in pending_all.items():
+                if not isinstance(held, dict):
+                    continue
+                pinned = self._manifest.get(server_key)
+                pinned = dict(pinned) if isinstance(pinned, dict) else {}
+                for name, fp in (held.get("tools") or {}).items():
+                    pinned[name] = fp
+                    approved.append((str(held.get("server") or server_key), name))
+                self._manifest[server_key] = pinned
+            self._manifest.pop(_PENDING_KEY, None)
+            self._persist()
+        except Exception:
+            return approved
+        return approved
+
+
+def _drift_coaching(tool_name, kind="drift"):
     """Agent-facing re-verify coaching for block mode (no em dashes; house style)."""
+    if kind == "poison":
+        return ("AgentX blocked '%s': this tool's description carries what looks like hidden "
+                "instructions for an agent. Check the tool with the human operator before "
+                "using it." % tool_name)
     return ("AgentX blocked '%s': this tool's definition (description or input schema) "
-            "changed since it was approved, a possible bait-and-switch. Re-verify the "
-            "tool with the human operator before using it." % tool_name)
+            "changed since it was first seen or last approved, a possible bait-and-switch. "
+            "Re-verify the tool with the human operator before using it." % tool_name)
 
 
 def _report_pin_events(events, mode, drifted, session_stats, log):
     """Surface drift/poison events: a loud stderr warning (warn AND block), a local
-    flight-recorder row so `agentx status` attributes it to 'MCP Tool Description
-    Drift', and -- in block mode -- add the tool to the drifted set so a later
-    tools/call to it is gated. Never raises."""
+    flight-recorder row under MCP_DRIFT_POLICY_NAME or MCP_POISON_POLICY_NAME (ran in warn
+    mode, stopped in block mode), and -- in block mode -- add the tool to the drifted set so a
+    later tools/call to it is gated. Never raises."""
     for kind, name in events:
         try:
+            if kind in ("held", "held-poison"):
+                # Already reported and still waiting for approval: gate it, say so once per
+                # session, and write no second ledger row for the same definition.
+                if mode == "block" and drifted is not None and name not in drifted:
+                    drifted.add(name)
+                    session_stats.setdefault("_pin_kinds", {})[name] = (
+                        "poison" if kind == "held-poison" else "drift")
+                    print("[agentx-mcp] Calls to '%s' are still blocked: %s waits for approval "
+                          "(uvx agentx-mcp --approve-changes)."
+                          % (name, "its description, which may hide instructions,"
+                             if kind == "held-poison" else "its changed definition"), file=log)
+                continue
             if kind == "drift":
-                print("[agentx-mcp] WARNING: tool '%s' changed its description/schema since you "
-                      "approved it, possible rug-pull (MCP Tool Description Drift)." % name, file=log)
+                print("[agentx-mcp] WARNING: tool '%s' changed its description or inputs since it "
+                      "was first seen or last approved. A server can change a tool after you "
+                      "trust it (%s)." % (name, MCP_DRIFT_DISPLAY_NAME), file=log)
+                if mode == "block":
+                    print("[agentx-mcp] Calls to '%s' are blocked until you approve the change. "
+                          "Once you have checked it:  uvx agentx-mcp --approve-changes" % name,
+                          file=log)
             else:
-                print("[agentx-mcp] WARNING: tool '%s' advertises a description carrying a possible "
-                      "injection/hidden-instruction payload (MCP Tool Description Drift)." % name,
+                print("[agentx-mcp] WARNING: tool '%s' advertises a description that may hide "
+                      "instructions for your agent (%s)." % (name, MCP_POISON_DISPLAY_NAME),
                       file=log)
+                if mode == "block":
+                    print("[agentx-mcp] Calls to '%s' are blocked until you approve it. Once "
+                          "you have checked it:  uvx agentx-mcp --approve-changes" % name,
+                          file=log)
             if session_stats.get("_ledger"):
                 try:
                     # A uuid trace, NOT the shared _ledger_seq counter: this runs on the
@@ -1462,13 +1638,20 @@ def _report_pin_events(events, mode, drifted, session_stats, log):
                     # rows never recover, so a unique id suffices (no monotonic counter).
                     trace = "%s-drift-%s" % (session_stats.get("_trace_id") or "mcp-session",
                                              uuid.uuid4().hex[:8])
+                    # Recorded as what the SERVER did, not as a call: the agent called nothing.
+                    # Whether the tool is now held ('enforce') or trusted as it is ('audit') is
+                    # in the posture.
+                    held_now = mode == "block" and drifted is not None
                     log_intercept(trace, "mcp_proxy", name, None,
-                                  MCP_DRIFT_POLICY_NAME, "CHALLENGED",
-                                  posture="enforce")
+                                  MCP_POISON_POLICY_NAME if kind == "poison"
+                                  else MCP_DRIFT_POLICY_NAME,
+                                  SERVER_EVENT_STATUS,
+                                  posture="enforce" if held_now else "audit")
                 except Exception:
                     pass
             if mode == "block" and drifted is not None:
                 drifted.add(name)
+                session_stats.setdefault("_pin_kinds", {})[name] = kind
         except Exception:
             continue
 
@@ -1530,12 +1713,16 @@ def _inspect_list_line(line, pins, pending_list_ids, server_key, mode, drifted, 
         try:
             names = [t.get("name") for t in tools
                      if isinstance(t, dict) and isinstance(t.get("name"), str) and t.get("name")]
-            session_stats.setdefault("_advertised", {})[server_key] = names
-            session_stats.setdefault("_roster_pending", set()).add(server_key)
+            # Keyed by the roster's own id, not the pin key: one server launched with two
+            # spellings of its folder pins twice (by design) but is one server to count.
+            roster_key = session_stats.get("_roster_key") or server_key
+            session_stats.setdefault("_advertised", {})[roster_key] = names
+            session_stats.setdefault("_roster_pending", set()).add(roster_key)
             _flush_mcp_roster(session_stats)
         except Exception:
             pass
-        events = pins.inspect(server_key, tools)
+        events = pins.inspect(server_key, tools, hold=(mode == "block"),
+                              label=session_stats.get("_server_label"))
         if events:
             _report_pin_events(events, mode, drifted, session_stats, log)
     except Exception:
@@ -1579,7 +1766,8 @@ def _flush_mcp_roster(session_stats):
         for key in list(pending):
             if no_call_yet and key in no_row:
                 continue
-            if record_mcp_roster(key, advertised.get(key) or [], only_if_present=no_call_yet):
+            if record_mcp_roster(key, advertised.get(key) or [], only_if_present=no_call_yet,
+                                 replaces=session_stats.get("_roster_replaces")):
                 pending.discard(key)
             elif no_call_yet:
                 no_row.add(key)
@@ -1695,6 +1883,22 @@ def _count_block(session_stats):
     _note_own_agent_block(_MCP_AGENT_ID, session_stats)
 
 
+def _record_unrun_call(session_stats, msg, status, why):
+    """One ledger row for a tools/call this proxy stopped at an exit that wrote none: the
+    decorator's rule (one row per call, whatever happened to it; `_record_not_run`). Same
+    trace and guard as the pinning gate's row. Never raises."""
+    if not session_stats.get("_ledger"):
+        return
+    try:
+        seq = session_stats.get("_ledger_seq", 0)
+        session_stats["_ledger_seq"] = seq + 1
+        log_intercept("%s-%d" % (session_stats.get("_trace_id") or "mcp-session", seq),
+                      "mcp_proxy", str((msg.get("params") or {}).get("name")), None, why,
+                      status, posture="enforce")
+    except Exception:
+        pass
+
+
 def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest=None):
     """Screen ONE parsed JSON-RPC message. Returns ``"forward"`` (the caller relays it
     to the server) or ``"block"`` (a blocked tools/call, already handled — do NOT
@@ -1724,6 +1928,9 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         else:
             print("[agentx-mcp] dropped id-less tools/call past the runaway ceiling", file=log)
         _count_block(session_stats)
+        # HALTED, the decorator's word for a loop breaker (founder option A): one row per call,
+        # never a policy block the review queue and insights would read as one.
+        _record_unrun_call(session_stats, msg, HALTED_STATUS, "Runaway call ceiling")
         session_stats["runaway_halts"] = session_stats.get("runaway_halts", 0) + 1
         print("[agentx-mcp] blocked tools/call (runaway ceiling %d exceeded at %d calls)."
               % (ceiling, session_stats["total_calls"]), file=log)
@@ -1740,14 +1947,41 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
             drifted = session_stats.get("_drifted")
             gate_name = str((msg.get("params") or {}).get("name"))
             if drifted and gate_name in drifted:
+                kind = (session_stats.get("_pin_kinds") or {}).get(gate_name, "drift")
                 req_id = msg.get("id")
+                coaching = _drift_coaching(gate_name, kind)
                 if req_id is not None:
-                    writer.send(_block_response(req_id, _drift_coaching(gate_name)))
+                    writer.send(_block_response(req_id, coaching))
                 else:
                     print("[agentx-mcp] dropped id-less call to drifted tool '%s'" % gate_name, file=log)
                 _count_block(session_stats)
-                print("[agentx-mcp] blocked tools/call '%s' (MCP Tool Description Drift; re-verify required)."
-                      % gate_name, file=log)
+                # The agent DID call this tool and it was stopped, so it is recorded as a call,
+                # under its own rule name: the changed-tool names are for what the server did.
+                # Until this row existed the one real call in that story left no record. Not an
+                # open block: approving the tool, not changing the call, is what lets it run.
+                if session_stats.get("_ledger"):
+                    try:
+                        seq = session_stats.get("_ledger_seq", 0)
+                        session_stats["_ledger_seq"] = seq + 1
+                        log_intercept("%s-%d" % (session_stats.get("_trace_id") or "mcp-session",
+                                                 seq),
+                                      "mcp_proxy", gate_name, None, MCP_HELD_CALL_POLICY_NAME,
+                                      # "enforce" whatever the session posture: tool pinning
+                                      # enforced this stop. Marked audit, the call would read
+                                      # as one that ran undefended.
+                                      "CHALLENGED", posture="enforce",
+                                      challenge_issued=coaching if req_id is not None else None)
+                    except Exception:
+                        pass
+                    _flush_mcp_roster(session_stats)
+                if kind == "poison":
+                    print("[agentx-mcp] blocked tools/call '%s' (%s): it waits for approval "
+                          "(uvx agentx-mcp --approve-changes)."
+                          % (gate_name, MCP_POISON_DISPLAY_NAME), file=log)
+                else:
+                    print("[agentx-mcp] blocked tools/call '%s' (%s): its changed definition waits "
+                          "for approval (uvx agentx-mcp --approve-changes)."
+                          % (gate_name, MCP_DRIFT_DISPLAY_NAME), file=log)
                 return "block"
     except Exception:
         pass
@@ -1790,6 +2024,8 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
         # A strict fail-CLOSED is a BLOCK, not a fail-open: do NOT touch shield_failopens
         # (that metric means "ran unscreened"). Just a once-per-process notice.
         _note_mcp_fail_closed(log)
+        # The decorator's reason word for the same fault.
+        _record_unrun_call(session_stats, msg, REFUSED_STATUS, "Policy file unreadable")
         return "block"
 
     if load_err is not None and session_stats.get("_enforcement") == "audit":
@@ -1886,7 +2122,8 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
             flat_payload, table_copies=_table_copies,
             arguments=params.get("arguments"), tool_name=name, name_leads=True,
             declared_args=session_stats.get("_tool_declared", {}).get(str(name)),
-            agent_id=_MCP_AGENT_ID if explicit_project_dir() else None)
+            agent_id=_MCP_AGENT_ID if explicit_project_dir() else None,
+            own_tool_door=True)
         if decision is None:
             _remember_table_copy(_table_copies, flat_payload)
     except Exception as err:
@@ -2037,7 +2274,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
             _flush_mcp_roster(session_stats)
         return "forward"
 
-    # AUDIT posture: this call matched a policy, but AGENTX_ENFORCEMENT=audit — record the
+    # AUDIT posture: this call matched a policy, but AGENTX_POSTURE=audit — record the
     # WOULD_BLOCK and FORWARD the real call instead of answering with coaching, so the
     # wrapped server runs untouched. Takes NONE of the block accounting below (no intercept
     # / critical count, no CHALLENGED ledger row, no strike, no harvest) — the twin of the
@@ -2373,10 +2610,13 @@ def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
     pin_mode = _tool_pinning_mode()
     pins = _ToolPins() if pin_mode != "off" else None
     server_key = _server_key(child_cmd)
+    session_stats["_roster_key"] = _roster_key(child_cmd)
+    session_stats["_roster_replaces"] = server_key
     pending_list_ids = set()
     drifted = set()
     if pins is not None:
         session_stats["_pin_mode"] = pin_mode
+        session_stats["_server_label"] = _server_label(child_cmd)
         session_stats["_drifted"] = drifted
         session_stats["_pending_list_ids"] = pending_list_ids
 
@@ -2530,7 +2770,13 @@ def _protection_report(session_stats, log):
         halted_calls = int(session_stats.get("runaway_halts", 0) or 0)
         if recovered_n or continued_n or unmeasured_n or abandoned_n or halted_calls:
             _unmeasured_note = ", %d not measurable" % unmeasured_n if unmeasured_n else ""
-            print("[agentx-mcp]   -> %d recovered, %d continued%s, %d still-open (abandoned), %d runaway-halted call(s)."
+            # Each number says what it counts, because they count three different things:
+            # "6 stopped" above counts calls; recovered counts fixes that ran after a stop; the
+            # next three count tools, so six stops on three tools read "1 continued, 2 not
+            # measurable" here, which looked like three stops had gone missing.
+            print("[agentx-mcp]   -> After those stops: %d recovered (fixes that ran). By tool "
+                  "stopped, each tool once: %d continued%s, %d still-open (abandoned). "
+                  "%d call(s) halted as a runaway loop."
                   % (recovered_n, continued_n, _unmeasured_note, abandoned_n, halted_calls), file=log)
         # Recovery nudge -> the unified review (twin of the decorator's `agentx review`
         # nudge), so the MCP surface points at the same one-key adopt/label pass. `review`
@@ -2705,6 +2951,70 @@ def _reader_globals(fn, argv):
                 os.environ[_var] = _saved
 
 
+def _pin_store_paths():
+    """Every pins file a proxy on this machine could have written from here: the one
+    `AGENTX_MCP_PINS_PATH` names, else the project store the readers resolve AND the per-user
+    store. Absolute, each once. Leaves the reader's project resolution as it found it."""
+    global _MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE
+    from .overrides import PROJECT_DIR_VAR
+    saved = (_MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE)
+    saved_project = os.environ.get(PROJECT_DIR_VAR)        # the reader may adopt one
+    paths = []
+    try:
+        if os.environ.get("AGENTX_MCP_PINS_PATH"):
+            paths = [_pins_path()]
+        else:
+            _resolve_mcp_project("reader")
+            paths = [_pins_path(), os.path.join(_user_store_dir(), "mcp_tool_pins.json")]
+    finally:
+        _MCP_PROJECT, _MCP_PROJECT_SOURCE, _MCP_PROJECT_UNUSABLE = saved
+        if saved_project is None:
+            os.environ.pop(PROJECT_DIR_VAR, None)
+        else:
+            os.environ[PROJECT_DIR_VAR] = saved_project
+    return list(dict.fromkeys(os.path.abspath(p) for p in paths))
+
+
+def held_tools():
+    """[(server label, tool name)] held for approval in any pins file `--approve-changes` would
+    read. Reads only; never raises. What the audit says is held NOW, from the file that holds
+    it, rather than from the ledger's history of what pinning did at the time."""
+    out = []
+    try:
+        for path in _pin_store_paths():
+            if os.path.exists(path):
+                out += [t for t in _ToolPins(path).pending() if t not in out]
+    except Exception:
+        return out
+    return out
+
+
+def _approve_changes():
+    """`agentx-mcp --approve-changes`: accept every tool change the block-mode pin is holding.
+
+    Approves in EVERY pins file a proxy on this machine could have written from here: the one
+    `AGENTX_MCP_PINS_PATH` names, else the project store the readers resolve AND the per-user
+    store. One store was not enough either way (reviews): read per-user only, a held tool in a
+    project store had no way out; read the project only, one held per-user did. Names each file
+    it read, and says a running proxy keeps the tool blocked until the client restarts it."""
+    approved = []
+    for path in _pin_store_paths():
+        sys.stderr.write("[agentx-mcp] checked %s\n" % path)
+        approved += _ToolPins(path).approve_pending()
+    if not approved:
+        sys.stderr.write("[agentx-mcp] No held tools are waiting for approval.\n")
+        return 0
+    # "held", not "changed": a tool whose description looked like it hides instructions waits
+    # here too, and nothing about it changed.
+    sys.stderr.write("[agentx-mcp] Approved %d held tool%s. Calls to %s run again once your "
+                     "MCP client restarts the server:\n"
+                     % (len(approved), "" if len(approved) == 1 else "s",
+                        "it" if len(approved) == 1 else "them"))
+    for server, name in approved:
+        sys.stderr.write("  %s  (server: %s)\n" % (name, server))
+    return 0
+
+
 def _point_stores_at_mcp_home():
     """Point EVERY store a reader command touches at the per-user MCP home.
 
@@ -2747,10 +3057,12 @@ def _point_stores_at_mcp_home():
         from agentx_sdk import db as _db
         ledger = _mcp_ledger_path()
         _db.DB_PATH = ledger
-        # The FOURTH thing: once db.DB_PATH is this door's ledger, per-block verdict
-        # items read from it would double the policy-level MCP verdict `_mcp_review_items`
-        # already offers. Off here, beside the repoint that would otherwise turn it on.
-        _db.PER_BLOCK_LEDGER_REVIEW = False
+        # Per-block verdicts stay ON here. They were switched off so a block would not be asked
+        # about twice beside the policy-level verdict `_mcp_review_items` offers, but that one
+        # comes from the opt-in harvest corpus, so on a default install `--review` asked about
+        # nothing while the ledger held the blocks. `_mcp_review_items` now skips its policy
+        # question for a policy whose blocks are asked here, which is what prevents the double.
+        _db.PER_BLOCK_LEDGER_REVIEW = True
         os.makedirs(os.path.dirname(ledger) or ".", exist_ok=True)
         os.environ["AGENTX_INCIDENT_DB"] = ledger
         overrides_path = _mcp_overrides_path()
@@ -2769,7 +3081,7 @@ def _proxy_posture():
     a developer who exported AGENTX_API_KEY for their Python agents and launched Cursor from
     that shell got every wrapped server ENFORCING, against every MCP surface's "out of the box
     it blocks nothing", with the only line saying "enforcing" on stderr, which MCP hosts
-    swallow. Anything a person wrote down (AGENTX_POSTURE / AGENTX_ENFORCEMENT) still wins.
+    swallow. Anything a person wrote down (AGENTX_POSTURE) still wins.
 
     One function rather than an inline call so a test can drive the proxy's own answer and a
     second test can check `main()` actually uses it; `main()` itself is only reachable as a
@@ -2779,6 +3091,21 @@ def _proxy_posture():
     return _resolve_enforcement(None, keyless_door=True)
 
 
+def _version_line():
+    """Both versions, each named. It printed the SDK's version under the launcher's name
+    (`agentx-mcp 0.5.6` for launcher 0.2.5, cold install). The SDK also ships an
+    `agentx-mcp` command of its own, where no launcher package is installed."""
+    try:
+        from agentx_sdk import __version__ as sdk
+    except Exception:
+        sdk = "unknown"
+    try:
+        from agentx_mcp import __version__ as launcher
+    except Exception:
+        return "agentx-mcp, from agentx-security-sdk %s\n" % sdk
+    return "agentx-mcp %s (agentx-security-sdk %s)\n" % (launcher, sdk)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:]) if argv is None else list(argv)
 
@@ -2786,11 +3113,7 @@ def main(argv=None):
         sys.stderr.write(_USAGE)
         return 0
     if argv and argv[0] == "--version":
-        try:
-            from agentx_sdk import __version__
-            sys.stderr.write("agentx-mcp %s\n" % __version__)
-        except Exception:
-            sys.stderr.write("agentx-mcp\n")
+        sys.stderr.write(_version_line())
         return 0
     if argv and argv[0] == "--demo":
         # Dispatch BEFORE the proxy session setup below (stdout aliasing, ledger init,
@@ -2841,6 +3164,11 @@ def main(argv=None):
         # under uvx.
         _reader_globals("execute_feedback", argv[1:])
         return 0
+    if argv and argv[0] == "--approve-changes":
+        # The re-verify step the pinning block gate promises. A changed tool stays blocked on
+        # every run until this accepts its new definition; before it existed, the proxy accepted
+        # the change itself on the next start.
+        return _approve_changes()
     # 🔴 THE BARE WORD IS THE NATURAL TYPO. Every one of the four commands above has an
     # `agentx <word>` twin on the SDK door (no dashes), so a reader switching doors -- or
     # copy-pasting a snippet meant for the other one -- types `agentx-mcp audit` out of
@@ -2857,6 +3185,14 @@ def main(argv=None):
             "[agentx-mcp] unknown command '%s'. Did you mean '--%s'?\n"
             "  uvx agentx-mcp --%s\n" % (argv[0], argv[0], argv[0])
         )
+        return 2
+    # An option this door does not know (`--status`, the SDK door's word) fell through to the
+    # launch: the full watching banner, then "command not found: --status", exit 127. A real
+    # server command never starts with "-", and the dispatch above has handled every option
+    # this door has, so a dash here can only be a mistake. "--" is the separator, kept.
+    if argv and argv[0].startswith("-") and argv[0] != "--":
+        sys.stderr.write("[agentx-mcp] unknown option '%s'.\n" % argv[0])
+        sys.stderr.write(_USAGE)
         return 2
     if argv and argv[0] == "--":          # explicit end-of-options separator
         argv = argv[1:]
@@ -2894,7 +3230,7 @@ def main(argv=None):
     session_stats["_trace_id"] = "mcp-" + uuid.uuid4().hex[:12]
     session_stats["_ledger"] = True
     # ENFORCEMENT LEVEL (posture) for the whole wrapped server — chokepoint parity with
-    # the decorator: the SAME global AGENTX_ENFORCEMENT switch means "audit the whole
+    # the decorator: the SAME global AGENTX_POSTURE switch means "audit the whole
     # server" is one env line here too. In `audit` a caught tools/call is recorded
     # (WOULD_BLOCK) and FORWARDED to the real server instead of being answered with a
     # coaching error, so a team can run the shield non-blocking in staging first. Resolved
@@ -2956,12 +3292,10 @@ def main(argv=None):
         #
         # ⚠️ THE ENV BRANCH KEEPS ITS ALARM. Someone who set the variable is running a server
         # they believe is defended in a posture that defends nothing, and that is worth being
-        # loud about. Which spelling they used is read back, not assumed, because both work.
-        _set_name = next(
-            (n for n in ("AGENTX_POSTURE", "AGENTX_ENFORCEMENT")
-             if (os.environ.get(n) or "").strip().lower() == "audit"),
-            None,
-        )
+        # loud about. AGENTX_POSTURE is the one variable read (AGENTX_ENFORCEMENT removed).
+        _set_name = ("AGENTX_POSTURE"
+                     if (os.environ.get("AGENTX_POSTURE") or "").strip().lower() == "audit"
+                     else None)
         print("[agentx-mcp] "
               "============================================================", file=sys.stderr)
         if _set_name:

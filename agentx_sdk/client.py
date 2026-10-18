@@ -391,7 +391,7 @@ class AgentXClient:
         # and verdict path — is byte-identical to today (no pool aggregation runs).
         if budget_pool_id:
             payload["budget_pool_id"] = str(budget_pool_id)
-        # Enforcement posture (AGENTX_ENFORCEMENT). Forwarded ONLY when audit, so the
+        # Enforcement posture (AGENTX_POSTURE). Forwarded ONLY when audit, so the
         # gateway skips persisting a policy CHALLENGED for an evaluating (non-enforcing)
         # install — it still returns the verdict, so the SDK records its own local
         # WOULD_BLOCK. Omitted for enforce so an enforcing/legacy caller's payload — and
@@ -525,7 +525,10 @@ class AgentXClient:
                     "message": (f"AgentX cannot use the gateway URL {self.gateway_url!r} "
                                 f"(from {source}): {unusable}. That is configuration, not an "
                                 f"outage: the tool was NOT run, and retrying will not help."),
-                    "detail": f"unusable_gateway_url: {unusable}"}
+                    "detail": f"unusable_gateway_url: {unusable}",
+                    # The ledger's REFUSED row names the reason with this, in the TS SDK's
+                    # words (gateway.ts `cause`), so the two ledgers read alike.
+                    "cause": "Gateway address unusable"}
 
         try:
             response = requests.post(
@@ -566,19 +569,31 @@ class AgentXClient:
             #
             # 429 deliberately NOT here: rate limiting IS a transient capacity condition, and
             # that is exactly what the availability contract is for.
+            # `gateway_answered` on these ONLY with the gateway's header, the same proof the
+            # non-JSON branch below asks for: a 401 or 403 is just as much the shape of an SSO
+            # proxy or an unrelated service at a wrong URL. The gateway's middleware stamps the
+            # header on every /v1/evaluate response, its own auth rejections included.
             if response.status_code == 401:
                 # Unchanged wording: this string predates the class and is what an existing
                 # test and anyone's log-grep expects. Widening the CLASS must not silently
                 # reword the member that was already right.
-                return {"status": "ERROR", "message": "Invalid AgentX API Key."}
-            if response.status_code in (403, 407):
-                return {"status": "ERROR",
-                        "message": f"AgentX gateway request was rejected "
-                                   f"(HTTP {response.status_code}). Either this gateway does not "
-                                   f"serve this request, or something in front of it refused the "
-                                   f"credential. Not an outage: the tool was NOT run, and "
-                                   f"retrying will not help. See the detail below.",
-                        "detail": (response.text or "")[:300]}
+                out = {"status": "ERROR", "message": "Invalid AgentX API Key.",
+                       "cause": "Invalid AgentX API Key"}
+            elif response.status_code in (403, 407):
+                out = {"status": "ERROR", "cause": "Gateway refused the request",
+                       "message": f"AgentX gateway request was rejected "
+                                  f"(HTTP {response.status_code}). Either this gateway does not "
+                                  f"serve this request, or something in front of it refused the "
+                                  f"credential. Not an outage: the tool was NOT run, and "
+                                  f"retrying will not help. See the detail below.",
+                       "detail": (response.text or "")[:300]}
+            else:
+                out = None
+            if out is not None:
+                if response.headers.get("X-AgentX-Reasoning") is not None:
+                    out["gateway_answered"] = True
+                    out["gateway_identified"] = True
+                return out
 
             # A 5xx, or ANY non-JSON body (a proxy's HTML error page, a bare
             # "Internal Server Error"), means the gateway could not return a verdict.
@@ -677,6 +692,11 @@ class AgentXClient:
             # header on EVERY /v1/evaluate response, so the SDK learns it on any verdict
             # (block/escalate/allow) — not just the body paths that used to mention it.
             # Inject it so the decorator's capture stays uniform; absent header => None.
+            # `cause` is OURS: the client's fixed words for why no verdict could be had, which
+            # the ledger's REFUSED row records. A body from whatever answers at gateway_url must
+            # not supply it ("Approved by SOC" as the reason on a refused call; review round 1).
+            if isinstance(result, dict):
+                result.pop("cause", None)
             hdr = response.headers.get("X-AgentX-Reasoning")
             if hdr is not None and isinstance(result, dict):
                 result["reasoning_enabled"] = (hdr == "1")
@@ -709,7 +729,8 @@ class AgentXClient:
             # Deliberately still a hard ERROR: anything that is NOT a transport failure is
             # a bug in our own code (a TypeError here, a bad payload we built), and that
             # should be loud rather than silently degraded into "gateway unavailable".
-            return {"status": "ERROR", "message": f"AgentX unexpected error: {e}"}
+            return {"status": "ERROR", "message": f"AgentX unexpected error: {e}",
+                    "cause": "Request could not be built"}
 
     def register_incident(self, agent_id, query, chain_of_thought, policy_id,
                           policy_name, challenge_issued, trace_id=None, tool=None):
