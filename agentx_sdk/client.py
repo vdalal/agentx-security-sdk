@@ -59,6 +59,21 @@ STATEMENT_TEXT_MAX_LEN = 8192
 # (`db._MAX_DEST_HOSTS`), so this never cuts what the decorator sends; it bounds a direct caller.
 DEST_HOSTS_MAX = 8
 
+# An admin key within the agent's reach: said once per process, on stderr, the first time this agent asks the gateway anything.
+_ADMIN_KEY_NOTICE_SAID = [False]
+
+
+def _say_once_if_an_admin_key_is_within_reach():
+    if _ADMIN_KEY_NOTICE_SAID[0]:
+        return
+    _ADMIN_KEY_NOTICE_SAID[0] = True
+    line = envfile.admin_key_within_agent_reach()
+    if line:
+        try:
+            print(f"⚠️  [AgentX] {line}", file=sys.stderr)
+        except Exception:
+            pass
+
 
 _SAID_PARENT_ENV_IS_IGNORED = []
 # The gate is check-then-set, and `gateway_url` is read on the per-call path of an SDK that
@@ -254,7 +269,7 @@ class AgentXClient:
     def evaluate_intent(self, agent_id, query, chain_of_thought, receipt_id=None, trace_id=None,
                         action=None, args=None, session_tokens=0, session_cost_usd=0, budget_pool_id=None,
                         enforcement=None, strike_count=None, tool=None, shield_matched=None,
-                        statement_text=None, dest_hosts=None):
+                        statement_text=None, dest_hosts=None, watch_source=None):
         # `tool` is APPENDED, after the deprecated `strike_count`, not slotted in beside
         # the fields it belongs with. `strike_count` is retained precisely so existing
         # direct callers do not break, and inserting ahead of it would hand a caller
@@ -277,6 +292,7 @@ class AgentXClient:
             )
         # ✅ Fetch it dynamically right when the network request is made
         api_key = resolve_api_key()
+        _say_once_if_an_admin_key_is_within_reach()
 
         if not api_key:
             # Keyless (no key configured) is a SUPPORTED mode, not an error. Signal
@@ -415,6 +431,10 @@ class AgentXClient:
             # side deploys first, which is the only property worth having here — deploy
             # ORDERING is not something a released SDK can be made to respect.
             payload["audit_releases_all"] = True
+            # What set watch ("AGENTX_POSTURE" or "tool option"), so the gateway's record of a
+            # call it would have stopped says why it ran. Read for no decision.
+            if watch_source:
+                payload["watch_source"] = str(watch_source)
 
         # How long we will still be listening. The gateway fits its judge inside this so a
         # verdict cannot be produced after we have stopped waiting (P-157). Sent on EVERY

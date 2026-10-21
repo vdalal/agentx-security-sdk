@@ -1978,6 +1978,21 @@ def get_destinations(path=None, statuses=None):
     return _destinations_where("status IN (%s)" % ", ".join("?" * len(wanted)), wanted, path)
 
 
+def first_site_recorded_at(path=None):
+    """Epoch seconds of the first call this ledger recorded a site for (any agent), or None:
+    no ledger, no such row, or a ledger older than the column. Lets a screen say WHEN site
+    recording started instead of "from this version on". Never raises."""
+    if not os.path.exists(path or DB_PATH):
+        return None
+    try:
+        with _calls_connection(path) as conn:
+            row = conn.execute("SELECT MIN(timestamp) FROM event_log "
+                               "WHERE dest_hosts IS NOT NULL AND dest_hosts != ''").fetchone()
+    except Exception:
+        return None
+    return row[0] if row and row[0] is not None else None
+
+
 def get_proposable_destinations(allowlist_policy_id, path=None):
     """{agent_id: {host: calls}} an allowlist may be PROPOSED from: calls that ran with no
     objection (`ALLOWED`, `UNSIZED`), plus calls whose only objection was the allowlist itself
@@ -3753,7 +3768,7 @@ def get_rule_match_summary(path=None):
             "uncompared_by_id": uncompared_by_id}
 
 
-def get_call_log(path=None, limit=50, offset=0):
+def get_call_log(path=None, limit=50, offset=0, include_ours=True):
     """P-92: what the agent did, ONE ROW PER CALL, newest first. Never raises.
 
     The per-call sibling of `get_call_inventory`, which groups by tool. Both read the same
@@ -3772,6 +3787,10 @@ def get_call_log(path=None, limit=50, offset=0):
 
     `limit=None` returns every row in the window -- what `--all` and `--json` pass. "Every
     row" is bounded by construction: _RETENTION_MAX_ROWS is the ceiling on this table.
+
+    `include_ours=False` leaves our own demo and example rows out IN THE QUERY, so the page
+    and its "N more" both count the reader's rows (the human screen's default once they have
+    any). `totals` stays ledger-wide either way.
 
     Returns {readable, rows, shown, window_start, covers_all, totals}, where `totals`
     is the shared `_ledger_totals` block -- handed over whole rather than picked apart, so a
@@ -3824,16 +3843,21 @@ def get_call_log(path=None, limit=50, offset=0):
             # is the burst this view exists to make visible.
             # `dest_hosts` read through the same legacy retry as every newer column: on a
             # ledger the migration has not reached it is NULL, never a failed read.
+            _where, _where_params = ("", [])
+            if not include_ours:
+                _theirs_sql, _where_params = _our_agents_clause(negate=True)
+                # `%%` because the column list is %-formatted below.
+                _where = " WHERE " + _theirs_sql.replace("%", "%%")
             sql = ("SELECT timestamp, tool_name, status, arg_names, amount, target_class, "
-                   "policy_name, trace_id, agent_id, policy_id, %s FROM event_log "
-                   "ORDER BY timestamp DESC, id DESC")
+                   "policy_name, trace_id, agent_id, policy_id, %s FROM event_log"
+                   + _where + " ORDER BY timestamp DESC, id DESC")
             # 🔴 OFFSET SURVIVES `limit=None`. The clause used to be appended only when a
             # limit was set, so `get_call_log(limit=None, offset=50)` silently returned the
             # whole list from row 1 -- the next paging caller gets 50 duplicated rows with
             # nothing red. SQLite has no OFFSET without LIMIT, and `LIMIT -1` is its
             # documented "no limit", so the two stay independent as the signature promises.
             sql += " LIMIT ? OFFSET ?"
-            params = [-1 if limit is None else int(limit), int(offset)]
+            params = list(_where_params) + [-1 if limit is None else int(limit), int(offset)]
             try:
                 cursor.execute(sql % "dest_hosts", params)
             except sqlite3.OperationalError:

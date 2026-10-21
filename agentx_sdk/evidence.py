@@ -320,6 +320,35 @@ def _not_run_or_opinion_clause():
             list(params) + [db.REFUSED_STATUS, db.HALTED_STATUS])
 
 
+# Kept byte-identical to the gateway's own copy of this rule (a test asserts it). A host can carry
+# a secret in a label (`ghp_<token>.paste.example`
+# is how DNS-label exfiltration is written), and this file is built to be handed on, so a label of
+# 20 or more characters mixing letters and digits is shown as [withheld]; the rest of the host
+# still says where the call went. An IP address has no letters and is never masked.
+_SECRETISH_LABEL_RE = re.compile(r"^(?=[a-z0-9_-]*[0-9])(?=[a-z0-9_-]*[a-z])[a-z0-9_-]{20,}$")
+
+
+def evidence_host(host):
+    """`host` as this file shows it: a secret-looking label replaced by [withheld]."""
+    return ".".join("[withheld]" if _SECRETISH_LABEL_RE.match(label) else label
+                    for label in str(host).split("."))
+
+
+def _masked_sites(sites):
+    """{agent: {host: calls}} with each host shown as evidence_host shows it; two hosts that show
+    the same are counted together. None (could not read) stays None."""
+    if not isinstance(sites, dict):
+        return sites
+    out = {}
+    for agent, hosts in sites.items():
+        merged = {}
+        for host, calls in (hosts or {}).items():
+            shown = evidence_host(host)
+            merged[shown] = merged.get(shown, 0) + (calls or 0)
+        out[agent] = merged
+    return out
+
+
 def _ledger(db_path, verdicts):
     """(stopped rows, sites_since, sites undated, readable). The sites' period is read over the
     rows `db.get_destinations` counts (a site named, an allowed status), never the whole ledger."""
@@ -336,10 +365,18 @@ def _ledger(db_path, verdicts):
         # PLUS the calls refused for want of a verdict: not an opinion, but a call this machine
         # did not run, which is what this list is for. Same widening in `_opinion_counts`.
         opinion_sql, opinion_params = _not_run_or_opinion_clause()
-        rows = conn.execute(
-            "SELECT id, timestamp, agent_id, tool_name, policy_name, status, posture "
-            "FROM event_log WHERE %s ORDER BY timestamp DESC, id DESC LIMIT ?" % opinion_sql,
-            tuple(opinion_params) + (STOPPED_LIMIT,)).fetchall()
+        # The site each call was addressed to, so a reviewer can see where a call that ran while
+        # watching went. A record older than the `dest_hosts` column has none to give: its rows
+        # say null (not read), never [] (read, no site).
+        select = ("SELECT id, timestamp, agent_id, tool_name, policy_name, status, posture, %s "
+                  "FROM event_log WHERE %s ORDER BY timestamp DESC, id DESC LIMIT ?")
+        params = tuple(opinion_params) + (STOPPED_LIMIT,)
+        try:
+            rows = conn.execute(select % ("dest_hosts", opinion_sql), params).fetchall()
+            sites_column = True
+        except sqlite3.OperationalError:
+            rows = conn.execute(select % ("NULL", opinion_sql), params).fetchall()
+            sites_column = False
     except sqlite3.Error:
         conn.close()
         return None, None, False, False
@@ -362,8 +399,11 @@ def _ledger(db_path, verdicts):
                 "tool": tool, "rule": rule,
                 "verdict": verdicts.get(status, status), "status": status,
                 "posture": {"audit": "watching", "enforce": "enforcing"}.get(posture, posture),
+                # Masking can make two hosts read the same: listed once.
+                "sites": (sorted({evidence_host(h) for h in (hosts or "").split(",") if h})
+                          if sites_column else None),
                 "ledger_id": rid, "receipt_id": None}
-               for rid, ts, agent, tool, rule, status, posture in rows]
+               for rid, ts, agent, tool, rule, status, posture, hosts in rows]
     return stopped, _iso(sites_oldest) if sites_oldest is not None else None, \
         bool(sites_undated), True
 
@@ -422,8 +462,8 @@ def build(db_path=None):
     fingerprint = hashlib.sha256(_canonical([version, sorted(fp_rows, key=_canonical)])
                                  .encode("utf-8")).hexdigest()
     stopped, sites_since, sites_undated, readable = _ledger(db_path, w["verdicts"])
-    sites = db.get_destinations(db_path, statuses=db.RAN_WITHOUT_OPINION_STATUSES) if readable \
-        else None
+    sites = _masked_sites(db.get_destinations(db_path, statuses=db.RAN_WITHOUT_OPINION_STATUSES)) \
+        if readable else None
     head, intact = _record_head(db_path)
     could_not_read = [name for name, value in (("stopped_or_held_calls", stopped),
                                                ("sites_recorded", sites),
@@ -550,7 +590,7 @@ def main(args=None):
             calls += ", %d not run (no verdict)" % refused
         if halted:
             calls += ", %d halted (a runaway loop)" % halted
-        calls += ", %d flagged while watching (they ran)" % watched
+        calls += ", %d flagged while watching (%s)" % (watched, "it ran" if watched == 1 else "they ran")
     print("Wrote %s: %d rules in force, %d switched off, %s."
           % (out_path, len(doc["rules_in_force"]), len(doc["rules_off"]), calls))
     # The one value the reader is told to keep and check later, so it is printed, not left at

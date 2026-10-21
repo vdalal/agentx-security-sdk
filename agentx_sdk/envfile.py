@@ -225,3 +225,51 @@ def resolve_api_key(overlay=None):
     if not val and overlay is not None:
         val = str(overlay.get("AGENTX_API_KEY") or "").strip()
     return val or None
+
+
+# Admin keys. An admin key approves held calls and pushes lists. The gateway refuses it for checking
+# calls; these name it when it turns up where an agent can read it.
+ADMIN_KEY_PREFIX = "agentx_sk_a_"
+
+
+def admin_key_within_agent_reach():
+    """-> one sentence saying where an admin key sits in THIS process's reach, or None.
+
+    Asked by the runtime (an agent's own process), so the process environment is what counts,
+    plus the project `.env`, which any agent in the project can open. Never raises."""
+    try:
+        if (resolve_api_key() or "").startswith(ADMIN_KEY_PREFIX):
+            return ("AGENTX_API_KEY in this agent's environment is an admin key. The gateway "
+                    "refuses it for checking calls: give the agent its agent key.")
+        if (os.environ.get("AGENTX_ADMIN_KEY") or "").strip():
+            return ("AGENTX_ADMIN_KEY is set in this agent's environment, so the agent could "
+                    "approve its own held calls. Set it only where you run agentx commands.")
+        if str(dotenv_overlay(include_parent=True).get("AGENTX_ADMIN_KEY") or "").strip():
+            return ("AGENTX_ADMIN_KEY is in this project's .env, where an agent can read it and "
+                    "approve its own held calls. Move it out of the project.")
+    except Exception:
+        return None
+    return None
+
+
+def resolve_admin_key(overlay=None):
+    """-> (key, refusal) for an agentx command that needs a person's key: approving held calls,
+    pushing a list. AGENTX_ADMIN_KEY from the process environment ONLY. When it is in the
+    project's `.env` instead (`overlay`), the key is None and `refusal` says why: an agent in the
+    project can read that file, so using it would teach the habit that defeats the key."""
+    val = (os.environ.get("AGENTX_ADMIN_KEY") or "").strip()
+    if val:
+        # The key goes only to an address the person chose: their shell's AGENTX_GATEWAY_URL, or
+        # the default. An agent that can write .env could otherwise point the address at itself
+        # and collect the admin key on the next `agentx holds` (review round 1).
+        if (overlay is not None and not (os.environ.get("AGENTX_GATEWAY_URL") or "").strip()
+                and str(overlay.get("AGENTX_GATEWAY_URL") or "").strip()):
+            return None, ("Your gateway address comes from this project's .env, which an agent can "
+                          "change, so the admin key was not sent. Set AGENTX_GATEWAY_URL in your "
+                          "own shell as well.")
+        return val, None
+    if overlay is not None and str(overlay.get("AGENTX_ADMIN_KEY") or "").strip():
+        return None, ("AGENTX_ADMIN_KEY is in this project's .env, where your agent can read it "
+                      "and approve its own held calls, so it was not used. Remove it from .env and "
+                      "set it in your own shell, where you run agentx commands.")
+    return None, None

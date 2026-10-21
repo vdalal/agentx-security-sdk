@@ -2,6 +2,7 @@ import os
 import sys
 import copy as _copy
 import json
+import textwrap
 import atexit
 import time
 import functools
@@ -1429,7 +1430,7 @@ _ENV_FLAG_FALSE = ("", "0", "false", "no", "off")
 _ENV_FLAG_WARNED = set()
 
 
-def _env_flag_is_true(name):
+def _env_flag_is_true(name, default=False):
     """Read an on/off env var, and REFUSE TO GUESS at a value that is neither.
 
     The house style elsewhere is `os.environ.get(name, "false").lower() == "true"`, which
@@ -1437,12 +1438,15 @@ def _env_flag_is_true(name):
     behaviour on, silently reading the user's "yes" as "no" is the worst available failure:
     they set it, nothing happens, and there is no line anywhere saying why. So the accepted
     spellings are the ones people actually type, and anything else warns ONCE by name and
-    falls back to off rather than being swallowed. Same rule, and the same reason, as
+    falls back to `default` (off unless the switch says otherwise) rather than being swallowed. Same rule, and the same reason, as
     `_resolve_fail_mode`: a toggle must never be disabled by a typo in silence.
 
     Unset is off. Set-but-empty is off, deliberately and explicitly: it is what an unset
     variable in a `.env` file looks like, and the one other place this project has an
-    empty-string env value it meant two different things on two doors."""
+    empty-string env value it meant two different things on two doors.
+
+    `default` is what a value that is neither reads as. A switch that is on by default keeps
+    it: a typo there would otherwise turn the switch off, and the notice says which it kept."""
     raw = (os.environ.get(name) or "").strip().lower()
     if raw in _ENV_FLAG_TRUE:
         return True
@@ -1459,9 +1463,24 @@ def _env_flag_is_true(name):
         # reason, and its docstring is the write-up.
         _print_banner(
             "⚠️  [AgentX] Unrecognized %s=%r. Expected %s to turn it on, or %s to turn it off. "
-            "Treating it as OFF, so nothing changed. Fix the value if you meant to turn it on.",
+            + ("Treating it as ON, its default. Fix the value if you meant to turn it off."
+               if default else
+               "Treating it as OFF, so nothing changed. Fix the value if you meant to turn it on."),
             name, os.environ.get(name), "/".join(_ENV_FLAG_TRUE), "/".join(x for x in _ENV_FLAG_FALSE if x))
-    return False
+    return bool(default)
+
+
+def _watch_source(override, enforcement_level):
+    """What set watch on this call, in the words the gateway records: "tool option" (the
+    tool's own `posture=`), "AGENTX_POSTURE", or None (not watching, or the rung's default,
+    which only a keyless install has and a keyless install never asks a gateway)."""
+    if enforcement_level != "audit":
+        return None
+    if override is not None:
+        return "tool option"
+    if (os.environ.get("AGENTX_POSTURE") or "").strip().lower() == "audit":
+        return "AGENTX_POSTURE"
+    return None
 
 
 def _keyed_shield_defers(enforcement_level):
@@ -1488,8 +1507,15 @@ def _keyed_shield_defers(enforcement_level):
     not yet (a local script piped into a shell, `cat setup.sh | sh`), so a keyed install gets the
     gateway's answer on it.
 
-    Audit is unchanged: it decides nothing, so it has nothing to defer. The same key read as
-    `_default_posture_for_rung`, for the same reason it gives: the key IS the rung.
+    WATCHING DEFERS TOO. It used to be exempt ("audit decides nothing, so it
+    has nothing to defer"), and that kept a keyed watched match off the gateway entirely: the
+    call ran, the SDK ledger had it, and the gateway's record, the one the hosted evidence is
+    built from, never saw it. Deferring changes nothing about what runs (watching runs the call
+    on every answer: a block or a hold is released, an allow runs, an unreachable gateway leaves
+    the shield's would-block standing), only who records it: the gateway's would-stop verdict
+    is recorded there as a call that ran while watching, and its allow wins here as it does
+    when enforcing. The same key read as `_default_posture_for_rung`, for the same reason it
+    gives: the key IS the rung.
 
     ON BY DEFAULT. `AGENTX_SHIELD_ASKS_GATEWAY=false` (or 0 / no / off) keeps the old behaviour:
     a matched call is refused in process and the gateway is never asked. Unset or empty is the
@@ -1500,8 +1526,7 @@ def _keyed_shield_defers(enforcement_level):
     """
     if not _shield_asks_gateway_switch():
         return False
-    return (enforcement_level != "audit"
-            and bool(resolve_api_key()))
+    return bool(resolve_api_key())
 
 
 def _gateway_can_judge(matched_policy):
@@ -1567,12 +1592,12 @@ def _own_files_also_stop(call_text, agent_id):
 def _shield_asks_gateway_switch():
     """`AGENTX_SHIELD_ASKS_GATEWAY`, ON unless a person set it to an off spelling. Unset and
     empty are the default (on): an empty value is what an unset line in a `.env` file looks like.
-    A value that is neither on nor off warns once and reads as off, the house rule for a typo
-    (`_env_flag_is_true`)."""
+    A value that is neither on nor off warns once and keeps the default (on): read as off, a
+    typo would quietly hand the gateway's decisions back to the SDK (`_env_flag_is_true`)."""
     raw = os.environ.get("AGENTX_SHIELD_ASKS_GATEWAY")
     if raw is None or not raw.strip():
         return True
-    return _env_flag_is_true("AGENTX_SHIELD_ASKS_GATEWAY")
+    return _env_flag_is_true("AGENTX_SHIELD_ASKS_GATEWAY", default=True)
 
 
 def _shield_asks_gateway_set():
@@ -2979,10 +3004,11 @@ def _print_agentx_summary():
         if not _carried and not _keyed:
             print(" 🔀 Shield asks gateway:   OFF |  set, but no API key: nothing to ask")
         elif not _carried:
-            # The one zero that needs a pointer: keyed, switched on, and nothing deferred. The
-            # usual cause is posture, which is per tool and which this line deliberately does
-            # not try to read (see the counter's note).
-            print(" 🔀 Shield asks gateway:   ON  |  nothing matched yet, or the tool is watching")
+            # The one zero that needs a pointer: keyed, switched on, and nothing deferred. Watching
+            # defers too now, so posture is no longer a cause: either nothing matched, or every
+            # match was one the developer's own files also stop (`_own_files_also_stop`,
+            # `_gateway_can_judge`), which is always decided here.
+            print(" 🔀 Shield asks gateway:   ON  |  nothing matched yet that your gateway can decide")
         else:
             print(f" 🔀 Shield asks gateway:   ON  |  asked about {_carried} matched call(s), {_answered} answered")
     print("─"*60)
@@ -3212,9 +3238,20 @@ def _print_agentx_summary():
         # permanent zero teaches a reader to stop reading the line. When it is non-zero it is
         # the most important number here, because it is the one the rate cannot speak for.
         _unmeasured_note = f" · {unmeasured_ch} not measurable" if unmeasured_ch else ""
+        # The episodes a held call's answer settled (_recovery_breakdown leaves them out of its
+        # buckets; they are counted under Human Escalations). Printed when there are any, so the
+        # line still adds up: without it, a block and an approved hold on the same tool printed
+        # "of 1 challenge(s): 0 recovered · 0 continued · 0 abandoned · 0 looped". "answered",
+        # not "by a person": the key that answered may be the agent's. Worded as WHERE the
+        # episode happened, not that the answer settled it: the exclusion is per trace, so a
+        # DELETE abandoned on a run where some other call's hold was approved lands here too.
+        _held_ch = (total_ch - recovered_ch - continued_ch - unmeasured_ch - abandoned_ch
+                    - looped_ch)
+        _held_note = (f" · {_held_ch} on a run where a held call was answered"
+                      if _held_ch > 0 else "")
         print(f"    ↳ of {total_ch} challenge(s): "
               f"{recovered_ch} recovered · {continued_ch} continued · "
-              f"{abandoned_ch} abandoned · {looped_ch} looped{_unmeasured_note}")
+              f"{abandoned_ch} abandoned · {looped_ch} looped{_unmeasured_note}{_held_note}")
         if unmeasured_ch:
             # Names what the two arms of _is_narrower actually read, so the sentence cannot
             # promise less (or more) than the predicate: statements, and the labelled
@@ -3313,8 +3350,10 @@ def _print_agentx_summary():
         print("─"*60)
         # "item(s)" not "block(s)": the count spans BOTH kinds — blocks needing a
         # verdict AND reframes ready to adopt — so naming only one under-describes the count.
-        print(f" 💡 {_pending} item(s) from your agents await a quick review —")
-        print("    label a block, or adopt a safe-path it learned:")
+        print(" 💡 %s from your agents %s a quick review: label a block, or adopt"
+              % ("1 item" if _pending == 1 else "%d items" % _pending,
+                 "awaits" if _pending == 1 else "await"))
+        print("    a safe path it learned:")
         print("    ▶ agentx review")
     elif len(_session_stats["recovered_traces"]) > 0:
         # This line promised "AgentX may have learned reusable safe-paths" and
@@ -3752,8 +3791,68 @@ def _scrub_pii(data, pii_targets):
     
     elif isinstance(data, list):
         return [_scrub_pii(item, pii_targets) for item in data]
-    
+
+    elif isinstance(data, tuple):
+        # A DB-API `fetchall()` returns a list of TUPLES, and this function used to return a
+        # tuple untouched, so the read the 102 rule exists for came back unredacted. A
+        # namedtuple is rebuilt as itself; any other tuple subclass whose constructor will not
+        # take the items becomes a plain tuple.
+        items = [_scrub_pii(item, pii_targets) for item in data]
+        if hasattr(data, "_fields"):
+            try:
+                return type(data)(*items)
+            except Exception:
+                return tuple(items)
+        try:
+            rebuilt = type(data)(items)
+        except Exception:
+            return tuple(items)
+        # A subclass whose constructor wraps its arguments would hand back a different shape.
+        return rebuilt if len(rebuilt) == len(items) else tuple(items)
+
+    elif isinstance(data, (bytes, bytearray)):
+        # A BLOB or a driver that returns text as bytes. Text that is not UTF-8 is handed back
+        # as it came: there is no text to read it as.
+        try:
+            text = bytes(data).decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        scrubbed = _scrub_pii(text, pii_targets).encode("utf-8")
+        return bytearray(scrubbed) if isinstance(data, bytearray) else scrubbed
+
+    elif _is_sqlite_row(data):
+        # `conn.row_factory = sqlite3.Row` rows are neither tuples nor dicts, so they came back
+        # unredacted. sqlite3.Row cannot be built from Python, so the scrubbed row keeps the
+        # two ways it is read: by position and by column name.
+        return _ScrubbedRow(data.keys(), [_scrub_pii(item, pii_targets) for item in data])
+
     return data
+
+
+def _is_sqlite_row(data):
+    import sqlite3
+    return isinstance(data, sqlite3.Row)
+
+
+class _ScrubbedRow(tuple):
+    """A redacted sqlite3.Row: a tuple of the values that also answers `row["col"]` and
+    `row.keys()`, the way sqlite3.Row does (column names match without regard to case)."""
+
+    def __new__(cls, keys, values):
+        row = super().__new__(cls, values)
+        row._keys = list(keys)
+        return row
+
+    def keys(self):
+        return list(self._keys)
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            for i, name in enumerate(self._keys):
+                if name.lower() == key.lower():
+                    return tuple.__getitem__(self, i)
+            raise IndexError("No item with that key")
+        return tuple.__getitem__(self, key)
 
 # =====================================================================
 # 🧬 MODULE-LEVEL MEMORY PASS: LOCAL VECTOR SHIELD STREAMING LOOPS
@@ -5038,7 +5137,7 @@ _PIPE_TO_SHELL_RE = re.compile(
     r"\|&?[\s\\]*"                                                  # pipe (incl. `|&` pipe-both), tolerating ws / a line-continuation backslash
     r"(?:(?:sudo|doas|su|runuser|env|exec|nohup|nice|timeout|setsid|stdbuf|xargs)\b"
     r"[^|;&\n]*?\s)*"                                               # zero+ wrapper commands with their flags / args
-    r"(?:bash|zsh|ksh|dash|ash|sh)\b")                             # ...ending at a shell interpreter (whole word)
+    r"(?:bash|zsh|ksh|dash|ash|sh|iex|invoke-expression)\b")       # ...ending at a shell interpreter (whole word); iex is PowerShell's (`iwr ... | iex`)
 
 
 # =============================================================================
@@ -8121,9 +8220,13 @@ def _loaded_or_builtin(policy):
 def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="action",
                           table_copies=None, arguments=None, tool_name=None,
                           name_leads=False, declared_args=None, agent_id=None,
-                          own_machine=None, own_tool_door=False):
+                          own_machine=None, own_tool_door=False, site_arguments=None):
     """Keyless Layer-0 detection — the SINGLE home shared by the @agentx_protect
     decorator and the ``agentx-mcp`` stdio proxy so the two paths can never drift.
+
+    ``site_arguments`` (a dict) is given by the decorator when a tool's ``extract_query_func``
+    chose the scan text: every bound argument, read by the outbound allowlist (3) only, so an
+    address in an argument the extractor left out is still checked against the site list.
 
     ``own_machine`` is given only by the Claude Code hook: the call runs on the developer's
     own machine, so the machine itself is not an SSRF target (`_LOOPBACK_RAILS`). Only whether
@@ -8427,12 +8530,25 @@ def evaluate_call_keyless(query, *, bypass_local_shield=False, scan_scope="actio
     #    argument the vocabulary does not know (`webhook=`, `to=`) is still somewhere the call
     #    can send data, and an agent a person limited may reach only the listed sites. The
     #    ledger and the review proposals keep the narrower reading, so a URL in a note is never
-    #    proposed as a site. Only when the door passed the agent and the arguments.
-    if agent_id is not None and isinstance(arguments, dict):
+    #    proposed as a site. Only when the door passed the agent and the arguments. On the
+    #    extractor path the scan text is the extractor's and the arguments come as
+    #    `site_arguments`: both are read, so an extractor cannot leave an address unchecked.
+    if agent_id is not None and (isinstance(arguments, dict) or isinstance(site_arguments, dict)):
         from .rules import allowlist_miss
+        site_text = full
+        if not isinstance(arguments, dict):
+            parts = [full]
+            for value in site_arguments.values():
+                try:
+                    coerced = _coerce_arg_value(value)
+                except Exception:
+                    continue
+                if coerced is not None:
+                    parts.append(str(coerced))
+            site_text = " ".join(parts)
         # The developer's own doors (the Claude Code hook, agentx-mcp) are not covered by `*`;
         # they say so with `own_tool_door`, never by their name (`rules._STAR_EXEMPT_DOOR_IDS`).
-        miss = allowlist_miss(agent_id, destination_url_hosts(full),
+        miss = allowlist_miss(agent_id, destination_url_hosts(site_text),
                               star_applies=not own_tool_door)
         if miss:
             return _allowlist_decision(miss)
@@ -9637,6 +9753,11 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # extractor path, where the caller chose the scan text and the names are not
             # what it scans.
             shield_args = None
+            # Every bound argument by name on the EXTRACTOR path, for the site list only: the
+            # extractor chose the scan text, but a URL in an argument it left out is still
+            # somewhere the call can send data. Without this an extractor tool skipped the
+            # outbound allowlist on the free path (the gateway reads every argument already).
+            site_args = None
             query = _QUERY_UNSET
             reflect_err = None
             # 🔴 THE THIRD UNSCREENED CLASS, and P-92's `screened` rule missed it. A reflection
@@ -9658,11 +9779,15 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
 
                 if extract_query_func is None:
                     shield_args = {}
+                else:
+                    site_args = {}
                 for param_name, param_value in bound_args.arguments.items():
                     # Filter database/network context objects that poison hyper-space weights
                     if param_name in ("self", "cls", "conn", "cursor", "db_session", "client"):
                         continue
 
+                    if site_args is not None:
+                        site_args[param_name] = param_value
                     if extract_query_func is None:
                         shield_args[param_name] = param_value
                         # Only the no-extractor path needs the flattened text. Building it
@@ -10233,13 +10358,14 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     matched_policy = evaluate_call_keyless(
                         query, table_copies=_run_copies,
                         arguments=shield_args if reflect_err is None else None,
-                        tool_name=func_name, agent_id=agent_id)
+                        tool_name=func_name, agent_id=agent_id,
+                        site_arguments=site_args)
 
                     if (matched_policy and _keyed_shield_defers(enforcement_level)
                             and _gateway_can_judge(matched_policy)
                             and not _own_files_also_stop(query, agent_id)):
-                        # A keyed enforce run carries the match to the gateway instead of
-                        # deciding here. The gateway's block, breaker or human hold replaces
+                        # A keyed run, enforcing or watching, carries the match to the gateway
+                        # instead of deciding here. The gateway's block, breaker or human hold replaces
                         # this block; anything else and the block is delivered below the
                         # gateway call, unchanged.
                         deferred_shield = matched_policy
@@ -10256,7 +10382,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         print(f"🛡️ [AgentX SDK] Local shield matched '{func_name}' "
                               f"({matched_policy['policy_name']}); asking the gateway.")
                     elif matched_policy:
-                        # Keyless, or audit: the shield decides, as it always has.
+                        # Keyless, or a match the gateway cannot judge: the shield decides.
                         return _block_on_local_shield(matched_policy)
                 # ✅ DO NOT swallow our own intentional routing exceptions.
                 # AgentXPolicyLoadError joins this tuple: it is a FAIL-CLOSED signal
@@ -10354,6 +10480,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 session_cost_usd=session_cost_total,
                 budget_pool_id=resolved_pool_id,
                 enforcement=enforcement_level,
+                watch_source=_watch_source(enforcement, enforcement_level),
                 # NO LONGER SENT. `shield_matched` tells the gateway "if you allow this, it
                 # will not run", which stopped being true when the gateway's allow started to
                 # win: an allowed call runs, and the gateway's records of it (strike run,
@@ -10805,10 +10932,29 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 poll_interval = 3
                 elapsed = 0
 
-                print("\n🚨 [AgentX SDK] Task suspended. Request escalated to Human SOC.")
+                print("\n🚨 [AgentX SDK] Task suspended. This call is held for a person.")
                 print(f"⏳ [AgentX SDK] Polling for human decision (Receipt: {receipt_id})...")
-                print(f"   Waiting up to {max_poll_seconds}s for a person to Approve or Deny")
-                print("   in the dashboard's SOC Sandbox tab. Nothing runs until they do.")
+                # The gateway says how to answer where our own text is wrong (a hosted tenant
+                # runs no gateway and no dashboard shows its holds). Else our text.
+                _how = eval_res.get("how_to_answer")
+                if isinstance(_how, str) and _how.strip():
+                    print(f"   Waiting up to {max_poll_seconds}s for a person to Approve or Deny.")
+                    # Each `command` is held together through the wrap, as the "See it" line
+                    # does: the founder's walk got `agentx` / `holds approve <receipt>` split
+                    # across two lines, which cannot be copied in one go.
+                    _held = re.sub(r"`[^`]*`", lambda m: m.group(0).replace(" ", "⁠"),
+                                   _how.strip())
+                    for _line in textwrap.wrap(_held, 90, break_long_words=False,
+                                               break_on_hyphens=False):
+                        print(f"   {_line.replace(chr(0x2060), ' ')}")
+                    print("   Nothing runs until they do.")
+                else:
+                    print(f"   Waiting up to {max_poll_seconds}s for a person to Approve or Deny")
+                    # `agentx holds` too: a gateway with an admin key refuses the dashboard's
+                    # answer. Not in cloud mode, where holds live in the control plane and the
+                    # CLI sees none.
+                    print("   in the dashboard's Held Calls tab, or with `agentx holds` (a gateway you")
+                    print("   run that is not in cloud mode). Nothing runs until they do.")
                 print("   Set AGENTX_HITL_TIMEOUT_SECONDS to wait longer.")
                 
                 # The Polling Loop
@@ -10826,7 +10972,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                             current_status = status_check.json().get("status")
                             
                             if current_status == "APPROVED":
-                                print(f"\n✅ [AgentX SDK] Human SOC APPROVED the override!")
+                                print("\n✅ [AgentX SDK] The held call was approved.")
                                 # Human-assisted, not autonomous: mark the trace resolved so
                                 # a later safe call on it is NOT miscounted as self-correction.
                                 _mark_trace("human_resolved_traces", current_trace_id)
@@ -10843,10 +10989,10 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                                 return _ExecuteTool(screened=True)
                                 
                             elif current_status == "DENIED":
-                                print(f"\n❌ [AgentX SDK] Human SOC DENIED the override.")
+                                print("\n❌ [AgentX SDK] The held call was denied.")
                                 return json.dumps({
                                     "error": "AgentX Human Override Denied",
-                                    "instruction": "The SOC analyst explicitly denied this action. You must find an alternative path or fail the task."
+                                    "instruction": "This action was denied while it was held. Do not retry it: find an alternative path or fail the task."
                                 })
 
                             # 🔴 DISMISSED IS TERMINAL AT THE GATEWAY AND WAS NOT TERMINAL HERE.
@@ -10865,11 +11011,11 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                             # on a human-approval control is the one direction that cannot be
                             # taken back, so it stops here and says which of the two happened.
                             elif current_status == "DISMISSED":
-                                print("\n🗂️ [AgentX SDK] Human SOC DISMISSED the escalation "
-                                      "without approving it.")
+                                print("\n🗂️ [AgentX SDK] The held call was dismissed "
+                                      "without being approved.")
                                 return json.dumps({
                                     "error": "AgentX Human Escalation Dismissed",
-                                    "instruction": "A SOC analyst cleared this escalation from the queue without approving the action. Treat it as not approved: find an alternative path or fail the task."
+                                    "instruction": "This held action was dismissed without being approved. Treat it as not approved: find an alternative path or fail the task."
                                 })
                                 
                         elif status_check.status_code == 401:

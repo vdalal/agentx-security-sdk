@@ -35,7 +35,7 @@ from .rules import (harvest_rule_candidates, harvest_rule_candidates_from_calls,
 
 # Re-exported from the stdlib-only envfile module (kept importable here for
 # backward compatibility — callers and tests still do `from .cli import load_env_file`).
-from .envfile import load_env_file, resolve_env, resolve_api_key
+from .envfile import load_env_file, resolve_env, resolve_api_key, resolve_admin_key
 
 
 def _ledger_path_line(path, indent="   "):
@@ -3995,7 +3995,7 @@ def _audit_usage():
     imports, so a constant computed at import would resolve the wrong door however it was
     written.
     """
-    return ("   Usage:  %s [--calls] [--json] [--share] [--limit N | --all]\n"
+    return ("   Usage:  %s [--calls [--with-demo]] [--json] [--share] [--limit N | --all]\n"
             "           %s [--require-calls] [--fail-on-rule-match]   (for CI: exit codes)"
             % (_audit_cmd(), " " * len(_audit_cmd())))
 
@@ -4198,7 +4198,9 @@ _RULE_MATCH_MARK = "^"
 _CALL_STATUS_MEANINGS = {
     "ran": "ran = AgentX had no objection.",
     "ran, flagged": "ran, flagged = ran; AgentX objected but did not stop it (watch-only).",
-    "stopped": "stopped = AgentX stopped it; no retry was recorded.",
+    # Not "no retry was recorded": the agent often carries on in the same run, and a reader
+    # sees that a line up. What the record lacks is a narrower version of THIS call that ran.
+    "stopped": "stopped = AgentX stopped it; no narrower retry of it is on record.",
     # 🔴 SAYS WHAT THE LEDGER MEASURED, NOT WHAT WE HOPE. "reached the goal another way" was
     # a claim the ledger cannot make: a RECOVERED row means the agent came back with a
     # NARROWER version of the same action and that retry ran (`decorators.py`, "is the retry
@@ -4216,6 +4218,10 @@ _CALL_STATUS_MEANINGS = {
     "halted": "halted = AgentX stopped it as a runaway loop; it did not run.",
     "unrecorded": "unrecorded = written before the verdict was kept; no claim either way.",
 }
+
+
+# One sentence for the dash, printed by both audit screens.
+_SURFACE_DASH_MEANING = "A dash under SURFACE means we could not tell what that tool touches."
 
 
 def _calls_status_legend(labels_on_page):
@@ -4280,6 +4286,8 @@ def _parse_audit_args(args):
             opts["json"] = True; i += 1
         elif tok == "--all":
             opts["all"] = True; i += 1
+        elif tok == "--with-demo":
+            opts["with_demo"] = True; i += 1
         elif tok == "--require-calls":
             opts["require_calls"] = True; i += 1
         elif tok == "--fail-on-rule-match":
@@ -4362,6 +4370,21 @@ def _local_day_and_clock(ts):
         return moment.strftime("%Y-%m-%d"), moment.strftime("%H:%M:%S")
     except (TypeError, ValueError, OSError, OverflowError):
         return "", "--:--:--"
+
+
+def _local_zone_phrase(ts=None):
+    """"local time, UTC-7": the clock `_local_day_and_clock` and `_since_phrase`
+    print in, said once per screen. The offset at `ts` when given (a screen passes its newest
+    row), else now's. Never raises; "" when the zone cannot be read."""
+    try:
+        moment = datetime.fromtimestamp(float(ts)) if ts else datetime.now()
+        off = moment.astimezone().utcoffset()
+        mins = int(off.total_seconds() // 60)
+        sign = "+" if mins >= 0 else "-"
+        h, m = divmod(abs(mins), 60)
+        return "local time, UTC%s%d%s" % (sign, h, (":%02d" % m) if m else "")
+    except Exception:
+        return ""
 
 
 def _split_arg_names(joined):
@@ -5000,8 +5023,21 @@ def _print_destinations(db_module):
         except Exception:
             web = False
         if web:
-            print("  Sites your agents sent requests to: recorded from this version on, so")
-            print("  calls made before it show none.")
+            # Says "none" and when the counter started (warm-ledger walk): "from
+            # this version on" named no version, on a ledger going back months, and read as a
+            # statement rather than as an empty section. The start is the first row ANY agent
+            # recorded a site for, our demo's included, since that is when recording began.
+            try:
+                _since = db_module.first_site_recorded_at()
+                _since = datetime.fromtimestamp(_since).strftime("%Y-%m-%d") if _since else None
+            except Exception:
+                _since = None
+            if _since:
+                _print_wrapped("Sites your agents sent requests to: none on record. This ledger "
+                               "records a call's site from %s on." % _since)
+            else:
+                _print_wrapped("Sites your agents sent requests to: none on record. Sites are "
+                               "recorded from this SDK version on, so earlier calls show none.")
             print("")
         return
     # Read from every call that RAN, flagged ones too: it prints under the "tripped nothing"
@@ -5090,10 +5126,14 @@ def _print_call_log(db_module, log, opts):
         # a footnote at the bottom does not undo a number read at the top.
         print("  This ledger has been trimmed, so the rows below are what was KEPT, not")
         print("  everything your agent has ever done.")
-    print("  %s across %s%s"
-          % (_plural(log["totals"]["rows"], "call"),
-             _plural(log["totals"]["distinct_tools"], "tool"),
-             _since_phrase(log["window_start"])))
+    # The offset of the NEWEST row shown: the page prints the newest rows, and a window that
+    # began before a daylight-saving change would label every row on it with the wrong offset.
+    _zone = _local_zone_phrase(log["rows"][0]["ts"] if log["rows"] else None)
+    _print_wrapped("%s across %s%s%s"
+                   % (_plural(log["totals"]["rows"], "call"),
+                      _plural(log["totals"]["distinct_tools"], "tool"),
+                      _since_phrase(log["window_start"]), " (%s)" % _zone if _zone else ""))
+    _left_out = log.get("ours_left_out") or 0
     # 🔴 THE TWO SCREENS PRINT THE SAME SENTENCE WITH DIFFERENT NUMBERS, AND THIS IS WHERE A
     # READER MEETS IT. The grouped view says "39 calls across 4 tools"; this one says "77
     # calls across 4 tools" over the same ledger, in the same words, on a screen the grouped
@@ -5164,9 +5204,18 @@ def _print_call_log(db_module, log, opts):
         print("  Of those, %s."
               % (", ".join(_parts[:-1]) + " and " + _parts[-1] if len(_parts) > 1
                  else _parts[0]))
-    if log["shown"] < log["totals"]["rows"]:
-        print("  (showing the most recent %d; %s more not listed: use --all)"
-              % (log["shown"], f"{log['totals']['rows'] - log['shown']:,}"))
+    if _left_out:
+        # After the split, which is about every call above; this line is about the page.
+        _print_wrapped("Your agents made %s; %s made %s, left out here (--with-demo "
+                       "shows them)."
+                       % (f"{log['totals']['rows'] - _left_out:,}", OURS_PHRASE,
+                          f"{_left_out:,}"))
+    # Counted over the rows this page could list: with ours left out, those are the reader's.
+    _listable = log["totals"]["rows"] - _left_out
+    if log["shown"] < _listable:
+        print("  (showing the most recent %d%s; %s more not listed: use --all)"
+              % (log["shown"], " of yours" if _left_out else "",
+                 f"{_listable - log['shown']:,}"))
     print("")
     # 🔴 THE AGENT COLUMN APPEARS ONLY WHEN IT DISCRIMINATES, the same rule the grouped
     # screen runs under. On a single-agent ledger it is one repeated name down fifty rows,
@@ -5179,9 +5228,12 @@ def _print_call_log(db_module, log, opts):
     #
     # Our own agents come out before counting, so a developer who ran `agentx demo` does not
     # acquire a second agent and pay for a column to display ours.
-    _agents_here = {r["agent_id"] for r in log["rows"]
-                    if r["agent_id"] and r["agent_id"] not in db_module.OUR_AGENT_IDS}
-    show_agent = len(_agents_here) > 1
+    #
+    # ⚠️ SUPERSEDED BY THE DATE HEADER (founder decision): the agent is named on the header
+    # line whenever the date OR the agent changes, so a run by one agent reads as a block and
+    # no column width is spent. On the founder's ledger the column never appeared (one agent
+    # on the page beside our demo), so the screen could not say who made any call.
+    show_agent = False
     # 🔴 SURFACE IS 7, WHICH IS ITS HEADER. The VALUES are at most five characters ("SHELL",
     # "CLOUD"), because a per-call row carries ONE class where the grouped screen can carry
     # a union of several. So the header is the widest thing this column ever holds.
@@ -5227,7 +5279,8 @@ def _print_call_log(db_module, log, opts):
     # a single number would be wrong for one of them. `_fit_names` drops WHOLE names and
     # says "+N more" rather than slicing the join, which is the defect both the writer and
     # the grouped reader have already been fixed for.
-    shown_day = None
+    shown_day, shown_agent = None, None
+    _dash_on_page = False
     # Rule name -> how many rows ON THIS PAGE were its shape, for the legend below.
     # Counted from the rows rendered, not the ledger, for the same reason the demo legend
     # is: a footnote about a marker the reader cannot see on the page is a footnote about
@@ -5241,9 +5294,12 @@ def _print_call_log(db_module, log, opts):
         # A date line only when the day CHANGES. The alternative is a date on every row,
         # which costs 11 columns of argument names on every line to repeat a fact that is
         # the same for most of them.
-        if day != shown_day:
-            print("  %s" % (day or "(no date)"))
-            shown_day = day
+        # And the agent, on the same line, when either changes.
+        # Compared in FULL, shortened only to print (two long names shared a shortened form).
+        agent = row["agent_id"] or "(no agent recorded)"
+        if day != shown_day or agent != shown_agent:
+            print("  %s  %s" % (day or "(no date)", _fit(agent, 75 - 14)))
+            shown_day, shown_agent = day, agent
         # An asterisk, explained once below. Our own rows are MARKED rather than dropped
         # (the grouped screen makes the same call): someone who ran `agentx demo --audit`
         # to get a populated screen would otherwise be shown an empty one.
@@ -5272,6 +5328,7 @@ def _print_call_log(db_module, log, opts):
         # correct by its own definition (we genuinely do not know), which is why no migration
         # is needed and why the column could not have shipped before the writer was fixed.
         _surface = _surface_label(db_module, row["target_class"]) or "-"
+        _dash_on_page = _dash_on_page or _surface == "-"
         if show_agent:
             # "-" for a row with no agent recorded (the P-57 migration path contemplates
             # them), never blank: an empty cell in a column every other row fills reads as a
@@ -5309,6 +5366,10 @@ def _print_call_log(db_module, log, opts):
     for _line in _calls_status_legend(_statuses_on_page):
         print("  %s" % _line)
         legend_printed = True
+    if _dash_on_page:
+        # The grouped screen's sentence, here too: the dash is on this page as well.
+        print("  %s" % _SURFACE_DASH_MEANING)
+        legend_printed = True
     if _matched_on_page:
         # The marker says a rule matched; this says WHICH. Names, because the reader wrote
         # these rules and knows them by name. Counted from the page, and the same sentence
@@ -5339,10 +5400,11 @@ def _print_call_log(db_module, log, opts):
         print("    not by your agent.")
         legend_printed = True
     elif shown_ours:
-        print("  * %s above written by %s, not by your agent."
-              % (_plural(shown_ours, "row"), OURS_PHRASE))
+        # Wrapped: from three rows up the sentence ran to 77 columns.
+        _print_wrapped("* %s above written by %s, not by your agent."
+                       % (_plural(shown_ours, "row"), OURS_PHRASE))
         legend_printed = True
-    if off_page_ours > 0:
+    if off_page_ours > 0 and not log.get("ours_left_out"):     # else the opener said it
         print("  %s elsewhere in this ledger came from %s."
               % (_plural(off_page_ours, "row"), OURS_PHRASE))
         legend_printed = True
@@ -5430,7 +5492,12 @@ _RECORD_WARNING = "changed without a journal entry (outside AgentX, or by an old
 def _record_head_line(v, tag):
     when = datetime.fromtimestamp(v["head_at"]).strftime("%Y-%m-%d %H:%M") if v.get(
         "head_at") else "?"
-    return "latest entry %s:%s:%s (%s)" % (tag, v["head_seq"], (v["head_link"] or "")[:12], when)
+    # The sequence counts CHANGES to the record (a row taken in when journaling began, written,
+    # changed or trimmed), not calls: the founder's 987-call ledger ends at 990 (966 taken in,
+    # 24 written or changed). Said, so the two numbers do not read as one.
+    return "%s recorded, the latest %s:%s:%s (%s)" % (
+        _plural(v["head_seq"] or 0, "change"), tag, v["head_seq"],
+        (v["head_link"] or "")[:12], when)
 
 
 def _record_check_head(path, want, tag="ledger"):
@@ -5677,6 +5744,17 @@ def _execute_audit_screen(args=None):
     # --- HUMAN, ONE ROW PER CALL ------------------------------------------------------
     if opts["calls"]:
         log = get_call_log(limit=_effective_limit(opts, _DEFAULT_CALL_ROWS))
+        # Our own demo and example rows are left out once the reader has rows of their own:
+        # every `agentx demo` puts seven at the top, and on the founder's ledger they were 23 of
+        # the first 50. A ledger holding only ours keeps them, or the first screen of the
+        # ladder would be empty. `--with-demo` shows them; the JSON above stays complete.
+        _t = log.get("totals") or {}
+        log["ours_left_out"] = 0
+        if (log["readable"] and not opts.get("with_demo") and _t.get("ours")
+                and (_t.get("rows") or 0) > _t["ours"]):
+            log = get_call_log(limit=_effective_limit(opts, _DEFAULT_CALL_ROWS),
+                               include_ours=False)
+            log["ours_left_out"] = (log.get("totals") or {}).get("ours") or 0
         print("\n\U0001f50e WHAT YOUR AGENT DID, CALL BY CALL     (local to this ledger)")
         print("=" * 75)
         if not log["readable"]:
@@ -6080,16 +6158,46 @@ def _execute_audit_screen(args=None):
     # The whole count first when some calls tripped a policy, in the words and numbers
     # `--calls` opens with: "1 call that tripped nothing" alone, beside a `--calls` screen
     # saying "2 calls", read as two screens disagreeing about one session.
+    #
+    # 🔴 TWO LINES, THEN THE TABLE (founder decision, from the warm-ledger walk). The opener
+    # stacked five count lines over four different bases (987 calls / 810 that tripped nothing
+    # / 183 of those ours / 627 of yours split five ways / 5 unsized), and a reader with a few
+    # weeks of history met all of them before the first row. Now: every call and its window,
+    # then whose they were and how many tripped a policy. The size split moved under the
+    # table (`_print_size_split`), beside the tools it describes, and the table names its own
+    # population in a caption.
     _all = inventory.get("totals") or {}
-    if (_all.get("rows") or 0) > inventory["total_calls"]:
-        _print_wrapped("%s across %s%s, one line each on %s."
-                       % (_plural(_all["rows"], "call"),
-                          _plural(_all.get("distinct_tools") or 0, "tool"),
-                          _since_phrase(_all.get("window_start")), _audit_cmd() + " --calls"))
-    print("  %s that tripped nothing, across %s%s"
-          % (_plural(inventory['total_calls'], "call"),
-             _plural(inventory['distinct_tools'], "tool"),
-             _since_phrase(inventory["window_start"])))
+    _rows_all = _all.get("rows") or 0
+    _ours_all = _all.get("ours") or 0
+    _zone = _local_zone_phrase()     # now's offset: the window's start may predate a DST change
+    _print_wrapped("%s across %s%s%s."
+                   % (_plural(max(_rows_all, inventory["total_calls"]), "call"),
+                      _plural(_all.get("distinct_tools") or inventory["distinct_tools"], "tool"),
+                      _since_phrase(_all.get("window_start") or inventory["window_start"]),
+                      " (%s)" % _zone if _zone else ""))
+    # Whose calls, only when some of OURS are in the table below: when the demo's only rows
+    # tripped a policy, the tripped-calls section attributes them and this would say it twice.
+    _opener_named_ours = bool((inventory.get("inventory_from_demo") or 0)
+                              and _ours_all and _rows_all > _ours_all)
+    # Whether a sentence ABOVE the table has said every row in it is ours. Set where such a
+    # sentence prints, and read by the table's `*` marker: deriving it from the counts alone left
+    # a demo-only table unmarked under a mixed opener that never said so (review round 1).
+    _said_table_is_ours = False
+    if _opener_named_ours:
+        _print_wrapped("Your agents made %s, %s made %s%s."
+                       % (f"{_rows_all - _ours_all:,}", OURS_PHRASE, f"{_ours_all:,}",
+                          "; %s tripped a policy" % f"{inventory['flagged_total']:,}"
+                          if inventory["flagged_total"] else ""))
+    elif (inventory.get("inventory_from_demo") or 0) and _ours_all and _rows_all == _ours_all:
+        # Every call is ours. Said about the opener's own number, so no count below has to be
+        # matched against one it never stated ("3 calls ... All 2 came from" read as 2 of 3).
+        # The number stays in (an earlier walk: "every one of them" sent the reader back up).
+        print("  %s came from %s, not your agent."
+              % ("It" if _rows_all == 1 else "All %s" % f"{_rows_all:,}", OURS_PHRASE))
+        _opener_named_ours = True
+        _said_table_is_ours = True
+    elif inventory["flagged_total"] and _rows_all > inventory["total_calls"]:
+        print("  %s tripped a policy." % f"{inventory['flagged_total']:,}")
     # 🔴 DIRECTLY UNDER THE COUNT BECAUSE IT QUALIFIES IT, and it is the one line on this
     # screen that reports something we did NOT decide. "Tripped nothing" is true of these
     # rows and invites exactly one wrong reading: that nothing among them was large. A real
@@ -6122,8 +6230,10 @@ def _execute_audit_screen(args=None):
     _their_would_blocks = max(
         0, inventory["would_block_total"] - (inventory.get("would_block_from_demo") or 0))
     if from_demo:
-        for _ln in _demo_row_note(from_demo, of_total=inventory["total_calls"]):
-            print(_ln)
+        if not _opener_named_ours:
+            for _ln in _demo_row_note(from_demo, of_total=inventory["total_calls"]):
+                print(_ln)
+            _said_table_is_ours = from_demo >= inventory["total_calls"]
         if from_demo >= inventory["total_calls"]:
             # 🔴 THIS SENTENCE USED TO BE UNCONDITIONAL, AND IT WAS FALSE FOR ALMOST
             # EVERYONE WHO READ IT (P-112). It printed "Wrap one of your tools and its calls
@@ -6158,107 +6268,117 @@ def _execute_audit_screen(args=None):
             else:
                 print("  Wrap one of your tools and its calls land here beside these.")
     _totals = inventory.get("totals") or {}
-    # The same count split four ways by what each call established about itself.
-    # This is the line a clean agent's day is worth opening for: a SELECT and a DROP TABLE
-    # both "tripped nothing", and until this line the screen could not tell them apart.
-    #
-    # All four numbers, zeroes included, and "could not tell" always among them: a reader
-    # must see how much of the day the label could not classify, or three small numbers
-    # read as the whole day. The words are POSITIONS, chosen so none reads as a promise --
-    # "bounded" is what the statement names, never "we kept a copy".
-    #
-    # Guarded on `reversibility_readable`, not on the counts, for the reason the line
-    # below gives. Skipped when the reader's own agents have no inventory rows at all --
-    # labelled or older -- because four zeroes under a demo-only table describe nothing of
-    # theirs. (The first guard counted only LABELLED rows, so a freshly upgraded ledger,
-    # hundreds of older calls and no new one yet, printed nothing here at all.)
-    #
-    # 🔴 "OF THOSE" IS A PARTITION CLAIM, SO EVERY ROW THE HEADER COUNTED IS IN A TERM. The
-    # four labels cover the reader's own rows that carry one. The header also counts our
-    # demo's rows and, on an upgraded ledger, every row written before the label existed;
-    # the first cut left both out and printed "7 calls ... Of those: 1, 1, 0, 1". The
-    # older rows get a fifth term here when nonzero; the demo's rows are carried by the
-    # demo footnote a few lines down, which already names their number, so it is not
-    # printed twice. `test_the_screen_line_sums_to_its_header` drives a mixed ledger
-    # through this exact rendering and sums the terms and the footnote against the header.
-    _split = _totals.get("reversibility") or {}
-    _unlabelled = _totals.get("reversibility_unlabelled") or 0
-    # Not for a Claude Code reader when not one call could be sized: a command line never
-    # states its own size, so the line read "0, 0, 0, N could not tell" (walk). A record with
-    # one sized call, or with any other door's calls, keeps the whole line.
-    _sized = sum(_split.get(_v, 0) for _v in _REVERSIBILITY_LABELS if _v != _REV_UNKNOWN)
-    _nothing_sized = _claude_code_only() and not _sized and not _unlabelled
-    if _totals.get("reversibility_readable") and (sum(_split.values()) + _unlabelled) \
-            and not _nothing_sized:
-        # Keyed off the four constants and `_LABEL_WORDS`, never off literals: the words used to
-        # be spelled here and again on the insights screen, and the two spellings drifted.
-        _terms = ["%s %s" % (f"{_split.get(_value, 0):,}", _label_word(_value))
-                  for _value in _REVERSIBILITY_LABELS]
-        if _unlabelled:
-            _terms.append("%s recorded before this label existed"
-                          % f"{_totals['reversibility_unlabelled']:,}")
-        # Packed a whole TERM at a time, never word-wrapped: `_wrap` broke the line
-        # between a number and its words ("... could not tell, 2 / recorded before this
-        # label existed"), which the founder's walk read as a stranded digit. Same 75
-        # fence as every other line on this screen.
-        # A continuation line starts under the first term, one column past the lead
-        # ("  Of those:" or "  Of your N:"), which is why the indent is the lead's length
-        # and not a number; the founder's MCP walk once showed it one column further right.
-        _pieces = [t + ("," if i < len(_terms) - 1 else ".") for i, t in enumerate(_terms)]
-        # "Of your N:" when the header's count includes our rows (the note above has just
-        # said how many), "Of those:" when every row the header counted is theirs.
-        _theirs = max(0, int(inventory["total_calls"]) - int(from_demo))
-        _lead = "  Of your %s:" % f"{_theirs:,}" if from_demo else "  Of those:"
-        _line = _lead
-        for _p in _pieces:
-            if len(_line) + 1 + len(_p) > 75 and _line != _lead:
-                print(_line)
-                _line = " " * len(_lead)      # a continuation starts under the first term
-            _line += " " + _p
-        print(_line)
-    if _totals.get("unsized_readable") and _totals.get("unsized_writes"):
-        print("  %s we could not size: a condition picks the rows, and nothing"
-              % _plural(_totals["unsized_writes"], "write"))
-        print("  in the statement caps how many match.")
-    # The paid door's own answer on the same question, and a SEPARATE sentence from the one
-    # above on purpose.
-    #
-    # 🔴 TWO READERS, TWO COUNTS, NEVER SUMMED AND NEVER MERGED INTO ONE LINE. The sentence
-    # above counts rows the free regex reader could not size; this one counts rows the
-    # gateway's parser could not size. They disagree on ordinary shapes -- `DELETE FROM
-    # sessions WHERE id = 41` is unsized to the regex and AT MOST 1 row to the parser -- so a
-    # ledger routinely holds a large count above and none here. Adding them would report the
-    # same call twice on a keyed install.
-    #
-    # 🔴 AND THIS ONE HAS A CTA WHERE THAT ONE HAS NONE, WHICH IS THE POINT OF THE STATUS.
-    # The comment on the count above says "there is nothing for the reader to do about it
-    # yet". Now there is: the row is in the review queue, and the answer we need is a number
-    # only the operator has.
-    # ⚠️ `observed_excluding_ours`, NOT `observed`. This sentence sits under a header about what
-    # THEIR agent did, so it has to count their traffic -- the same scoping the unsized-writes
-    # sentence above it already uses. The ledger-wide `observed` exists for the per-call screen's
-    # partition arithmetic and would report our own demo's rows as theirs if printed here.
-    if _totals.get("observed_excluding_ours"):
-        # 🔴 DELIBERATELY NOT PHRASED LIKE THE SENTENCE ABOVE IT, WHICH IT WOULD OTHERWISE
-        # ECHO ALMOST WORD FOR WORD. Both can print on one screen, and two near-identical
-        # sentences carrying different numbers over different populations is the adjacency
-        # defect this reader has already been fixed for. This one names WHO could not size the
-        # write and carries the CTA; the one above explains the shape and has none. No pronoun,
-        # so the wording cannot disagree with a count of 1.
-        # 🔴 LEADS WITH THE ACTION, NOT A SECOND MEASUREMENT, AND THE FIRST VERSION DID THE
-        # OPPOSITE. It read "N writes the gateway could not size", which sits DIRECTLY under
-        # "N writes we could not size" above -- two near-identical sentences with different
-        # numbers, and a reader's first thought is "is that 1 one of the 5?". It is not: the
-        # populations are disjoint (that line counts ALLOWED rows the regex could not size, this
-        # one counts rows with their own status), so it cannot even be joined with "1 of them".
-        # Describing what the reader can DO leaves nothing to reconcile, because the two lines
-        # stop answering the same question.
+    # Printed UNDER the table now (founder decision: a two-line opener), beside the tools it
+    # describes; `_print_size_split()` is called after the table's legends.
+    def _print_size_split():
+        # The same count split four ways by what each call established about itself.
+        # This is the line a clean agent's day is worth opening for: a SELECT and a DROP TABLE
+        # both "tripped nothing", and until this line the screen could not tell them apart.
         #
-        # ⚠️ "your verdict", NOT "a row limit". `agentx review` asks "was this worth flagging?"
-        # today; the number is a later step. Promising a limit here would be copy that outruns
-        # the product, which is the thing this screen keeps being fixed for.
-        print("  %s waiting for your verdict:  %s"
-              % (_plural(_totals["observed_excluding_ours"], "write"), _review_cmd()))
+        # All four numbers, zeroes included, and "could not tell" always among them: a reader
+        # must see how much of the day the label could not classify, or three small numbers
+        # read as the whole day. The words are POSITIONS, chosen so none reads as a promise --
+        # "bounded" is what the statement names, never "we kept a copy".
+        #
+        # Guarded on `reversibility_readable`, not on the counts, for the reason the line
+        # below gives. Skipped when the reader's own agents have no inventory rows at all --
+        # labelled or older -- because four zeroes under a demo-only table describe nothing of
+        # theirs. (The first guard counted only LABELLED rows, so a freshly upgraded ledger,
+        # hundreds of older calls and no new one yet, printed nothing here at all.)
+        #
+        # 🔴 "OF THOSE" IS A PARTITION CLAIM, SO EVERY ROW THE HEADER COUNTED IS IN A TERM. The
+        # four labels cover the reader's own rows that carry one. The header also counts our
+        # demo's rows and, on an upgraded ledger, every row written before the label existed;
+        # the first cut left both out and printed "7 calls ... Of those: 1, 1, 0, 1". The
+        # older rows get a fifth term here when nonzero; the demo's rows are carried by the
+        # demo footnote a few lines down, which already names their number, so it is not
+        # printed twice. `test_the_screen_line_sums_to_its_header` drives a mixed ledger
+        # through this exact rendering and sums the terms and the footnote against the header.
+        _split = _totals.get("reversibility") or {}
+        _unlabelled = _totals.get("reversibility_unlabelled") or 0
+        # Not for a Claude Code reader when not one call could be sized: a command line never
+        # states its own size, so the line read "0, 0, 0, N could not tell" (walk). A record with
+        # one sized call, or with any other door's calls, keeps the whole line.
+        _sized = sum(_split.get(_v, 0) for _v in _REVERSIBILITY_LABELS if _v != _REV_UNKNOWN)
+        _nothing_sized = _claude_code_only() and not _sized and not _unlabelled
+        if _totals.get("reversibility_readable") and (sum(_split.values()) + _unlabelled) \
+                and not _nothing_sized:
+            # Keyed off the four constants and `_LABEL_WORDS`, never off literals: the words used to
+            # be spelled here and again on the insights screen, and the two spellings drifted.
+            _terms = ["%s %s" % (f"{_split.get(_value, 0):,}", _label_word(_value))
+                      for _value in _REVERSIBILITY_LABELS]
+            if _unlabelled:
+                _terms.append("%s recorded before this label existed"
+                              % f"{_totals['reversibility_unlabelled']:,}")
+            # Packed a whole TERM at a time, never word-wrapped: `_wrap` broke the line
+            # between a number and its words ("... could not tell, 2 / recorded before this
+            # label existed"), which the founder's walk read as a stranded digit. Same 75
+            # fence as every other line on this screen.
+            # A continuation line starts under the first term, one column past the lead
+            # ("  Of those:" or "  Of your N:"), which is why the indent is the lead's length
+            # and not a number; the founder's MCP walk once showed it one column further right.
+            _pieces = [t + ("," if i < len(_terms) - 1 else ".") for i, t in enumerate(_terms)]
+            # Under the table the line needs its own subject, so it names the population on a
+            # line of its own and the terms follow, packed under it.
+            _theirs = max(0, int(inventory["total_calls"]) - int(from_demo))
+            _print_wrapped("Your agents' %s that tripped nothing, by what each could change:"
+                           % _plural(_theirs, "call"))
+            _lead = "   "
+            _line = _lead
+            for _p in _pieces:
+                if len(_line) + 1 + len(_p) > 75 and _line != _lead:
+                    print(_line)
+                    _line = _lead
+                _line += " " + _p
+            print(_line)
+        if _totals.get("unsized_readable") and _totals.get("unsized_writes"):
+            # Says where they sit: among the calls the line above split (on every ledger
+            # measured they are in its "not classified", but the two columns are separate, so
+            # the population is named rather than a term).
+            _theirs = max(0, int(inventory["total_calls"]) - int(from_demo))
+            _print_wrapped("%s of those %s %s we could not size: a condition picks the rows, "
+                           "and nothing in the statement caps how many match."
+                           % (f"{_totals['unsized_writes']:,}", f"{_theirs:,}",
+                              "is a write" if _totals["unsized_writes"] == 1 else "are writes"))
+        # The paid door's own answer on the same question, and a SEPARATE sentence from the one
+        # above on purpose.
+        #
+        # 🔴 TWO READERS, TWO COUNTS, NEVER SUMMED AND NEVER MERGED INTO ONE LINE. The sentence
+        # above counts rows the free regex reader could not size; this one counts rows the
+        # gateway's parser could not size. They disagree on ordinary shapes -- `DELETE FROM
+        # sessions WHERE id = 41` is unsized to the regex and AT MOST 1 row to the parser -- so a
+        # ledger routinely holds a large count above and none here. Adding them would report the
+        # same call twice on a keyed install.
+        #
+        # 🔴 AND THIS ONE HAS A CTA WHERE THAT ONE HAS NONE, WHICH IS THE POINT OF THE STATUS.
+        # The comment on the count above says "there is nothing for the reader to do about it
+        # yet". Now there is: the row is in the review queue, and the answer we need is a number
+        # only the operator has.
+        # ⚠️ `observed_excluding_ours`, NOT `observed`. This sentence sits under a header about what
+        # THEIR agent did, so it has to count their traffic -- the same scoping the unsized-writes
+        # sentence above it already uses. The ledger-wide `observed` exists for the per-call screen's
+        # partition arithmetic and would report our own demo's rows as theirs if printed here.
+        if _totals.get("observed_excluding_ours"):
+            # 🔴 DELIBERATELY NOT PHRASED LIKE THE SENTENCE ABOVE IT, WHICH IT WOULD OTHERWISE
+            # ECHO ALMOST WORD FOR WORD. Both can print on one screen, and two near-identical
+            # sentences carrying different numbers over different populations is the adjacency
+            # defect this reader has already been fixed for. This one names WHO could not size the
+            # write and carries the CTA; the one above explains the shape and has none. No pronoun,
+            # so the wording cannot disagree with a count of 1.
+            # 🔴 LEADS WITH THE ACTION, NOT A SECOND MEASUREMENT, AND THE FIRST VERSION DID THE
+            # OPPOSITE. It read "N writes the gateway could not size", which sits DIRECTLY under
+            # "N writes we could not size" above -- two near-identical sentences with different
+            # numbers, and a reader's first thought is "is that 1 one of the 5?". It is not: the
+            # populations are disjoint (that line counts ALLOWED rows the regex could not size, this
+            # one counts rows with their own status), so it cannot even be joined with "1 of them".
+            # Describing what the reader can DO leaves nothing to reconcile, because the two lines
+            # stop answering the same question.
+            #
+            # ⚠️ "your verdict", NOT "a row limit". `agentx review` asks "was this worth flagging?"
+            # today; the number is a later step. Promising a limit here would be copy that outruns
+            # the product, which is the thing this screen keeps being fixed for.
+            print("  %s waiting for your verdict:  %s"
+                  % (_plural(_totals["observed_excluding_ours"], "write"), _review_cmd()))
     # SAY WHEN THE TABLE IS NOT THE WHOLE HEADER. The counts above are ledger-wide and the
     # rows below are capped, so "30 tools" over 25 rows silently invites the reader to
     # believe they are looking at all of them. Same class as the counts that were being
@@ -6322,6 +6442,18 @@ def _execute_audit_screen(args=None):
     # between TOOL/CALLS and CALLS/SURFACE -- the columns were reading as one run after CALLS
     # narrowed -- plus one each for SURFACE (12 -> 13, so a two-class list stops ellipsising)
     # and ARGUMENTS (28 -> 29).
+    # The table's own population, named over it: CALLS counts the calls that tripped nothing,
+    # which the opener no longer states on a line of its own. Only when that differs from the
+    # opener's total. No command here: the screen already names `--calls` further down, once.
+    if _rows_all > inventory["total_calls"]:
+        # The pointer rides here only when no section below will name `--calls` (they print
+        # for calls that tripped a policy or did not run); a ledger of clean calls plus unsized
+        # writes otherwise lost its only one (review round 1).
+        _below_names_calls = bool(inventory["flagged_total"] or _all.get("refused_excluding_ours")
+                                  or _all.get("halted_excluding_ours"))
+        print("  The %s that tripped nothing, by tool%s"
+              % (_plural(inventory["total_calls"], "call"),
+                 ":" if _below_names_calls else " (each call: %s --calls):" % _audit_cmd()))
     print("  " + _AUDIT_COLS % ("TOOL", "CALLS", "SURFACE", "ARGUMENTS"))
     print("  " + "-" * 71)
     _rule_matches = db_module.get_rule_match_summary()
@@ -6332,7 +6464,7 @@ def _execute_audit_screen(args=None):
     # fact, explained once under the table, instead of a prose clause on every such row.
     # The founder's fresh-ledger walk read that clause five times under a header that had
     # already said "All 5 came from ..."; one fact, six spellings, on one screen.
-    _header_said_all_ours = bool(from_demo) and from_demo >= inventory["total_calls"]
+    _header_said_all_ours = _said_table_is_ours
     _marked_ours = False
     for row in inventory["tools"]:
         classes = "/".join(
@@ -6497,7 +6629,16 @@ def _execute_audit_screen(args=None):
         # honest answer "we could not tell", and `list_tables` earns one because "table" was
         # taken out of that list on purpose. Said here rather than left to inference, since
         # the reader's other option is to conclude the row is broken.
-        print("  A dash under SURFACE means we could not tell what that tool touches.")
+        print("  %s" % _SURFACE_DASH_MEANING)
+        print("")
+    # The size split, under the table it describes; a blank line after it only if it printed.
+    import contextlib as _ctx
+    import io as _io
+    _size_buf = _io.StringIO()
+    with _ctx.redirect_stdout(_size_buf):
+        _print_size_split()
+    if _size_buf.getvalue():
+        print(_size_buf.getvalue(), end="")
         print("")
     # 🔴 WHICH TOOLS RAN WITHOUT BEING DEFENDED. A per-tool `enforcement="audit"` argument
     # turns blocking off for that whole tool, permanently, in the developer's own source. It
@@ -6552,9 +6693,11 @@ def _execute_audit_screen(args=None):
         # it, then set AGENTX_POSTURE=enforce. Every row from before the switch lands here,
         # and the old sentence sent that reader hunting for a posture= in their source that
         # was never there.
-        print("  Your run is enforcing now, but these rows were written while")
-        print("  something was watching: an earlier run on the watching default, an")
-        print("  env var, or a posture= pin. The row does not record which.")
+        # "Where you ran this command", not "your run": `agentx audit` is not a run, and what
+        # it read is the posture this shell and project resolve to (warm-ledger walk).
+        print("  Blocking is on where you ran this command, but these rows were written")
+        print("  while something was watching: an earlier run on the watching default,")
+        print("  an env var, or a posture= pin. The row does not record which.")
         print("  Nothing was stopped for them.")
         print("")
     # ⚠️ THERE WAS A LINE HERE SAYING "N earlier calls were recorded before we tracked which
@@ -6613,7 +6756,14 @@ def _execute_audit_screen(args=None):
             # line whose job is telling someone which of their arguments we are talking about.
             # `_wrap` returns ONE already-wrapped STRING, not a list of lines. Iterating it
             # walks characters and prints one per line, which is what the first version did.
-            print(_wrap(_rule_line(_p, gateway_clause=True), "     #%s  " % _p.get("seq", "?"), width=75))
+            print(_wrap(_rule_line(_p), "     #%s  " % _p.get("seq", "?"), width=75))
+        # What a gateway adds, said ONCE under the list: it rode on every line and read five
+        # times over on the founder's ledger.
+        try:
+            if any(_rule_line(_p, gateway_clause=True) != _rule_line(_p) for _p in _proposals):
+                print("     A gateway that reads these rules also judges calls by what each means.")
+        except Exception:
+            pass
         print("")
         # NO COMMAND ON THIS LINE. The screen already carries exactly one `agentx insights`
         # CTA, and a test asserts that count is 1 -- the house rule being one clear actionable
@@ -6876,8 +7026,10 @@ def _execute_audit_screen(args=None):
         # NOT by their count: test_audit_novelty pins that this line carries no number, because
         # the line above already states how many, and two numbers for one event is the defect
         # this screen keeps re-earning.
-        print("  ⚠️  %s ran: watching records; it does not block."
-              % ("The one that" if would_block == 1 else "The ones that"))
+        # "watching records; it does not block" was two clauses about a posture, read as one
+        # about the calls (warm-ledger walk). Said about the calls, in one clause.
+        print("  ⚠️  %s ran %s only recorded: watching does not block."
+              % (("The one that", "was") if would_block == 1 else ("The ones that", "were")))
         # 🔴 THE LINE ABOVE RAISES A QUESTION IT USED TO LEAVE UNANSWERED: which one? A
         # warning that something slipped through, with no way to find it, is worse than the
         # count alone -- it tells the reader to go looking and gives them nowhere to look.
@@ -10052,16 +10204,16 @@ def _gateway_destinations():
     return out
 
 
-def execute_allowlist(args, gateway_url, api_key):
+def execute_allowlist(args, gateway_url, api_key, admin_key=None, admin_refusal=None):
     """`agentx allowlist [status|push]`: the tools and sites each agent may use.
 
     The list is written here, in `.agentx/allowlist.json` (git records who changed it), and
     enforced by the gateway from the copy `push` stores for this key's customer. `status` (the
     default) says whether the two are the same list.
 
-    ⚠️ Any holder of the key can push, including the agent's own process, which holds the same
-    key. A separate admin key is the fix; until then the gateway's copy is only as trustworthy as
-    every process holding the key."""
+    `push` sends AGENTX_ADMIN_KEY when it is set: a gateway with admin keys refuses a list
+    pushed with the agent's key, which the agent's own process holds. Without one it sends
+    AGENTX_API_KEY, which a single-key gateway with no admin key still accepts."""
     from . import rules as rules_mod
     sub = (args[0].lower() if args else "status")
     if sub not in ("status", "push"):
@@ -10079,6 +10231,11 @@ def execute_allowlist(args, gateway_url, api_key):
         print("=" * 75)
         sys.exit(1)
     local_fp = rules_mod.allowlist_fingerprint(agents) if os.path.exists(path) else None
+    api_key = api_key or admin_key or ""         # either key reads the gateway's copy
+    if not api_key and admin_refusal:
+        print(f"\n❌ Nothing was sent. {admin_refusal}")
+        print("=" * 75)
+        sys.exit(1)
     if not api_key:
         print("\n⚠️  No AGENTX_API_KEY, so there is no gateway copy to compare or send to.")
         print("   Without a key, this machine's SDK limits each agent's sites from this file; the tool")
@@ -10093,9 +10250,15 @@ def execute_allowlist(args, gateway_url, api_key):
             print("   'agentx review' proposes each agent's tools and sites from what it ran.")
             print("=" * 75)
             sys.exit(1)
+        if admin_refusal:
+            print(f"\n❌ Nothing was sent. {admin_refusal}")
+            print("=" * 75)
+            sys.exit(1)
         body = rules_mod.allowlist_push_document(agents)
+        push_headers = {"Authorization": f"Bearer {admin_key or api_key}"}
         try:
-            res = requests.put(f"{gateway_url}/v1/allowlist", json=body, headers=headers, timeout=5.0)
+            res = requests.put(f"{gateway_url}/v1/allowlist", json=body, headers=push_headers,
+                               timeout=5.0)
         except Exception as err:
             print(f"\n❌ Could not reach your gateway at {gateway_url}, so nothing was sent: {err}")
             print("=" * 75)
@@ -10146,6 +10309,150 @@ def execute_allowlist(args, gateway_url, api_key):
         print(f"   Your gateway holds a DIFFERENT list ({view.get('source')}, fingerprint "
               f"{view.get('fingerprint')}).")
         print("   ▶ agentx allowlist push   (sends this file and replaces the gateway's copy)")
+    print("=" * 75)
+
+
+_HOLD_VERDICTS = {"approve": "APPROVED", "deny": "DENIED", "dismiss": "DISMISSED"}
+
+
+def execute_holds(args, gateway_url, api_key, admin_key=None, admin_refusal=None):
+    """`agentx holds [approve|deny|dismiss <receipt>]`: the calls your gateway is holding for a
+    person, and your answer to one.
+
+    Listing works with either key. Answering sends AGENTX_ADMIN_KEY: a gateway with admin keys
+    refuses an answer made with the agent's key, so an agent can never approve its own held call.
+    A single-key gateway with no admin key still accepts AGENTX_API_KEY, as before."""
+    import urllib.parse
+    from .decorators import _sanitize_detail
+    sub = (args[0].lower() if args else "list")
+    if sub not in ("list",) + tuple(_HOLD_VERDICTS) or (sub in _HOLD_VERDICTS and len(args) < 2):
+        print("\n⚠️  Usage:")
+        print("   agentx holds                     the calls your gateway is holding for you")
+        print("   agentx holds approve <receipt>   let that call run")
+        print("   agentx holds deny <receipt>      stop it")
+        print("   agentx holds dismiss <receipt>   clear it from the list without an answer")
+        print("=" * 75)
+        sys.exit(2)
+    # Listing uses the agent's key when there is one: the admin key travels only with an answer.
+    key = api_key or admin_key
+    if not key and admin_refusal:
+        # The admin key was set and not used: say why, not "no key" (review round 2).
+        print(f"\n❌ Nothing was sent. {admin_refusal}")
+        print("=" * 75)
+        sys.exit(1)
+    if not key:
+        print("\n⚠️  No AGENTX_API_KEY, so there is no gateway to ask. Calls are held only at a")
+        print("   gateway; without a key, this machine's SDK stops or allows each call itself.")
+        print("=" * 75)
+        sys.exit(1)
+
+    def _detail(res):
+        try:
+            d = _remote_json(res).get("detail") or res.text
+        except Exception:
+            d = res.text
+        return _sanitize_detail(str(d), limit=400)
+
+    if sub in _HOLD_VERDICTS:
+        receipt = args[1]
+        if admin_refusal:
+            print(f"\n❌ Nothing was sent. {admin_refusal}")
+            print("=" * 75)
+            sys.exit(1)
+        # Only a call that is WAITING may be approved or denied. The gateway's resolve route takes
+        # a verdict on any receipt, so without this `holds approve <receipt of a stopped call>`
+        # wrote APPROVED onto a block nobody was waiting on (found by the walk). Dismiss clears
+        # any item, as the dashboard's does.
+        seen = None     # the status the list showed: None = not seen (list failed, or > 200 rows)
+        if sub != "dismiss":
+            try:
+                lst = requests.get(f"{gateway_url}/v1/incidents",
+                                   headers={"Authorization": f"Bearer {key}"}, timeout=5.0)
+                rows = _remote_json(lst).get("incidents") or [] if lst.status_code == 200 else None
+            except Exception:
+                rows = None
+            if rows is not None:
+                row = next((r for r in rows if isinstance(r, dict)
+                            and r.get("receipt_id") == receipt), None)
+                if row is not None and row.get("status") not in ("ESCALATED", "EXPIRED"):
+                    print(f"\n❌ {_sanitize_detail(receipt, limit=80)} is not waiting for an answer "
+                          f"(its record says {_sanitize_detail(str(row.get('status')), limit=20)}), "
+                          "so nothing was sent.")
+                    print("   ▶ agentx holds   (lists the calls that are)")
+                    print("=" * 75)
+                    sys.exit(1)
+                seen = row.get("status") if row is not None else None
+        try:
+            res = requests.post(f"{gateway_url}/v1/incidents/{urllib.parse.quote(receipt, safe='')}/resolve",
+                                json={"status": _HOLD_VERDICTS[sub]},
+                                headers={"Authorization": f"Bearer {admin_key or api_key}"},
+                                timeout=5.0)
+        except Exception as err:
+            print(f"\n❌ Could not reach your gateway at {gateway_url}, so nothing was answered: {err}")
+            print("=" * 75)
+            sys.exit(1)
+        if res.status_code == 404:
+            print(f"\n❌ Your gateway holds no call with receipt {_sanitize_detail(receipt, limit=80)}.")
+            print("   ▶ agentx holds   (lists the ones it does)")
+            print("=" * 75)
+            sys.exit(1)
+        if res.status_code != 200:
+            print(f"\n❌ Your gateway refused the answer ({res.status_code}): {_detail(res)}")
+            print("=" * 75)
+            sys.exit(1)
+        said = {"approve": "approved: the agent's call runs when it next checks",
+                "deny": "denied: the agent's call does not run",
+                "dismiss": "dismissed: cleared from the list"}[sub]
+        if sub == "approve" and seen == "EXPIRED":
+            # The agent already gave up on this call, so "runs when it next checks" would be
+            # false (review round 3). Not promised: that a retry is let through. Only the
+            # cumulative-read limit reads an earlier approval; another rule holds the retry again.
+            said = "approved, but the agent had stopped waiting, so that call did not run"
+        elif sub == "approve" and seen != "ESCALATED":
+            # Not in the list (it failed, or the hold is older than its newest 200 rows): the
+            # gateway also takes an approval on an expired hold, so promise nothing (round 4).
+            said = "approved: the agent's call runs if it was still waiting"
+        print(f"\n✅ {_sanitize_detail(receipt, limit=80)} {said}.")
+        print("=" * 75)
+        return
+
+    try:
+        res = requests.get(f"{gateway_url}/v1/incidents",
+                           headers={"Authorization": f"Bearer {key}"}, timeout=5.0)
+    except Exception as err:
+        print(f"\n❌ Could not reach your gateway at {gateway_url}: {err}")
+        print("=" * 75)
+        sys.exit(1)
+    if res.status_code != 200:
+        print(f"\n❌ Your gateway would not list its held calls ({res.status_code}): {_detail(res)}")
+        print("=" * 75)
+        sys.exit(1)
+    rows = [r for r in (_remote_json(res).get("incidents") or [])
+            if isinstance(r, dict) and r.get("status") == "ESCALATED"]
+    if not rows:
+        print("\n✅ No calls are waiting for your answer.")
+        print("=" * 75)
+        return
+    def _when(v):
+        # The store keeps UTC ISO; the screens print local time (the audit screens' clock).
+        try:
+            return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone() \
+                .strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return _sanitize_detail(str(v or ""), limit=40)
+    _zone = _local_zone_phrase()
+    print(f"\n⏸️  {_plural(len(rows), 'call')} waiting for your answer, newest first"
+          f"{' (' + _zone + ')' if _zone else ''}:")
+    for r in rows:
+        print(f"\n   {r.get('receipt_id')}   {_when(r.get('created_at'))}")
+        # No tool name = none was recorded (an agent asking for a person names none), so
+        # "called a tool" would say more than the record does (founder's walk).
+        _who, _rule = r.get('agent_id') or 'an agent', r.get('policy_violated') or 'a rule'
+        if r.get('tool_name'):
+            print(f"   {_who} called {r.get('tool_name')}, held by {_rule}")
+        else:
+            print(f"   {_who}'s call was held by {_rule}")
+    print("\n   ▶ agentx holds approve <receipt>   or   agentx holds deny <receipt>")
     print("=" * 75)
 
 
@@ -10915,8 +11222,18 @@ def _rule_line(rule, gateway_clause=False):
             and "largest recorded size" not in desc):
         takes = (" (%s: %s)" % ("argument" if len(names) == 1 else "arguments",
                                 ", ".join(names))) if names else ""
-        desc = "Mark every call to '%s'%s in your record as matching this rule" % (tool, takes)
-        line = "%s (%s)" % (desc, ev) if ev else desc
+        # The rule IS "every call to this tool", so the line says how many it would have
+        # flagged rather than "seen N times" beside a sentence that hid that (warm-ledger walk:
+        # #5 marks all 43 http_request calls, and nothing on the line said so).
+        # "Mark", not "Flag": "flagged" is a status word on these screens (AgentX objected); a
+        # rule match shows as `ran^`, recorded and not blocked (review round 1).
+        desc = "Mark every call to '%s'%s as matching this rule" % (tool, takes)
+        m = re.match(r"^seen (once|([\d,]+) times), out of ([\d,]+) allowed calls?$", ev)
+        if m:
+            line = "%s: %s of your %s allowed calls so far" % (
+                desc, "1" if m.group(1) == "once" else m.group(2), m.group(3))
+        else:
+            line = "%s (%s)" % (desc, ev) if ev else desc
         # True as said only where the SDK is all there is. With a key or a gateway, the
         # gateway arms the same rule by its meaning too, so "mark" alone undersold it. Only on
         # the audit screen's proposals: insights, adopt and review print `_rule_armed_clause`
@@ -13512,6 +13829,7 @@ def _print_cli_usage(advanced=False):
     print("                ('--stats' for a summary of every incident's outcome, not just what's pending)")
     print("  allowlist   The tools and sites each agent may use, compared with your gateway's copy")
     print("                ('allowlist push' sends .agentx/allowlist.json to your gateway)")
+    print("  holds       Calls your gateway is holding for a person ('holds approve <receipt>', 'deny')")
     print("  help        Show this message (also: -h, --help)")
     if not advanced:
         print("\n  More commands:  agentx help --advanced   (curation, floor tuning, org sync)")
@@ -13773,7 +14091,11 @@ def main():
     elif command == "share":
         execute_share(args[1:])
     elif command == "allowlist":
-        execute_allowlist(args[1:], gateway_url, resolve_api_key(env) or "")
+        execute_allowlist(args[1:], gateway_url, resolve_api_key(env) or "",
+                          *resolve_admin_key(env))
+    elif command == "holds":
+        execute_holds(args[1:], gateway_url, resolve_api_key(env) or "",
+                      *resolve_admin_key(env))
     elif command in ["status", "inspect"]:
         execute_status_inspection(gateway_url, api_key, mode)
     elif command in ("--version", "version"):
