@@ -305,17 +305,21 @@ def door_counts(db_path=None):
 
     The audit screen picks its instructions from it: a Claude Code reader turns blocking on
     where they start `claude`, and has no tool function to wrap."""
-    from .hook import AGENT_ID
+    from .hook import HOOK_AGENT_IDS
     path = db_path or DB_PATH
     if not os.path.exists(path):
         return {"claude_code": 0, "code": 0}
     theirs, params = _our_agents_clause(negate=True)
-    sql = ("SELECT COALESCE(SUM(agent_id IS ?), 0), COALESCE(SUM(agent_id IS NOT ?), 0) "
-           "FROM event_log WHERE %s" % theirs)
+    # Every agent id the hook writes (Claude Code, Codex, AgentX's own repository) is the hook's
+    # door: none of those readers has a tool function to wrap.
+    marks = ",".join("?" for _ in HOOK_AGENT_IDS)
+    sql = ("SELECT COALESCE(SUM(agent_id IN (%s)), 0), "
+           "COALESCE(SUM(agent_id IS NULL OR agent_id NOT IN (%s)), 0) "
+           "FROM event_log WHERE %s" % (marks, marks, theirs))
     try:
         conn = calls_view(sqlite3.connect(read_only_uri(path), uri=True))
         try:
-            row = conn.execute(sql, [AGENT_ID, AGENT_ID] + params).fetchone()
+            row = conn.execute(sql, list(HOOK_AGENT_IDS) * 2 + params).fetchone()
         finally:
             conn.close()
     except sqlite3.Error:
@@ -2004,6 +2008,22 @@ def get_proposable_destinations(allowlist_policy_id, path=None):
     return _destinations_where(
         "(status IN (?, ?) OR (status = ? AND policy_id = ?))",
         (INVENTORY_STATUS, UNSIZED_WRITE_STATUS, WOULD_BLOCK_STATUS, allowlist_policy_id), path)
+
+
+def get_tool_call_counts(path=None):
+    """[(agent_id, tool_name, calls)] over the agent's calls (server events left out), or [] when
+    the ledger is absent or cannot be read. Read by `agentx rule add` to name an SDK agent's tools
+    a rule on `shell` does not check."""
+    p = path or DB_PATH
+    if not os.path.exists(p):
+        return []
+    try:
+        with _calls_connection(p) as conn:
+            return conn.execute(
+                "SELECT agent_id, tool_name, COUNT(*) FROM event_log WHERE tool_name IS NOT NULL"
+                " GROUP BY agent_id, tool_name").fetchall()
+    except sqlite3.Error:
+        return []
 
 
 def get_proposable_tools(path=None):

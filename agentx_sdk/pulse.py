@@ -72,7 +72,11 @@ _ALLOWED_KEYS = {"install_id", "sdk_version", "python", "os", "first_seen", "ts"
                  # same either way, and since watching is the default that was most of them.
                  # `rules_adopted`: how many detection rules this install has adopted, a
                  # count of rows in its policy store. Names stay on disk.
-                 "posture", "rules_adopted"}
+                 "posture", "rules_adopted",
+                 # `team_rules`: active team rules in the project's `.agentx/team-rules.json`;
+                 # `team_rule_matches_7d`: calls one of them matched in the last 7 days. Both
+                 # counts, sent by the hook only (the door that checks team rules), else null.
+                 "team_rules", "team_rule_matches_7d"}
 _ALLOWED_SESSION_KEYS = {
     "tools_monitored", "intercepts", "critical_blocks",
     "human_escalations", "self_corrections", "would_blocks",
@@ -972,6 +976,11 @@ def _rules_adopted():
         return None
 
 
+def _count_or_none(v):
+    """A non-negative int, or None. A bool is not a count."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
 def build_payload(session_stats, state, first_block_ever=None):
     """Assemble the abstract pulse. WHITELIST ONLY — reads counters, never content.
 
@@ -1027,6 +1036,12 @@ def build_payload(session_stats, state, first_block_ever=None):
         # (adoption happens in the CLI), but read from the store rather than persisted state
         # because the store IS the fact. None = could not read, never 0 for that.
         "rules_adopted": _rules_adopted(),
+        # Team rules, read by the hook from the project when it sends (the pulse goes at most
+        # once a day, so a per-session count would lose the other sessions). Only the hook
+        # checks team rules; every other door sends null, which reads "not this door", never
+        # "none written". None from the hook = a file it could not read.
+        "team_rules": _count_or_none(session_stats.get("team_rules")),
+        "team_rule_matches_7d": _count_or_none(session_stats.get("team_rule_matches_7d")),
         "session": {
             "tools_monitored": int(session_stats.get("total_calls", 0)),
             "intercepts": int(session_stats.get("intercepts", 0)),

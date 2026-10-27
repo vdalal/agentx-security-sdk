@@ -227,7 +227,7 @@ def resolve_api_key(overlay=None):
     return val or None
 
 
-# Admin keys. An admin key approves held calls and pushes lists. The gateway refuses it for checking
+# Admin keys. An admin key approves held calls and pushes lists and team rules. The gateway refuses it for checking
 # calls; these name it when it turns up where an agent can read it.
 ADMIN_KEY_PREFIX = "agentx_sk_a_"
 

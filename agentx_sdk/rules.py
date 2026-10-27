@@ -240,7 +240,7 @@ def _allowed_call_rows(db_path=None):
     # the drift this helper was extracted to prevent.
     excluded = [a for a in _db.OUR_AGENT_IDS if a]
     frag, frag_params = _db._exclude_agents_fragment(excluded)
-    from .hook import AGENT_ID as _HOOK_AGENT, SCREENED_SHELL_TOOLS as _HOOK_SHELL
+    from .hook import HOOK_AGENT_IDS as _HOOK_AGENTS, SCREENED_SHELL_TOOLS as _HOOK_SHELL
 
     # ONE grouped pass. The per-tool pattern this deliberately avoids was measured at 20,013
     # queries on a wide ledger; the fix named there is to fold into the group, not add to it.
@@ -248,9 +248,10 @@ def _allowed_call_rows(db_path=None):
     sql = (
         "SELECT tool_name, MAX(quantity), COUNT(*), "
         "GROUP_CONCAT(DISTINCT arg_names), GROUP_CONCAT(DISTINCT target_class), "
-        "MIN(agent_id IS ?) "
+        "MIN(COALESCE(agent_id IN (%s), 0)) "
         "FROM event_log "
-        "WHERE status = ? AND tool_name IS NOT NULL AND tool_name != ''" + frag +
+        "WHERE status = ? AND tool_name IS NOT NULL AND tool_name != ''" % ",".join(
+            "?" for _ in _HOOK_AGENTS) + frag +
         " GROUP BY tool_name "
         # 🔴 NO LIMIT IN THE QUERY. It used to take the top 5 and THEN drop the tools already
         # ruled on, so a developer who adopted rules for their five biggest tools got an empty
@@ -261,7 +262,8 @@ def _allowed_call_rows(db_path=None):
         conn = _db.calls_view(sqlite3.connect(path))
         try:
             rows = conn.execute(
-                sql, tuple([_HOOK_AGENT, _db.INVENTORY_STATUS] + list(frag_params))).fetchall()
+                sql, tuple(list(_HOOK_AGENTS) + [_db.INVENTORY_STATUS] + list(frag_params))
+            ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
@@ -1374,7 +1376,8 @@ _ALLOWLIST_ANY_AGENT = "*"
 # screen and adopt, which read the ledger those doors wrote. An entry naming one of them
 # explicitly still applies. Pinned equal to `hook.AGENT_ID` and `mcp_proxy._MCP_AGENT_ID` by
 # sdk_tests/test_tool_allowlist_file.py.
-_STAR_EXEMPT_DOOR_IDS = frozenset({"claude_code_hook", "mcp_proxy"})
+_STAR_EXEMPT_DOOR_IDS = frozenset({"claude_code_hook", "codex_hook", "agentx_own_repo",
+                                   "mcp_proxy"})
 
 
 def _allowlist_file_path(path=None):

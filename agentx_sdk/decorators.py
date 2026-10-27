@@ -695,6 +695,7 @@ def _emit_audit_banner(via_override=False):
             " Every call your protected tools make is screened and\n"
             " recorded. A flagged call is recorded and still runs, so\n"
             " nothing we get wrong can break your agent.\n"
+            + _unexported_key_lines() +
             " See what your agent did:  agentx audit\n"
             "════════════════════════════════════════════════════════════"
         )
@@ -743,6 +744,30 @@ def _emit_audit_banner(via_override=False):
         _env_name,
     )
     _AUDIT_BANNER_SHOWN = True
+
+
+def _unexported_key_lines():
+    """Banner lines for a key in the project's `.env` that this process cannot see, else "".
+
+    The runtime reads the key from the process environment only, on purpose (a key in a file
+    nobody exported must not flip a running agent to enforce), so a key pasted into `.env`
+    without `load_dotenv()` left the agent keyless and watching with nothing said. This says
+    so on the screen that already states the posture. Never the key's value. Never raises."""
+    try:
+        from .envfile import ADMIN_KEY_PREFIX, dotenv_overlay, resolve_api_key
+        value = str(dotenv_overlay().get("AGENTX_API_KEY") or "").strip()
+        if resolve_api_key() is None and value:
+            if value.startswith(ADMIN_KEY_PREFIX):
+                # Loading it would only swap silence for a refusal: the gateway does not check
+                # calls with an admin key.
+                return (" Your .env has an admin key as AGENTX_API_KEY. An agent\n"
+                        " uses its agent key there; the admin key answers holds.\n")
+            return (" Your .env has AGENTX_API_KEY, but this process cannot\n"
+                    " see it, so no gateway is asked. Load it before AgentX\n"
+                    " runs (load_dotenv()), or set it in your shell.\n")
+    except Exception:
+        pass
+    return ""
 
 
 def set_audit_banner_quiet(quiet=True):

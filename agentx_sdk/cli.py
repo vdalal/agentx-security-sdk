@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import tempfile
+import textwrap
 import requests
 from datetime import datetime, timezone
 
@@ -288,9 +289,11 @@ def _print_hook_health():
     started the check without the flag that keeps the project folder off its import path.
     Prints nothing when all is well."""
     try:
-        from .hook import missing_hook_paths, unisolated_check
+        from .hook import install_command_here, missing_hook_paths, unisolated_check
         missing = missing_hook_paths(os.getcwd())
         unisolated = not missing and unisolated_check(os.getcwd())
+        # In AgentX's own repository a plain install is refused, so the fix says --internal.
+        fix = install_command_here()
     except Exception:
         return
     if unisolated:
@@ -299,8 +302,8 @@ def _print_hook_health():
         # same command today (review).
         _print_wrapped("⚠️  Claude Code's AgentX hook in this project starts Python with the "
                        "project folder on its import path, so a file the agent writes here "
-                       "could switch the check off. Fix: agentx hook install (if it says this "
-                       "Python cannot, install AgentX in a virtual environment)")
+                       "could switch the check off. Fix: %s (if it says this Python cannot, "
+                       "install AgentX in a virtual environment)" % fix)
         return
     if not missing:
         return
@@ -321,8 +324,8 @@ def _print_hook_health():
         effect = "calls are still checked, but sessions are not closed out"
     print()
     _print_wrapped("⚠️  Claude Code's AgentX hook in this project runs %s, which no longer "
-                   "%s, so %s. Fix: agentx hook install"
-                   % (" and ".join(paths), "exists" if len(paths) == 1 else "exist", effect))
+                   "%s, so %s. Fix: %s"
+                   % (" and ".join(paths), "exists" if len(paths) == 1 else "exist", effect, fix))
 
 
 def _print_held_tools():
@@ -1989,10 +1992,10 @@ def _print_coaching_effectiveness(verbose=False):
     # Claude Code hook blocks are left out of the comparison: each of its calls is recorded on
     # its own, so a later safer call is never joined to the block and every rate would read 0%
     # (walk: "2 blocks · 0 recovered (0%)"). Counted, and said, rather than shown as a zero.
-    from .hook import AGENT_ID as _HOOK_AGENT
+    from .hook import HOOK_AGENT_IDS as _HOOK_AGENTS
     try:
         data = db_module.get_coaching_effectiveness(
-            exclude_agents=list(_OUR_AGENT_IDS) + [_HOOK_AGENT])
+            exclude_agents=list(_OUR_AGENT_IDS) + list(_HOOK_AGENTS))
         _theirs = db_module.get_coaching_effectiveness(exclude_agents=list(_OUR_AGENT_IDS))
     except Exception:
         return
@@ -10452,6 +10455,13 @@ def execute_holds(args, gateway_url, api_key, admin_key=None, admin_refusal=None
             print(f"   {_who} called {r.get('tool_name')}, held by {_rule}")
         else:
             print(f"   {_who}'s call was held by {_rule}")
+        # Why it was held, as the gateway told the agent: the person answering needs what was
+        # read and where it is going, not only the rule's name (found on a walk). The
+        # website's held-calls list already shows it.
+        _why = _sanitize_detail(str(r.get('challenge_issued') or ''), limit=700)
+        # A host or a path is never split at its hyphen (`api.data-` / `sync.io` misreads).
+        for _line in textwrap.wrap(_why, width=68, break_on_hyphens=False, break_long_words=False):
+            print(f"     {_line}")
     print("\n   ▶ agentx holds approve <receipt>   or   agentx holds deny <receipt>")
     print("=" * 75)
 
@@ -13806,6 +13816,9 @@ def _print_cli_usage(advanced=False):
     # In the DEFAULT view: for a Claude Code user it is the whole of wiring us in, one command.
     print("  hook        Check Claude Code's shell commands and MCP calls ('hook install' adds it to")
     print("                this project's .claude/settings.local.json; '--enforce' blocks)")
+    print("  rule        Turn a correction you keep repeating into a team rule: Claude Code asks")
+    print("                you first ('rule add \"run_suites.py\" --why \"...\"'; 'rule list', 'rule remove';")
+    print("                'rule push' sends them to your gateway)")
     # In the DEFAULT view, not --advanced, because it is the rung immediately after `demo`
     # and both demo footers now send the reader here. A command the on-ramp names and the
     # help screen hides is unfindable the moment that footer scrolls away.
@@ -14060,9 +14073,19 @@ def main():
         execute_review(args[1:])
     elif command == "feedback":
         execute_feedback(args[1:])
+    elif command == "rules" and args[1:2] and args[1].lower() in ("add", "list", "remove"):
+        # `agentx rule` with an s: pointed at the one name, never run as team rules (one word
+        # with two meanings is hard to explain) and never as the import below.
+        # The arguments are not echoed: no quoting is safe in both bash and PowerShell, and a
+        # phrase such as `>.env` typed back from an echo would empty that file (review).
+        print("Nothing ran. Did you mean: agentx rule %s" % args[1].lower())
+        print("Team rules are agentx rule; agentx rules is the old name for import.")
+        sys.exit(1)
     elif command in ("import", "rules"):
         # `rules` is the retired spelling, kept dispatching and out of the help listing. It
         # collided with the DETECTION RULES `agentx adopt` arms; nobody's script has to care.
+        if command == "rules":
+            print("Note: agentx rules is now agentx import. Team rules are agentx rule.")
         execute_import(args[1:])
     elif command == "policies":
         execute_policies(args[1:])
@@ -14096,6 +14119,10 @@ def main():
     elif command == "holds":
         execute_holds(args[1:], gateway_url, resolve_api_key(env) or "",
                       *resolve_admin_key(env))
+    elif command == "rule":
+        from .team_rules import main as _rule_main
+        sys.exit(_rule_main(args[1:], gateway_url, resolve_api_key(env) or "",
+                            *resolve_admin_key(env)))
     elif command in ["status", "inspect"]:
         execute_status_inspection(gateway_url, api_key, mode)
     elif command in ("--version", "version"):

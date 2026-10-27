@@ -392,10 +392,10 @@ def _ledger(db_path, verdicts):
         sites_oldest, sites_undated = None, 0
     finally:
         conn.close()
-    from .hook import AGENT_ID as _HOOK_AGENT
-    # The hook's own agent id is ours, not a name a reviewer knows: said as what it is.
+    from .hook import HOOK_AGENT_LABELS as _HOOK_LABELS
+    # The hook's own agent ids are ours, not names a reviewer knows: said as what they are.
     stopped = [{"time": _iso(ts),
-                "agent": "Claude Code (through the AgentX hook)" if agent == _HOOK_AGENT else agent,
+                "agent": _HOOK_LABELS.get(agent, agent),
                 "tool": tool, "rule": rule,
                 "verdict": verdicts.get(status, status), "status": status,
                 "posture": {"audit": "watching", "enforce": "enforcing"}.get(posture, posture),

@@ -58,6 +58,31 @@ def call_record_name(call_id):
     return hashlib.sha256(str(call_id).encode("utf-8")).hexdigest()[:24] + ".json"
 
 
+def _record_asked_call_ran(event):
+    """A call a team rule asked about has run (Claude Code runs this hook only after a call that
+    ran), so its row can now be written. The check wrote none when it asked, because a call the
+    developer declines never runs. The row needs the package, so it is started here, once, for
+    these calls only.
+
+    🔴 THE COMMAND IS FIXED HERE AND NEVER READ FROM THE CALL RECORD. The record sits in the
+    project, where the agent's own shell commands can write; a command line taken from it would
+    run whatever the agent wrote there, outside any sandbox. This interpreter, with the project
+    folder kept off its import path: `-I`, else `-P` where `-I` cannot find the package."""
+    import subprocess
+    payload = json.dumps(event).encode("utf-8")
+    for flag in ("-I", "-P"):
+        if flag == "-P" and sys.version_info < (3, 11):
+            continue
+        try:
+            done = subprocess.run([sys.executable, flag, "-m", "agentx_sdk.hook", "record-ran"],
+                                  input=payload, capture_output=True, timeout=10,
+                                  cwd=project_dir(event))
+            if done.returncode == 0:
+                return
+        except Exception:
+            return
+
+
 def post_tool_use(stdin=None, stdout=None):
     """Print the note for the agent when the call's record says watching let it through."""
     stdin = stdin or sys.stdin
@@ -71,6 +96,8 @@ def post_tool_use(stdin=None, stdout=None):
                             call_record_name(call_id))
         with open(path, encoding="utf-8") as fh:
             record = json.load(fh)
+        if isinstance(record, dict) and record.get("team_asked"):
+            _record_asked_call_ran(event)
         if not (isinstance(record, dict) and record.get("would_block")):
             return 0
         note = ("AgentX: your %s call just now matched its rule '%s'. AgentX is watching, not "
