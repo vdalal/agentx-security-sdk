@@ -3032,8 +3032,12 @@ def _print_agentx_summary():
             # The one zero that needs a pointer: keyed, switched on, and nothing deferred. Watching
             # defers too now, so posture is no longer a cause: either nothing matched, or every
             # match was one the developer's own files also stop (`_own_files_also_stop`,
-            # `_gateway_can_judge`), which is always decided here.
-            print(" 🔀 Shield asks gateway:   ON  |  nothing matched yet that your gateway can decide")
+            # `_gateway_can_judge`), which is always decided here. It says only what this line
+            # counts. It used to read "nothing matched yet that your gateway can decide", which
+            # was false beside a call the gateway held on its own (a team rule, its judge): the
+            # gateway decides every keyed call, and this line counts only the built-in matches.
+            print(" 🔀 Shield asks gateway:   ON  |  no call matched a built-in check yet, so "
+                  "none was handed over")
         else:
             print(f" 🔀 Shield asks gateway:   ON  |  asked about {_carried} matched call(s), {_answered} answered")
     print("─"*60)

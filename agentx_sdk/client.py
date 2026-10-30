@@ -256,7 +256,7 @@ class AgentXClient:
         if self._explicit_url is not None:
             return self._explicit_url
         resolved = ((resolve_env("AGENTX_GATEWAY_URL") or "").strip().rstrip("/")
-                    or "http://localhost:8000")
+                    or envfile.DEFAULT_GATEWAY_URL)
         _say_once_if_only_a_parent_names_the_gateway(resolved)
         return resolved
 

@@ -96,6 +96,143 @@ def _with(description, sentence):
 # The kinds of rule the screens count by, as this file names them.
 KIND_FILE = "word list (from your policies file)"
 KIND_ADOPTED = "your rule (adopted)"
+KIND_TEAM = "your team's rule (asks)"
+
+
+def team_rule_entries():
+    """(in force, switched off, fingerprint rows) for the team rules this machine's hook checks:
+    the project's team rules file and the rules it took from your gateway, each id the copy the
+    hook uses, read as the hook reads them (`hook._team_rules_here`, never asking the gateway).
+
+    WHY. The file opened with "the rules this machine's AgentX checks agent calls against" and
+    left every team rule out, while `agentx rule list` showed them.
+
+    🔴 FACTS, NOT A VERDICT PER CALL (two review rounds). A first version decided, per rule,
+    which harness checks it here, and every round found another case it guessed wrong: a hook
+    installed in a settings file it did not read, an MCP tool's name taken for an SDK function,
+    the wrong fix named for the wrong harness. So each description says what the rule matches and
+    how the hook treats it, stated with its scope; where the hook was found is a fact of its own
+    (`rule_sources`' "team_rules_hook"), never folded into a conclusion. Never raises: [] on a
+    failed read, which `rule_sources` then names."""
+    from . import hook, team_rules
+    try:
+        path = team_rules.team_rules_path()
+        rules, _line = hook._team_rules_here(os.getcwd(), path, pull=False)
+    except Exception:
+        return [], [], []
+    in_force, off = [], []
+    for r in rules:
+        rid = str(r["id"])
+        name = "Team rule %s" % rid
+        # Not "(agentx rule push)": a rule on the gateway can be made on the website too.
+        source = ("taken from your gateway" if r.get(team_rules.FROM_GATEWAY)
+                  else "in the project's team rules file")
+        if not r.get("active", True):
+            off.append({"id": rid, "name": name,
+                        "why": "A team rule (%s), switched off, so nothing matches it." % source})
+            continue
+        # Where the hook runs is the notes' and `team_rules_hook`'s to say, not each rule's.
+        clauses = [
+            "Asks before %s: the AgentX hook checks a matching shell or MCP call before Claude "
+            "Code or Codex runs it, whether AgentX is blocking or watching. The first matching "
+            "team rule answers, and a call a built-in rule stops is stopped first."
+            % team_rules._describe(r)]
+        if any(t != "PowerShell" for t in r["tools"]):
+            # Codex's hook never sees PowerShell (`hook.CODEX_HOOK_MATCHER`). Known limit: a rule
+            # naming only "PowerShell" also matches an MCP tool by that bare name, which Codex
+            # does see; left unsaid, as no such tool is known (review round 4).
+            clauses.append("Codex cannot ask, so there it %s." % (
+                "stops the call" if r.get("where_ask_unsupported") == "stop"
+                else "warns and lets the call run"))
+        clauses.append("Claude Code in a mode that does not ask, such as auto, stops the call.")
+        bare = [t for t in r["tools"] if t not in (team_rules.SHELL, "Bash", "PowerShell")
+                and not t.startswith("mcp__")]
+        if bare:
+            # What the hook sees of a bare name, never what the name is (review: an MCP server's
+            # function also shows in the SDK's record under the same name).
+            clauses.append("The hook sees %s only in an MCP call (mcp__<server>__<name>); a call "
+                           "to an SDK agent's function, or to another Claude Code tool, by that "
+                           "name is not one the hook sees."
+                           % " or ".join("'%s'" % t for t in bare))
+        # A gateway reads ONE copy (`_team_rules_source_path`): the pushed one whenever it has
+        # one, never merged, and a shared box never the file (review; `team_rules._PUSH_HINT`).
+        clauses.append("The SDK on its own checks no team rule. A gateway checks the copy it "
+                       "reads: the project's team rules file when it runs beside this project "
+                       "and was never sent rules, else the copy last sent with agentx rule push.")
+        clauses.append("Why: %s (%s)." % (r["why"].rstrip("."), source))
+        in_force.append({"id": rid, "name": name, "kind": KIND_TEAM, "applies_to": None,
+                         "description": " ".join(clauses)})
+    # ONE row, in order: the first matching rule answers, so swapping two rules changes what is
+    # checked, and the fingerprint (computed over sorted rows) must move with it (review). In
+    # force or off follows each rule's own `active`, which the row holds.
+    rows = [["team_rules", [[{k: v for k, v in r.items() if k != team_rules.FROM_GATEWAY},
+                             bool(r.get(team_rules.FROM_GATEWAY))] for r in rules]]] if rules else []
+    return in_force, off, rows
+
+
+# Where `agentx hook install` (and `--codex`) put the hook in a project, and where Claude Code
+# also runs one from (hook.install reads the shared file too).
+_HOOK_SETTINGS = (("Claude Code", os.path.join(".claude", "settings.local.json")),
+                  ("Claude Code", os.path.join(".claude", "settings.json")),
+                  ("Codex", os.path.join(".codex", "hooks.json")))
+
+
+def team_rules_hook():
+    """Which of the project's settings files hold the AgentX hook's check (its PreToolUse
+    entry, the one that asks): "found in <files>", "not found in <files>", plus "could not read
+    <file>" for one that would not parse (never counted as "not found": review). The project
+    is the one the team rules file is read from (`_anchored_root`), not the working folder.
+    Settings outside the project are not read, and the value says so. A fact for the reader,
+    never a conclusion about a call (review). Never raises."""
+    from . import hook
+    from .overrides import _anchored_root
+    try:
+        root = _anchored_root()
+        found, unread = [], []
+        for _harness, rel in _HOOK_SETTINGS:
+            shown = rel.replace(os.sep, "/")
+            settings, err = hook._read_settings(os.path.join(root, rel))
+            if err:
+                unread.append(shown)
+                continue
+            pre = ((settings or {}).get("hooks") or {}).get("PreToolUse") or []
+            if any(hook._is_ours(h) for entry in pre if isinstance(entry, dict)
+                   and isinstance(entry.get("hooks"), list) for h in entry["hooks"]):
+                found.append(shown)
+        parts = []
+        read_ok = [rel.replace(os.sep, "/") for _h, rel in _HOOK_SETTINGS
+                   if rel.replace(os.sep, "/") not in unread]
+        if found:
+            parts.append("found in %s" % ", ".join(found))
+        elif read_ok:
+            parts.append("not found in %s" % ", ".join(read_ok))
+        if unread:
+            parts.append("could not read %s" % ", ".join(unread))
+        return "%s (settings outside the project not read)" % "; ".join(parts)
+    except Exception:
+        return "could not read"
+
+
+def team_rules_from_gateway():
+    """Where the copy of your gateway's team rules the hook checks stands: "no key" (none found
+    here, so the hook takes none), "not taken yet" (the hook takes it before its next check),
+    "taken", or the copy's own status ("refused", "unreachable", "old", "unreadable", "error")
+    with ", earlier copy kept" where the hook still checks the rules it took before. Read as the
+    hook reads it; never asks the gateway. A list with no gateway rule must say why (review)."""
+    from . import hook, team_rules
+    try:
+        gateway = hook._team_gateway()
+        if not gateway:
+            return "no key"
+        doc = team_rules.read_pulled(gateway[0], gateway[1], path=team_rules.team_rules_path())
+        if doc is None:
+            return "not taken yet"
+        status = doc.get("status")
+        if status == "ok":
+            return "taken"
+        return "%s%s" % (status, ", earlier copy kept" if team_rules.pulled_rules(doc) else "")
+    except Exception:
+        return "could not read"
 
 
 def builtin_checks():
@@ -164,9 +301,22 @@ def rule_sources():
             policies = "could not open"
         except Exception:
             policies = "damaged"
+    from . import team_rules
+    try:
+        team = team_rules.team_rules_state()
+    except Exception:
+        team = "could not read"
     return {"policies_file": policies,
             "adopted_rules": rules_mod.adopted_rules_state(),
-            "outbound_allowlist": rules_mod.allowlist_state()}
+            "outbound_allowlist": rules_mod.allowlist_state(),
+            # The project's team rules file. "damaged": its rules are not in
+            # rules_in_force, and only those the hook took from your gateway are.
+            "team_rules": team,
+            # The second source of team rules, said apart so a list with none of the gateway's
+            # rules says why (review).
+            "team_rules_from_gateway": team_rules_from_gateway(),
+            # Where the hook that checks team rules was found: a fact, not a verdict (review).
+            "team_rules_hook": team_rules_hook()}
 
 
 # The states that mean the source was read. An absent file holds nothing, and an earlier import
@@ -458,6 +608,10 @@ def build(db_path=None):
     notes = w["notes"]["local"]
     in_force, off, fp_rows, load_error, allow_error, allowlist, _ = _rules(
         w["descriptions"]["local"])
+    # Team rules here, not in `_rules`: its lists also feed `agentx status`'s built-in counts,
+    # where a team rule switched off is not a built-in policy.
+    team_in, team_off, team_rows = team_rule_entries()
+    in_force, fp_rows = in_force + team_in, fp_rows + team_rows
     version = _sdk_version()
     fingerprint = hashlib.sha256(_canonical([version, sorted(fp_rows, key=_canonical)])
                                  .encode("utf-8")).hexdigest()
@@ -509,7 +663,7 @@ def build(db_path=None):
         "rules_off": off + [
             {"id": r["id"], "name": r.get("name") or r["id"],
              "why": "A rule you added, switched off, so nothing matches it."}
-            for r in rules_mod.switched_off_adopted_rules()],
+            for r in rules_mod.switched_off_adopted_rules()] + team_off,
         "rules_fingerprint": fingerprint,
         "rules_fingerprint_note": notes["rules_fingerprint"],
         "stopped_or_held_calls": stopped,

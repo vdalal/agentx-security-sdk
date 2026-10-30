@@ -8,6 +8,14 @@ cli.py re-exports load_env_file from here for backward compatibility.
 import os
 
 
+# 🔴 THE GATEWAY ADDRESS WHEN NOTHING NAMES ONE: `127.0.0.1`, NOT `localhost`. `localhost`
+# resolves to `::1` as well, the gateway binds `0.0.0.0` (IPv4 only), and Windows waits on the
+# IPv6 attempt before it tries IPv4: on Windows 11, against an IPv4-only server, about 2 s per
+# request through `localhost` and a few milliseconds through `127.0.0.1`. One constant, read by
+# every Python caller, so the default cannot be right at some sites and not others.
+DEFAULT_GATEWAY_URL = "http://127.0.0.1:8000"
+
+
 # 🔴 ONE SPELLING OF THE FALLBACK, SHARED BY THE READER AND BY ANYTHING THAT NAMES IT.
 # `parent_env_dir` below has to tell a developer WHICH folder is being skipped, and the
 # obvious ways to do that both go wrong: changing what `load_env_file` returns breaks a

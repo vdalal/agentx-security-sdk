@@ -36,7 +36,8 @@ from .rules import (harvest_rule_candidates, harvest_rule_candidates_from_calls,
 
 # Re-exported from the stdlib-only envfile module (kept importable here for
 # backward compatibility — callers and tests still do `from .cli import load_env_file`).
-from .envfile import load_env_file, resolve_env, resolve_api_key, resolve_admin_key
+from .envfile import (load_env_file, resolve_env, resolve_api_key, resolve_admin_key,
+                      DEFAULT_GATEWAY_URL)
 
 
 def _ledger_path_line(path, indent="   "):
@@ -8457,7 +8458,7 @@ def _gateway_reachable(timeout=0.4, gateway_url=None):
         # One statement of the precedence, shared with the SDK runtime. The overlay is
         # passed rather than resolved inside, so this keeps the CLI's ../.env fallback
         # (a human ran this command in that tree) and keeps `load_env_file` patchable.
-        gateway_url = resolve_env("AGENTX_GATEWAY_URL", "http://localhost:8000", overlay=env)
+        gateway_url = resolve_env("AGENTX_GATEWAY_URL", DEFAULT_GATEWAY_URL, overlay=env)
     # 🔴 A URL THE SDK REFUSES IS NOT A REACHABLE GATEWAY, AND SAYING OTHERWISE MAKES THIS
     # COMMAND CONTRADICT THE THING IT REPORTS ON. Without this check,
     # `AGENTX_GATEWAY_URL=http://gw:0` made `agentx status` report the gateway reachable:
@@ -10183,7 +10184,7 @@ def _gateway_destinations():
     if not api_key:
         return {}
     from .db import clean_host
-    gateway_url = resolve_env("AGENTX_GATEWAY_URL", "http://localhost:8000", overlay=env)
+    gateway_url = resolve_env("AGENTX_GATEWAY_URL", DEFAULT_GATEWAY_URL, overlay=env)
     try:
         if not _gateway_reachable(gateway_url=gateway_url):
             return {}
@@ -10205,6 +10206,71 @@ def _gateway_destinations():
                     and isinstance(calls, int) and not isinstance(calls, bool) and calls > 0):
                 out.setdefault(str(agent), {})[host] = calls
     return out
+
+
+def _refused_with_key(code, key_name):
+    """The clause after "answered <code>" for a refused read, or "" for any other code. ONE
+    wording for `agentx allowlist` and `agentx rule list`. A proxy or a platform's access check
+    in front of the gateway answers 401 and 403 too, so neither is said as the key being wrong
+    for certain (code review), as _REFUSED_REASON_WORDS already says it."""
+    if code == 401:
+        return ": the gateway, or something in front of it, did not accept your %s" % key_name
+    if code == 403:
+        return (": the gateway, or something in front of it, refused the request made with your %s"
+                % key_name)
+    return ""
+
+
+# How much of a gateway's refusal a push or an answer prints: room for its longest sentence (the
+# admin-key refusal of a team rules push is about 330 characters; 300 cut it mid-word), still a
+# bound on remote text.
+_REFUSAL_DETAIL_MAX = 600
+
+
+def _refuser(code):
+    """Who refused, opening a line that says a push or an answer was refused: for 401 and 403 the
+    gateway or something in front of it (`_refused_with_key`'s reason), and for any 5xx, which a
+    load balancer or the platform answers too (a 503 during a deploy); any other code is the
+    gateway's own answer."""
+    return ("Your gateway, or something in front of it,"
+            if code in (401, 403) or 500 <= (code or 0) <= 599 else "Your gateway")
+
+
+def _never_sent(err):
+    """True only when a request certainly never reached the gateway: no connection was made (a
+    refused or timed-out connect, a name that did not resolve) or the address was unusable. A
+    read timeout or a connection dropped mid-answer can come after the gateway stored the push
+    or the answer (scoped review: "nothing was sent" after a slow gateway's 5.2 s write)."""
+    import requests
+    if isinstance(err, (requests.exceptions.ConnectTimeout, requests.exceptions.MissingSchema,
+                        requests.exceptions.InvalidSchema, requests.exceptions.InvalidURL)):
+        return True
+    if isinstance(err, requests.exceptions.ConnectionError):
+        reason = getattr(err.args[0], "reason", None) if err.args else None
+        try:
+            from urllib3.exceptions import ConnectTimeoutError   # NewConnectionError's base
+        except Exception:
+            return False
+        return isinstance(reason, ConnectTimeoutError)
+    return not isinstance(err, requests.exceptions.RequestException)
+
+
+def _unreached(err, gateway_url, nothing, thing, check):
+    """The line for a request that got no answer: "nothing was <nothing>" only when it certainly
+    never arrived (`_never_sent`), else that it is not known, naming the command that checks."""
+    if _never_sent(err):
+        return f"Could not reach your gateway at {gateway_url}, so nothing was {nothing}: {err}"
+    return (f"Your gateway at {gateway_url} did not finish answering, so whether it took the "
+            f"{thing} is not known ({check} says): {err}")
+
+
+def _copy_after(code, check):
+    """What a refused push left at the gateway: unchanged after the gateway's own refusal; not
+    known after a 5xx, which can arrive after the write (a load balancer's 504), so the line names
+    the command that compares the two copies (scoped review)."""
+    if 500 <= (code or 0) <= 599:
+        return "so whether its copy changed is not known (%s compares it with this file)" % check
+    return "so its copy is unchanged"
 
 
 def execute_allowlist(args, gateway_url, api_key, admin_key=None, admin_refusal=None):
@@ -10234,6 +10300,7 @@ def execute_allowlist(args, gateway_url, api_key, admin_key=None, admin_refusal=
         print("=" * 75)
         sys.exit(1)
     local_fp = rules_mod.allowlist_fingerprint(agents) if os.path.exists(path) else None
+    key_name = "AGENTX_API_KEY" if api_key else "AGENTX_ADMIN_KEY"
     api_key = api_key or admin_key or ""         # either key reads the gateway's copy
     if not api_key and admin_refusal:
         print(f"\n❌ Nothing was sent. {admin_refusal}")
@@ -10263,7 +10330,7 @@ def execute_allowlist(args, gateway_url, api_key, admin_key=None, admin_refusal=
             res = requests.put(f"{gateway_url}/v1/allowlist", json=body, headers=push_headers,
                                timeout=5.0)
         except Exception as err:
-            print(f"\n❌ Could not reach your gateway at {gateway_url}, so nothing was sent: {err}")
+            print("\n❌ " + _unreached(err, gateway_url, "sent", "list", "agentx allowlist"))
             print("=" * 75)
             sys.exit(1)
         if res.status_code != 200:
@@ -10274,8 +10341,9 @@ def execute_allowlist(args, gateway_url, api_key, admin_key=None, admin_refusal=
             # A raw body is remote text too: cleaned, redacted and bounded like every other
             # gateway body this SDK prints (a FastAPI 422's `detail` is a list, hence str()).
             from .decorators import _sanitize_detail
-            detail = _sanitize_detail(str(detail), limit=300)
-            print(f"\n❌ Your gateway refused the list ({res.status_code}), so its copy is unchanged: {detail}")
+            detail = _sanitize_detail(str(detail), limit=_REFUSAL_DETAIL_MAX)
+            print(f"\n❌ {_refuser(res.status_code)} refused the list ({res.status_code}), "
+                  f"{_copy_after(res.status_code, 'agentx allowlist')}: {detail}")
             print("=" * 75)
             sys.exit(1)
         got = _remote_json(res)
@@ -10291,15 +10359,29 @@ def execute_allowlist(args, gateway_url, api_key, admin_key=None, admin_refusal=
         print("=" * 75)
         sys.exit(0 if same else 1)
 
-    # status
+    # status. Three failures, three lines, as `agentx rule list` says them: no answer, an answer
+    # that is a refusal or fault (its code), and a 200 whose body is not the answer. "could not be
+    # read" for all three read a gateway that is not running as a fault in the gateway.
     try:
         res = requests.get(f"{gateway_url}/v1/allowlist", headers=headers, timeout=3.0)
-        view = _remote_json(res) if res.status_code == 200 else None
     except Exception:
-        view = None
+        res = None
+    view = None
+    if res is not None and res.status_code == 200:
+        try:
+            view = _remote_json(res)
+        except Exception:
+            view = None
+        view = view if isinstance(view, dict) else "unreadable"
     print(f"\n📋 Allowlist: {shown}" + (f", fingerprint {local_fp}" if local_fp else " (no file yet)"))
-    if view is None:
-        print(f"   Your gateway at {gateway_url} could not be read, so it is unknown which list it enforces.")
+    if res is None:
+        print(f"   Your gateway at {gateway_url} did not answer, so it is unknown which list it enforces.")
+    elif res.status_code != 200:
+        print(f"   Your gateway at {gateway_url} answered {res.status_code}, so it is unknown which list "
+              f"it enforces{_refused_with_key(res.status_code, key_name)}.")
+    elif view == "unreadable":
+        print(f"   Your gateway at {gateway_url} answered, but its reply could not be read, so it is "
+              f"unknown which list it enforces.")
     elif not view.get("readable", True):
         print(f"   Your gateway's copy cannot be read, so it is refusing every call: {view.get('error')}")
     elif view.get("source") == "none":
@@ -10354,7 +10436,7 @@ def execute_holds(args, gateway_url, api_key, admin_key=None, admin_refusal=None
             d = _remote_json(res).get("detail") or res.text
         except Exception:
             d = res.text
-        return _sanitize_detail(str(d), limit=400)
+        return _sanitize_detail(str(d), limit=_REFUSAL_DETAIL_MAX)
 
     if sub in _HOLD_VERDICTS:
         receipt = args[1]
@@ -10391,7 +10473,7 @@ def execute_holds(args, gateway_url, api_key, admin_key=None, admin_refusal=None
                                 headers={"Authorization": f"Bearer {admin_key or api_key}"},
                                 timeout=5.0)
         except Exception as err:
-            print(f"\n❌ Could not reach your gateway at {gateway_url}, so nothing was answered: {err}")
+            print("\n❌ " + _unreached(err, gateway_url, "answered", "answer", "agentx holds"))
             print("=" * 75)
             sys.exit(1)
         if res.status_code == 404:
@@ -10400,7 +10482,11 @@ def execute_holds(args, gateway_url, api_key, admin_key=None, admin_refusal=None
             print("=" * 75)
             sys.exit(1)
         if res.status_code != 200:
-            print(f"\n❌ Your gateway refused the answer ({res.status_code}): {_detail(res)}")
+            print(f"\n❌ {_refuser(res.status_code)} refused the answer ({res.status_code}): {_detail(res)}")
+            if 500 <= res.status_code <= 599:
+                # A 5xx can arrive after the answer was recorded (scoped review).
+                print("   Whether the answer was recorded is not known.")
+                print("   ▶ agentx holds   (lists the calls still waiting)")
             print("=" * 75)
             sys.exit(1)
         said = {"approve": "approved: the agent's call runs when it next checks",
@@ -10544,7 +10630,7 @@ def _gateway_tools():
     if not api_key:
         return {}
     from .rules import _tool_entry
-    gateway_url = resolve_env("AGENTX_GATEWAY_URL", "http://localhost:8000", overlay=env)
+    gateway_url = resolve_env("AGENTX_GATEWAY_URL", DEFAULT_GATEWAY_URL, overlay=env)
     try:
         if not _gateway_reachable(gateway_url=gateway_url):
             return {}
@@ -13818,7 +13904,7 @@ def _print_cli_usage(advanced=False):
     print("                this project's .claude/settings.local.json; '--enforce' blocks)")
     print("  rule        Turn a correction you keep repeating into a team rule: Claude Code asks")
     print("                you first ('rule add \"run_suites.py\" --why \"...\"'; 'rule list', 'rule remove';")
-    print("                'rule push' sends them to your gateway)")
+    print("                'rule push' sends them to your gateway, 'rule pull' takes its changes)")
     # In the DEFAULT view, not --advanced, because it is the rung immediately after `demo`
     # and both demo footers now send the reader here. A command the on-ramp names and the
     # help screen hides is unfindable the moment that footer scrolls away.
@@ -14018,7 +14104,7 @@ def main():
     # Shared with the SDK runtime and with `_gateway_reachable` above; see resolve_env.
     # Only this one line is ported: the neighbours resolve different variables and are
     # left exactly as they are rather than swept up in a change about one of them.
-    gateway_url = resolve_env("AGENTX_GATEWAY_URL", "http://localhost:8000", overlay=env)
+    gateway_url = resolve_env("AGENTX_GATEWAY_URL", DEFAULT_GATEWAY_URL, overlay=env)
 
     # AGENTX_CLOUD_ADMIN_PLANE is retired — CONTROL_PLANE_URL is the one name for
     # the control-plane location everywhere.

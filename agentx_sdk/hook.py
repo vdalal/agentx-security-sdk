@@ -43,6 +43,10 @@ import sys
 import time
 import uuid
 
+# When this process started: Claude Code and Codex start one per call, so a pulled copy checked
+# since then is one this call fetched (`_sync_team_rules`).
+_PROCESS_STARTED = time.time()
+
 AGENT_ID = "claude_code_hook"
 # The agent id each harness's calls are checked and recorded under, so the record (and an
 # allowlist entry, which names the same id) can always say which harness made a call.
@@ -275,7 +279,7 @@ def _hand_back(command, tool, mode, needs_yes=False):
             return ("To run it yourself, type it with ! as the very first character (with --yes: a ! "
                     "command cannot answer agentx's y/N question): !%s --yes" % command)
         return ("To run it yourself, type it with ! as the very first character; if it runs agentx "
-                "rule add or remove, add --yes to that command (a ! command cannot answer agentx's "
+                "rule add, remove or pull, add --yes to that command (a ! command cannot answer agentx's "
                 "y/N question): !%s" % command)
     return "To run it yourself, type it with ! as the very first character: !%s" % command
 
@@ -364,8 +368,8 @@ def _rule_change_rule(command):
     """The built-in team rule a command that changes the team rules matches, or None.
 
     THE RULE IS THE WORDS, NOT A SPELLING: the command holds the CLI (a word whose own name is
-    `agentx`, `agentx.exe` or `agentx_sdk.cli`, so not a folder in a path), `rule`, and `add`
-    or `remove`, in any order; or it names `team-rules.json` with some shell writes,
+    `agentx`, `agentx.exe` or `agentx_sdk.cli`, so not a folder in a path), `rule`, and `add` or
+    `remove` in any order, or `pull` as the subcommand; or it names `team-rules.json` with some shell writes,
     such as rm, > and git checkout. Every spelling has those words (a wrapper, a subshell, a
     quoted path, flags anywhere), and the check is linear on any input. Two spelling patterns
     were tried first: one missed the wrappers, the next took minutes on a crafted command, past
@@ -386,7 +390,18 @@ def _rule_change_rule(command):
     # A token's own name, so a folder in a path (".agentx/", "agentx-rules") is not the CLI.
     names = {re.split(r"[\\/]", t)[-1] for t in tokens}
     cli = bool(names & _CLI_NAMES)
-    changes = cli and "rule" in names and bool(names & {"add", "remove"})
+    # `pull` rewrites the file too (code review): the agent's key can change the gateway's list,
+    # and a pull then writes that into the committed file. Only as the subcommand, the first word
+    # after `rule` that is not a flag, as `team_rules.main` reads it (it drops `--yes` from
+    # anywhere): `agentx rule --yes pull` is a pull, `git pull && agentx rule list` is ordinary
+    # work (scoped reviews). add and remove keep any order.
+    pulls = False
+    for i, t in enumerate(tokens):
+        if t == "rule":
+            after = [u for u in tokens[i + 1:] if not u.startswith("-")]
+            if after and after[0] == "pull":
+                pulls = True
+    changes = cli and "rule" in names and (bool(names & {"add", "remove"}) or pulls)
     # Some shell writes to the rules file, such as rm, > and git checkout. A `>` counts when the
     # file is what it writes to, or when where it writes cannot be read (a quote or `$` in it);
     # `cat .agentx/team-rules.json 2>&1` reads the file.
@@ -408,7 +423,10 @@ def _rule_change_rule(command):
             "where_ask_unsupported": "stop", "action": "ask", "builtin": True,
             # What the check SAW, not what the call does: a commit message naming the command
             # is asked about too (review: "runs" and "changes" were false of those).
-            "found": "names agentx rule add or remove" if changes else
+            # A pull is said for what it does, not as a third kind of edit.
+            "found": ("names agentx rule add or remove" if names & {"add", "remove"} else
+                      "names agentx rule pull, which rewrites your team rules file with your "
+                      "gateway's list") if changes else
                      "names %s with a command that can write it, such as rm, > or git checkout"
                      % TEAM_RULES_SHOWN,
             # Said to the developer and the agent: how a person makes the change, since a ! line
@@ -430,7 +448,7 @@ def _team_answer(rule, harness, answer, event=None, command=None, tool=None):
     there the rule's `where_ask_unsupported` decides: "warn" shows the rule and the call runs,
     "stop" refuses it with the rule's reason."""
     from .team_rules import reason_text
-    reason = reason_text(rule)
+    reason = reason_text(rule, hosted=_hosted_key())
     if harness == "codex":
         if rule.get("where_ask_unsupported") == "stop":
             return dict(answer or {}, hookSpecificOutput={
@@ -543,14 +561,29 @@ def decide(event, posture=None, harness="claude"):
         from . import team_rules
         rules_path = team_rules.team_rules_path(project=project)
         shell = tool_key in SCREENED_SHELL_TOOLS
+        rules, gateway_lines = _team_rules_here(project, rules_path)
+        once.extend(gateway_lines)
         team = (_rule_change_rule(query) if shell else None) or \
-            team_rules.match_team_rule(tool_key, query, path=rules_path)
+            team_rules.match_rules(tool_key, query, rules)
+        if (team is not None and not team.get("builtin") and not team.get(team_rules.FROM_GATEWAY)
+                and _hosted_key() and _held_on_gateway_as_here(team, rules_path)):
+            # The file holds the gateway's rule word for word (after `agentx rule pull`, or a
+            # teammate's committed pull): an edit here changes only this machine, so with the
+            # website's key the ask names the website, where it changes for everyone (scoped
+            # review). Marked on this call's copy only; nothing is written with it.
+            team = dict(team, **{team_rules.FROM_GATEWAY: True})
         if team is None and team_rules.team_rules_state(rules_path) == "damaged":
             # A file that cannot be read (a merge conflict, a hand edit) must not switch every
             # team rule off in silence.
-            once.append(("team-rules-damaged", "AgentX: %s could not be read, so no team rule "
-                         "is checked until it is fixed (agentx rule list says why)."
-                         % rules_path))
+            # Only the gateway's rules are still checked then, and the line says so (code review:
+            # "no team rule is checked" was false beside a pulled rule that asks).
+            still = sum(1 for r in rules if r.get(team_rules.FROM_GATEWAY)
+                        and r.get("active", True))      # a switched-off rule checks nothing
+            what = ("no team rule is checked" if not still else
+                    "only the %s from your gateway %s checked"
+                    % (("rule", "is") if still == 1 else ("%d rules" % still, "are")))
+            once.append(("team-rules-damaged", "AgentX: %s could not be read, so %s until it "
+                         "is fixed (agentx rule list says why)." % (rules_path, what)))
         if team is not None:
             command = query if shell else None
             stop_answer, stop_outcome = _team_answer(team, harness, None, event,
@@ -585,15 +618,19 @@ def decide(event, posture=None, harness="claude"):
     if team is not None:
         record["team_rule"] = team["id"]
         record["team_outcome"] = outcome
-    if outcome == "ask" and decision is None:
+    if outcome == "ask":
         # The developer has not answered yet, and a call they decline never runs, so no row is
         # written now. Claude Code runs the after-the-call note only for a call that ran (or
-        # failed, which still ran); the note starts `record-ran`, which writes the row then.
-        # (A call a built-in rule is also WATCHING keeps its row here, as every watched call
-        # does: that row says what the rules saw, before any answer.)
+        # failed, which still ran); the note starts `record-ran`, which writes the row then and
+        # logs "ran" for the rule.
         record["team_asked"] = 1
-        _write_call_record(project, event, record)
-        return answer
+        if decision is None:
+            _write_call_record(project, event, record)
+            return answer
+        # A call a built-in rule is also WATCHING keeps its row here, as every watched call does
+        # (that row says what the rules saw, before any answer), so `record-ran` logs only "ran";
+        # without it, "asked N, ran M" would leave these out of M.
+        record["team_row_written"] = 1
     _keep(event, project, posture, tool_key, arguments, decision, challenge, record, team=team,
           agent_id=agent_id, team_stopped=outcome == "stop")
     return answer
@@ -625,17 +662,210 @@ def record_ran(stdin=None):
         tool_key = str(event.get("tool_name"))
         # The passing row is the call's, like every other passing row; which team rule asked
         # about it goes in the rule's own log, so no reader takes it for an adopted rule.
-        _record(event, project, posture, tool_key, arguments, None, None, {},
-                agent_id=_agent_id(project, "claude"))
+        if not record.get("team_row_written"):
+            _record(event, project, posture, tool_key, arguments, None, None, {},
+                    agent_id=_agent_id(project, "claude"))
         from . import team_rules
         rule_id = record.get("team_rule")
         rules_path = team_rules.team_rules_path(project=project)
-        if isinstance(rule_id, str) and any(r["id"] == rule_id
-                                            for r in team_rules.read_team_rules(rules_path)):
+        # A rule this machine checks: the project's file, or the rules pulled from the gateway.
+        rules, _line = _team_rules_here(project, rules_path, pull=False)
+        if isinstance(rule_id, str) and any(r["id"] == rule_id for r in rules):
             team_rules.log_team_rule_use(rule_id, "ran", "claude", path=rules_path)
     except Exception:
         pass
     return 0
+
+
+def _team_gateway():
+    """(url, key) of the gateway whose team rules this project also checks, or None without a
+    key. The CLI's order (`agentx rule push`): the environment the harness was started with first,
+    a key per developer, then the project's `.env`, a key per project. The agent key only; the
+    admin key is never read here. Never raises."""
+    try:
+        from .envfile import DEFAULT_GATEWAY_URL, dotenv_overlay, resolve_api_key, resolve_env
+        overlay = dotenv_overlay()
+        key = resolve_api_key(overlay)
+        if not key:
+            return None
+        url = (resolve_env("AGENTX_GATEWAY_URL", DEFAULT_GATEWAY_URL, overlay=overlay)
+               or DEFAULT_GATEWAY_URL).strip().rstrip("/")
+        return url, key
+    except Exception:
+        return None
+
+
+# The website's hosted keys begin with this, as the hosted gateway and the signup mint them.
+_HOSTED_KEY_PREFIX = "agentx_sk_h_"
+
+
+def _hosted_key():
+    """Whether this project's key is the website's, so a gateway rule can be changed on
+    agentx-core.com/app (a self-hosted gateway's cannot). Never raises."""
+    gateway = _team_gateway()
+    return bool(gateway and str(gateway[1]).startswith(_HOSTED_KEY_PREFIX))
+
+
+def _held_on_gateway_as_here(rule, rules_path):
+    """Whether the gateway's list holds `rule` exactly as this project's file does. Reads the
+    copy `_team_rules_here` has just refreshed; never asks the gateway. Never raises. Only a copy
+    the gateway just sent: one kept while it does not answer may hold a rule since removed on the
+    website (scoped review)."""
+    from . import team_rules
+    try:
+        url, key = _team_gateway()
+        doc = team_rules.read_pulled(url, key, path=rules_path)
+        return bool(doc and doc.get("status") == "ok" and team_rules.gateway_list_known(doc)
+                    and any(team_rules._same(rule, g) for g in team_rules.pulled_rules(doc)))
+    except Exception:
+        return False
+
+
+def _team_rules_here(project, rules_path, pull=True):
+    """(the rules this call is checked against, the one-time lines to show, as (key, text)
+    pairs: none, or one or two). The project's file and
+    the rules pulled from the gateway, by id, the gateway's copy winning wherever it changed
+    since the two last agreed (`team_rules.three_way`: a rule edited, switched off or
+    removed on the website reaches this machine). A refused key, an older gateway or a lost
+    cache leaves exactly the file's rules, as before. With a key (`pull`), a copy older than its
+    keep time (5 minutes for an answer) is refreshed BEFORE the call is checked, so a rule
+    switched off on the website stops asking within 5 minutes. It used to be refreshed only after
+    the answer, and a switched-off rule then asked once more past the 5 minutes; Claude Code and
+    Codex wait for the hook to finish either way, so the call pays the same round trip. Never
+    raises."""
+    from . import team_rules
+    damaged = False
+    try:
+        local = team_rules.read_team_rules(rules_path)
+    except Exception:
+        local, damaged = [], True        # a damaged file is said by the caller
+    gateway = _team_gateway()
+    if not gateway:
+        return local, []
+    try:
+        url, key = gateway
+        # `refresh_pulled` keeps a copy younger than its keep time and asks the gateway otherwise.
+        doc = (team_rules.refresh_pulled(url, key, path=rules_path) if pull
+               else team_rules.read_pulled(url, key, path=rules_path))
+        if damaged:
+            # A file that cannot be read is not "every rule removed here": every rule the gateway
+            # sent asks, as before the three-way choice (code review).
+            pulled = [dict(r, **{team_rules.FROM_GATEWAY: True})
+                      for r in team_rules.pulled_rules(doc)]
+            return pulled, _lines(_team_gateway_line(doc, url, rules_path, len(pulled)))
+        if not team_rules.gateway_list_known(doc):
+            return local, _lines(_team_gateway_line(doc, url, rules_path, 0))
+        checked, there = team_rules.three_way(local, team_rules.pulled_rules(doc),
+                                              team_rules.read_base(url, key, path=rules_path))
+        pulled = sum(1 for r in checked if r.get(team_rules.FROM_GATEWAY))
+        # Both lines, never one in place of the other: a gateway that is down must not hide the
+        # project's rules its last copy overrides (scoped review).
+        return checked, _lines(_team_gateway_line(doc, url, rules_path, pulled),
+                               _overridden_line(local, there, rules_path))
+    except Exception:
+        # Anything wrong with the pulled copy (it sits where the agent can write) costs only the
+        # gateway's rules, never the project's own or the call's check (code review).
+        return local, []
+
+
+def _lines(*lines):
+    return [line for line in lines if line]
+
+
+def _overridden_line(local, there, rules_path):
+    """The one-time line naming this project's rules that are checked as the gateway has them
+    (changed, switched off or removed there), or None. Said because the copy those come from sits
+    where the agent can write: a forged one would switch a committed rule off with nothing on
+    screen, and a person reading this line sees which rules it touched (code review)."""
+    from .team_rules import _describe
+    mine = {r["id"]: r for r in local}
+    ids = [rid for rid, _how, _r in there if rid in mine]
+    if not ids:
+        return None
+    # Keyed by the rules it names, so a later override in the same session is said too: one
+    # fixed key let the first line hide every one after it (scoped review).
+    import hashlib
+    named = hashlib.sha256(",".join(sorted(ids)).encode("utf-8")).hexdigest()[:12]
+    # Each rule by its words as this file has them, not its id: a bare id does not say which
+    # rule it is. "for", not "that asks": the file's copy may be off.
+    return ("team-gateway-overrides-" + named, "AgentX: %s in %s %s checked as your gateway has %s "
+            "(changed, switched off or removed there): %s. To take that into the file: agentx "
+            "rule pull" % ("1 team rule" if len(ids) == 1 else "%d team rules" % len(ids),
+                           rules_path, "is" if len(ids) == 1 else "are",
+                           "it" if len(ids) == 1 else "them",
+                           ("the rule for " if len(ids) == 1 else "the rules for ")
+                           + "; for ".join(_describe(mine[rid]) for rid in ids)))
+
+
+def _team_gateway_line(doc, url, rules_path, pulled):
+    """The one-time line for a gateway whose team rules this machine could not take just now, as
+    (claim key, text), or None when it answered."""
+    status = (doc or {}).get("status")
+    if status in (None, "ok"):
+        return None
+    if status == "refused":
+        # "or something in front of it": a proxy or a platform's access check answers 401 and
+        # 403 too, so the key is not said to be wrong for certain (code review, cli's
+        # _refused_with_key).
+        why = ("(or something in front of it) did not accept your AGENTX_API_KEY (%s)"
+               % doc.get("code"))
+    elif status == "old":
+        from .team_rules import RULES_PULL_SINCE
+        why = "is older than %s, which hands out its team rules" % RULES_PULL_SINCE
+    elif status == "unreadable":
+        why = "cannot read its own copy of the team rules"
+    elif status == "error":
+        # Not "did not answer": it did, with a fault.
+        why = "answered %s when asked for its team rules" % (doc.get("code") or "with a fault")
+    else:
+        why = "did not answer"
+    if pulled:
+        what = "rule it last sent is" if pulled == 1 else "%d rules it last sent are" % pulled
+        tail = "so the %s checked here, with %s" % (what, rules_path)
+    elif os.path.exists(rules_path):
+        tail = "so team rules come only from %s here" % rules_path
+    else:
+        # Not "only from <file>": with no file there, no team rule is checked at all.
+        tail = "so no team rule is checked here (this project has no %s)" % rules_path
+    return ("team-gateway-" + status, "AgentX: your gateway at %s %s, %s." % (url, why, tail))
+
+
+def _sync_team_rules(project, report=True, force_report=False):
+    """After the answer is out: refresh the pulled rules once their copy is old (normally already
+    done before the answer, by `_team_rules_here`, so this finds it fresh), and send the gateway
+    what its rules matched here. AgentX's own repository pulls but never reports. A fault
+    here never reaches a verdict, which is already given. Never raises.
+
+    ⚠️ NOT FREE FOR THE HARNESS: Claude Code and Codex wait for this process to exit, so the call
+    that does the refresh waits for it (a round trip every 5 minutes; 1.5 s at most, once a minute,
+    while the gateway does not answer). No report is sent to a gateway whose last pull failed, so
+    a gateway that is down never costs a call two timeouts (code review)."""
+    try:
+        gateway = _team_gateway()
+        if not gateway:
+            return
+        from . import team_rules
+        url, key = gateway
+        rules_path = team_rules.team_rules_path(project=project)
+        doc = team_rules.refresh_pulled(url, key, path=rules_path)
+        # The file and a list the gateway just sent are the same: that is the base now, so a
+        # teammate whose file came from git (not a push) gets one too. Only for a pull THIS
+        # process made (before the answer, or just now): the cached copy answers "ok" for its
+        # whole keep time, and each call is a process of its own (code review).
+        if ((doc or {}).get("status") == "ok"
+                and (doc.get("checked_at") or 0) >= _PROCESS_STARTED
+                and doc.get("source") != "none"):
+            try:
+                local = team_rules.read_team_rules(rules_path)
+                gateway = team_rules.pulled_rules(doc)
+                if team_rules.team_rules_fingerprint(local) == team_rules.team_rules_fingerprint(gateway):
+                    team_rules.write_base(url, key, gateway, path=rules_path)
+            except Exception:
+                pass
+        if report and not _is_agentx_source_tree(project):
+            team_rules.report_uses(url, key, doc, path=rules_path, force=force_report)
+    except Exception:
+        pass
 
 
 def _agent_id(project, harness):
@@ -684,7 +914,8 @@ def _record(event, project, posture, tool_key, arguments, decision, challenge, r
         row = _team_rule_row(team)
         from .team_rules import reason_text
         db.log_intercept(trace, agent_id, tool_key, row["id"], row["name"], "CHALLENGED",
-                         posture=posture, challenge_issued=reason_text(team), arg_names=names,
+                         posture=posture, challenge_issued=reason_text(team, hosted=_hosted_key()),
+                         arg_names=names,
                          amount=amount, target_class=target_class, quantity=quantity,
                          dest_hosts=db._dest_hosts_value(tool_key, arguments), row_cap=row_cap,
                          reversibility=reversibility)
@@ -746,6 +977,7 @@ def pre_tool_use(stdin=None, stdout=None, installed=None, harness="claude"):
             folder = _session_dir(project, event.get("session_id"))
             if os.path.isdir(folder) and _first_in_session(project, event, "prune"):
                 _prune_stale_sessions(project, keep=folder)
+            _sync_team_rules(project)
             return 0
     except Exception:
         if decided:
@@ -787,6 +1019,13 @@ def session_end(stdin=None):
             _remove(folder, paths)
         else:
             _send_session_pulse(project, folder)
+    except Exception:
+        pass
+    # What the team's rules matched this session goes now, not at the next session's calls. In
+    # the project folder, as `pre-tool-use` works: its `.env` is where a key per project is.
+    try:
+        os.chdir(project)
+        _sync_team_rules(project, force_report=True)
     except Exception:
         pass
     _prune_stale_sessions(project, keep=folder)
