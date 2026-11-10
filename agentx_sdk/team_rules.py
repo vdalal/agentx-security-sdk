@@ -33,6 +33,7 @@ Pure standard library, like `rules.py`, so it is import-safe at SDK load.
 import hashlib
 import json
 import os
+import re
 import subprocess
 import uuid
 
@@ -48,6 +49,62 @@ WHERE_ASK_UNSUPPORTED = ("warn", "stop")
 SHELL = "shell"
 # The shell tools each harness names. Claude Code: Bash, PowerShell. Codex: Bash.
 SHELL_TOOLS = ("Bash", "PowerShell")
+# A rule may name an argument and the number it holds at, one number or one per environment,
+# and for money a currency. 🔴 MIRROR of the gateway's `_check_team_rule_number`: the same rule
+# is accepted or refused on both doors.
+# `\Z`, not `$`: `$` also matches before a trailing newline, so "prod\n" passed.
+ENV_RE = re.compile(r"^[a-z0-9_-]{1,32}\Z")
+ARGUMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
+CURRENCY_RE = re.compile(r"^[A-Za-z]{2,10}\Z")
+UNITS = ("cents",)
+NUMBER_KEYS = ("argument", "hold_at", "currency", "currency_field", "unit")
+
+
+LIMIT_MAX = 10 ** 15
+
+
+def _limit_ok(n):
+    """A `hold_at` number: an int or float above 0 and below 10**15, never a bool. The ceiling
+    keeps the number a hold shows a number; no count or amount a rule guards comes near it."""
+    return (isinstance(n, (int, float)) and not isinstance(n, bool)
+            and n == n and 0 < n < LIMIT_MAX)
+
+
+def _check_number(r, p, rid):
+    """The number keys of a rule, checked. Raises ValueError naming the rule. A rule with none
+    of them is a rule on phrases alone."""
+    if not any(k in r for k in NUMBER_KEYS):
+        return
+    arg = r.get("argument")
+    if not isinstance(arg, str) or not ARGUMENT_RE.match(arg) or len(arg) > 200:
+        raise ValueError("%s: rule %s needs \"argument\", the name of the argument it reads "
+                         "(a dotted path reaches inside an object)" % (p, rid))
+    if "hold_at" not in r:
+        raise ValueError("%s: rule %s names an argument and needs \"hold_at\", the number it "
+                         "holds at" % (p, rid))
+    hold_at = r["hold_at"]
+    if isinstance(hold_at, dict):
+        if not hold_at or not all(isinstance(k, str) and ENV_RE.match(k) and _limit_ok(v)
+                                  for k, v in hold_at.items()):
+            raise ValueError("%s: rule %s has a hold_at that is not a number per environment "
+                             "(lower-case names, each a number above 0 and below "
+                             "1,000,000,000,000,000)" % (p, rid))
+    elif not _limit_ok(hold_at):
+        raise ValueError("%s: rule %s has a hold_at that is not a number above 0 and below "
+                         "1,000,000,000,000,000" % (p, rid))
+    cur = r.get("currency")
+    if "currency" in r and (not isinstance(cur, str) or not CURRENCY_RE.match(cur)):
+        raise ValueError("%s: rule %s has a currency that is not a code such as USD" % (p, rid))
+    for key in ("currency_field", "unit"):
+        if key in r and "currency" not in r:
+            raise ValueError("%s: rule %s has %s, which needs \"currency\"" % (p, rid, key))
+    cf = r.get("currency_field")
+    if "currency_field" in r and (not isinstance(cf, str) or not ARGUMENT_RE.match(cf)
+                                  or len(cf) > 200):
+        raise ValueError("%s: rule %s has a currency_field that is not an argument name"
+                         % (p, rid))
+    if "unit" in r and r["unit"] not in UNITS:
+        raise ValueError("%s: rule %s has unit %r; only \"cents\" is read" % (p, rid, r["unit"]))
 
 
 def team_rules_path(path=None, project=None):
@@ -86,6 +143,7 @@ def _check_rule(r, p):
                          % (p, rid, r.get("where_ask_unsupported")))
     if not isinstance(r.get("active", True), bool):
         raise ValueError("%s: rule %s has an active value that is not true or false" % (p, rid))
+    _check_number(r, p, rid)
     return r
 
 
@@ -116,6 +174,16 @@ def team_rules_fingerprint(rules):
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+# What the file is, said in the file: it is committed and read by every teammate, so a reader who
+# has never heard of AgentX learns what made it and where to read about it. Readers look only at
+# `rules`, so these lines change nothing for an older SDK. No SDK version: teammates on
+# different versions would rewrite that line on every save.
+_FILE_SCHEMA = "agentx.team-rules/1"
+_FILE_ABOUT = ("Team rules for AgentX (https://agentx-core.com/docs): each asks a person before a "
+               "matching agent call runs. Change them with agentx rule add or agentx rule remove; "
+               "agentx rule push sends them to your gateway.")
+
+
 def _write(p, rules):
     """Whole file via a temp file and rename, so a crash leaves the old file."""
     parent = os.path.dirname(p)
@@ -123,7 +191,8 @@ def _write(p, rules):
         os.makedirs(parent, exist_ok=True)
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump({"version": _FILE_VERSION, "rules": rules}, fh, indent=2, ensure_ascii=False)
+        json.dump({"about": _FILE_ABOUT, "schema": _FILE_SCHEMA, "version": _FILE_VERSION,
+                   "rules": rules}, fh, indent=2, ensure_ascii=False)
         fh.write("\n")
     os.replace(tmp, p)
 
@@ -137,16 +206,30 @@ def _git_user():
         return None
 
 
+def _added(r):
+    """ "added by Dana", or "added" when the rule names nobody: never "added by nobody named".
+    The website's Rules tab says it the same way."""
+    return "added by %s" % r["owner"] if r.get("owner") else "added"
+
+
 def add_team_rule(tools, match, why, *, said=None, owner=None, where_ask_unsupported="warn",
-                  path=None):
+                  path=None, argument=None, hold_at=None, currency=None, currency_field=None,
+                  unit=None):
     """Write one active rule and return it. Raises ValueError, with nothing written, on a rule
-    that cannot be stored or a file that cannot be read."""
+    that cannot be stored or a file that cannot be read. `argument` and `hold_at` make it a rule
+    with a number: it holds a call whose argument is at or above the number."""
     p = team_rules_path(path)
     rules = read_team_rules(p)
-    same = existing_team_rule(tools or [SHELL], match, rules)
+    same = existing_team_rule(tools or [SHELL], match, rules, argument=argument)
     if same is not None:
-        raise ValueError("this is already a team rule (%s, added by %s). See it: agentx rule "
-                         "list" % (same["id"], same.get("owner") or "nobody named"))
+        # A switched-off one says so: "already a team rule" alone reads as in force, and the
+        # person is left wondering why the call still runs.
+        if not same.get("active", True):
+            raise ValueError("this team rule is already in the file, switched off (%s, %s). To "
+                             "add it again, remove that one first: agentx rule remove %s"
+                             % (same["id"], _added(same), same["id"]))
+        raise ValueError("this is already a team rule (%s, %s). See it: agentx rule list"
+                         % (same["id"], _added(same)))
     why = str(why or "").strip()
     if not why:
         raise ValueError("a team rule needs a reason (--why): it is what the agent and the "
@@ -157,6 +240,14 @@ def add_team_rule(tools, match, why, *, said=None, owner=None, where_ask_unsuppo
             "action": "ask",
             "where_ask_unsupported": where_ask_unsupported,
             "why": why}
+    if argument is not None:
+        rule["argument"] = argument
+    if hold_at is not None:
+        rule["hold_at"] = hold_at
+    for key, value in (("currency", currency), ("currency_field", currency_field),
+                       ("unit", unit)):
+        if value is not None:
+            rule[key] = value
     if said and str(said).strip():
         rule["said"] = str(said).strip()
     rule["owner"] = (str(owner).strip() if owner and str(owner).strip() else None) or _git_user()
@@ -169,14 +260,39 @@ def add_team_rule(tools, match, why, *, said=None, owner=None, where_ask_unsuppo
     return rule
 
 
-def existing_team_rule(tools, match, rules):
+def asks_before(tool, words=None):
+    """What a team rule on one tool does, in the words `agentx review` shows before the key and
+    stores as the rule's reason (what the person and the agent read when a call is held)."""
+    said = "a person approves each call to '%s'" % tool
+    if words:
+        said += " that contains \"%s\"" % words
+    return said + " before it runs"
+
+
+def add_tool_rule(tool, words=None, gateway_url=None, key=None):
+    """Add the team rule `agentx review` offers for one tool: every call to it, or only those
+    that also contain `words`. The tool's name is the first phrase because the text a team rule
+    is matched against, by the gateway and the hook alike, starts with the tool's name for any
+    tool that is not a shell. Agrees the gateway's copy first, as `agentx rule add` does. Raises
+    ValueError, with nothing written, as `add_team_rule` does."""
+    _agree_before_a_change(gateway_url, key)
+    words = str(words or "").strip()
+    return add_team_rule([tool], [tool] + ([words] if words else []), asks_before(tool, words))
+
+
+def existing_team_rule(tools, match, rules, argument=None):
     """The rule in `rules` that checks the same tools for the same phrases (any order, any
-    case), or None. Its reason may differ; the match is what decides what gets asked."""
-    def key(ts, ms):
+    case) and reads the same argument (None for a rule on phrases alone), or None. Its reason
+    and its number may differ; the match is what decides what gets asked. Without the argument
+    in the key, a number rule beside an every-call rule on one tool was refused as the same
+    rule. Mirror of the website's `sameRule`."""
+    def key(ts, ms, arg):
         return (frozenset(str(t).strip() for t in ts if str(t).strip()),
-                frozenset(str(m).strip().lower() for m in ms if str(m).strip()))
-    wanted = key(tools, match or [])
-    return next((r for r in rules if key(r["tools"], r["match"]) == wanted), None)
+                frozenset(str(m).strip().lower() for m in ms if str(m).strip()),
+                arg or None)
+    wanted = key(tools, match or [], argument)
+    return next((r for r in rules
+                 if key(r["tools"], r["match"], r.get("argument")) == wanted), None)
 
 
 def remove_team_rule(rule_id, path=None):
@@ -203,33 +319,203 @@ def _tool_names(tool_name):
     return names
 
 
-def match_team_rule(tool_name, call_text, path=None):
+def match_team_rule(tool_name, call_text, path=None, arguments=None, environment=None):
     """The first active rule this call matches, or None. `call_text` is what the call says (a
     shell command, or an MCP call's name and argument values). Never raises: an unreadable
     file matches nothing here, and `team_rules_state` is what reports it."""
     try:
-        return match_rules(tool_name, call_text, read_team_rules(path))
+        return match_rules(tool_name, call_text, read_team_rules(path), arguments=arguments,
+                           environment=environment)
     except Exception:
         return None
 
 
-def match_rules(tool_name, call_text, rules):
-    """The first active rule in `rules` this call matches, or None. The one matcher: the file's
-    rules and the rules pulled from a gateway go through it alike, and the gateway's own
-    `_match_team_rule` is its mirror. Never raises."""
+# ---- a rule with a number ---------------------------------------------------------------------
+# 🔴 MIRROR of the gateway's readers of the same name (`_team_rule_hold_at`,
+# `_team_rule_number_read`, `_team_rule_money_read`, `_walk_team_rules`, `_team_rule_number_says`):
+# the same call is held by the same rule, for the same reason, on both doors.
+
+SIGNS = "$€£¥₹"
+# Text is read only when it can mean ONE number; a separator followed by exactly three digits
+# and nothing after ("450.000", "1,000") is a thousands mark in one country and a decimal point
+# in another, so it is held, as an unreadable value is. ASCII digits only.
+_PLAIN_RE = re.compile(r"^\d+(\.\d+)?\Z", re.ASCII)
+_TWO_WAYS_RE = re.compile(r"^[1-9]\d{0,2}\.\d{3}\Z", re.ASCII)
+_GROUPED_RE = re.compile(r"^[1-9]\d{0,2}(?:(?:,\d{3}){2,}(?:\.\d+)?|,\d{3}\.\d+)\Z", re.ASCII)
+TOO_LARGE = "a number too large to show"
+
+
+def environment_here():
+    """`AGENTX_ENVIRONMENT` when it is a short lower-case name, else None."""
+    raw = os.environ.get("AGENTX_ENVIRONMENT", "")
+    return raw if raw and ENV_RE.match(raw) else None
+
+
+def is_money(rule):
+    return "argument" in rule and "currency" in rule
+
+
+def hold_at_for(rule, environment):
+    """(the number `rule` holds at in `environment`, the environment it is for). No environment,
+    or one the map does not name: the lowest, with None."""
+    hold_at = rule["hold_at"]
+    if not isinstance(hold_at, dict):
+        return hold_at, None
+    if environment in hold_at:
+        return hold_at[environment], environment
+    return min(hold_at.values()), None
+
+
+def _text_number(s):
+    from .rules import _coerce_only_when_number
+    if _PLAIN_RE.match(s) and not _TWO_WAYS_RE.match(s):
+        return _coerce_only_when_number(s)
+    if _GROUPED_RE.match(s):
+        return _coerce_only_when_number(s.replace(",", ""))
+    return None
+
+
+def number_read(rule, arguments):
+    """(number, None), or (None, why) when the value cannot be read: the call is then held."""
+    from .rules import _ONLY_WHEN_ABSENT, _coerce_only_when_number, _only_when_value
+    try:
+        value = _only_when_value(arguments if isinstance(arguments, dict) else {},
+                                 rule["argument"])
+        if value is _ONLY_WHEN_ABSENT:
+            return None, "it was not passed"
+        if value is None:
+            return None, "it was empty"
+        if isinstance(value, (list, tuple)):
+            if is_money(rule):
+                return None, "it is a list, not one amount"
+            return len(value), None
+        if isinstance(value, str):
+            s = value.strip()
+            if s and s[0] in SIGNS:
+                s = s[1:].strip()
+            elif s and s[-1] in SIGNS:
+                s = s[:-1].strip()
+            if s[:1] in ("-", "+"):
+                s = s[1:].strip()
+            num = _text_number(s)
+            if num is None:
+                return None, ("it is not written as one plain number"
+                              if re.match(r"^[\d.,]+\Z", s) else "it is not a number")
+        else:
+            num = _coerce_only_when_number(value)
+        if num is None:
+            return None, "it is not a number"
+        try:
+            num = abs(float(num))
+        except OverflowError:
+            num = 1e308
+        if rule.get("unit") == "cents":
+            num = num / 100
+        return (int(num) if num < 1e15 and num.is_integer() else num), None
+    except Exception:
+        return None, "it could not be read"
+
+
+def money_read(rule, arguments, environment):
+    """What a money rule reads: the amount, why not, whether the reason is the currency, the
+    currency, and the number it holds at. The call's currency is never echoed."""
+    from .rules import _ONLY_WHEN_ABSENT, _only_when_value
+    at, env = hold_at_for(rule, environment)
+    value, why = number_read(rule, arguments)
+    currency = rule["currency"].upper()
+    currency_problem = False
+    if why is None and rule.get("currency_field"):
+        raw = _only_when_value(arguments if isinstance(arguments, dict) else {},
+                               rule["currency_field"])
+        code = raw.strip() if isinstance(raw, str) else ""
+        if raw is _ONLY_WHEN_ABSENT or raw is None or (isinstance(raw, str) and not code):
+            why, currency_problem = "%s was not passed" % rule["currency_field"], True
+        elif not CURRENCY_RE.match(code):
+            why, currency_problem = "%s was not a currency code" % rule["currency_field"], True
+        elif code.upper() != currency:
+            why, currency_problem = "it is not in %s, the currency this rule is in" % currency, True
+    return {"value": value, "why": why, "at": at, "environment": env, "currency": currency,
+            "currency_problem": currency_problem}
+
+
+def match_rules(tool_name, call_text, rules, arguments=None, environment=None):
+    """The first active rule in `rules` that holds this call, or None, in file order. The one
+    matcher: the file's rules and the rules pulled from a gateway go through it alike, and the
+    gateway's `_walk_team_rules` is its mirror. A rule on phrases holds when they match. A
+    number rule holds when its argument is at or above its number for `environment`, or cannot
+    be read; below, the next rule is tried. A number or money rule comes back as a copy carrying
+    `_number` or `_money`, what was read, for the sentence the person is shown. Never raises."""
     try:
         names = _tool_names(tool_name)
         text = str(call_text or "").lower()
+        # A phrase that is this call's full MCP name (`mcp__github__delete_repo`, as /app and
+        # `agentx review` saved it before the bare name) is read as the bare name: the hook's text
+        # starts with `delete_repo`, so the full name never matched and the rule was silently off.
+        # The gateway's text has the full name, which contains the bare one, so it agrees.
+        full, lead = str(tool_name).lower(), _leading_name(tool_name).lower()
         for r in rules:
             if not r.get("active", True):
                 continue
             if not names & set(r["tools"]):
                 continue
-            if all(m.lower() in text for m in r["match"]):
+            if not all((lead if m.lower() == full else m.lower()) in text for m in r["match"]):
+                continue
+            if "argument" not in r:
                 return r
+            if is_money(r):
+                read = money_read(r, arguments, environment)
+                if read["why"] is not None or read["value"] >= read["at"]:
+                    return dict(r, _money=read)
+                continue
+            at, env = hold_at_for(r, environment)
+            value, why = number_read(r, arguments)
+            if why is not None or value >= at:
+                return dict(r, _number={"value": value, "why": why, "at": at, "environment": env})
     except Exception:
         return None
     return None
+
+
+def _number_text(n):
+    """A number as a person reads it. Never raises."""
+    if isinstance(n, bool):
+        return "a value that is not a number"
+    try:
+        n = float(n)
+    except OverflowError:
+        return TOO_LARGE
+    except (TypeError, ValueError):
+        return "a value that is not a number"
+    if n != n:
+        return "a value that is not a number"
+    if n in (float("inf"), float("-inf")) or abs(n) >= 1e21:
+        return TOO_LARGE
+    return "{:,.2f}".format(n) if not n.is_integer() else "{:,.0f}".format(n)
+
+
+def number_says(rule):
+    """The number sentence of a number or money rule's match, or "". The same words as the
+    gateway's held-call reason."""
+    read = rule.get("_number") or rule.get("_money")
+    if not read:
+        return ""
+    # "Its count is 50": a sentence opening on a bare argument name read as code.
+    arg, money = "Its " + rule["argument"], "_money" in rule
+    if read["why"] is not None:
+        if money and read.get("currency_problem"):
+            return "%s could not be compared: %s, so this call waits for a person." % (
+                arg, read["why"])
+        return "%s could not be read (%s), so this call waits for a person." % (arg, read["why"])
+    unit = (" " + read["currency"]) if money else ""
+    at, value = _number_text(read["at"]), _number_text(read["value"])
+    is_value = "is too large to show" if value == TOO_LARGE else "is %s%s" % (value, unit)
+    if read["environment"]:
+        return "%s %s, at or above the %s%s set for %s." % (
+            arg, is_value, at, unit, read["environment"])
+    if isinstance(rule.get("hold_at"), dict):
+        return ("%s %s, at or above %s%s, the lowest this rule sets: this call named no "
+                "environment the rule lists." % (arg, is_value, at, unit))
+    return "%s %s, at or above the %s%s set." % (arg, is_value, at, unit)
 
 
 def team_rules_state(path=None):
@@ -534,9 +820,11 @@ BASE_FILE_NAME = "team-rules.base.json"
 
 
 def _canon(r):
-    """A rule as compared: its stored fields, never the hook's own mark."""
-    return json.dumps({k: v for k, v in r.items() if k != FROM_GATEWAY}, sort_keys=True,
-                      separators=(",", ":"), ensure_ascii=True)
+    """A rule as compared: its stored fields, never the hook's own mark nor what a match read
+    from the call (`_number`, `_money`), which a matched rule carries on its copy."""
+    return json.dumps({k: v for k, v in r.items()
+                       if k != FROM_GATEWAY and k not in ("_number", "_money")},
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
 def _same(a, b):
@@ -751,6 +1039,17 @@ the file; push refuses to undo them until you do.
                    Bash or PowerShell command in Claude Code or Codex.
                    Otherwise a tool's exact name: an SDK agent's
                    function (run_shell) or an MCP tool. Repeat for more.
+  --argument NAME  Hold a call by a number in it instead of by words:
+                   the argument to read, with --hold-at and one --tool.
+  --hold-at N      The number it holds at, or one per environment
+                   (AGENTX_ENVIRONMENT): --hold-at prod=25 --hold-at dev=500.
+  --currency CODE  The number is money in this currency (USD). For this
+                   tool it takes the place of the gateway's money limit,
+                   unless a limit the gateway's operator set is lower.
+  --currency-field NAME
+                   The argument naming the call's currency; a call in
+                   another currency, or none, is held.
+  --unit cents     The amount is in cents: 2550 is 25.50.
   --said "QUOTE"   Optional: your words when you corrected the agent.
   --stop-where-cannot-ask
                    In Codex, which cannot ask, stop the call instead of
@@ -758,8 +1057,9 @@ the file; push refuses to undo them until you do.
   --yes            Write without asking you to confirm (for a script you
                    run yourself).
 
-Example:
+Examples:
   agentx rule add "run_suites.py" --why "the suites run once, at the end, with my go-ahead"
+  agentx rule add --tool provision_instances --argument count --hold-at prod=25 --hold-at dev=500 --why "more than a handful of VMs needs a second look"
 """
 
 
@@ -826,12 +1126,64 @@ def _joined(items, word):
     return items[0] if len(items) == 1 else "%s %s %s" % (", ".join(items[:-1]), word, items[-1])
 
 
+def _leading_name(tool):
+    """The name every call's matched text starts with, on every door: an MCP tool's bare name
+    (the hook builds `mcp__srv__refund`'s text from `refund`; the gateway from the full name,
+    which contains it), else the tool's own name."""
+    parts = str(tool).split("__", 2)
+    if str(tool).startswith("mcp__") and len(parts) == 3 and parts[2]:
+        return parts[2]
+    return str(tool)
+
+
+def shown_phrases(rule):
+    """The phrases a person reads for a rule. For a rule on one tool that is not a shell, a
+    phrase found in the name every call's text starts with (`_leading_name`, compared as the
+    matcher compares: any case, nothing trimmed) is left out: every call contains it, so it holds
+    nothing back, and 'contains "refund_customer"' would only repeat the call's name. So is the
+    tool's own full MCP name, which `match_rules` reads as the bare name. A phrase the matcher
+    would not find there (a stray space) stays, so "every call" is said only of a rule that does
+    hold every call. `agentx review` writes the tool's name as a
+    rule's first phrase; the file keeps it, so an older SDK or gateway reads the rule as before.
+    The gateway's `_team_rule_shown_phrases` and the website's `shownPhrases` do the same."""
+    tools, match = rule.get("tools") or [], list(rule.get("match") or [])
+    if len(tools) == 1 and tools[0] not in (SHELL,) + SHELL_TOOLS:
+        lead, full = _leading_name(tools[0]).lower(), str(tools[0]).lower()
+        return [m for m in match if str(m).lower() not in lead and str(m).lower() != full]
+    return match
+
+
+def every_call(rule):
+    """True for a rule that holds every call to one tool: every phrase it has is the tool's own
+    name. Said as "every call to the tool X", never as a call that "contains" anything. Never a
+    rule with a number, which holds only a call at or above it: counted as every call,
+    `agentx review` stopped offering a rule for the calls below it (review)."""
+    tools = rule.get("tools") or []
+    return ("argument" not in rule and len(tools) == 1 and tools[0] not in (SHELL,) + SHELL_TOOLS
+            and bool(rule.get("match")) and not shown_phrases(rule))
+
+
+
 def _describe(rule):
     # Any one of the tools, and every phrase (`match_team_rule`): a comma said neither. The
     # website's `describeRule` and the gateway's `_evidence_team_rule_calls` word it the same.
+    if "argument" in rule and "hold_at" in rule:
+        # Not "every call": a rule with a number holds only a call at or above it. Every tool it
+        # names (review: only the first was said; a rule from the file may name more).
+        # The words before the number: after it, "…and 25 anywhere else and that contains" read
+        # as if the words belonged to "anywhere else" alone (scoped review).
+        shown = shown_phrases(rule)
+        words = (" that contains %s and" % _joined(('"%s"' % m for m in shown), "and")
+                 if shown else "")
+        return "%s%s whose %s is at or above %s" % (
+            _joined(("a call to the tool '%s'" % t for t in rule["tools"]), "or"), words,
+            rule["argument"], _hold_at_words(rule["hold_at"], rule.get("currency")))
+    if every_call(rule):
+        return "every call to the tool '%s'" % rule["tools"][0]
     tools = _joined(("any shell command" if t == SHELL else "a call to the tool '%s'" % t
                      for t in rule["tools"]), "or")
-    return "%s that contains %s" % (tools, _joined(('"%s"' % m for m in rule["match"]), "and"))
+    return "%s that contains %s" % (tools, _joined(('"%s"' % m for m in shown_phrases(rule)),
+                                                   "and"))
 
 
 def _sdk_tools_seen(limit=5):
@@ -859,6 +1211,17 @@ def _sdk_tools_seen(limit=5):
             continue
         counts[tool] = counts.get(tool, 0) + n
     return [t for t, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
+
+
+def _mcp_tools_seen():
+    """The bare tool names this project's record holds from agentx-mcp (its servers' tools,
+    which Claude Code asks about). Empty when there is no record. Never raises."""
+    try:
+        from . import db
+        return {tool for agent, tool, _n in db.get_tool_call_counts()
+                if agent == db.MCP_PROXY_AGENT_ID and str(tool).strip()}
+    except Exception:
+        return set()
 
 
 def _sdk_tools_hint(tools):
@@ -980,7 +1343,7 @@ def _print_rule(r, view, local_uses=True):
     print("    why: %s" % r["why"])
     if r.get("said"):
         print("    you said: \"%s\"" % r["said"])
-    print("    added by %s on %s (id %s)" % (r.get("owner") or "nobody named",
+    print("    %s on %s (id %s)" % (_added(r),
                                           _local_date(r.get("added_at")), r["id"]))
 
 
@@ -1518,7 +1881,7 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
             if not _confirm(["About to remove %s: it asks before %s." % (target["id"],
                                                                         _describe(target)),
                              "Why: %s" % target["why"],
-                             "Added by %s on %s" % (target.get("owner") or "nobody named",
+                             "A%s on %s" % (_added(target)[1:],
                                                     _local_date(target.get("added_at")))],
                             assume_yes):
                 return 1
@@ -1533,10 +1896,12 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
             return 0
 
         phrases, tools, why, said, stop = [], [], None, None, False
+        argument, hold_ats, money = None, [], {}
         i = 0
         while i < len(args):
             a = args[i]
-            if a in ("--why", "--said", "--tool"):
+            if a in ("--why", "--said", "--tool", "--argument", "--hold-at", "--currency",
+                     "--currency-field", "--unit"):
                 if i + 1 >= len(args):
                     print(_USAGE)
                     return 1
@@ -1545,6 +1910,12 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
                     why = value
                 elif a == "--said":
                     said = value
+                elif a == "--argument":
+                    argument = value
+                elif a == "--hold-at":
+                    hold_ats.append(value)
+                elif a in ("--currency", "--currency-field", "--unit"):
+                    money[a[2:].replace("-", "_")] = value
                 else:
                     tools.append(value)
                 i += 2
@@ -1557,6 +1928,9 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
             else:
                 phrases.append(a)
             i += 1
+        if argument is not None or hold_ats or money:
+            return _add_number_rule(tools, phrases, argument, hold_ats, why, said, stop,
+                                    assume_yes, gateway_url, read_key, money=money)
         if not phrases or not why:
             # Say what is missing; the whole help hid it (copy pass).
             print("A team rule needs the words to look for and a reason, for example:")
@@ -1566,8 +1940,8 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
         preview = {"tools": tools or [SHELL], "match": phrases}
         same = existing_team_rule(preview["tools"], phrases, read_team_rules())
         if same is not None:
-            _say("This is already a team rule: it asks before %s (added by %s). See it: "
-                 "agentx rule list" % (_describe(same), same.get("owner") or "nobody named"))
+            _say("This is already a team rule: it asks before %s (%s). See it: "
+                 "agentx rule list" % (_describe(same), _added(same)))
             return 1
         # Which door checks it. A rule naming only tools this project's record shows an SDK
         # agent calling is checked by a gateway, never by Claude Code or Codex (scoped review:
@@ -1580,6 +1954,9 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
         # A named tool the record has not shown an SDK agent calling may be either kind; say both
         # doors rather than guess (scoped review: a fresh project's run_shell read as Claude's).
         either = [t for t in named if not t.startswith("mcp__")] if not sdk_only else []
+        # Every tool a plain name the record does not show as an MCP tool: the gateway leads.
+        gateway_first = bool(either) and len(either) == len(preview["tools"]) \
+            and not set(either) & _mcp_tools_seen()
         quoted = "\"%s\"" % "\", \"".join(phrases)
         # One real example of how wide the match is, not a description of matching (copy pass).
         # Built from EVERY phrase, since a rule needs all of them; the command is a line of its
@@ -1588,15 +1965,37 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
             example = ["A command that only mentions %s asks too, for example:"
                        % ("it" if len(phrases) == 1 else "them"),
                        "  git commit -m \"notes on %s\"" % " ".join(phrases)]
+        elif every_call(preview):
+            # "every call to the tool X" already says how wide it is; the width warning below
+            # would read as a second condition.
+            example = []
         else:
+            # The door the screen leads with says the verb (review: a gateway-first screen said
+            # "asks", Claude Code's word).
             example = ["A call that only mentions %s in an argument %s too."
-                       % (quoted, "is held" if sdk_only else "asks")]
+                       % (quoted, "is held" if sdk_only or gateway_first else "asks")]
         if sdk_only:
             lines = ["About to add a team rule. A gateway you run from this project will hold "
                      "%s, for you to answer with agentx holds." % _describe(preview)] + example + [
                      "Why: %s" % why,
                      "The hosted gateway checks it once you send it with agentx rule push; the "
                      "SDK on its own does not check team rules."]
+        elif gateway_first:
+            # Every tool is a plain name, which an SDK agent's function or an MCP tool may have:
+            # the gateway first, Claude Code as the MCP case (a fresh project's rule on
+            # delete_bucket read as Claude Code's).
+            names_said = " or ".join("'%s'" % t for t in either)
+            lines = ["About to add a team rule. A gateway holds %s, for you to answer with agentx "
+                     "holds; where nobody can answer a hold, it stops the call." % _describe(preview)
+                     ] + example + [
+                     "Why: %s" % why,
+                     "The hosted gateway checks it once you send it with agentx rule push; the "
+                     "SDK on its own does not check team rules.",
+                     "If %s is an MCP tool, Claude Code asks you instead, through the AgentX hook. "
+                     "In a mode that does not ask, such as auto, AgentX stops the call; to let it "
+                     "run, leave that mode and ask again." % names_said,
+                     "In Codex, which cannot ask, the call is stopped." if stop else
+                     "In Codex, which cannot ask, you see a warning and the call runs."]
         else:
             lines = ["About to add a team rule. Claude Code will ask you before %s."
                      % _describe(preview)] + example + ["Why: %s" % why]
@@ -1662,6 +2061,157 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
         return 1
 
 
+def _parse_hold_at(values):
+    """`--hold-at` values as a rule's `hold_at`: one plain number ("25"), or one per environment
+    ("prod=25", "dev=500"). Raises ValueError with the line to write."""
+    def number(text):
+        t = str(text).strip()
+        # Digits and at most one point: float() also took "1e5" and "1_000", and "25.0" was
+        # stored and shown as 25.0 (review).
+        if not re.fullmatch(r"\d+(\.\d+)?", t, re.ASCII):
+            raise ValueError("--hold-at %s is not a number. Write a number, or one per "
+                             "environment: --hold-at prod=25 --hold-at dev=500" % text)
+        n = float(t)
+        n = int(n) if n.is_integer() else n
+        if not _limit_ok(n):
+            raise ValueError("--hold-at %s: the number must be above 0 and below "
+                             "1,000,000,000,000,000" % text)
+        return n
+    if not values:
+        raise ValueError("a rule with --argument needs the number it holds at: --hold-at 25, or "
+                         "one per environment: --hold-at prod=25 --hold-at dev=500")
+    if len(values) == 1 and "=" not in values[0]:
+        return number(values[0])
+    out = {}
+    for v in values:
+        env, sep, n = str(v).partition("=")
+        env = env.strip()
+        if not sep or not ENV_RE.match(env):
+            raise ValueError(("--hold-at %s: each names an environment in lower case, such as "
+                              "--hold-at prod=25" if len(values) > 1 else
+                              "--hold-at %s: name the environment in lower case, such as "
+                              "--hold-at prod=25") % v)
+        if env in out:
+            raise ValueError("--hold-at names %s twice" % env)
+        out[env] = number(n)
+    return out
+
+
+def _hold_at_words(hold_at, currency=None):
+    """'25', '25 on prod and 500 on dev, and 25 anywhere else', or with a currency after EACH
+    number, '500 USD on prod, and 500 USD anywhere else' (review: one currency at the end read as
+    the last environment's). "Anywhere else": a call naming no environment the rule lists is held
+    at the lowest, and "500 USD on prod" alone read as if dev were not limited."""
+    unit = (" " + currency.upper()) if currency else ""
+    # A whole number without ".0", as /app writes it: a file may hold 25.0 (scoped review).
+    num = lambda n: "{:,}".format(int(n) if isinstance(n, float) and n.is_integer() else n)  # noqa: E731
+    if not isinstance(hold_at, dict):
+        return num(hold_at) + unit
+    parts = ["{}{} on {}".format(num(n), unit, env) for env, n in hold_at.items()]
+    said = parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
+    return "{}, and {}{} anywhere else".format(said, num(min(hold_at.values())), unit)
+
+
+def _money_options(money):
+    """`--currency`, `--currency-field` and `--unit` as a rule's keys, or a sentence saying what
+    to write instead (a str)."""
+    if not money:
+        return {}
+    cur = money.get("currency")
+    if not cur or not CURRENCY_RE.match(cur):
+        return ("--currency names the currency the number is in, such as --currency USD"
+                if cur is None or not money.get("currency") else
+                "--currency %s is not a currency code such as USD" % cur)
+    out = {"currency": cur.upper()}
+    if "currency_field" in money:
+        if not ARGUMENT_RE.match(money["currency_field"]):
+            return "--currency-field names the argument that says the call's currency"
+        out["currency_field"] = money["currency_field"]
+    if "unit" in money:
+        if money["unit"] not in UNITS:
+            return "--unit takes only cents: --unit cents reads 2550 as 25.50"
+        out["unit"] = money["unit"]
+    return out
+
+
+def _add_number_rule(tools, phrases, argument, hold_ats, why, said, stop, assume_yes,
+                     gateway_url, read_key, money=None):
+    """`agentx rule add --tool T --argument A --hold-at N`: a rule that holds a call whose
+    argument is at or above a number, one number or one per environment; with `--currency`, a
+    money rule, which also replaces the gateway's default money limit for the tool. Its screen
+    leads with the gateway, which is what checks it (the general screen led with Claude Code)."""
+    money = _money_options(money)
+    if isinstance(money, str):
+        print(money)
+        return 1
+    tools = list(dict.fromkeys(tools))
+    named = [t for t in tools if t not in (SHELL,) + SHELL_TOOLS]
+    if len(tools) != 1 or not named:
+        print("A rule with --argument names the one tool whose argument it reads, for example:")
+        print("  agentx rule add --tool provision_instances --argument count --hold-at 25 "
+              "--why \"more than a handful of VMs needs a second look\"")
+        return 1
+    if not argument or not ARGUMENT_RE.match(argument):
+        print("--argument names the argument the rule reads, such as count, or spec.replicas "
+              "inside an object.")
+        return 1
+    hold_at = _parse_hold_at(hold_ats)
+    if not why:
+        print("A team rule needs a reason, for example:")
+        print("  --why \"more than a handful of VMs needs a second look\"")
+        return 1
+    tool = tools[0]
+    # The name the tool's calls start with: an MCP tool's bare name, which the hook reads (review:
+    # the full mcp__ name was never found in the call's text, so the rule held nothing there).
+    match = list(dict.fromkeys(phrases or [_leading_name(tool)]))
+    same = existing_team_rule(tools, match, read_team_rules(), argument=argument)
+    if same is not None:
+        _say("This is already a team rule: it reads %s on %s (%s). See it: agentx rule list"
+             % (argument, tool, _added(same)))
+        return 1
+    cur = money.get("currency")
+    lines = ["About to add a team rule. A gateway holds a call to %s when its %s is at or above %s, "
+             "for you to answer with agentx holds." % (tool, argument,
+                                                       _hold_at_words(hold_at, cur))]
+    if isinstance(hold_at, dict):
+        # The lowest is said once, in "anywhere else" above (scoped review); this says only how a
+        # deployment names where it runs.
+        lines.append("A deployment names its environment with AGENTX_ENVIRONMENT.")
+    if cur:
+        lines.append("This number is money: for this tool it takes the place of the gateway's "
+                     "own money limit, higher or lower, unless a limit the gateway's operator "
+                     "set is lower.")
+        if money.get("unit") == "cents":
+            lines.append("%s is read in cents: 2550 is 25.50 %s." % (argument, cur))
+        if money.get("currency_field"):
+            lines.append("A call whose %s is missing or not %s is held."
+                         % (money["currency_field"], cur))
+    lines += ["A call whose %s is missing or not a number is held too." % argument,
+              "Why: %s" % why,
+              "The hosted gateway checks it once you send it with agentx rule push; the SDK on "
+              "its own does not check team rules."]
+    sdk_only = tool in set(_sdk_tools_seen(limit=1000))
+    if not sdk_only:
+        # The hook reads a number rule on an MCP tool of this name too (review: the screen said
+        # only a gateway checks it, then Claude Code asked).
+        lines.append("If %s is an MCP tool, Claude Code asks you before such a call too, through "
+                     "the AgentX hook. In Codex, which cannot ask, %s." % (
+                         tool, "the call is stopped" if stop else
+                         "you see a warning and the call runs"))
+    if not _confirm(lines, assume_yes):
+        return 1
+    _agree_before_a_change(gateway_url, read_key)
+    rule = add_team_rule(tools, match, why, said=said,
+                         where_ask_unsupported="stop" if stop else "warn",
+                         argument=argument, hold_at=hold_at, **money)
+    _say("Added %s, saved in %s. To remove it: agentx rule remove %s"
+         % (rule["id"], team_rules_path(), rule["id"]))
+    _say("Commit the file, and teammates get the same rule.")
+    if read_key:
+        _say(_PUSH_HINT)
+    return 0
+
+
 def reason_text(rule, hosted=False):
     """The sentence the person asked, and the agent, are shown. The harness frames it (Claude
     Code: "requires confirmation for this command"); the hook adds what a mode that cannot ask
@@ -1680,8 +2230,15 @@ def reason_text(rule, hosted=False):
     who = (" (added by %s)" % rule["owner"]) if rule.get("owner") else ""
     # "Asks first", whatever the mode does with it: the auto-mode stop and Codex's warning are
     # said after this sentence by the hook.
-    text = "AgentX: your team asks first. Why: %s%s. This call contains %s." % (
-        rule["why"].rstrip("."), who, _joined(('"%s"' % m for m in rule["match"]), "and"))
+    text = "AgentX: your team asks first. Why: %s%s." % (rule["why"].rstrip("."), who)
+    number = number_says(rule)
+    if number:
+        text += " " + number
+    # The tool's own name is no phrase worth saying (`shown_phrases`): 'This call contains
+    # "refund_customer"' would only repeat the call's name back.
+    shown = shown_phrases(rule)
+    if shown:
+        text += " This call contains %s." % _joined(('"%s"' % m for m in shown), "and")
     if rule.get(FROM_GATEWAY):
         # Not in this project's file, or (the hook marks it so, with the website's key only) in
         # it exactly as the gateway holds it: the person asked is told where it is changed.

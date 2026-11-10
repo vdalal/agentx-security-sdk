@@ -57,6 +57,7 @@ SHIELD_MATCHED_MAX_LEN = 64
 STATEMENT_TEXT_MAX_LEN = 8192
 # The most sites one call's `dest_hosts` carries. The ledger keeps at most 8 per call
 # (`db._MAX_DEST_HOSTS`), so this never cuts what the decorator sends; it bounds a direct caller.
+# The same bound holds `dest_domains`, the recipients' email domains, for the same reason.
 DEST_HOSTS_MAX = 8
 
 # An admin key within the agent's reach: said once per process, on stderr, the first time this agent asks the gateway anything.
@@ -269,7 +270,8 @@ class AgentXClient:
     def evaluate_intent(self, agent_id, query, chain_of_thought, receipt_id=None, trace_id=None,
                         action=None, args=None, session_tokens=0, session_cost_usd=0, budget_pool_id=None,
                         enforcement=None, strike_count=None, tool=None, shield_matched=None,
-                        statement_text=None, dest_hosts=None, watch_source=None):
+                        statement_text=None, dest_hosts=None, watch_source=None,
+                        rule_args=None, dest_domains=None, environment=None):
         # `tool` is APPENDED, after the deprecated `strike_count`, not slotted in beside
         # the fields it belongs with. `strike_count` is retained precisely so existing
         # direct callers do not break, and inserting ahead of it would hand a caller
@@ -394,6 +396,20 @@ class AgentXClient:
         # the text it screened, so this can narrow what it records, never widen it.
         if dest_hosts is not None:
             payload["dest_hosts"] = [str(h) for h in dest_hosts][:DEST_HOSTS_MAX]
+        # The domains of the email addresses the call is addressed to, never the address, so the
+        # gateway records who was emailed as this door's ledger does. `is not None` for the same
+        # reason; the gateway keeps a domain only where the call's text carries `@` and it.
+        if dest_domains is not None:
+            payload["dest_domains"] = [str(d) for d in dest_domains][:DEST_HOSTS_MAX]
+        # The arguments as the code made them, defaults included (`decorators._rule_args_for_
+        # gateway`), so the gateway matches a rule's words, threshold and number on what the call
+        # does, and reads the money from them.
+        if rule_args:
+            payload["rule_args"] = rule_args
+        # Where the deployment runs (`AGENTX_ENVIRONMENT`, checked by the caller): a team rule's
+        # number may differ per environment. Sent only when set.
+        if environment:
+            payload["environment"] = str(environment)
         # Cumulative session spend for the budget-ceiling floor.
         # Sent like strike_count — the gateway owns the ceiling + verdict. Omitted
         # when zero so an un-metered caller's payload is unchanged.
@@ -753,7 +769,8 @@ class AgentXClient:
                     "cause": "Request could not be built"}
 
     def register_incident(self, agent_id, query, chain_of_thought, policy_id,
-                          policy_name, challenge_issued, trace_id=None, tool=None):
+                          policy_name, challenge_issued, trace_id=None, tool=None,
+                          dest_domains=None):
         """
         Park a CHALLENGED incident for an offline (Layer 0 keyword shield) block —
         FIRE-AND-FORGET, off the response path (issue #3).
@@ -799,6 +816,9 @@ class AgentXClient:
         # reached the gateway's evidence as "Tool: not recorded").
         if tool:
             payload["tool"] = str(tool)
+        # Who the stopped call was addressed to, domains only, as `evaluate_intent` sends them.
+        if dest_domains is not None:
+            payload["dest_domains"] = [str(d) for d in dest_domains][:DEST_HOSTS_MAX]
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"

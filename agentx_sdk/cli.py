@@ -33,6 +33,8 @@ from .rules import (harvest_rule_candidates, harvest_rule_candidates_from_calls,
                     _existing_rule_actions, ONLY_WHEN_GATEWAY_MIN,
                     read_allowlist, adopt_allowlist, remove_allowlist, host_is_listed,
                     _allowlist_file_path)
+from .team_rules import (SHELL, SHELL_TOOLS, asks_before, add_tool_rule, _sdk_tools_seen,
+                         read_team_rules, _leading_name)
 
 # Re-exported from the stdlib-only envfile module (kept importable here for
 # backward compatibility — callers and tests still do `from .cli import load_env_file`).
@@ -353,6 +355,31 @@ def _print_held_tools():
                       *(("it",) * 4 if one else ("them",) * 4)))
 
 
+def _print_unconfirmed_calls():
+    """Say so when a tool ran and its `verify=` did not confirm the change. It names the tools,
+    because a bare count leaves the reader nowhere to go. Prints nothing when there are none.
+
+    "On this ledger" because the count has no window and nothing clears it: without those words it
+    reads as something that just happened. A tool and its count stay on one line."""
+    try:
+        from . import db as db_module
+        found = db_module.get_unconfirmed_calls()
+        if not found["total"]:
+            return
+        names = ["%s (%d)" % (db_module.shown_tool_name(tool), n) for tool, n in found["tools"]]
+    except Exception:
+        return
+    one = found["total"] == 1
+    listed = _fit_names(names, 200).split(", ")
+    print()
+    _print_wrapped_units(
+        ("⚠️  On this ledger, %s ran and %s not confirmed:"
+         % (_plural(found["total"], "call"), "was" if one else "were")).split()
+        + ["%s," % name for name in listed[:-1]] + ["%s." % listed[-1]]
+        + ("Reading %s back did not show the change, or the check itself could not run."
+           % ("it" if one else "them")).split())
+
+
 def _shown_policy(name):
     """A stored policy name as a person reads it (one stored name is our jargon). Never raises."""
     try:
@@ -481,6 +508,7 @@ def _render_offline_dashboard(gateway_url, mode="local"):
             print("      applies from its next call. The list is on %s." % _audit_cmd())
     _print_hook_health()
     _print_held_tools()
+    _print_unconfirmed_calls()
 
     # 🔴 "THIS MACHINE" WAS FALSE, AND TWO RUNS PROVE IT. `DB_PATH` is ".agentx.db",
     # RELATIVE, resolved against the working directory (db.py documents that as deliberate
@@ -748,9 +776,10 @@ def _render_offline_dashboard(gateway_url, mode="local"):
                 print("   " + "─" * 70)
                 # Through `_plural`, per its own docstring: the parenthetical is "the tell
                 # of a screen nobody read aloud". Flagged rather than silently widened in
-                # an earlier commit; founder called it in.
+                # an earlier commit; founder called it in. "Tripped nothing", the audit screen's
+                # words: "passed" beside "5 calls ... not confirmed" read as a verdict on them.
                 print(f"   This ledger holds {_plural(_inventory_calls, 'recorded call')} "
-                      "that passed.")
+                      "that tripped nothing.")
                 # 🔴 "YOUR agent" IS THE CLAIM, SO OURS HAS TO BE NAMED. `agentx demo --audit`
                 # writes four ALLOWED rows into this ledger by design (the audit screen exists
                 # to show them), and this screen reported them under a sentence about the
@@ -894,29 +923,23 @@ def _render_offline_dashboard(gateway_url, mode="local"):
         #    time". Free is true of US and not of RUNNING it. One of those two screens told
         #    a developer about the key and the other invited them to click.
         #
-        # So: name the dashboard we actually give them, scope "free" to what we charge, and
-        # say the key out loud on the screen doing the ASKING rather than only on the one
-        # they might read afterwards. `_gateway_url` is unchanged; only the promise is.
-        print("\n  Want deeper checks, automatic recovery, and a dashboard for your own")
-        print("  rules and coaching? It runs on your machine and costs nothing from us;")
-        print("  recovery uses your own Gemini key:")
+        # So: say the key out loud on the screen doing the ASKING rather than only on the one
+        # they might read afterwards, and say which gateway it belongs to. Recovery on our hosted
+        # gateway needs no key of the reader's, and the signup at this link offers that first.
+        # The dashboard went with "It runs on your machine": a gateway the reader runs has none.
+        # `_gateway_url` is unchanged; only the promise is.
+        print()
+        _print_wrapped("Want deeper checks and automatic recovery? Use our hosted gateway with a "
+                       "free key and nothing to run, or run your own, where recovery uses your "
+                       "own Gemini key:")
         print("     ▶ Get AgentX gateway access:  %s" % _gateway_url())
     else:
-        # The same two corrections on the twin. This arm greets a reader who already has a
-        # gateway configured, so the shape differs -- but "team dashboard" was equally wrong
-        # here and "free, runs locally" equally unscoped, and a fix applied at one of two
-        # renderings of one claim is the class this branch keeps meeting.
-        # ⚠️ "COSTS NOTHING FROM US", BUT NOT "IT RUNS ON YOUR MACHINE" -- and the difference
-        # is which arm this is. The keyless arm above is talking to someone with no gateway
-        # at all, so "runs on your machine" describes what they would be setting up. THIS arm
-        # greets a reader who already has one CONFIGURED, and it cannot know where: a linked
-        # or cloud deployment may well be hosted elsewhere. Applying the corrected wording to
-        # both arms verbatim turned an offer into a statement of fact about the reader's own
-        # deployment, which is the same class the wording was fixed for -- a claim the screen
-        # is in no position to make. The cost half is ours to state; the location half is not.
-        print("\n  The gateway adds deeper checks, automatic recovery, and a dashboard for")
-        print("  your own rules and coaching. It costs nothing from us; recovery uses")
-        print("  your own Gemini key:")
+        # The same corrections on the twin. This arm greets a reader who already has a gateway
+        # configured, and it cannot know where: a linked or cloud deployment may well be hosted
+        # elsewhere. So it says what each kind of gateway takes, and nothing about theirs.
+        print()
+        _print_wrapped("The gateway adds deeper checks and automatic recovery. Ours takes a free "
+                       "key and nothing to run; on one you run, recovery uses your own Gemini key:")
         print("     ▶ Already a design partner?   docker compose up -d")
         print("     ▶ Get AgentX gateway access:   %s" % _gateway_url())
     print("=" * 75)
@@ -1001,6 +1024,7 @@ def _render_hosted_tenant_status(gateway_url, usage):
     blocks = usage.get("blocks_recorded")
     if isinstance(blocks, int):
         print(f"  Blocks recorded:   {blocks}")
+    _print_unconfirmed_calls()
     print("\n  Your full record of calls and blocks: agentx audit")
     print("=" * 75)
 
@@ -1071,6 +1095,7 @@ def execute_status_inspection(gateway_url, api_key, mode="local"):
     print("  What the gateway has intercepted this run, and the policies armed right now.")
     _print_hook_health()
     _print_held_tools()
+    _print_unconfirmed_calls()
     print(f"\n  🛑 Intercepts:               {telemetry.get('intercepts', 0)}")
     print(f"  🧠 Socratic challenges:      {telemetry.get('socratic_nudges_issued', 0)}")
     print(f"  🚨 Human escalations (HITL): {telemetry.get('human_escalations_required', 0)}")
@@ -3088,8 +3113,13 @@ def _print_wrapped(text, indent="  ", width=75):
     out by counting characters in the source the way the fixed lines above it are. Wrapping
     here is what lets a variable-length sentence live on a fence-aligned screen at all.
     """
-    words, line = (text or "").split(), ""
-    for word in words:
+    _print_wrapped_units((text or "").split(), indent, width)
+
+
+def _print_wrapped_units(units, indent="  ", width=75):
+    """`_print_wrapped` for text where a line may break only between the units given. Never raises."""
+    line = ""
+    for word in units:
         candidate = ("%s %s" % (line, word)).strip()
         if len(candidate) + len(indent) > width and line:
             print("%s%s" % (indent, line))
@@ -5385,9 +5415,9 @@ def _print_call_log(db_module, log, opts):
                                                  key=lambda kv: (-kv[1], kv[0])))
         # Two fixed lines inside the 75 fence, then the names on their own line: the names
         # are the reader's and can be any length, so they are the only part allowed to run.
-        print("  %s = matched a rule you adopted. Recorded, not blocked: the SDK matches"
+        print("  %s = matched a rule you adopted. Recorded, not blocked here: a gateway"
               % _RULE_MATCH_MARK)
-        print("    the shape of a rule, and only a gateway judges the meaning.")
+        print("    that reads your rules file stops a call with this shape.")
         print("    Matched: %s" % _named)
         legend_printed = True
     shown_ours = sum(1 for row in log["rows"] if row["ours"])
@@ -6110,6 +6140,8 @@ def _execute_audit_screen(args=None):
         # A server can change a tool before the agent calls anything: no call, still a change.
         if reason != "unreadable":
             _print_server_events(db_module)
+            # Every call on this ledger may have tripped a policy, and a watched one still ran.
+            _print_unconfirmed_calls()
 
         print("=" * 75)
         # The empty screen is still a screen the gate ran over; its verdict goes last too.
@@ -6271,6 +6303,8 @@ def _execute_audit_screen(args=None):
                 print("  here beside these.")
             else:
                 print("  Wrap one of your tools and its calls land here beside these.")
+    # After the count and whose calls those are, before the table, as on the TypeScript screen.
+    _print_unconfirmed_calls()
     _totals = inventory.get("totals") or {}
     # Printed UNDER the table now (founder decision: a two-line opener), beside the tools it
     # describes; `_print_size_split()` is called after the table's legends.
@@ -8167,7 +8201,8 @@ def execute_insights(args=None):
                     print("       author a rule:  agentx adopt --rule --action <tool> --desc \"…\"")
                 print(f"       or review {_covers}:   {_review_cmd()}")
             else:
-                print(f"  ▶ Review {_covers}, one key each:   {_review_cmd()}")
+                # Not "one key each": a rule in the queue may offer [h]old, which asks one more.
+                print(f"  ▶ Review {_covers}:   {_review_cmd()}")
                 # The `adopt <#>` / `--rule` forms are the PRECISE alternatives to the one-key pass
                 # above. They are `agentx` subcommands with no MCP equivalent, so on that door they are
                 # omitted rather than printed as a command-not-found. Nothing is lost: the line above
@@ -8519,8 +8554,9 @@ def _is_keyless_context():
 # first", and `agentx review` printed it six times on one screen at ~180 columns (once per
 # item, once on the confirmation, once in the summary). There are no gateway users running an
 # older build to warn, so the warning cost every reader its width for nobody's benefit. The
-# CHANGELOG names the build; a screen names the timing.
-_RULE_WHEN = "within a few minutes, on its next policy refresh"
+# CHANGELOG names the build; a screen names the timing. The timing, not how it is kept: the
+# gateway re-reads the file on its policy refresh, which is the reason, not the reader's news.
+_RULE_WHEN = "within a few minutes"
 
 
 def _rule_armed_clause(plural=False):
@@ -8759,8 +8795,8 @@ def _print_your_rules_table(db_module, rule_matches):
                                                      _review_cmd()))
         return
     # The same sentence about blocking as everywhere else this feature speaks, once.
-    print("  Recorded, not blocked: the SDK matches the shape of a rule, and only a")
-    print("  gateway judges the meaning. Remove one:  %s --undo" % _review_cmd())
+    print("  Recorded, not blocked here: a gateway that reads this file stops a call")
+    print("  with this shape. Remove one:  %s --undo" % _review_cmd())
 
 
 def _expect_or_exit(expect, actual):
@@ -9900,6 +9936,85 @@ def _field(label):
     return f"   {label:<{_REVIEW_LABEL_WIDTH}}  "
 
 
+def _can_ask(rule, seen=None):
+    """Whether a rule proposal may also be added as a team rule that asks a person first.
+
+    Only for a proposal built from the calls themselves (`from_calls`), on a tool this project's
+    record holds a call to (`seen`, else read from the record): a team rule holds every call to
+    the tool, which is what such a proposal covers. A judge's proposal names an action label
+    and describes a narrower class of call; even when the label happens to be a tool's name
+    (`fetch_url`), a team rule on it would hold more than the item says. Never a shell (`Bash`,
+    `PowerShell`, or `shell`, which a team rule reads as every shell tool): a shell rule needs
+    words from the command, which is what `agentx rule add` is for. And only on the `agentx`
+    door, whose screens can send the rule on with `agentx rule push`; the MCP door has none."""
+    tool = rule.get("target_action")
+    if MCP_ENTRY or not rule.get("from_calls") or not isinstance(tool, str) or not tool.strip():
+        return False
+    if tool in SHELL_TOOLS or tool == SHELL:
+        return False
+    return tool in (seen if seen is not None else _sdk_tools_seen(limit=None))
+
+
+def _narrowing_words(tool):
+    """The words a team rule from `agentx review` also needs, or "" for every call to `tool`.
+    None when the person backs out with `n`; `q` stops the review, as on every other prompt.
+    A word inside the tool's own name narrows nothing (the text a team rule is matched against
+    starts with that name), so it is refused and asked again rather than stored as a promise."""
+    while True:
+        # The tool is named in the item's header just above; naming it here too ran a long tool
+        # name past the 75-column fence.
+        words = input("   only calls that also contain (Enter: every call; n: cancel): ").strip()
+        low = words.lower()
+        if low in _QUIT:
+            raise _ReviewQuit()
+        if low in ("n", "no"):
+            return None
+        if low and low in tool.lower():
+            print(_wrap("`%s` is part of the tool's name, so every call contains it. Type "
+                        "other words, or press Enter for every call." % words, "   – "))
+            continue
+        # A letter or two ("y" typed as a yes) is in almost every call: the same promise of a
+        # narrower rule that holds nearly everything.
+        if low and len(low) < 3:
+            print(_wrap("`%s` is in almost every call. Type a longer word, or press Enter for "
+                        "every call." % words, "   – "))
+            continue
+        return words
+
+
+def _has_gateway_key():
+    """Whether `agentx rule push` would have a key to send with: the agent key or the admin key,
+    from this shell or the project's `.env`. Not `_is_keyless_context`, which also turns on a
+    local gateway answering, key or no key."""
+    env = load_env_file()
+    return bool(resolve_api_key(env) or resolve_admin_key(env)[0])
+
+
+def _team_rule_door_lines(tool, words, first=True):
+    """What `agentx review` prints after adding a team rule: what it does, which gateway holds
+    the calls, and the one command that sends it on, on a line of its own. A gateway is the one
+    door that checks this kind of rule for an app agent: the SDK on its own never reads it.
+    After the walk's first team rule (`first=False`), only what the rule does: the founder's walk
+    printed the same three lines of gateways and push after every one."""
+    if not first:
+        return [_wrap("team rule added: %s. It is held and sent like the one above."
+                      % asks_before(tool, words), "   ✓ ")]
+    # A gateway that was ever sent team rules checks that copy, not this file, so with a key it
+    # is named beside the hosted one (what `agentx rule add` says as `_PUSH_HINT`). Without a
+    # key nothing was ever sent, so the file is what a local gateway checks.
+    # The condition leads, so one sentence never says a gateway holds the calls and then that
+    # the same gateway needs a push first.
+    if _has_gateway_key():
+        where = ("A gateway you run from this project holds these calls for a person to "
+                 "approve, unless you have sent it team rules before; that one, and the hosted "
+                 "gateway, once you send it:")
+    else:
+        where = ("A gateway you run from this project holds these calls for a person to "
+                 "approve; the hosted gateway, once you send it (needs an AgentX key):")
+    return [_wrap("team rule added: %s. %s" % (asks_before(tool, words), where), "   ✓ "),
+            "        agentx rule push"]
+
+
 def _print_review_item(n, total, it):
     label = _shown_policy(it.get("policy_violated")) or it.get("policy_id") or "policy"
     if it["kind"] == "allowlist":
@@ -9926,7 +10041,20 @@ def _print_review_item(n, total, it):
         # not true for them yet.
         # Wrapped like `catch:` above; unwrapped, the keyless form of this clause ran past
         # the fence on every item of the founder's walk.
-        print(_wrap(_rule_armed_clause(), _field("if added:")))
+        if it.get("can_ask"):
+            # Before the choices: [h] then Enter would add an every-call rule beside this one.
+            # Said like the [h]old line, with the gateway in it: the SDK alone checks no team rule.
+            for phrases in it.get("held_when") or []:
+                print(_wrap("a team rule: a gateway holds %s" % (
+                    "its calls that contain %s" % " and ".join('"%s"' % p for p in phrases)
+                    if phrases else "every call to it"), _field("already:")))
+            # Two choices, so each says what it adds before the key, for the reason above.
+            print(_wrap("a detection rule: " + _rule_armed_clause(), _field("[y]es:")))
+            # The door is in the sentence: a gateway holds the call; the SDK alone does not.
+            print(_wrap("a team rule: a gateway holds each call to '%s' for a person to approve"
+                        % rule["target_action"], _field("[h]old:")))
+        else:
+            print(_wrap(_rule_armed_clause(), _field("if added:")))
         return
     if it["kind"] == "adopt":
         print(f"\n[{n}/{total}] RECOVERY · {label}")
@@ -10168,9 +10296,41 @@ def _rule_review_items():
     # No filter here any more: `_numbered_rule_candidates` drops already-ruled-on actions
     # BEFORE assigning `#N`, so the queue, the lists and `adopt <#>` share one set. Two filters
     # for one rule is how they drift.
-    return [{"kind": "rule", "rule": r, "seq": r.get("seq"),
-             "policy_id": None, "policy_violated": r.get("policy_violated")}
-            for r in rule_list]
+    # Whether each item offers [h]old, settled once here: the record is read once per walk
+    # rather than twice per item, and the item's text and its prompt cannot disagree.
+    seen = _sdk_tools_seen(limit=None) if rule_list and not MCP_ENTRY else []
+    items = [{"kind": "rule", "rule": r, "seq": r.get("seq"),
+              "policy_id": None, "policy_violated": r.get("policy_violated"),
+              "can_ask": _can_ask(r, seen)}
+             for r in rule_list]
+    if any(it["can_ask"] for it in items):
+        team = _active_team_rules()
+        for it in items:
+            if it["can_ask"]:
+                it["held_when"] = _narrower_holds(it["rule"]["target_action"], team)
+    return items
+
+
+def _active_team_rules():
+    """The project's switched-on team rules, or [] when the file is absent or cannot be read: the
+    review still runs, and its proposals simply do not name what a rule already holds."""
+    try:
+        return [r for r in read_team_rules() if r.get("active", True)]
+    except (ValueError, OSError):
+        return []
+
+
+def _narrower_holds(tool, team):
+    """For each switched-on team rule on `tool`, the phrases its calls must also contain, [] for a
+    rule that holds every call to it. Without this, the founder's walk re-offered send_email with
+    nothing saying its "prod" calls were already held. A one-tool rule on every call is not
+    proposed at all (`_existing_rule_actions`); a rule on several tools can still hold every call
+    to this one. Phrases are read per tool, as `shown_phrases` reads a one-tool rule: one the call's
+    leading name already contains (any case) is in every call to this tool, so it holds nothing
+    back here, whatever the other tools are."""
+    lead = _leading_name(tool).lower()
+    return [[m for m in r.get("match") or [] if str(m).lower() not in lead]
+            for r in team if tool in (r.get("tools") or [])]
 
 
 def _gateway_destinations():
@@ -10537,6 +10697,10 @@ def execute_holds(args, gateway_url, api_key, admin_key=None, admin_refusal=None
         # No tool name = none was recorded (an agent asking for a person names none), so
         # "called a tool" would say more than the record does (founder's walk).
         _who, _rule = r.get('agent_id') or 'an agent', r.get('policy_violated') or 'a rule'
+        # "your team's rule", as the website's held card says it, not "Team rule team-3fa9...":
+        # the why below names the rule. The TypeScript `holds` says the same.
+        if re.match(r"(?i)team rule\b", str(_rule)):
+            _rule = "your team's rule"
         if r.get('tool_name'):
             print(f"   {_who} called {r.get('tool_name')}, held by {_rule}")
         else:
@@ -10548,7 +10712,7 @@ def execute_holds(args, gateway_url, api_key, admin_key=None, admin_refusal=None
         # A host or a path is never split at its hyphen (`api.data-` / `sync.io` misreads).
         for _line in textwrap.wrap(_why, width=68, break_on_hyphens=False, break_long_words=False):
             print(f"     {_line}")
-    print("\n   ▶ agentx holds approve <receipt>   or   agentx holds deny <receipt>")
+    print("\n   ▶ agentx holds approve|deny <receipt>")
     print("=" * 75)
 
 
@@ -11141,7 +11305,15 @@ def _print_review_help():
     print()
     print("  In a terminal, each item is one keystroke:")
     print("    RECOVERY item     [Y]es adopt / [n]o / [s]kip / [q]uit")
-    print("    NEW RULE item     [y]es add / [n]o / [s]kip / [q]uit   (Enter does NOT add)")
+    # The keys the item's prompt offers, no more: `s` was never one on a rule item. `a` only on
+    # this door, for a rule built from the agent's own calls (`_can_ask`).
+    if MCP_ENTRY:
+        print("    NEW RULE item     [y]es add / [n]o / [q]uit   (Enter does NOT add)")
+    else:
+        # `h`, not `a`: `a` is accept-risk on a VERDICT item of the same screen, the opposite
+        # kind of answer, and a habit carried from one item to the next must not add a rule.
+        print("    NEW RULE item     [y]es add / [h]old for a person / [n]o / [q]uit")
+        print("                      (Enter does NOT add; [h]old: rules from your calls)")
     print("    VERDICT item      [c]orrect / [w]rong / [a]ccept-risk / [d]elete / [s]kip / [q]uit")
     if not MCP_ENTRY:
         # The MCP door offers one verdict per policy and never a ledger block, so
@@ -11992,11 +12164,17 @@ def execute_review(args=None):
     # the first sentence pointing the wrong way, at a reader who had just been burned by
     # pressing Enter.
     _shows_a_default = any(it["kind"] == "adopt" for it in items)
+    # No "one key each": [h]old asks which calls to hold, an allowlist item's [p]ick asks which
+    # sites or tools, and a group verdict can go one block at a time. [h]old, new on this screen,
+    # gets a line saying what follows its key (founder walk, #491).
+    _asks_more = any(it.get("can_ask") for it in items)
     # Two lines: as one it ran 103 columns, which the walk's fence assertion caught.
-    print("\n📋 %d item(s) to review, one key each. %s"
+    print("\n📋 %d item(s) to review. %s"
           % (len(items),
              "Enter accepts the CAPITALIZED default where one is shown;" if _shows_a_default
              else "Enter skips an item;"))
+    if _asks_more:
+        print("   [h]old asks one more question: which of the tool's calls to hold.")
     print("   'q' stops here and leaves the rest untouched.")
     if coverage:
         print(f"   ({coverage})")
@@ -12007,6 +12185,7 @@ def execute_review(args=None):
     if undo_mode:
         print("   These are single blocks you judged one at a time.")
     adopted = labeled = deleted = rules_added = sites_allowed = tools_allowed = 0
+    team_rules_added = 0
     # 🔴 THE THIRD PASS NEEDED THE SAME FLAG AS THE OTHER TWO. Both undo passes gained one so
     # that quitting reads "Stopped" rather than "Nothing changed", which is the wording
     # reserved for a reader who saw everything and kept it. This walk kept falling through to
@@ -12042,11 +12221,36 @@ def execute_review(args=None):
                 # The prompt now offers only what exists; the header already says Enter skips.
                 # Making `n` remember a declined rule is a store and a design choice, not a
                 # prompt edit.
-                raw = input("   add this detection rule? [y]es / [n]o / [q]uit: ")
+                can_ask = bool(it.get("can_ask"))
+                if can_ask:
+                    raw = input("   add this rule? [y]es / [h]old for a person / [n]o / [q]uit: ")
+                else:
+                    raw = input("   add this detection rule? [y]es / [n]o / [q]uit: ")
                 ans = raw.strip().lower()
                 if ans in _QUIT:
                     raise _ReviewQuit()
-                if ans in ("y", "yes"):
+                if can_ask and ans in ("h", "hold"):
+                    tool = it["rule"]["target_action"]
+                    words = _narrowing_words(tool)
+                    if words is None:
+                        print("   – skipped")
+                        continue
+                    _env = load_env_file()
+                    try:
+                        add_tool_rule(tool, words,
+                                      resolve_env("AGENTX_GATEWAY_URL", DEFAULT_GATEWAY_URL,
+                                                  overlay=_env),
+                                      resolve_api_key(_env) or resolve_admin_key(_env)[0])
+                    # OSError too: a team-rules file another program holds open (Windows) must
+                    # cost this one rule, not the rest of the walk and its tally.
+                    except (ValueError, OSError) as err:
+                        print(_wrap("not added: %s" % err, "   🚫 "))
+                    else:
+                        team_rules_added += 1
+                        for _ln in _team_rule_door_lines(tool, words,
+                                                         first=team_rules_added == 1):
+                            print(_ln)
+                elif ans in ("y", "yes"):
                     try:
                         adopt_rule(it["rule"])
                     except ValueError as err:
@@ -12062,7 +12266,7 @@ def execute_review(args=None):
                 elif ans in ("n", "no"):
                     print("   – skipped")
                 else:
-                    _skipped(ans, ["y", "n", "q"])
+                    _skipped(ans, ["y", "h", "n", "q"] if can_ask else ["y", "n", "q"])
             elif it["kind"] == "adopt":
                 raw = input("   teach this recovery? [Y]es / [n]o / [s]kip / [q]uit: ")
                 if raw.strip().lower() in _QUIT:
@@ -12208,7 +12412,8 @@ def execute_review(args=None):
             _walk_stopped_early = True
             break
     rec_word = "recovery" if adopted == 1 else "recoveries"
-    rule_word = "rule" if rules_added == 1 else "rules"
+    # "detection": beside "2 team rules added", a bare "1 rule added" did not say which kind.
+    rule_word = "detection rule" if rules_added == 1 else "detection rules"
     # 🔴 WAS FOUR OF OUR NOUNS AND A ROW OF ZEROES. "0 recoveries adopted, 0 rules added, 0
     # block(s) labeled, 0 block(s) deleted" is the write log of a transaction, printed to
     # someone who wants to know what they just accomplished. Each line now carries what the
@@ -12223,6 +12428,10 @@ def execute_review(args=None):
         # No clause: the item said what a rule does before the key (and a keyless run's
         # footer under this tally says it needs a gateway to fire). Said once, not three times.
         _done.append(f"    {rules_added} {rule_word} added")
+    if team_rules_added:
+        # What it does and where it waits are on each confirmation; the tally only counts.
+        _done.append("    %s added: a gateway holds those calls for a person to approve"
+                     % _plural(team_rules_added, "team rule"))
     if sites_allowed:
         _done.append(f"    {_plural(sites_allowed, 'site')} allowed, in .agentx/allowlist.json")
     if tools_allowed:
@@ -13923,6 +14132,7 @@ def _print_cli_usage(advanced=False):
     print("                (calls are recorded %s)" % RECORDING_UNIVERSAL)
     print("  evidence    A file for your reviewer: rules in force, calls stopped or flagged, a record link")
     print("                (writes agentx-evidence-<date>.json, or '--out FILE'; '--json' prints it)")
+    print("                ('--gateway' writes the file your gateway builds, for every agent on your key)")
     print("  status      Local protection stats + armed policies (default; live view needs the gateway)")
     print("  review      One-key pass over pending blocks: adopt a safe-path, or label a block")
     print("                ('--stats' for a summary of every incident's outcome, not just what's pending)")
@@ -14177,7 +14387,8 @@ def main():
         execute_policies(args[1:])
     elif command == "evidence":
         from .evidence import main as _evidence_main
-        sys.exit(_evidence_main(args[1:]))
+        sys.exit(_evidence_main(args[1:], gateway_url, resolve_api_key(env) or "",
+                                *resolve_admin_key(env)))
     elif command == "customize":
         execute_customize(args[1:])
     elif command == "demo":

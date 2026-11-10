@@ -113,7 +113,7 @@ try:
                                WOULD_BLOCK_STATUS, REFUSED_STATUS, HALTED_STATUS,
                                read_novelty, advance_watermark, format_novelty_item, top_novelty,
                                current_call_shape, _call_shape, _dest_hosts_value,
-                               WATERMARK_SESSION,
+                               _dest_domains_value, WATERMARK_SESSION,
                                record_mcp_roster, MCP_DRIFT_POLICY_NAME, MCP_DRIFT_DISPLAY_NAME,
                                MCP_POISON_POLICY_NAME, MCP_POISON_DISPLAY_NAME,
                                MCP_HELD_CALL_POLICY_NAME, SERVER_EVENT_STATUS)
@@ -903,8 +903,8 @@ def _adopted_rule_outcome_mcp(tool_name, arguments, session_stats):
         narrated = session_stats.setdefault("rule_matches_narrated", set())
         if rule["id"] not in narrated:
             narrated.add(rule["id"])
-            print("[agentx-mcp] '%s' matched your rule '%s'. Recorded and let run: the proxy "
-                  "matches the shape of a rule, and only a gateway judges the meaning. See "
+            print("[agentx-mcp] '%s' matched your rule '%s'. Recorded and let run here; a "
+                  "gateway that reads your rules file stops a call with this shape. See "
                   "every match:  uvx agentx-mcp --audit" % (tool_name, rule["name"]),
                   file=sys.stderr)
         return (rule, None)
@@ -2316,7 +2316,8 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                               quantity=quantity, posture="audit",
                               dest_hosts=_dest_hosts_value(
                                   tool_key, params.get("arguments"),
-                                  session_stats.get("_tool_declared", {}).get(str(tool_key))))
+                                  session_stats.get("_tool_declared", {}).get(str(tool_key))),
+                              dest_domains=_dest_domains_value(params.get("arguments")))
             except Exception:
                 pass
             _flush_mcp_roster(session_stats)
@@ -2426,7 +2427,8 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                                             if req_id is not None else None),
                           dest_hosts=_dest_hosts_value(
                               tool_key, params.get("arguments"),
-                              session_stats.get("_tool_declared", {}).get(str(tool_key))))
+                              session_stats.get("_tool_declared", {}).get(str(tool_key))),
+                          dest_domains=_dest_domains_value(params.get("arguments")))
         except Exception:
             pass
         # A stopped call is still a call the agent made: the roster's numerator exists.

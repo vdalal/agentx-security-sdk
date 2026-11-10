@@ -1,7 +1,10 @@
 import os
 import sys
 import copy as _copy
+import datetime
+import decimal
 import json
+import math
 import textwrap
 import atexit
 import time
@@ -17,6 +20,7 @@ import atexit
 import asyncio
 import inspect
 import threading
+import typing
 import contextvars
 from contextvars import ContextVar
 
@@ -41,6 +45,7 @@ from .db import (init_db, ensure_ledger_current, log_intercept, get_lifetime_sta
                  retention_failure_streak, failed_ledger_path, WOULD_BLOCK_STATUS,
                  record_call, is_demo_agent as _is_demo_agent, _call_shape)
 from . import db as db_module
+from . import flow as _flow
 from . import pulse
 from .envfile import resolve_api_key
 from .overrides import get_active_override, review_backlog_size, _anchored_root
@@ -1058,8 +1063,14 @@ _DETAIL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
 # them can reflect our Authorization header back, and this line goes to a logger that people
 # ship to aggregators. The project already keeps exception text off the pulse for this exact
 # reason; a local WARNING is not meaningfully safer than a pulse once it leaves the machine.
+# `Authorization: Bearer <token>` is tried first and takes the scheme with it: tried the other
+# way, the header's own match ended on "Bearer" and printed the token after it. A key prefix
+# must not follow a letter or digit, or `pip install flask-cors` printed `flask-[redacted]` and
+# the person answering a held install could not see the package. The TypeScript SDK's
+# `sanitizeDetail` carries the same pattern.
 _DETAIL_SECRET_RE = re.compile(
-    r"(?i)(bearer\s+|authorization\s*[:=]\s*|api[-_]?key\s*[:=]\s*|agentx_sk_|sk-)\S+")
+    r"(?i)(authorization\s*[:=]\s*(?:bearer\s+|basic\s+|token\s+)?|bearer\s+|api[-_]?key\s*[:=]\s*"
+    r"|(?<![a-z0-9])agentx_sk_|(?<![a-z0-9])sk-)\S+")
 
 
 def _sanitize_detail(detail, limit=160):
@@ -1519,11 +1530,8 @@ def _keyed_shield_defers(enforcement_level):
 
     The rule, stated as what happens rather than what is skipped: on a keyed enforce run a
     shield match is carried to the gateway; the gateway's BLOCK, its BREAKER, or its HOLD for a
-    human replaces the shield's block; any other answer (an allow, an unreachable gateway, a
-    body we cannot read) leaves the shield's block standing, with one line saying why. The one
-    way a call the shield stops today can run is a HUMAN APPROVING IT on the hold: nothing runs
-    unattended that did not run before, and the gateway's sharper reading (its coaching, its
-    human hold) reaches the caller where the shield's flat block used to.
+    human replaces the shield's block, so its sharper reading (its coaching, its human hold)
+    reaches the caller where the shield's flat block used to.
 
     WITH A KEY, THE GATEWAY DECIDES. The gateway's ALLOW wins too: the call runs, with one line
     saying the free check had matched it. Without a key this SDK is the whole check; with one it
@@ -1870,6 +1878,78 @@ class AgentXSecurityBlock(Exception):
         self.socratic_nudge = message        # kept for backward compatibility
 
 
+class AgentXUnconfirmed(str):
+    """What the agent gets from a tool that ran and whose `verify=` did not confirm the change,
+    for untyped / `-> str` tools. A real string, like `AgentXBlock`, but not a block: nothing was
+    stopped, so `is_block` is False for it and `is_unconfirmed` is True.
+
+    ``reason`` is "not_confirmed" (the read-back did not show the change) or "could_not_check"
+    (the read-back itself failed)."""
+    blocked = False
+    unconfirmed = True
+
+    def __new__(cls, prose, *, tool=None, reason=None):
+        obj = super().__new__(cls, prose)
+        obj.tool = tool
+        obj.reason = reason
+        return obj
+
+
+class AgentXUnconfirmedError(Exception):
+    """The same, raised for a strictly typed tool, where returning a string would crash a
+    framework that validates the return type. The tool HAS run. Catch it and feed
+    ``str(error)`` to your agent's LLM."""
+    blocked = False
+    unconfirmed = True
+
+    def __init__(self, message, tool=None, reason=None):
+        super().__init__(message)
+        self.tool = tool
+        self.reason = reason
+
+
+def is_unconfirmed(result) -> bool:
+    """True if a protected tool ran and its `verify=` did not confirm the change."""
+    return getattr(result, "unconfirmed", False) is True
+
+
+# 🔴 NEVER "FAILED", AND NEVER "NOT EXECUTED". The call ran. An agent told it failed retries, and
+# if the write did land, or is only slow, that retry is the double refund. So both messages say
+# the same two things: do not report it as done, and do not repeat it. The tool's own result is
+# left out of both, because its "success" is the word the model would repeat.
+_UNCONFIRMED_PREFIX = "⚠️ [AgentX Unconfirmed]"
+_UNCONFIRMED_NOT_CONFIRMED = "not_confirmed"
+_UNCONFIRMED_COULD_NOT_CHECK = "could_not_check"
+# What the ledger row says. Fixed words: an error from the developer's code never reaches it.
+_UNCONFIRMED_ROW_WORDS = {_UNCONFIRMED_NOT_CONFIRMED: "Not confirmed",
+                          _UNCONFIRMED_COULD_NOT_CHECK: "Could not check"}
+
+
+def _unconfirmed_message(tool, reason):
+    """The sentence the model reads. TS `unconfirmedMessage`, character for character."""
+    if reason == _UNCONFIRMED_COULD_NOT_CHECK:
+        return (f"{_UNCONFIRMED_PREFIX} '{tool}' ran, but the read-back itself failed, so the "
+                "result is unknown. Do not report this as done, and do not repeat the call. "
+                "Tell the user it is unconfirmed.")
+    return (f"{_UNCONFIRMED_PREFIX} '{tool}' ran, but reading it back did not show the change. "
+            "Do not report this as done. Do not repeat the call until you have checked the "
+            "current state. Tell the user it is unconfirmed.")
+
+
+def _verify_arguments(sig, args, kwargs):
+    """The call's arguments by name for `verify=`, with the defaults the call left out filled
+    in: a read-back compares against what the tool actually wrote."""
+    bound = _bound_arguments(sig, args, kwargs)
+    if sig is None:
+        return bound
+    named = dict(bound)
+    for name, param in sig.parameters.items():
+        if (name not in named and name not in ("self", "cls")
+                and param.default is not inspect.Parameter.empty):
+            named[name] = param.default
+    return named
+
+
 def is_block(result) -> bool:
     """True if a protected tool call was blocked by a security POLICY.
 
@@ -2014,6 +2094,10 @@ _session_stats = {
     # written, never on the pulse (build_payload names its keys one at a time). See
     # _same_store_sink_keyless and _remember_table_copy.
     "table_copies": {},
+    # Sensitive values protected tools returned, per run: {trace_id: {key: (kind, tool, masked)}}.
+    # The flow rule's memory (agentx_sdk.flow). Raw values, in this process only: never written,
+    # never on the pulse, dropped with the oldest run past the cap.
+    "flow_values": {},
     "rule_matches_narrated": set(),    # <-- rule ids narrated this session; one line per rule, not per call.
     "rule_uncompared_narrated": set(), # <-- rule ids whose only_when could not be compared, narrated once each. Screen-only, never on the pulse.
     # 🔴 P-92, AND THE REASON IT IS SEPARATE FROM would_blocks ABOVE. `would_blocks` can only
@@ -2236,6 +2320,69 @@ def _table_copies_for(trace_id):
         return copies
 
 
+def _flow_values_for(trace_id):
+    """This run's store of sensitive returned values (agentx_sdk.flow), created on first use under
+    the lock, the oldest runs dropped past the cap. Handed out by reference."""
+    with _stats_lock:
+        runs = _session_stats["flow_values"]
+        values = runs.get(trace_id)
+        if values is None:
+            values = runs[trace_id] = _flow.new_run_store()
+            while len(runs) > _flow.MAX_RUNS:
+                del runs[next(iter(runs))]
+        return values
+
+
+def _flow_rule_match(trace_id, tool_name, arguments, sends_out):
+    """The flow rule's decision for one call, in the shape the local shield delivers, or None."""
+    if not trace_id or arguments is None:
+        return None
+    with _stats_lock:
+        values = _session_stats["flow_values"].get(trace_id)
+        snapshot = list((values or {}).items())
+    if not snapshot:
+        return None
+    store = _flow.new_run_store()
+    store.update(snapshot)
+    send_words = frozenset(dict(_ACTION_KEYWORDS)["SEND"])
+    leak = _flow.find_leak(store, arguments,
+                           name_sends=bool(send_words.intersection(_name_tokens(tool_name))),
+                           flagged_sends=bool(sends_out))
+    if leak is None:
+        return None
+    return {
+        "policy_id": _flow.POLICY_ID,
+        "policy_name": _flow.POLICY_NAME,
+        "challenge_text": _flow.challenge(leak, tool_name),
+        "category": _flow.category(leak),
+        "preferred_alternative": _flow.safe_path(leak),
+    }
+
+
+_FLOW_SHAPES = None
+
+
+def _remember_flow_values(tool_name, result, returns_sensitive):
+    """Keep the sensitive values a tool that RAN returned, for the rest of this run. Never breaks
+    the tool's return: a fault here is counted as a shield fail-open and nothing is kept."""
+    global _FLOW_SHAPES
+    trace_id = trace_id_var.get()
+    if not trace_id:
+        return
+    try:
+        if _FLOW_SHAPES is None:
+            _FLOW_SHAPES = [(c, re.compile(p), _SCRUB_VALIDATORS.get(c))
+                            for c, p in _SCRUB_REGEX_MAP.items()]
+        pairs = _flow.sensitive_values(result, _FLOW_SHAPES, _PII_COLUMN_TOKENS_KEYLESS,
+                                       returns_sensitive=returns_sensitive)
+        if pairs:
+            store = _flow_values_for(trace_id)
+            with _stats_lock:
+                _flow.remember(store, tool_name, pairs)
+    except Exception as err:   # noqa: BLE001 -- the tool already ran; its result must reach the caller
+        _record_shield_failopen(tool_name, err)
+
+
 def _mark_trace(set_name, trace_id):
     """Add a trace_id to one of the recovery-accounting sets under the lock, so the
     success-path recovery check sees a consistent view (review #115 finding 6)."""
@@ -2369,6 +2516,24 @@ def _recovery_breakdown():
                        if p in continued and p not in unmeasured and _settled(p))
     abandoned_ep = len(open_ch) - looped_ep - human_ep - continued_ep - unmeasured_ep
     return total, recovered, continued_ep, unmeasured_ep, abandoned_ep, looped_ep
+
+
+def _a_string_fits_the_return_type(func, signature):
+    """Whether a tool may hand back a message in place of its result, or has to raise: an untyped or
+    `-> str` tool may, and a framework checking any other return type would reject the string and
+    lose the message, `-> None` included. Under `from __future__ import annotations` the annotation
+    is the TEXT 'str', so it is resolved first: left as text, every such tool raised, after the write
+    had run on the `verify=` path. Never raises."""
+    annotation = signature.return_annotation if signature is not None else inspect.Signature.empty
+    if isinstance(annotation, str):
+        try:
+            # With no "return" here (a callable instance's class annotations), the text stands.
+            annotation = typing.get_type_hints(func).get("return", annotation)
+        except Exception:
+            pass
+    if isinstance(annotation, str):
+        return annotation.strip() == "str"
+    return annotation is inspect.Signature.empty or annotation is str
 
 
 def _returns_coroutine(fn):
@@ -3110,7 +3275,7 @@ def _print_agentx_summary():
     # pulse counter, so our own demo traffic still shows on the screen it was run to fill.
     if _session_stats.get("rule_matches_seen", 0) > 0:
         print(f" 🧩 Your Rules Matched:    {_session_stats['rule_matches_seen']:<3} |  "
-              f"recorded, not blocked; only a gateway judges the meaning")
+              f"recorded, not blocked; a gateway that reads the file stops these")
 
     # --- FIXED: Display the Human Override metrics cleanly inside the table block layout ---
     # 🔴 THE SECOND HALF OF THIS LINE WAS THE SESSION NUMBER PRINTED TWICE. It read
@@ -3142,13 +3307,13 @@ def _print_agentx_summary():
             # get that payload past the gateway. That deserves a log, not a shrug.
             print(f"     -> {faults} of these: the engine ANSWERED but could not vet the call. Check its logs; a repeat on one payload is a bypass, not an outage.")
         from .links import GATEWAY_URL
-        # ⚠️ THE SAME COST CLAIM AS THE TWO ON `agentx status`, AND THIS WAS THE THIRD SITE.
-        # It read "get it (free, runs locally)" -- the same promise, spelled with the words
-        # reversed, which is how it survived a sweep that corrected the other two. "Free" is
-        # true of what we charge and not of running it: recovery needs a key the reader
-        # supplies. Keep all three renderings saying one thing.
-        print("     -> the gateway would have evaluated these. It runs on your machine and")
-        print("        costs nothing from us; recovery uses your own Gemini key:")
+        # ⚠️ THE SAME CLAIM AS THE TWO ON `agentx status`, AND THIS IS THE THIRD SITE: the Gemini
+        # key belongs to a gateway the reader runs, and our hosted one needs none of theirs. This
+        # is the wording of `agentx status`'s arm for a configured gateway, because this line is
+        # read by someone whose gateway did not answer, and it cannot know where that one runs.
+        # Keep all three renderings saying one thing.
+        print("     -> the gateway would have evaluated these. Ours takes a free key and")
+        print("        nothing to run; on one you run, recovery uses your own Gemini key:")
         print("        %s" % GATEWAY_URL)
 
     # --- AUDIT: the operator's POLICY CONFIG could not be read, so their own rules were not
@@ -9010,7 +9175,9 @@ def _record_would_block(trace_id, agent_id, tool_name, policy_id, policy_name, c
                  arg_names=names, amount=amount, target_class=target_class,
                  quantity=quantity, posture="audit",
                  dest_hosts=db_module._dest_hosts_value(
-                     tool_name, arguments if dest_args is None else dest_args))
+                     tool_name, arguments if dest_args is None else dest_args),
+                 dest_domains=db_module._dest_domains_value(
+                     arguments if dest_args is None else dest_args))
     # Best-effort narration: a broken/closed stdout must NOT raise out of here, or the
     # caller's `except Exception` (the Layer-0 shield's) would swallow it and fall through
     # to the gateway path, double-counting this one call. The record above already stood.
@@ -9073,6 +9240,217 @@ def _bound_arguments(sig, args, kwargs):
         return mapped
     except (TypeError, ValueError):
         return kwargs or {}
+
+
+_RULE_WIRE_DROP = object()
+
+
+def _rule_wire_value(value, depth=0):
+    """`value` as JSON can carry it with the text the SDK's rule matcher reads (`rules._call_text`,
+    `str` of each leaf) and the number its threshold reads, or `_RULE_WIRE_DROP`. A Decimal, a
+    date or a UUID travels as its `str`; a plain object (a database connection, a client) is
+    left off: its `str` is not an argument a rule names, and can carry a password in a DSN."""
+    if depth > 32:
+        return _RULE_WIRE_DROP
+    # 🔴 NOT A NON-FINITE FLOAT AS ITSELF. `requests` encodes with allow_nan=False, so an `inf`
+    # or `nan` raised there, the client read it as an unreachable gateway, and fail-open RAN THE
+    # TOOL past every gateway layer (scoped review of 0e7b6254). As text it is what the matcher
+    # reads (`str`), and the threshold reads "inf" as the largest number, as it reads the float.
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, decimal.Decimal):
+        return _decimal_wire_text(value)
+    if isinstance(value, (datetime.date, datetime.time, uuid.UUID)):
+        return str(value)
+    # Any other real number (numpy's int64 and float64, a Fraction) goes as the number it is:
+    # dropped, a team rule naming the argument read it as not passed and held the call (review).
+    import numbers
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        f = float(value)
+        return f if math.isfinite(f) else str(f)
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            w = _rule_wire_value(v, depth + 1)
+            if w is not _RULE_WIRE_DROP:
+                out[str(k)] = w
+        return out
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [w for w in (_rule_wire_value(v, depth + 1) for v in value)
+                if w is not _RULE_WIRE_DROP]
+    return _RULE_WIRE_DROP
+
+
+def _decimal_wire_text(value):
+    """A Decimal as text that can be read as ONE number: written out in full ("1.5E+3" is
+    "1500"), and one with exactly three places after the point and up to three before gets a
+    fourth, "0" ("1.500" is "1.5000"). The gateway holds text such as "1.500" because a person
+    may have meant one thousand five hundred; a Decimal is exact, so its text must not read as
+    that guess (review). The value is unchanged, and the old text stays inside the new one, so a
+    rule's words still find it. Never a float, which would change the amount."""
+    # 🔴 Not written out past 1000 places either way: `1E+100000000` became a hundred million
+    # characters, the request failed, the client read an unreachable gateway and fail-open ran
+    # the tool (scoped review of 6a614901). As its short text the gateway holds it as unreadable.
+    # Not lower: at 30, `1E-31` (about 0, which ran) was held as not a number (last review).
+    if not value.is_finite() or abs(value.adjusted()) > 1000:
+        return str(value)
+    text = format(value, "f")
+    if re.fullmatch(r"-?[1-9]\d{0,2}\.\d{3}", text):
+        text += "0"
+    return text
+
+
+_NUMBER_RULE_SAID = set()
+
+
+def _say_number_rule_needs_a_gateway(tool_name):
+    """Once per tool, with no key: a team rule in this project holds this tool by a number, and
+    only a gateway checks it, so nothing holds the call here. A developer who wrote the rule
+    believes it is on. Never raises; a team rules file that cannot be read says nothing here
+    (the rule commands say why)."""
+    try:
+        if tool_name in _NUMBER_RULE_SAID:
+            return
+        from .team_rules import read_team_rules
+        rules = read_team_rules()
+        # Looked up once per tool, whatever the answer: read for every keyless call to a tool
+        # with no such rule, the file was parsed again each time. Marked only once the file was
+        # read: a damaged file on the first call left the tool never warned (scoped review).
+        _NUMBER_RULE_SAID.add(tool_name)
+        rule = next((r for r in rules
+                     if r.get("active", True) and "argument" in r and tool_name in r["tools"]),
+                    None)
+        if rule is None:
+            return
+        print("⚠️  [AgentX] A team rule holds %s when its %s is at or above a number, and only a "
+              "gateway checks it. With no AGENTX_API_KEY set, nothing holds this call." %
+              (tool_name, rule["argument"]), file=sys.stderr)
+    except Exception:
+        return
+
+
+_ENVIRONMENT_SAID = set()
+
+
+def _call_environment():
+    """`AGENTX_ENVIRONMENT`, read at call time, when it is a short lower-case name (letters,
+    digits, `-`, `_`, at most 32), else None. A value that is set and not such a name is dropped
+    and said once on screen: a team rule's number per environment then uses its lowest, which is
+    a hold where the developer expected a run, and they need to know why. Never raises."""
+    try:
+        from .team_rules import ENV_RE
+        raw = os.environ.get("AGENTX_ENVIRONMENT", "")
+        if not raw:
+            return None
+        if ENV_RE.match(raw):
+            return raw
+        if raw not in _ENVIRONMENT_SAID:
+            _ENVIRONMENT_SAID.add(raw)
+            print("⚠️  [AgentX] AGENTX_ENVIRONMENT=%r is not sent: use a short lower-case name "
+                  "such as prod or dev. A team rule with a number per environment uses its "
+                  "lowest until then." % raw[:40], file=sys.stderr)
+        return None
+    except Exception:
+        return None
+
+
+def _defaulted_names(sig, args, kwargs):
+    """The parameters this call left at their default, from the signature and what was passed,
+    without binding it again. Empty when the signature is unknown. Never raises."""
+    out = set()
+    try:
+        if sig is None:
+            return out
+        kwargs, n_args, pos = kwargs or {}, len(args or ()), 0
+        for name, p in sig.parameters.items():
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                          inspect.Parameter.POSITIONAL_OR_KEYWORD):
+                passed = pos < n_args or name in kwargs
+                pos += 1
+            elif p.kind == inspect.Parameter.KEYWORD_ONLY:
+                passed = name in kwargs
+            else:
+                continue
+            if not passed and p.default is not inspect.Parameter.empty:
+                out.add(name)
+    except Exception:
+        return set()
+    return out
+
+
+def _is_secret_default(name, value):
+    """A default left off the wire: a strong secret name (`password`, `Authorization`), or a weak
+    one (`api_key`, `github_token`: the last word is key or token) holding anything but a number.
+    `max_tokens=4096` and `max_keys=1000` are counts a team rule can hold by: dropped, the rule
+    read them as not passed and held every call (scoped review of 25bfa70e)."""
+    from .flow import _secret_strength
+    strength = _secret_strength(name)
+    if strength >= 2:
+        return True
+    import numbers
+    return strength == 1 and value is not None and not isinstance(value, numbers.Number)
+
+
+def _without_secret_keys(value, depth=0):
+    """A defaulted dict or list with every secret entry left out, at any depth, by
+    `_is_secret_default`: `headers={"Authorization": "Bearer sk_live_..."}` went whole, and the
+    gateway kept it with a held call (scoped review of 25bfa70e). A pair whose first item is a
+    secret name goes too: `params=[("api_key", "sk_live_...")]`, as httpx and requests take
+    params and headers, carries the name inside the data (last review)."""
+    if depth > 32:
+        return value
+    if isinstance(value, dict):
+        return {k: _without_secret_keys(v, depth + 1) for k, v in value.items()
+                if not _is_secret_default(str(k), v)}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_without_secret_keys(v, depth + 1) for v in value
+                if not (isinstance(v, (list, tuple)) and len(v) == 2 and isinstance(v[0], str)
+                        and _is_secret_default(v[0], v[1]))]
+    return value
+
+
+def _rule_args_for_gateway(tool_name, sig, args, kwargs, bound=None):
+    """The call's arguments as the code made them, for a gateway that reads `.agentx/rules.json`
+    to match a rule's words and threshold (#491): `**kwargs` unpacked, every parameter name kept,
+    and every DEFAULT the call did not pass (`_destination_arguments`), since a default is what
+    the call does: `deploy("billing")` with env="prod" by default is a prod deploy. The wire
+    `args` keep the gateway's detector shape instead: `**kwargs` as one entry, `client` skipped.
+    Sent on EVERY call that reaches a gateway: a team rule naming an argument and a number is
+    kept on the gateway (pushed from the website or `agentx rule push`), so this project cannot
+    know which tools need them, and a count left at its default would arrive absent and be held.
+    A nested object keeps every leaf JSON can carry, where `args` drops it whole. Never raises,
+    and never returns what the client could not encode: a payload that fails to encode fails the
+    whole check open.
+
+    `conn`, `cursor` and `db_session` stay off, as they are off `args` and `query`: even as a
+    string such a value is a connection string, which can hold a password, and the gateway keeps
+    the payload with an incident (scoped review of 0e7b6254). `client` travels: as a string it is
+    an account name a rule can name ("Acme"); as an object it is dropped like any object.
+
+    A DEFAULT whose name says it is a secret (`api_key=STRIPE_KEY`, `password`, `github_token`:
+    `_is_secret_default`), and a secret entry inside a defaulted dict or list, is left out:
+    nobody passed it, and on every call it would reach the
+    gateway and be kept with a held call. A value the call passed
+    is sent as before. `bound`: the call's `_destination_arguments`, when the caller has them,
+    so the signature is not bound twice. None with no key: nothing is sent then."""
+    try:
+        if not resolve_api_key():
+            return None
+        merged = bound if bound is not None else _destination_arguments(sig, args, kwargs)
+        defaulted = _defaulted_names(sig, args, kwargs)
+        bound = {k: (_without_secret_keys(v) if k in defaulted else v)
+                 for k, v in merged.items()
+                 if k not in ("conn", "cursor", "db_session")
+                 and not (k in defaulted and _is_secret_default(k, v))}
+        wired = _rule_wire_value(bound)
+        json.dumps(wired, allow_nan=False)
+        return wired or None
+    except Exception:
+        return None
 
 
 def _destination_arguments(sig, args, kwargs):
@@ -9236,8 +9614,8 @@ def _adopted_rule_outcome_keyless(agent_id, tool_name, arguments):
         if first_time:
             try:
                 print(f"🧩 [AgentX RULE] '{tool_name}' matched your rule '{rule['name']}'. "
-                      f"Recorded and let run: the SDK matches the shape of a rule, and only "
-                      f"a gateway judges the meaning. See every match:  agentx audit")
+                      f"Recorded and let run here; a gateway that reads your rules file stops "
+                      f"a call with this shape. See every match:  agentx audit")
             except Exception:
                 pass
         return (rule, None)
@@ -9502,8 +9880,31 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
 
 
 # --- 3. THE MAIN SENSOR DECORATOR ---
-def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None, action: str = None, budget_pool_id: str = None, enforcement: str = None, posture: str = None):
+def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None, action: str = None, budget_pool_id: str = None, enforcement: str = None, posture: str = None, returns_sensitive: bool = False, sends_out: bool = False, verify=None):
     """Wrap a tool function so AgentX vets every call.
+
+    ``verify`` reads the change back after the tool has run, so the agent cannot report a write
+    that did not happen as done: ``verify(args, result)``, where ``args`` is the call's arguments
+    by name, and exactly ``True`` means confirmed::
+
+        @agentx_protect(agent_id="crm",
+            verify=lambda args, result: crm.get(args["contact_id"])["stage"] == args["stage"])
+        def update_contact(contact_id, stage): ...
+
+    Anything but ``True`` means the agent is told the change is not confirmed, and is told not to
+    report it as done and not to repeat the call. An error in ``verify`` tells it the result is
+    unknown, with the same two instructions. Either way the tool's own result is withheld, a line
+    is printed, and ``agentx status`` counts it. It runs in this process with your credentials,
+    needs no key, and acts while watching too, because you asked for it on this tool and the call
+    has already run. It does not run when the call was stopped or when the tool raised. A tool
+    with a strict return type raises ``AgentXUnconfirmedError`` instead of returning the message.
+
+    ``returns_sensitive=True`` marks the prose this tool returns as sensitive (text of 20
+    characters or more, more than one word), and
+    ``sends_out=True`` marks this tool as one that sends data out of the company. Both feed the
+    flow rule (see ``agentx_sdk.flow``): a sensitive value a protected tool returned, leaving
+    later in the same run through a call that sends data out. Without either flag the rule still
+    reads values by their shape and field name, and calls by their destination and name.
 
     ``posture`` is the per-tool override (audit | enforce): a surgical exception to the
     global env switch. Leave it unset to inherit the global, whose default follows the rung:
@@ -9530,6 +9931,17 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
     `enforcement="enforce"`. The same principle already governs an unrecognised value, which
     falls back to enforce rather than downgrading in silence.
     """
+    # Written with no parentheses, Python hands the tool itself in as agent_id, and the name then
+    # would hold the inner decorator: calling the tool would return a function, run nothing,
+    # record nothing and raise nothing. Refused here, where the line is.
+    if callable(agent_id):
+        tool_name = getattr(agent_id, "__name__", repr(agent_id))
+        raise TypeError(
+            f"@agentx_protect on '{tool_name}' needs an agent name, or the tool would never run. "
+            'Write @agentx_protect(agent_id="my_agent").')
+    if verify is not None and not callable(verify):
+        raise TypeError("verify= must be a function taking (args, result), so the check would "
+                        "never run. Got %r." % (type(verify).__name__,))
     if enforcement is not None:
         warnings.warn(
             "agentx_protect(enforcement=...) is deprecated; use posture=... instead. "
@@ -9552,6 +9964,18 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
         # Async tool functions (LangGraph / autogen / asyncio.gather swarms) get an
         # async wrapper; sync tools keep the original synchronous path unchanged.
         _is_async_tool = _returns_coroutine(func)
+        if verify is not None:
+            _named = _func_display_name(func)
+            # A coroutine nobody awaits is truthy, so on a sync tool it would never run.
+            if _returns_coroutine(verify) and not _is_async_tool:
+                raise TypeError(
+                    f"verify= on '{_named}' is async but the tool is not, so it could never be "
+                    "awaited. Make the tool async, or make verify= a plain function.")
+            # Calling a generator runs none of its body, so the read-back would come first.
+            if inspect.isgeneratorfunction(func) or inspect.isasyncgenfunction(func):
+                raise TypeError(
+                    f"verify= on '{_named}' cannot work: it is a generator, so nothing has "
+                    "happened yet when the call returns.")
         # The signature is fixed at decoration time — compute it ONCE and close over
         # it instead of re-running inspect.signature() on every call (hot path; #115
         # cleanup). Best-effort: an uninspectable callable falls back to None and
@@ -9709,15 +10133,10 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     safe_path=safe_path, instruction=instruction,
                 )
 
-                return_annotation = (
-                    _func_sig.return_annotation if _func_sig is not None
-                    else inspect.Signature.empty
-                )
-                # If the function is untyped or strictly expects a string, returning our
+                # If the function is untyped or a string fits what it returns, returning our
                 # AgentXBlock is safe (it IS a str). Do NOT return it for dict/Pydantic
                 # returns, or the framework will crash, so raise the structured exception.
-                safe_types = (inspect.Signature.empty, str, type(None))
-                if return_annotation in safe_types:
+                if _a_string_fits_the_return_type(func, _func_sig):
                     return AgentXBlock(
                         challenge_string,
                         policy=target_policy_name,
@@ -10201,7 +10620,9 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                               # Where the stopped call was headed: the denial evidence a
                               # reviewer asks for. Read by `audit`, never by a proposal.
                               dest_hosts=db_module._dest_hosts_value(
-                                  func_name, _destination_arguments(_func_sig, args, kwargs)))
+                                  func_name, _destination_arguments(_func_sig, args, kwargs)),
+                              dest_domains=db_module._dest_domains_value(
+                                  _destination_arguments(_func_sig, args, kwargs)))
 
                 # The fallback cases say so BEFORE the block line, so the console reads
                 # cause then effect: the gateway allowed it / was unreachable, and then
@@ -10233,7 +10654,10 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     trace_id=current_trace_id,
                     # The tool that tried, as `evaluate_intent` sends it: without it
                     # these rows read "Tool: not recorded" in the gateway's evidence.
-                    tool=func_name
+                    tool=func_name,
+                    # Who it was addressed to, domains only: the ledger row's reader.
+                    dest_domains=db_module.destination_domains(
+                        _destination_arguments(_func_sig, args, kwargs))
                 )
                 # 🔴 A KEYLESS RECEIPT NAMES THE CALL, NOT THE RULE. It was
                 # `local-check-<policy id>`, so every block under one rule carried one id
@@ -10389,6 +10813,23 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                         arguments=shield_args if reflect_err is None else None,
                         tool_name=func_name, agent_id=agent_id,
                         site_arguments=site_args)
+                    # The flow rule: a sensitive value an earlier protected tool returned,
+                    # leaving through this call. Decided here on every install, key or no key,
+                    # and BEFORE a match is handed to the gateway: the gateway never sees what a
+                    # tool returned, so its allow must not release this stop. It only ever adds
+                    # one. Read from every bound argument, the extractor path's included.
+                    # Its own try: a fault here is counted and the call goes on to the shield's
+                    # own verdict below, so it can never release a block the shield matched.
+                    flow_hit = None
+                    if reflect_err is None:
+                        try:
+                            flow_hit = _flow_rule_match(
+                                current_trace_id, func_name,
+                                shield_args if shield_args is not None else site_args, sends_out)
+                        except Exception as flow_err:   # noqa: BLE001 -- see above
+                            _record_shield_failopen(func_name, flow_err)
+                    if flow_hit:
+                        return _block_on_local_shield(flow_hit)
 
                     if (matched_policy and _keyed_shield_defers(enforcement_level)
                             and _gateway_can_judge(matched_policy)
@@ -10476,6 +10917,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # every swarm peer it spawns with zero code change. Unset => no pooling.
             resolved_pool_id = budget_pool_id or os.environ.get("AGENTX_BUDGET_POOL_ID") or None
 
+            # Bound once for both lists below (review: the bind ran twice per call).
+            _dest_args = _destination_arguments(_func_sig, args, kwargs)
             eval_res = _client.evaluate_intent(
                 agent_id=agent_id,
                 query=query,
@@ -10503,8 +10946,17 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # The sites this door records for the call, so the gateway records the
                 # same ones instead of rebuilding them from the flattened `query`. The same
                 # reader, on the same arguments, as every ledger row's `dest_hosts`.
-                dest_hosts=db_module.destination_hosts(
-                    func_name, _destination_arguments(_func_sig, args, kwargs)),
+                dest_hosts=db_module.destination_hosts(func_name, _dest_args),
+                # The domains of the email addresses it is addressed to, never the address: the
+                # same reader as every ledger row's `dest_domains`.
+                dest_domains=db_module.destination_domains(_dest_args),
+                # The arguments as the code made them, defaults included: the gateway matches a
+                # rule's words, threshold and number on these, and reads the money from them.
+                rule_args=_rule_args_for_gateway(func_name, _func_sig, args, kwargs,
+                                                 bound=_dest_args),
+                # Where this deployment runs (AGENTX_ENVIRONMENT), for a team rule's number per
+                # environment. From the process, never from the tool's arguments.
+                environment=_call_environment(),
                 session_tokens=session_tokens_total,
                 session_cost_usd=session_cost_total,
                 budget_pool_id=resolved_pool_id,
@@ -10517,6 +10969,8 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # A gateway still reads the field from older SDKs, for which it is still true.
                 shield_matched=None,
             )
+            if isinstance(eval_res, dict) and eval_res.get("reason") == "no_api_key":
+                _say_number_rule_needs_a_gateway(func_name)
             # Every text field below reaches the terminal, the ledger or the model, and all of
             # them come from whatever answers at gateway_url. Cleaned once, here, before any
             # reader sees them; see `_clean_verdict_text`.
@@ -10842,7 +11296,9 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                               challenge_issued=_delivered_coaching(
                                   challenge_text, _gateway_safe_path),
                               dest_hosts=db_module._dest_hosts_value(
-                                  func_name, _destination_arguments(_func_sig, args, kwargs)))
+                                  func_name, _destination_arguments(_func_sig, args, kwargs)),
+                              dest_domains=db_module._dest_domains_value(
+                                  _destination_arguments(_func_sig, args, kwargs)))
 
                 print(f"🛑 [AgentX SDK] Stopped '{func_name}': {policy_name} (your gateway).")
                 
@@ -11264,6 +11720,94 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 return _scrub_pii(result, decision.scrub_targets)
             return result
 
+        def _unconfirmed(args, kwargs, reason, why=None):
+            """The tool ran and `verify=` did not confirm it: say so to the person, write the row,
+            hand the agent the message. Raises for a tool whose strict return type a string would
+            break, as a block does. `why` is for the person only: it can quote the developer's own
+            error, so it reaches neither the model nor the ledger."""
+            if reason == _UNCONFIRMED_COULD_NOT_CHECK:
+                print(f"⚠️  [AgentX SDK] '{_func_name}' ran, but its verify= check could not run: "
+                      f"{why}. The caller was told the result is unknown.", file=sys.stderr)
+            else:
+                # "The caller", not "the agent": as often, the code itself calls the function.
+                print(f"⚠️  [AgentX SDK] '{_func_name}' ran, but reading it back did not show the "
+                      f"change{f' ({why})' if why else ''}. The caller was told it is not "
+                      "confirmed.", file=sys.stderr)
+            try:
+                shape = _call_shape(_func_name, _bound_arguments(_func_sig, args, kwargs))
+                log_intercept(trace_id_var.get(), agent_id, _func_name, None,
+                              _UNCONFIRMED_ROW_WORDS[reason], db_module.UNCONFIRMED_STATUS,
+                              arg_names=shape[0], amount=shape[1], target_class=shape[2],
+                              quantity=shape[3], posture=_resolve_enforcement(enforcement))
+            except Exception:
+                pass  # a ledger problem is never a tool problem
+            message = _unconfirmed_message(_func_name, reason)
+            if _a_string_fits_the_return_type(func, _func_sig):
+                return AgentXUnconfirmed(message, tool=_func_name, reason=reason)
+            raise AgentXUnconfirmedError(message, tool=_func_name, reason=reason)
+
+        def _verify_answer(answer, args, kwargs):
+            """Only exactly True confirms. A forgotten `return` is None, and a record returned
+            instead of a comparison is truthy either way, so neither may read as confirmed."""
+            if answer is True:
+                return None
+            if answer is False:
+                return _unconfirmed(args, kwargs, _UNCONFIRMED_NOT_CONFIRMED)
+            # A type name and never the value: the value may be the customer's record. None is the
+            # one a person meets (a forgotten `return`), and it has a name of its own.
+            got = "None" if answer is None else type(answer).__name__
+            return _unconfirmed(args, kwargs, _UNCONFIRMED_NOT_CONFIRMED,
+                                f"verify= returned {got}, not True or False")
+
+        def _verify_error(exc):
+            return _sanitize_detail(f"{type(exc).__name__}: {exc}") or type(exc).__name__
+
+        def _refuse_a_lazy_result(result):
+            """A plain function can hand back a coroutine or a generator, past the checks at
+            decoration when it wraps one. Its work may not have happened, so a read-back now may come
+            first and "it ran" may be false. Without `verify=` the caller would have run it, so this
+            says so on the first call instead of dropping the work in silence."""
+            if verify is None:
+                return
+            if inspect.iscoroutine(result) or inspect.isgenerator(result):
+                result.close()
+            elif not inspect.isasyncgen(result):
+                return
+            raise TypeError(
+                f"verify= on '{_func_name}' cannot work: it returned a {type(result).__name__}, so "
+                "verify= cannot tell whether the work is done. Have the tool finish its work and "
+                "return the result.")
+
+        def _read_back(args, kwargs, result):
+            """Run `verify=` after a sync tool. None means carry on with the tool's result."""
+            if verify is None:
+                return None
+            _refuse_a_lazy_result(result)
+            try:
+                answer = verify(_verify_arguments(_func_sig, args, kwargs), result)
+            except Exception as exc:
+                return _unconfirmed(args, kwargs, _UNCONFIRMED_COULD_NOT_CHECK, _verify_error(exc))
+            if inspect.isawaitable(answer):
+                # A lambda around an async call gets past the check at decoration.
+                if inspect.iscoroutine(answer):
+                    answer.close()
+                return _unconfirmed(args, kwargs, _UNCONFIRMED_COULD_NOT_CHECK,
+                                    "it returned something to await, on a tool that is not async")
+            return _verify_answer(answer, args, kwargs)
+
+        async def _read_back_async(args, kwargs, result):
+            """The same after an async tool, where `verify=` may be async too."""
+            if verify is None:
+                return None
+            _refuse_a_lazy_result(result)
+            try:
+                answer = verify(_verify_arguments(_func_sig, args, kwargs), result)
+                if inspect.isawaitable(answer):
+                    answer = await answer
+            except Exception as exc:
+                return _unconfirmed(args, kwargs, _UNCONFIRMED_COULD_NOT_CHECK, _verify_error(exc))
+            return _verify_answer(answer, args, kwargs)
+
         def _record_not_run(args, kwargs, call_state):
             """Write the ledger row for a call that ended WITHOUT RUNNING at an exit that marked
             it (`_mark_not_run`): HELD, REFUSED or HALTED (a loop breaker; its own word, never
@@ -11292,7 +11836,9 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                               arg_names=shape[0], amount=shape[1], target_class=shape[2],
                               quantity=shape[3], posture="enforce",
                               dest_hosts=db_module._dest_hosts_value(
-                                  _func_name, _destination_arguments(_func_sig, args, kwargs)))
+                                  _func_name, _destination_arguments(_func_sig, args, kwargs)),
+                              dest_domains=db_module._dest_domains_value(
+                                  _destination_arguments(_func_sig, args, kwargs)))
             except Exception:
                 pass
 
@@ -11378,7 +11924,16 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             terminal verdict straight back."""
             if isinstance(decision, _ExecuteTool):
                 _remember_copy_on_run(call_state)
-                return _apply_scrub(func(*args, **kwargs), decision)
+                # Before the scrub: `verify=` compares the tool's real result. When it does not
+                # confirm, that result never reaches the agent, so there is nothing to scrub or
+                # to remember.
+                raw = func(*args, **kwargs)
+                unconfirmed = _read_back(args, kwargs, raw)
+                if unconfirmed is not None:
+                    return unconfirmed
+                result = _apply_scrub(raw, decision)
+                _remember_flow_values(_func_name, result, returns_sensitive)
+                return result
             return decision
 
         if _is_async_tool:
@@ -11409,7 +11964,15 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 )
                 if isinstance(decision, _ExecuteTool):
                     _remember_copy_on_run(call_state)
-                    return _apply_scrub(await func(*args, **kwargs), decision)
+                    raw = await func(*args, **kwargs)
+                    unconfirmed = await _read_back_async(args, kwargs, raw)
+                    if unconfirmed is not None:
+                        return unconfirmed
+                    result = _apply_scrub(raw, decision)
+                    # Remembered after the scrub: a value the scrub redacted never reached
+                    # the agent, so it cannot leave through it.
+                    _remember_flow_values(_func_name, result, returns_sensitive)
+                    return result
                 return decision
             return async_wrapper
 

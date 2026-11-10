@@ -563,8 +563,17 @@ def decide(event, posture=None, harness="claude"):
         shell = tool_key in SCREENED_SHELL_TOOLS
         rules, gateway_lines = _team_rules_here(project, rules_path)
         once.extend(gateway_lines)
+        # A rule with a number reads the call's own arguments, and the environment this
+        # session's process names (AGENTX_ENVIRONMENT). A value that is set and refused is said
+        # once, as both SDKs say it (review: the hook dropped it in silence).
+        _env_raw = os.environ.get("AGENTX_ENVIRONMENT", "")
+        if _env_raw and team_rules.environment_here() is None:
+            once.append(("agentx-environment", "AgentX: AGENTX_ENVIRONMENT=%r is not used: use "
+                         "a short lower-case name such as prod or dev. A team rule with a "
+                         "number per environment uses its lowest until then." % _env_raw[:40]))
         team = (_rule_change_rule(query) if shell else None) or \
-            team_rules.match_rules(tool_key, query, rules)
+            team_rules.match_rules(tool_key, query, rules, arguments=arguments,
+                                   environment=team_rules.environment_here())
         if (team is not None and not team.get("builtin") and not team.get(team_rules.FROM_GATEWAY)
                 and _hosted_key() and _held_on_gateway_as_here(team, rules_path)):
             # The file holds the gateway's rule word for word (after `agentx rule pull`, or a
@@ -918,7 +927,8 @@ def _record(event, project, posture, tool_key, arguments, decision, challenge, r
                          arg_names=names,
                          amount=amount, target_class=target_class, quantity=quantity,
                          dest_hosts=db._dest_hosts_value(tool_key, arguments), row_cap=row_cap,
-                         reversibility=reversibility)
+                         reversibility=reversibility,
+                         dest_domains=db._dest_domains_value(arguments))
     elif decision is None:
         matched = uncompared = None
         try:
@@ -940,6 +950,7 @@ def _record(event, project, posture, tool_key, arguments, decision, challenge, r
         names, amount, target_class, quantity = db._call_shape(tool_key, arguments)
         shape = dict(arg_names=names, amount=amount, target_class=target_class,
                      quantity=quantity, dest_hosts=db._dest_hosts_value(tool_key, arguments),
+                     dest_domains=db._dest_domains_value(arguments),
                      row_cap=row_cap, reversibility=reversibility)
         if posture == "audit":
             db.log_intercept(trace, agent_id, tool_key, decision.get("policy_id"),

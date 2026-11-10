@@ -415,10 +415,39 @@ def _server_event_where():
             % (SERVER_EVENT_STATUS, MCP_PROXY_AGENT_ID, pins))
 
 
+# The status of a second row for a call that already has one: the tool ran, then its `verify=`
+# did not confirm the change. Not a call, or every count of calls would see one call twice, and
+# not a block, because nothing was stopped. `policy_name` says which of the two it was.
+UNCONFIRMED_STATUS = "UNCONFIRMED"
+
+
+def _not_a_call_where():
+    """The rows that are not a call the agent made."""
+    return "(%s OR status IS '%s')" % (_server_event_where(), UNCONFIRMED_STATUS)
+
+
 def _calls_subquery():
     """`FROM <the ledger's calls>`, aliased back to `event_log` so the query around it reads the
     same."""
-    return ("FROM (SELECT * FROM event_log WHERE NOT %s) AS event_log" % _server_event_where())
+    return ("FROM (SELECT * FROM event_log WHERE NOT %s) AS event_log" % _not_a_call_where())
+
+
+def get_unconfirmed_calls(path=None):
+    """Calls that ran and that their `verify=` did not confirm. Never raises.
+
+    ``{"total": int, "tools": [(tool, count), ...]}``, busiest tool first."""
+    empty = {"total": 0, "tools": []}
+    if not os.path.exists(path or DB_PATH):
+        return empty
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(
+                "SELECT tool_name, COUNT(*) FROM event_log WHERE status IS ? "
+                "AND tool_name IS NOT NULL GROUP BY tool_name ORDER BY COUNT(*) DESC, tool_name",
+                (UNCONFIRMED_STATUS,)).fetchall()
+    except Exception:
+        return empty
+    return {"total": sum(n for _tool, n in rows), "tools": [(tool, n) for tool, n in rows]}
 
 
 # What each kind of server event is, in the words every screen and the evidence file use.
@@ -907,6 +936,19 @@ _EVENT_LOG_COLUMNS = [
     # URL. It exists so `agentx audit` can say which sites an agent reaches and `agentx review`
     # can propose an allowlist from them. Appended at the END, same reason as every column above.
     ("dest_hosts",           "TEXT"),
+    # --- WHO AN EMAIL WAS ADDRESSED TO: THE DOMAIN ONLY ------------------------------------
+    #
+    # The second column derived from an argument value, by the same kind of decision: the DOMAIN
+    # of each email address in a recipient argument (`to`, `cc`, `bcc`, any name with
+    # `recipient`, at any depth: `message={"to": ...}`), never the address. A call addressed by
+    # email names no URL, so `dest_hosts` alone said nothing about where a sent email went.
+    # A domain can still say which company was emailed; that is the accepted cost.
+    #
+    # Its OWN column, not more hosts in `dest_hosts`: that column proposes the sites an agent may
+    # REACH (`agentx review`, the allowlist), and a domain an agent emailed is not a site it may
+    # fetch. Comma-joined, sorted, distinct, at most `_MAX_DEST_HOSTS`; NULL when the call names
+    # no recipient. `_dest_domains_value` is the only writer's reader. Appended at the END.
+    ("dest_domains",         "TEXT"),
 ]
 
 # The statuses a ledger row can carry that a person can be asked about: we had an opinion,
@@ -1966,6 +2008,27 @@ def _dest_hosts_value(tool_name, arguments, declared=None):
     return ",".join(destination_hosts(tool_name, arguments, declared)) or None
 
 
+def destination_domains(arguments):
+    """The distinct, sorted domains of the email addresses this call is addressed to, as
+    `clean_host` reads them, at most `_MAX_DEST_HOSTS`. Never the address. [] when the call names
+    no recipient or the arguments could not be read, and the decorator sends that to the gateway
+    as is, as it does `destination_hosts`. Pure; never raises."""
+    if not isinstance(arguments, dict):
+        return []
+    try:
+        from .flow import recipient_domains   # local: flow is pure, but keep db's imports light
+        domains = {d for d in (clean_host(r) for r in recipient_domains(arguments, _MAX_DEST_HOSTS))
+                   if d}
+    except Exception:
+        return []
+    return sorted(domains)[:_MAX_DEST_HOSTS]
+
+
+def _dest_domains_value(arguments):
+    """The `dest_domains` column value for one call: comma-joined, or None."""
+    return ",".join(destination_domains(arguments)) or None
+
+
 # The calls that REACHED their destination: they ran. A CHALLENGED row was stopped before it
 # left, so its host is evidence of a denial and must never be proposed as somewhere the agent
 # is allowed to go.
@@ -2199,10 +2262,11 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
             # get_ledger_census's `interceptions`". That is the rule -- and applying it to the
             # census and not here is what left it half-done.
             #
-            # Nor is what a server did to a tool: a trimmed server event is not an older block
-            # record dropped (it is still a row, so the trim itself takes it like any other).
+            # Nor is what a server did to a tool, or a call its `verify=` did not confirm: a
+            # trimmed one is not an older block record dropped (it is still a row, so the trim
+            # itself takes it like any other).
             _catch_sql, _catch_params = _had_an_opinion_clause()
-            _catch_sql = "(%s AND NOT %s)" % (_catch_sql, _server_event_where())
+            _catch_sql = "(%s AND NOT %s)" % (_catch_sql, _not_a_call_where())
             blocks = 0
 
             # Capture the oldest timestamp we are about to destroy BEFORE destroying it --
@@ -5196,15 +5260,19 @@ def record_call(trace_id, agent_id, tool_name, arguments=None, stats=None, stats
                   reversibility=(reversibility or REVERSIBILITY_UNKNOWN),
                   dest_hosts=_dest_hosts_value(
                       tool_name, arguments if dest_arguments is None else dest_arguments,
-                      declared_args))
+                      declared_args),
+                  dest_domains=_dest_domains_value(
+                      arguments if dest_arguments is None else dest_arguments))
 
 
 def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status, tokens=None, time_saved=None,
                   arg_names=None, amount=0.0, target_class=None, challenge_issued=None,
                   quantity=0.0, posture=None, rule_uncompared=None, row_cap=None,
-                  reversibility=None, dest_hosts=None):
+                  reversibility=None, dest_hosts=None, dest_domains=None):
     # `dest_hosts`: ALREADY reduced to hosts by `_dest_hosts_value`, same contract as the
     # shape parameters below. Never pass a URL or an argument value here.
+    # `dest_domains`: ALREADY reduced to recipient domains by `_dest_domains_value`. Never an
+    # email address.
     # `rule_uncompared`: the id of an adopted rule whose shape this call had and whose
     # `only_when` threshold could not be compared (see the column's comment). Our own string.
     # 🔴 CONTRACT: `arg_names`/`amount`/`target_class`/`quantity` MUST ALREADY BE REDUCED, via
@@ -5320,7 +5388,8 @@ def log_intercept(trace_id, agent_id, tool_name, policy_id, policy_name, status,
                     # `_marks` and nowhere else. The shape-only rung (no marks) keeps the
                     # shape on a ledger that predates every mark column; the legacy insert
                     # below the loop is the last resort, and its error still propagates.
-                    _marks = (("dest_hosts", dest_hosts), ("reversibility", reversibility),
+                    _marks = (("dest_domains", dest_domains), ("dest_hosts", dest_hosts),
+                              ("reversibility", reversibility),
                               ("row_cap", row_cap), ("rule_uncompared", rule_uncompared))
                     _shape_cols = ("arg_names", "amount", "target_class", "challenge_issued",
                                    "quantity", "posture")

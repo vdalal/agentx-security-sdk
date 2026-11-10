@@ -44,6 +44,7 @@ never start doing so, because it is read by tooling whose whole job is to descri
 touching it -- a report generator that wrote a ledger into a customer's repo as a side effect of
 describing itself is a defect this project has already had once.
 """
+import decimal
 import json
 import re
 from urllib.parse import unquote
@@ -100,18 +101,56 @@ _STATEMENT_ARG_NAMES = frozenset((
 ))
 
 
+_DECIMAL_WALK_DEPTH = 32
+
+
+def _decimals_as_text(value, done=None, depth=0):
+    """`value` with every `Decimal` under a dict, list or tuple as its text. A value holding none
+    comes back as the same object, so an ordinary call's wire is untouched. Each container is walked
+    once, so a graph of shared or looping references costs its size and not its paths. One inside
+    itself stays as it is, and the encoder then refuses it, as it always did."""
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    if not isinstance(value, (dict, list, tuple)) or depth >= _DECIMAL_WALK_DEPTH:
+        return value
+    done = {} if done is None else done
+    if id(value) in done:
+        return done[id(value)]
+    done[id(value)] = value
+    if isinstance(value, dict):
+        out = {k: _decimals_as_text(v, done, depth + 1) for k, v in value.items()}
+        changed = any(out[k] is not value[k] for k in out)
+    else:
+        out = [_decimals_as_text(v, done, depth + 1) for v in value]
+        changed = any(a is not b for a, b in zip(out, value))
+    done[id(value)] = out if changed else value
+    return done[id(value)]
+
+
 def _wire_value(value):
     """ONE argument value in the shape the gateway is sent: a tuple, set or frozenset becomes a
-    list (a set sorted by `repr`, so two calls with the same set send the same text), anything
-    else as it is. Used by the flattened text below AND the decorator's `args`, so the gateway's
-    "is `query` exactly these arguments?" comparison sees the same value on both sides.
+    list (a set sorted by `repr`, so two calls with the same set send the same text), a `Decimal`
+    becomes its text, alone or under a dict, list or tuple (not in a set: no floor reads one), and
+    anything else stays as it is. Used by the flattened text below AND the
+    decorator's `args`, so the gateway's "is `query` exactly these arguments?" comparison sees the
+    same value on both sides.
 
     A tuple or set used to reach the gateway not at all: this function returned None for it, so
-    `crawl(urls=("https://x/",))` sent only a placeholder and no gateway check saw the address."""
-    if isinstance(value, tuple):
-        return list(value)
+    `crawl(urls=("https://x/",))` sent only a placeholder and no gateway check saw the address.
+
+    A `Decimal` is how Python holds money, and JSON cannot encode one, so it was dropped from both
+    `args` and the text: `refund(amount=Decimal("250000"), currency="usd")` read as 0 on the
+    gateway's transfer floor and ran where the int form is held. As text the floor reads it (the
+    `str` of 2.5E+5 reads 250000). Text, and never `float`, which would change the amount. Never
+    raises: an argument this cannot read goes on as it was, for the encoder to accept or drop."""
     if isinstance(value, (set, frozenset)):
         return sorted(value, key=repr)
+    try:
+        value = _decimals_as_text(value)
+    except Exception:
+        return list(value) if isinstance(value, tuple) else value
+    if isinstance(value, tuple):
+        return list(value)
     return value
 
 
@@ -167,8 +206,9 @@ def _statement_parts(arguments, tool_name=None, head=None, declared=None):
     tokens (`run_sql`, `execute_query`, `shell_exec`) and declares no argument by name has
     declared all of its string arguments (`run_sql(q=..., db=...)` reads both).
 
-    Pure; never raises on any argument shape (a value whose json and str both raise is
-    skipped, as `_coerce_arg_value`'s callers already do)."""
+    Pure. A value whose json and str both raise is skipped, as `_coerce_arg_value`'s callers
+    already do. A dict inside itself, a value too deep to walk, or a mapping that raises when read
+    raises: the tool does not run, and the call is never checked half read."""
     parts = []
     if head:
         parts.append(str(head))

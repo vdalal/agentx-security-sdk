@@ -521,12 +521,21 @@ def _ledger(db_path, verdicts):
         select = ("SELECT id, timestamp, agent_id, tool_name, policy_name, status, posture, %s "
                   "FROM event_log WHERE %s ORDER BY timestamp DESC, id DESC LIMIT ?")
         params = tuple(opinion_params) + (STOPPED_LIMIT,)
-        try:
-            rows = conn.execute(select % ("dest_hosts", opinion_sql), params).fetchall()
-            sites_column = True
-        except sqlite3.OperationalError:
-            rows = conn.execute(select % ("NULL", opinion_sql), params).fetchall()
-            sites_column = False
+        # Newest column first, each older record falling back one step: a record with sites and
+        # no recipient domains still lists its sites.
+        sites_column = domains_column = False
+        rows = None
+        for cols, has_sites, has_domains in (("dest_hosts, dest_domains", True, True),
+                                             ("dest_hosts, NULL", True, False),
+                                             ("NULL, NULL", False, False)):
+            try:
+                rows = conn.execute(select % (cols, opinion_sql), params).fetchall()
+                sites_column, domains_column = has_sites, has_domains
+                break
+            except sqlite3.OperationalError:
+                continue
+        if rows is None:
+            raise sqlite3.OperationalError("event_log could not be read")
     except sqlite3.Error:
         conn.close()
         return None, None, False, False
@@ -552,8 +561,14 @@ def _ledger(db_path, verdicts):
                 # Masking can make two hosts read the same: listed once.
                 "sites": (sorted({evidence_host(h) for h in (hosts or "").split(",") if h})
                           if sites_column else None),
+                # The domains of the email addresses the call was addressed to, never the
+                # address; null on a record older than the column. The gateway's file lists
+                # them too, as the SDK sent them.
+                "recipient_domains": (
+                    sorted({evidence_host(d) for d in (domains or "").split(",") if d})
+                    if domains_column else None),
                 "ledger_id": rid, "receipt_id": None}
-               for rid, ts, agent, tool, rule, status, posture, hosts in rows]
+               for rid, ts, agent, tool, rule, status, posture, hosts, domains in rows]
     return stopped, _iso(sites_oldest) if sites_oldest is not None else None, \
         bool(sites_undated), True
 
@@ -695,18 +710,161 @@ def build(db_path=None):
     }
 
 
-def main(args=None):
-    """`agentx evidence` writes the file (`--out FILE`, else agentx-evidence-<day>.json here) and
-    says what is in it; `--json` prints the document on stdout for a program instead. Only
-    `--json` writes to stdout, because the CLI's banner moves to stderr on `--json` alone: a
-    document printed without it reached a pipe with the banner above it and did not parse."""
-    args = list(args or [])
-    doc = build()
-    text = json.dumps(doc, indent=2, ensure_ascii=False)
+_GATEWAY_USAGE = (
+    "Usage:\n"
+    "  agentx evidence            this machine's record, in a dated file\n"
+    "  agentx evidence --gateway  the file your gateway builds, for a reviewer\n"
+    "\n"
+    "  Either one takes:\n"
+    "    --out FILE               written to FILE\n"
+    "    --json                   printed, for a program\n"
+    "\n"
+    "  agentx evidence --gateway --head <value>\n"
+    "                             checks the record was not rewritten since a\n"
+    "                             file was made")
+
+
+def _escape_c1(text):
     # C1 control characters (U+0080-U+009F) are not escaped by json.dumps, and a server-chosen
     # tool name can carry one: written raw, `cat` of the file would run it as a terminal code.
     # They can only sit inside strings, where \u escapes are valid JSON.
-    text = re.sub(r"[\x80-\x9f]", lambda m: "\\u%04x" % ord(m.group()), text)
+    return re.sub(r"[\x80-\x9f]", lambda m: "\\u%04x" % ord(m.group()), text)
+
+
+def _value_after(args, flag):
+    """The value after `flag`; None when it is last, empty or followed by another flag. Empty is
+    missing: `--head "$SAVED"` with nothing saved wrote the file and exited 0, which a script reads
+    as "still matches" (review); the TypeScript command refuses it the same way."""
+    i = args.index(flag)
+    value = args[i + 1] if i + 1 < len(args) else None
+    return None if not value or value.startswith("--") else value
+
+
+def _from_gateway(args, gateway_url, api_key, admin_key=None, admin_refusal=None):
+    """`agentx evidence --gateway`: the file the gateway builds, notes and all (GET
+    /v1/evidence?file=1), written as it came. The TypeScript SDK's `evidence` command and the
+    website's download fetch the same file. `--head <value>` checks a value saved from an earlier
+    file against the record now and writes nothing: 0 when it still matches, 1 otherwise."""
+    import requests
+    from .decorators import _sanitize_detail
+    as_json = "--json" in args
+    say = (lambda s: print(s, file=sys.stderr)) if as_json else print
+    modes = [f for f in ("--out", "--json", "--head") if f in args]
+    out = _value_after(args, "--out") if "--out" in args else ""
+    head = _value_after(args, "--head") if "--head" in args else ""
+    takes_value = {"--out", "--head"}
+    stray = [a for i, a in enumerate(args)
+             if (a.startswith("-") and a not in takes_value | {"--json", "--gateway"})
+             or (not a.startswith("-") and (i == 0 or args[i - 1] not in takes_value))]
+    if len(modes) > 1 or out is None or head is None or stray:
+        print(_GATEWAY_USAGE, file=sys.stderr)
+        return 2
+    # Reading the evidence takes either key; the admin key is never needed for it.
+    key = api_key or admin_key
+    # Marked as the TypeScript `evidence` and both SDKs' `holds` mark them: an error leads with ❌,
+    # a missing key with ⚠️ (founder's walk: the two SDKs' error lines differed).
+    if not key and admin_refusal:
+        say("❌ Nothing was sent. %s" % admin_refusal)
+        return 1
+    if not key:
+        say("⚠️  No AGENTX_API_KEY, so there is no gateway to ask: the evidence file is built from your "
+            "gateway's record of calls. For this machine's record: agentx evidence")
+        return 1
+    params = {"file": "1", **({"head": head} if head else {})}
+    try:
+        res = requests.get("%s/v1/evidence" % gateway_url.rstrip("/"), params=params,
+                           headers={"Authorization": "Bearer %s" % key}, timeout=30.0)
+    except Exception:
+        # Never the exception's text: it can name the address with a token in it.
+        say("❌ Could not reach your gateway at %s." % _sanitize_detail(gateway_url, limit=200))
+        return 1
+    if res.status_code in (401, 403):
+        say("❌ Your gateway did not accept this key (%d)." % res.status_code)
+        return 1
+    try:
+        doc = res.json()
+    except ValueError:
+        doc = None
+    if res.status_code != 200 or not isinstance(doc, dict):
+        detail = doc.get("detail") if isinstance(doc, dict) else None
+        say("❌ Your gateway could not produce the evidence (%d): %s"
+            % (res.status_code, _sanitize_detail(str(detail or res.text))))
+        return 1
+    if doc.get("schema") != SCHEMA:
+        # An older gateway answers with the data alone; writing that would hand a reviewer a
+        # file with none of its notes.
+        say("❌ Your gateway does not build the evidence file yet. Update it to its latest version.")
+        return 1
+    if head:
+        said = doc.get("record_head_check_note") or "Your gateway did not say."
+        say(_sanitize_detail(str(said), limit=300))
+        check = doc.get("record_head_check")
+        return 0 if isinstance(check, dict) and check.get("result") == "matches" else 1
+    text = _escape_c1(json.dumps(doc, indent=2, ensure_ascii=False))
+    if as_json:
+        print(text)
+        return 0
+    out_path = out or "agentx-evidence-%s.json" % datetime.now().strftime("%Y-%m-%d")
+    try:
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(text + "\n")
+    except OSError as exc:
+        # Exit 2, as the local `agentx evidence` exits on a write it could not make.
+        say("❌ Could not write %s (%s)." % (out_path, exc.strerror or exc))
+        return 2
+
+    def _count(field):
+        return len(doc[field]) if isinstance(doc.get(field), list) else None
+
+    stopped, watched = _count("stopped_or_held_calls"), _count("ran_while_watching")
+    calls = ("the stopped calls could not be read" if stopped is None else
+             "%d stopped or held call%s listed" % (stopped, "" if stopped == 1 else "s"))
+    if watched:
+        calls += ", %d call%s that ran while watching" % (watched, "" if watched == 1 else "s")
+    rules = _count("rules_in_force") or 0
+    # "off", not "switched off": a gateway rule is also off when no limit is set for it, which
+    # nobody switched (its `why` in the file says which). The TypeScript command prints the same.
+    print("Wrote %s: %d rule%s in force, %d off, %s."
+          % (out_path, rules, "" if rules == 1 else "s", _count("rules_off") or 0, calls))
+    if doc.get("record_head"):
+        print("Record's latest entry: %s" % _sanitize_detail(str(doc["record_head"]), limit=200))
+        print("To check later that the record was not rewritten: agentx evidence --gateway "
+              "--head <that value>")
+    if doc.get("before_you_share"):
+        # Cleaned like every other server string on this screen: the file's copy is JSON-escaped,
+        # the terminal's is not (review).
+        print(_sanitize_detail(str(doc["before_you_share"]), limit=400))
+    return 0
+
+
+def main(args=None, gateway_url=None, api_key="", admin_key=None, admin_refusal=None):
+    """`agentx evidence` writes the file (`--out FILE`, else agentx-evidence-<day>.json here) and
+    says what is in it; `--json` prints the document on stdout for a program instead. Only
+    `--json` writes to stdout, because the CLI's banner moves to stderr on `--json` alone: a
+    document printed without it reached a pipe with the banner above it and did not parse.
+
+    `--gateway` writes the file your gateway builds instead (`_from_gateway`)."""
+    args = list(args or [])
+    if "--gateway" in args:
+        from .envfile import DEFAULT_GATEWAY_URL     # the one spelling of the default
+        return _from_gateway(args, gateway_url or DEFAULT_GATEWAY_URL, api_key,
+                             admin_key, admin_refusal)
+    if "--head" in args:
+        # A check of the gateway's record, never a file written over a flag this path ignores.
+        print("agentx evidence: --head checks your gateway's record, so add --gateway. For this "
+              "machine's record: agentx audit --record --head <value>", file=sys.stderr)
+        return 2
+    # Before anything is built or written: this path read only the flags it knew, so `--help`, or a
+    # typo of `--json`, wrote the file. To stderr and non-zero, as `--gateway` and TypeScript do, so
+    # `--json` keeps stdout a document even when the command line is wrong.
+    stray = [a for i, a in enumerate(args)
+             if (a.startswith("-") and a not in ("--out", "--json"))
+             or (not a.startswith("-") and (i == 0 or args[i - 1] != "--out"))]
+    if stray:
+        print(_GATEWAY_USAGE, file=sys.stderr)
+        return 2
+    doc = build()
+    text = _escape_c1(json.dumps(doc, indent=2, ensure_ascii=False))
     if "--json" in args:
         print(text)
         return 0

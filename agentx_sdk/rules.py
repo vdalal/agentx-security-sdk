@@ -439,6 +439,12 @@ def harvest_rule_candidates_from_calls(db_path=None, limit=5):
             # name the rule from the same facts instead of re-parsing the sentence.
             "arg_names": names,
             "count": int(count or 0),
+            # Built from calls the record holds, so `target_action` IS a tool name a call
+            # carries and the proposal covers every call to it. A judge's proposal names an
+            # action label and a narrower class of call; `agentx review` offers a team rule on
+            # the tool only for these. `adopt_rule` copies named fields, so this never reaches
+            # the rules file.
+            "from_calls": True,
         })
         if len(candidates) >= int(limit):
             break
@@ -613,7 +619,11 @@ def _write_rules_file(p, rules):
     parent = os.path.dirname(p)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    doc = {"version": _RULES_FILE_VERSION,
+    # What the file is, said in the file (it is committed): readers look only at `rules`.
+    doc = {"about": ("Detection rules you adopted in AgentX (https://agentx-core.com/docs), with "
+                     "agentx adopt or agentx review."),
+           "schema": "agentx.rules/%d" % _RULES_FILE_VERSION,
+           "version": _RULES_FILE_VERSION,
            "rules": sorted(rules, key=lambda r: str(r.get("id")))}
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
@@ -790,13 +800,30 @@ def _load_rules_for_writing(path=None):
 
 
 def _existing_rule_actions(path=None):
-    """`target_action` values the developer ADOPTED, so we never propose a rule for something
-    they have already ruled on. Never raises; an unreadable or absent file suppresses nothing.
-    Switched-off rules count: the developer ruled on that tool, whichever way the switch sits."""
+    """`target_action` values the developer ADOPTED, and the tools an active team rule holds
+    EVERY call to, so we never propose a rule for something they have already ruled on:
+    `agentx review` adds either kind for a proposal, and one answered with a team rule must not
+    come back on every later run. Never raises; an unreadable or absent file suppresses nothing.
+    Switched-off adopted rules count: the developer ruled on that tool, whichever way the switch
+    sits.
+
+    A team rule counts only when it is on, names that one tool, and matches every call to it
+    (its one phrase is the tool's name, as `agentx review` writes it). A narrowed rule ("only
+    calls containing prod") or a switched-off one leaves the other calls unruled, and hiding the
+    proposal then would be a decision carried by an absence: `insights` and `audit` do not name
+    team rules, so the proposal would simply vanish there."""
     try:
-        return {r.get("target_action") for r in _load_rules(path) if r.get("target_action")}
+        ruled = {r.get("target_action") for r in _load_rules(path) if r.get("target_action")}
     except Exception:
-        return set()
+        ruled = set()
+    try:
+        from . import team_rules
+        for r in team_rules.read_team_rules():
+            if r.get("active", True) and team_rules.every_call(r):
+                ruled.add(r["tools"][0])
+    except Exception:
+        pass
+    return ruled
 
 
 def adopted_rules(path=None):
@@ -1490,7 +1517,13 @@ def _write_allowlist_doc(p, agents):
         if e.get("tools") is not None:
             entry["tools"] = sorted(set(e["tools"]))
         out[a] = entry
-    doc = {"version": _ALLOWLIST_FILE_VERSION_TOOLS if needs_v2 else _ALLOWLIST_FILE_VERSION,
+    version = _ALLOWLIST_FILE_VERSION_TOOLS if needs_v2 else _ALLOWLIST_FILE_VERSION
+    # What the file is, said in the file (it is committed): readers look only at `agents`.
+    doc = {"about": ("The tools and sites each agent may use, as AgentX checks them "
+                     "(https://agentx-core.com/docs). agentx allowlist push sends this file to "
+                     "your gateway."),
+           "schema": "agentx.allowlist/%d" % version,
+           "version": version,
            "agents": out}
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
