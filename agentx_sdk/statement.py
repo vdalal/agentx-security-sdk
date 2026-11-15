@@ -44,9 +44,14 @@ never start doing so, because it is read by tooling whose whole job is to descri
 touching it -- a report generator that wrote a ledger into a customer's repo as a side effect of
 describing itself is a defect this project has already had once.
 """
+import datetime
 import decimal
 import json
+import math
+import numbers
+import os
 import re
+import uuid
 from urllib.parse import unquote
 
 
@@ -101,57 +106,154 @@ _STATEMENT_ARG_NAMES = frozenset((
 ))
 
 
-_DECIMAL_WALK_DEPTH = 32
+_WIRE_DEPTH = 32
+_WIRE_DROP = object()
 
 
-def _decimals_as_text(value, done=None, depth=0):
-    """`value` with every `Decimal` under a dict, list or tuple as its text. A value holding none
-    comes back as the same object, so an ordinary call's wire is untouched. Each container is walked
-    once, so a graph of shared or looping references costs its size and not its paths. One inside
-    itself stays as it is, and the encoder then refuses it, as it always did."""
-    if isinstance(value, decimal.Decimal):
+def _decimal_wire_text(value):
+    """A Decimal as text that can be read as ONE number: written out in full ("1.5E+3" is
+    "1500"), and one with exactly three places after the point and up to three before gets a
+    fourth, "0" ("1.500" is "1.5000"). The gateway holds text such as "1.500" because a person
+    may have meant one thousand five hundred; a Decimal is exact, so its text must not read as
+    that guess (review). The value is unchanged, and the old text stays inside the new one, so a
+    rule's words still find it. Never a float, which would change the amount."""
+    # 🔴 Not written out past 1000 places either way: `1E+100000000` became a hundred million
+    # characters, the request failed, the client read an unreachable gateway and fail-open ran
+    # the tool (scoped review of 6a614901). As its short text the gateway holds it as unreadable.
+    # Not lower: at 30, `1E-31` (about 0, which ran) was held as not a number (last review).
+    if not value.is_finite() or abs(value.adjusted()) > 1000:
         return str(value)
-    if not isinstance(value, (dict, list, tuple)) or depth >= _DECIMAL_WALK_DEPTH:
+    text = format(value, "f")
+    if re.fullmatch(r"-?[1-9]\d{0,2}\.\d{3}", text):
+        text += "0"
+    return text
+
+
+def _wire_leaf(value):
+    """ONE value that is not a dict, list, tuple or set, as JSON can carry it, or `_WIRE_DROP`.
+
+    🔴 THE ONE LIST OF LEAF TYPES. `args`, `query` and `rule_args` all come through here, so a type
+    added for one reaches the others (two hand-kept lists had already parted: numpy and Fraction
+    reached `rule_args` and not `args`). A Decimal, a date, a time and a UUID go as their text; a
+    non-finite float as its text (`requests` encodes with allow_nan=False, so `inf` raised there,
+    the client read an unreachable gateway and fail-open ran the tool); any other real number
+    (numpy's int64 and float64, a Fraction) as the number it is. Anything else (bytes, a
+    timedelta, a client, a database connection) is `_WIRE_DROP`: its `str` is not an argument a
+    rule names, and can carry a password in a DSN."""
+    if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, decimal.Decimal):
+        return _decimal_wire_text(value)
+    if isinstance(value, (datetime.date, datetime.time, uuid.UUID)):
+        return str(value)
+    # A path as the text the OS reads (`os.fspath`), in `args` and `query` alike: left out of
+    # `args` and written into `query` as its `str`, a Windows path there was JSON-escaped
+    # (`C:\\\\Users\\\\...`) and the path check missed `.aws\\credentials`, which main's
+    # `PureWindowsPath('C:/...')` spelling caught; and the two sides differed, so prose beside a
+    # path was read as a statement (scoped review of c3b5fa21).
+    if isinstance(value, os.PathLike):
+        try:
+            text = os.fspath(value)
+        except Exception:
+            return _WIRE_DROP
+        return text if isinstance(text, str) else _WIRE_DROP
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    if isinstance(value, numbers.Real):
+        f = float(value)
+        return f if math.isfinite(f) else str(f)
+    return _WIRE_DROP
+
+
+def _json_key(key):
+    """A dict key spelled as `json.dumps` spells it (`None` is "null", `True` is "true"), so a
+    call's keys read the same as they did before this walk built the dict."""
+    if isinstance(key, str):
+        return key
+    if key is None:
+        return "null"
+    if isinstance(key, bool):
+        return "true" if key else "false"
+    if isinstance(key, (int, float)):
+        try:
+            return json.dumps(key)
+        except Exception:
+            pass
+    return str(key)
+
+
+def _wire_tree(value, depth=0, done=None, too_deep=None, text=False):
+    """`value` as JSON can carry it, or `_WIRE_DROP`: each leaf by `_wire_leaf`, a dict with its keys
+    spelled as JSON spells them, a tuple as a list, a set as a list sorted by `repr` (two calls with
+    the same set send the same text). A leaf JSON cannot carry is LEFT OUT, alone: before, one such
+    leaf beside an amount (`payment={"amount": 250000, "memo": b"x"}`) made the whole object
+    unencodable, `args` dropped it, amount and all, and the transfer floor read 0 and ran the call.
+
+    `text=True` is `query`, the text the keyword and path checks read: there such a leaf STAYS as
+    it is, for the caller to write as its `str` (`[Path("/etc/passwd")]`, `[b"rm -rf /"]` reached
+    that text before this walk, and left out they reached no check: review of de7a47df).
+
+    Each container is walked once, so a graph of shared or looping references costs its size and
+    not its paths; one inside itself is left out where it repeats.
+
+    Past `_WIRE_DEPTH`, a container is `too_deep` (`_WIRE_DROP` for `rule_args`) or, by default,
+    goes on AS IT WAS: a statement nested 40 deep reached `query` before this walk existed, so it
+    must not be cut there now."""
+    if not isinstance(value, (dict, list, tuple, set, frozenset)):
+        wired = _wire_leaf(value)
+        return value if text and wired is _WIRE_DROP else wired
+    if depth > _WIRE_DEPTH:
+        return value if too_deep is None else too_deep
     done = {} if done is None else done
     if id(value) in done:
         return done[id(value)]
-    done[id(value)] = value
+    done[id(value)] = _WIRE_DROP  # while it is being walked: a value inside itself is left out
     if isinstance(value, dict):
-        out = {k: _decimals_as_text(v, done, depth + 1) for k, v in value.items()}
-        changed = any(out[k] is not value[k] for k in out)
+        out = {}
+        for k, v in value.items():
+            key = _json_key(k)
+            if text and key in out:
+                # Two keys that spell the same (`1` and `"1"`): rebuilt, the second overwrote the
+                # first, and `{1: "rm -rf /", "1": "ls"}` left the command out of the text the
+                # checks read. As it was, `json.dumps` writes both (scoped review of c3b5fa21).
+                done[id(value)] = value
+                return value
+            w = _wire_tree(v, depth + 1, done, too_deep, text)
+            if w is not _WIRE_DROP:
+                out[key] = w
     else:
-        out = [_decimals_as_text(v, done, depth + 1) for v in value]
-        changed = any(a is not b for a, b in zip(out, value))
-    done[id(value)] = out if changed else value
-    return done[id(value)]
+        items = sorted(value, key=repr) if isinstance(value, (set, frozenset)) else value
+        out = [w for w in (_wire_tree(v, depth + 1, done, too_deep, text) for v in items)
+               if w is not _WIRE_DROP]
+    done[id(value)] = out
+    return out
+
+
+def _rule_wire_tree(value):
+    """`rule_args`: the same walk, with anything past the depth limit left out."""
+    return _wire_tree(value, too_deep=_WIRE_DROP)
 
 
 def _wire_value(value):
-    """ONE argument value in the shape the gateway is sent: a tuple, set or frozenset becomes a
-    list (a set sorted by `repr`, so two calls with the same set send the same text), a `Decimal`
-    becomes its text, alone or under a dict, list or tuple (not in a set: no floor reads one), and
-    anything else stays as it is. Used by the flattened text below AND the
-    decorator's `args`, so the gateway's "is `query` exactly these arguments?" comparison sees the
-    same value on both sides.
+    """ONE argument value in the shape the gateway is sent (`_wire_tree`). Used by the flattened
+    text below AND the decorator's `args`, so the gateway's "is `query` exactly these arguments?"
+    comparison sees the same value on both sides; `rule_args` is built by the same walk.
 
     A tuple or set used to reach the gateway not at all: this function returned None for it, so
     `crawl(urls=("https://x/",))` sent only a placeholder and no gateway check saw the address.
 
     A `Decimal` is how Python holds money, and JSON cannot encode one, so it was dropped from both
     `args` and the text: `refund(amount=Decimal("250000"), currency="usd")` read as 0 on the
-    gateway's transfer floor and ran where the int form is held. As text the floor reads it (the
-    `str` of 2.5E+5 reads 250000). Text, and never `float`, which would change the amount. Never
-    raises: an argument this cannot read goes on as it was, for the encoder to accept or drop."""
-    if isinstance(value, (set, frozenset)):
-        return sorted(value, key=repr)
+    gateway's transfer floor and ran where the int form is held. As text the floor reads it.
+    Never raises: an argument that is itself a leaf JSON cannot carry, or one this cannot walk,
+    goes on as it was, for the encoder to accept or drop."""
     try:
-        value = _decimals_as_text(value)
+        wired = _wire_tree(value)
     except Exception:
         return list(value) if isinstance(value, tuple) else value
-    if isinstance(value, tuple):
-        return list(value)
-    return value
+    return value if wired is _WIRE_DROP else wired
 
 
 def _coerce_arg_value(value):
@@ -159,8 +261,13 @@ def _coerce_arg_value(value):
     None to skip it. The single home for value flattening, shared by the decorator's
     arg loop and the agentx-mcp proxy's _flatten_call so the two feeders can't drift:
     str as-is, bool/int/float stringified, dict/list (and a tuple or set, as a list) as
-    compact JSON."""
-    value = _wire_value(value)
+    compact JSON, with anything inside that JSON cannot carry (a path, bytes) written as its
+    `str`, never left out: this is what the checks read."""
+    original = value
+    try:
+        value = _wire_tree(value, text=True)
+    except Exception:
+        value = list(value) if isinstance(value, tuple) else value
     if isinstance(value, str):
         return value
     if isinstance(value, (bool, int, float)):   # bool is an int subclass; str() is identical
@@ -172,9 +279,9 @@ def _coerce_arg_value(value):
             # bidi override / Tags-block char) smuggled inside a NESTED arg into \uXXXX TEXT,
             # slipping it past _detect_invisible_unicode. The ASCII-pattern detectors (keyword
             # / SSRF / destructive-SQL) are unaffected -- their targets were already ASCII.
-            return json.dumps(value, ensure_ascii=False)
+            return json.dumps(value, ensure_ascii=False, default=str)
         except Exception:
-            return str(value)
+            return str(original)
     return None
 
 

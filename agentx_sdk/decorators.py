@@ -38,7 +38,7 @@ from .client import AgentXClient
 # LIST and splits letter<->digit runs; `statement._name_tokens` returns a SET and does not. The
 # difference is load-bearing in both directions -- see the warning in `statement._name_tokens`.
 from .statement import _STATEMENT_ARG_NAMES, _coerce_arg_value, _statement_text, _statement_parts  # noqa: F401
-from .statement import _wire_value
+from .statement import _wire_value, _rule_wire_tree, _WIRE_DROP
 from .statement import _SSRF_URL_RE, url_hosts, destination_url_hosts  # noqa: F401
 from .db import (init_db, ensure_ledger_current, log_intercept, get_lifetime_stats,
                  log_self_correction, get_retention_status, format_ratio, retention_is_failing,
@@ -9242,66 +9242,12 @@ def _bound_arguments(sig, args, kwargs):
         return kwargs or {}
 
 
-_RULE_WIRE_DROP = object()
-
-
-def _rule_wire_value(value, depth=0):
-    """`value` as JSON can carry it with the text the SDK's rule matcher reads (`rules._call_text`,
-    `str` of each leaf) and the number its threshold reads, or `_RULE_WIRE_DROP`. A Decimal, a
-    date or a UUID travels as its `str`; a plain object (a database connection, a client) is
-    left off: its `str` is not an argument a rule names, and can carry a password in a DSN."""
-    if depth > 32:
-        return _RULE_WIRE_DROP
-    # 🔴 NOT A NON-FINITE FLOAT AS ITSELF. `requests` encodes with allow_nan=False, so an `inf`
-    # or `nan` raised there, the client read it as an unreachable gateway, and fail-open RAN THE
-    # TOOL past every gateway layer (scoped review of 0e7b6254). As text it is what the matcher
-    # reads (`str`), and the threshold reads "inf" as the largest number, as it reads the float.
-    if isinstance(value, float) and not math.isfinite(value):
-        return str(value)
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, decimal.Decimal):
-        return _decimal_wire_text(value)
-    if isinstance(value, (datetime.date, datetime.time, uuid.UUID)):
-        return str(value)
-    # Any other real number (numpy's int64 and float64, a Fraction) goes as the number it is:
-    # dropped, a team rule naming the argument read it as not passed and held the call (review).
-    import numbers
-    if isinstance(value, numbers.Integral):
-        return int(value)
-    if isinstance(value, numbers.Real):
-        f = float(value)
-        return f if math.isfinite(f) else str(f)
-    if isinstance(value, dict):
-        out = {}
-        for k, v in value.items():
-            w = _rule_wire_value(v, depth + 1)
-            if w is not _RULE_WIRE_DROP:
-                out[str(k)] = w
-        return out
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [w for w in (_rule_wire_value(v, depth + 1) for v in value)
-                if w is not _RULE_WIRE_DROP]
-    return _RULE_WIRE_DROP
-
-
-def _decimal_wire_text(value):
-    """A Decimal as text that can be read as ONE number: written out in full ("1.5E+3" is
-    "1500"), and one with exactly three places after the point and up to three before gets a
-    fourth, "0" ("1.500" is "1.5000"). The gateway holds text such as "1.500" because a person
-    may have meant one thousand five hundred; a Decimal is exact, so its text must not read as
-    that guess (review). The value is unchanged, and the old text stays inside the new one, so a
-    rule's words still find it. Never a float, which would change the amount."""
-    # 🔴 Not written out past 1000 places either way: `1E+100000000` became a hundred million
-    # characters, the request failed, the client read an unreachable gateway and fail-open ran
-    # the tool (scoped review of 6a614901). As its short text the gateway holds it as unreadable.
-    # Not lower: at 30, `1E-31` (about 0, which ran) was held as not a number (last review).
-    if not value.is_finite() or abs(value.adjusted()) > 1000:
-        return str(value)
-    text = format(value, "f")
-    if re.fullmatch(r"-?[1-9]\d{0,2}\.\d{3}", text):
-        text += "0"
-    return text
+# `rule_args` as JSON can carry it with the text the SDK's rule matcher reads (`rules._call_text`,
+# `str` of each leaf) and the number its threshold reads, or `_RULE_WIRE_DROP`. The SAME walk as
+# `args` and `query` (`statement._wire_tree`, one list of leaf types): two hand-kept lists had
+# already parted (numpy and Fraction reached `rule_args` and not `args`).
+_rule_wire_value = _rule_wire_tree
+_RULE_WIRE_DROP = _WIRE_DROP
 
 
 _NUMBER_RULE_SAID = set()
@@ -9986,6 +9932,13 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             _func_sig = None
         # Partial-safe tool name (a functools.partial has no __name__) — resolved once.
         _func_name = _func_display_name(func)
+        # A tool a team rule names, changed since this project last ran it, says so once on
+        # stderr (tool_changes.py). Never raises; a tool no rule names is not looked at.
+        try:
+            from . import tool_changes as _tool_changes
+            _tool_changes.note_wrapped_tool(_func_name, func)
+        except Exception:
+            pass
         # The decorated function's own docstring is this door's equivalent of the description
         # an MCP server advertises: the sentence the author wrote to say what the tool does.
         # Resolved ONCE here for the same reason the signature is -- this runs inside every
@@ -11495,6 +11448,17 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                             # approval of the call. Reading "not worth reviewing" as "go ahead"
                             # on a human-approval control is the one direction that cannot be
                             # taken back, so it stops here and says which of the two happened.
+                            # REPLACED: the same payment was sent again while this one waited, and
+                            # the gateway moved the hold to the newer call, so one approval pays
+                            # once. This call never runs; the newer one is the one to wait on.
+                            elif current_status == "REPLACED":
+                                print("\n🔁 [AgentX SDK] The held call was replaced by a later "
+                                      "retry of the same payment, which waits for a person "
+                                      "instead. This call did not run.")
+                                return json.dumps({
+                                    "error": "AgentX Held Call Replaced",
+                                    "instruction": "The same payment was sent again while this call was held, and that later call now carries it and waits for a person. This call did not run: treat it as not run, and do not send it again."
+                                })
                             elif current_status == "DISMISSED":
                                 print("\n🗂️ [AgentX SDK] The held call was dismissed "
                                       "without being approved.")

@@ -20,7 +20,8 @@
     "DENIED": "then refused",
     "DISMISSED": "then dismissed",
     "COMPLIED": "then the agent changed course",
-    "EXPIRED": "then no answer in time"
+    "EXPIRED": "then no answer in time",
+    "REPLACED": "then replaced by a later retry of the same payment"
   },
   "notes": {
     "before_you_share": "This file names your own agents, tools and the sites in their calls, as your code sent them. Check it before you send it to others outside your organization.",

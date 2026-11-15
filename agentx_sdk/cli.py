@@ -10619,6 +10619,15 @@ def execute_holds(args, gateway_url, api_key, admin_key=None, admin_refusal=None
             if rows is not None:
                 row = next((r for r in rows if isinstance(r, dict)
                             and r.get("receipt_id") == receipt), None)
+                if row is not None and row.get("status") == "REPLACED":
+                    # A later retry of the same payment holds it now (gateway 2026.11.14).
+                    print(f"\n❌ This held call (receipt {_sanitize_detail(receipt, limit=80)}) was "
+                          "replaced by a later retry of the same payment, so nothing was sent.")
+                    print("   Answer the newer held call for that payment instead: it is the one "
+                          "that pays if approved.")
+                    print("   ▶ agentx holds   (lists the calls waiting)")
+                    print("=" * 75)
+                    sys.exit(1)
                 if row is not None and row.get("status") not in ("ESCALATED", "EXPIRED"):
                     print(f"\n❌ {_sanitize_detail(receipt, limit=80)} is not waiting for an answer "
                           f"(its record says {_sanitize_detail(str(row.get('status')), limit=20)}), "

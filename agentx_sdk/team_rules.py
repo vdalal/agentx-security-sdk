@@ -57,7 +57,7 @@ ENV_RE = re.compile(r"^[a-z0-9_-]{1,32}\Z")
 ARGUMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
 CURRENCY_RE = re.compile(r"^[A-Za-z]{2,10}\Z")
 UNITS = ("cents",)
-NUMBER_KEYS = ("argument", "hold_at", "currency", "currency_field", "unit")
+NUMBER_KEYS = ("argument", "hold_at", "currency", "currency_field", "unit", "recipient")
 
 
 LIMIT_MAX = 10 ** 15
@@ -95,14 +95,15 @@ def _check_number(r, p, rid):
     cur = r.get("currency")
     if "currency" in r and (not isinstance(cur, str) or not CURRENCY_RE.match(cur)):
         raise ValueError("%s: rule %s has a currency that is not a code such as USD" % (p, rid))
-    for key in ("currency_field", "unit"):
+    for key in ("currency_field", "unit", "recipient"):
         if key in r and "currency" not in r:
             raise ValueError("%s: rule %s has %s, which needs \"currency\"" % (p, rid, key))
-    cf = r.get("currency_field")
-    if "currency_field" in r and (not isinstance(cf, str) or not ARGUMENT_RE.match(cf)
-                                  or len(cf) > 200):
-        raise ValueError("%s: rule %s has a currency_field that is not an argument name"
-                         % (p, rid))
+    # `recipient`: the argument naming who is paid, so payments to one recipient add up on the
+    # gateway. Read only there.
+    for key in ("currency_field", "recipient"):
+        v = r.get(key)
+        if key in r and (not isinstance(v, str) or not ARGUMENT_RE.match(v) or len(v) > 200):
+            raise ValueError("%s: rule %s has a %s that is not an argument name" % (p, rid, key))
     if "unit" in r and r["unit"] not in UNITS:
         raise ValueError("%s: rule %s has unit %r; only \"cents\" is read" % (p, rid, r["unit"]))
 
@@ -214,7 +215,7 @@ def _added(r):
 
 def add_team_rule(tools, match, why, *, said=None, owner=None, where_ask_unsupported="warn",
                   path=None, argument=None, hold_at=None, currency=None, currency_field=None,
-                  unit=None):
+                  unit=None, recipient=None):
     """Write one active rule and return it. Raises ValueError, with nothing written, on a rule
     that cannot be stored or a file that cannot be read. `argument` and `hold_at` make it a rule
     with a number: it holds a call whose argument is at or above the number."""
@@ -245,7 +246,7 @@ def add_team_rule(tools, match, why, *, said=None, owner=None, where_ask_unsuppo
     if hold_at is not None:
         rule["hold_at"] = hold_at
     for key, value in (("currency", currency), ("currency_field", currency_field),
-                       ("unit", unit)):
+                       ("unit", unit), ("recipient", recipient)):
         if value is not None:
             rule[key] = value
     if said and str(said).strip():
@@ -1049,7 +1050,17 @@ the file; push refuses to undo them until you do.
   --currency-field NAME
                    The argument naming the call's currency; a call in
                    another currency, or none, is held.
-  --unit cents     The amount is in cents: 2550 is 25.50.
+  --unit cents     The call's amount is in cents (an amount of 2550 is
+                   25.50). --hold-at stays in the currency.
+  --recipient NAME
+                   The argument naming who is paid (customer_id). The
+                   hosted gateway adds up payments to one recipient
+                   over 24 hours and holds the one that reaches the
+                   number; a gateway you run sets the window with
+                   AGENTX_MONEY_TOTAL_HOURS (0 is off). Without it,
+                   the gateway looks for an argument such as to,
+                   payee or customer, and adds up the tool's payments
+                   together if none is found.
   --said "QUOTE"   Optional: your words when you corrected the agent.
   --stop-where-cannot-ask
                    In Codex, which cannot ask, stop the call instead of
@@ -1901,7 +1912,7 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
         while i < len(args):
             a = args[i]
             if a in ("--why", "--said", "--tool", "--argument", "--hold-at", "--currency",
-                     "--currency-field", "--unit"):
+                     "--currency-field", "--unit", "--recipient"):
                 if i + 1 >= len(args):
                     print(_USAGE)
                     return 1
@@ -1914,7 +1925,7 @@ def main(args, gateway_url=None, api_key=None, admin_key=None, admin_refusal=Non
                     argument = value
                 elif a == "--hold-at":
                     hold_ats.append(value)
-                elif a in ("--currency", "--currency-field", "--unit"):
+                elif a in ("--currency", "--currency-field", "--unit", "--recipient"):
                     money[a[2:].replace("-", "_")] = value
                 else:
                     tools.append(value)
@@ -2131,6 +2142,10 @@ def _money_options(money):
         if money["unit"] not in UNITS:
             return "--unit takes only cents: --unit cents reads 2550 as 25.50"
         out["unit"] = money["unit"]
+    if "recipient" in money:
+        if not ARGUMENT_RE.match(money["recipient"]):
+            return "--recipient names the argument that says who is paid, such as customer_id"
+        out["recipient"] = money["recipient"]
     return out
 
 
@@ -2186,6 +2201,12 @@ def _add_number_rule(tools, phrases, argument, hold_ats, why, said, stop, assume
         if money.get("currency_field"):
             lines.append("A call whose %s is missing or not %s is held."
                          % (money["currency_field"], cur))
+        if money.get("recipient"):
+            lines.append("The hosted gateway adds up payments to the same %s over 24 hours "
+                         "and holds the one that reaches the number. A gateway you run sets "
+                         "that window with AGENTX_MONEY_TOTAL_HOURS (0 is off); one that sends "
+                         "its records to a control plane does not add them up."
+                         % money["recipient"])
     lines += ["A call whose %s is missing or not a number is held too." % argument,
               "Why: %s" % why,
               "The hosted gateway checks it once you send it with agentx rule push; the SDK on "
