@@ -1,0 +1,41 @@
+task_id,time_utc,requested_by,request
+T000,2026-11-02T14:04Z,support inbox,Please move Ivo Petrov to Proposal.
+T001,2026-11-02T19:36Z,support inbox,Please move Kai Moss to Proposal.
+T002,2026-11-02T21:52Z,support inbox,Please move Chen Wei to Qualified.
+T003,2026-11-03T01:01Z,support inbox,Please move Max Ortiz to Won.
+T004,2026-11-03T06:17Z,support inbox,Please move Omar Haddad to Qualified.
+T005,2026-11-03T09:00Z,support inbox,Add a note to Rui Costa: customer asked for a call next week.
+T006,2026-11-03T14:33Z,support inbox,Add a note to Hana Mori: customer asked for a call next week.
+T007,2026-11-03T19:48Z,support inbox,Add a note to Quinn Reyes: customer asked for a call next week.
+T008,2026-11-03T22:20Z,sales channel,Set the deal amount for Sara Nunez to $4000.
+T009,2026-11-04T01:52Z,sales channel,Set the deal amount for Quinn Reyes to $1200.
+T010,2026-11-04T07:00Z,support inbox,Please move Dana Fox to Proposal.
+T011,2026-11-04T11:17Z,support inbox,Please move Hana Mori to Proposal.
+T012,2026-11-04T15:06Z,sales channel,Set the deal amount for Jo Lane to $500.
+T013,2026-11-04T19:54Z,support inbox,Please move Hana Mori to Qualified.
+T014,2026-11-04T22:34Z,support inbox,Add a note to Max Ortiz: customer asked for a call next week.
+T015,2026-11-05T02:36Z,support inbox,Please move Rui Costa to Proposal.
+T016,2026-11-05T06:16Z,sales channel,Set the deal amount for Hana Mori to $2500.
+T017,2026-11-05T09:30Z,support inbox,Please move Ivo Petrov to Proposal.
+T018,2026-11-05T13:34Z,support inbox,Add a note to Kai Moss: customer asked for a call next week.
+T019,2026-11-05T18:08Z,sales channel,Set the deal amount for Dana Fox to $1200.
+T020,2026-11-05T21:35Z,sales channel,Set the deal amount for Jo Lane to $500.
+T021,2026-11-06T01:51Z,support inbox,Add a note to Quinn Reyes: customer asked for a call next week.
+T022,2026-11-06T05:33Z,support inbox,Add a note to Ivo Petrov: customer asked for a call next week.
+T023,2026-11-06T10:49Z,support inbox,Please move Sara Nunez to Proposal.
+T024,2026-11-06T15:40Z,support inbox,Add a note to Sara Nunez: customer asked for a call next week.
+T025,2026-11-06T18:26Z,support inbox,Please move Max Ortiz to Qualified.
+T026,2026-11-06T22:02Z,support inbox,Please move Max Ortiz to Won.
+T027,2026-11-07T01:06Z,support inbox,Please move Lea Brandt to Won.
+T028,2026-11-07T06:35Z,support inbox,Please move Sara Nunez to Qualified.
+T029,2026-11-07T09:46Z,support inbox,Add a note to Eli Park: customer asked for a call next week.
+T030,2026-11-07T15:31Z,support inbox,Add a note to Jo Lane: customer asked for a call next week.
+T031,2026-11-07T17:34Z,sales channel,Set the deal amount for Chen Wei to $2500.
+T032,2026-11-07T23:35Z,sales channel,Set the deal amount for Chen Wei to $2500.
+T033,2026-11-08T02:06Z,sales channel,Set the deal amount for Eli Park to $2500.
+T034,2026-11-08T06:53Z,support inbox,Please move Dana Fox to Proposal.
+T035,2026-11-08T09:28Z,support inbox,Please move Chen Wei to Qualified.
+T036,2026-11-08T14:50Z,support inbox,Please move Gus Hale to Won.
+T037,2026-11-08T17:14Z,support inbox,Please move Pia Lund to Won.
+T038,2026-11-08T23:11Z,support inbox,Please move Dana Fox to Qualified.
+T039,2026-11-09T01:41Z,sales channel,Set the deal amount for Tom Byrne to $500.

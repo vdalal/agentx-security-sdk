@@ -45,6 +45,7 @@ from .db import (init_db, ensure_ledger_current, log_intercept, get_lifetime_sta
                  retention_failure_streak, failed_ledger_path, WOULD_BLOCK_STATUS,
                  record_call, is_demo_agent as _is_demo_agent, _call_shape)
 from . import db as db_module
+from . import runs as runs_module
 from . import flow as _flow
 from . import pulse
 from .envfile import resolve_api_key
@@ -1922,7 +1923,7 @@ _UNCONFIRMED_NOT_CONFIRMED = "not_confirmed"
 _UNCONFIRMED_COULD_NOT_CHECK = "could_not_check"
 # What the ledger row says. Fixed words: an error from the developer's code never reaches it.
 _UNCONFIRMED_ROW_WORDS = {_UNCONFIRMED_NOT_CONFIRMED: "Not confirmed",
-                          _UNCONFIRMED_COULD_NOT_CHECK: "Could not check"}
+                          _UNCONFIRMED_COULD_NOT_CHECK: db_module.COULD_NOT_CHECK_ROW_WORDS}
 
 
 def _unconfirmed_message(tool, reason):
@@ -9036,6 +9037,9 @@ def _audit_scope_phrase():
 # posture enforces; "" otherwise. Set at the top of `_decide`; read by `_audit_scope_phrase`, so
 # every watch-only line (the would-block, the scrub, the backstop, the halt) follows it.
 _WATCH_SCOPE = contextvars.ContextVar("agentx_watch_scope", default="")
+# Whether "this key is set to enforce on the gateway" was said in this process (a list, so the
+# wrapper can mark it without `global`).
+_KEY_POSTURE_SAID = []
 # Per call: True when the tool's own `posture` argument set its level. Set beside `_WATCH_SCOPE`.
 _OWN_POSTURE = contextvars.ContextVar("agentx_own_posture", default=False)
 
@@ -9826,7 +9830,7 @@ def _audit_release(outcome, trace_id, agent_id, tool_name, arguments=None, descr
 
 
 # --- 3. THE MAIN SENSOR DECORATOR ---
-def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None, action: str = None, budget_pool_id: str = None, enforcement: str = None, posture: str = None, returns_sensitive: bool = False, sends_out: bool = False, verify=None):
+def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None, action: str = None, budget_pool_id: str = None, enforcement: str = None, posture: str = None, returns_sensitive: bool = False, sends_out: bool = False, verify=None, effect: str = None):
     """Wrap a tool function so AgentX vets every call.
 
     ``verify`` reads the change back after the tool has run, so the agent cannot report a write
@@ -9844,6 +9848,12 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
     needs no key, and acts while watching too, because you asked for it on this tool and the call
     has already run. It does not run when the call was stopped or when the tool raised. A tool
     with a strict return type raises ``AgentXUnconfirmedError`` instead of returning the message.
+
+    ``effect`` says what the tool changes in the world when it runs: ``"books"`` (it makes a
+    booking) or ``"cancels"`` (it removes one). It is kept in the local run file beside each call
+    (with ``agentx_sdk.task()`` or ``AGENTX_KEEP_ARG_VALUES=1``), and ``agentx match`` checks a
+    ``"books"`` tool's calls against your calendar. Without it, the report names the tool as not
+    checked and shows the line to add. Nothing reads meaning into the tool's name.
 
     ``returns_sensitive=True`` marks the prose this tool returns as sensitive (text of 20
     characters or more, more than one word), and
@@ -9888,6 +9898,12 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
     if verify is not None and not callable(verify):
         raise TypeError("verify= must be a function taking (args, result), so the check would "
                         "never run. Got %r." % (type(verify).__name__,))
+    # What the tool changes in the world when it runs, said once by the person who wrote it: kept
+    # in the run file beside each call, so `agentx match` knows which calls to check against the
+    # calendar, without reading meaning into a tool's name.
+    if effect is not None and effect not in runs_module.EFFECTS:
+        raise ValueError('effect= must be one of %s, so agentx match knows what the tool does. Got %r.'
+                         % (", ".join('"%s"' % e for e in runs_module.EFFECTS), effect))
     if enforcement is not None:
         warnings.warn(
             "agentx_protect(enforcement=...) is deprecated; use posture=... instead. "
@@ -10921,6 +10937,9 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # routine-call row, copy source, read budget) are records of a call that ran.
                 # A gateway still reads the field from older SDKs, for which it is still true.
                 shield_matched=None,
+                # This wrapper stops a watched call when the gateway says the key enforces (the
+                # `key_posture` check below), so it says so; a direct client caller does not.
+                obeys_posture=True,
             )
             if isinstance(eval_res, dict) and eval_res.get("reason") == "no_api_key":
                 _say_number_rule_needs_a_gateway(func_name)
@@ -10928,6 +10947,26 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             # them come from whatever answers at gateway_url. Cleaned once, here, before any
             # reader sees them; see `_clean_verdict_text`.
             eval_res = _clean_verdict_text(eval_res)
+
+            # The gateway keeps this key's posture and it enforces (`key_posture`, from its
+            # header only, client.py): a call set here to only watch is checked as an enforcing
+            # one, so a block stops it and a hold waits for the person. A call may be stricter
+            # than its key, never looser.
+            if (enforcement_level == "audit" and isinstance(eval_res, dict)
+                    and eval_res.get("key_posture") == "enforce"):
+                enforcement_level = "enforce"
+                _WATCH_SCOPE.set("")
+                # The wrapper chose the watch path before asking; this tells it to keep the
+                # verdict (`_audit_release` is skipped for this call).
+                if call_state is not None:
+                    call_state["key_enforces"] = True
+                if not _KEY_POSTURE_SAID:          # once per process: it is a setting, not news
+                    _KEY_POSTURE_SAID.append(True)
+                    # "the gateway checks": a match on this machine's own files, decided here
+                    # before the gateway is asked, still only watches (code review).
+                    print("🔒 [AgentX SDK] This key is set to enforce on the gateway, so the "
+                          "calls the gateway checks are enforced even where this code says only "
+                          "watch. A person changes that at agentx-core.com/app.")
 
             status = eval_res.get("status") if isinstance(eval_res, dict) else None
 
@@ -11684,27 +11723,39 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 return _scrub_pii(result, decision.scrub_targets)
             return result
 
+        def _read_back_row(args, kwargs, words, status, shape=None, posture=None):
+            """The second row for a call `verify=` read back: CONFIRMED or UNCONFIRMED, with the
+            call's shape (names, never values) and fixed words. `shape` and `posture` are given
+            when the row is written later, on another thread, so it holds what the call had. Never
+            raises: a ledger problem is never a tool problem."""
+            try:
+                if shape is None:
+                    shape = _call_shape(_func_name, _bound_arguments(_func_sig, args, kwargs))
+                log_intercept(trace_id_var.get(), agent_id, _func_name, None, words, status,
+                              arg_names=shape[0], amount=shape[1], target_class=shape[2],
+                              quantity=shape[3],
+                              posture=posture or _resolve_enforcement(enforcement))
+            except Exception:
+                pass
+
+        def _say_could_not_check(why, told="The caller was told the result is unknown."):
+            """The one line a person gets when `verify=` could not run, whatever stopped it."""
+            print(f"⚠️  [AgentX SDK] '{_func_name}' ran, but its verify= check could not run: "
+                  f"{why}. {told}", file=sys.stderr)
+
         def _unconfirmed(args, kwargs, reason, why=None):
             """The tool ran and `verify=` did not confirm it: say so to the person, write the row,
             hand the agent the message. Raises for a tool whose strict return type a string would
             break, as a block does. `why` is for the person only: it can quote the developer's own
             error, so it reaches neither the model nor the ledger."""
             if reason == _UNCONFIRMED_COULD_NOT_CHECK:
-                print(f"⚠️  [AgentX SDK] '{_func_name}' ran, but its verify= check could not run: "
-                      f"{why}. The caller was told the result is unknown.", file=sys.stderr)
+                _say_could_not_check(why)
             else:
                 # "The caller", not "the agent": as often, the code itself calls the function.
                 print(f"⚠️  [AgentX SDK] '{_func_name}' ran, but reading it back did not show the "
                       f"change{f' ({why})' if why else ''}. The caller was told it is not "
                       "confirmed.", file=sys.stderr)
-            try:
-                shape = _call_shape(_func_name, _bound_arguments(_func_sig, args, kwargs))
-                log_intercept(trace_id_var.get(), agent_id, _func_name, None,
-                              _UNCONFIRMED_ROW_WORDS[reason], db_module.UNCONFIRMED_STATUS,
-                              arg_names=shape[0], amount=shape[1], target_class=shape[2],
-                              quantity=shape[3], posture=_resolve_enforcement(enforcement))
-            except Exception:
-                pass  # a ledger problem is never a tool problem
+            _read_back_row(args, kwargs, _UNCONFIRMED_ROW_WORDS[reason], db_module.UNCONFIRMED_STATUS)
             message = _unconfirmed_message(_func_name, reason)
             if _a_string_fits_the_return_type(func, _func_sig):
                 return AgentXUnconfirmed(message, tool=_func_name, reason=reason)
@@ -11714,6 +11765,10 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             """Only exactly True confirms. A forgotten `return` is None, and a record returned
             instead of a comparison is truthy either way, so neither may read as confirmed."""
             if answer is True:
+                # The read-back is evidence too: without this row a confirmed call looked exactly
+                # like a call with no `verify=` at all, so `agentx match` and the evidence file
+                # could count what failed and never what was checked and held.
+                _read_back_row(args, kwargs, db_module.CONFIRMED_ROW_WORDS, db_module.CONFIRMED_STATUS)
                 return None
             if answer is False:
                 return _unconfirmed(args, kwargs, _UNCONFIRMED_NOT_CONFIRMED)
@@ -11854,7 +11909,23 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             try:
                 outcome = _decide(args, kwargs, call_state)
             except _AUDIT_SUPPRESSIBLE_RAISES as stop:
+                # The gateway said this KEY enforces (`key_enforces`, set in `_decide`): the
+                # call was checked as an enforcing one, so its stop stands, as on enforce.
+                if call_state is not None and call_state.get("key_enforces"):
+                    _record_not_run(args, kwargs, call_state)
+                    raise
                 outcome = stop
+            if call_state is not None and call_state.get("key_enforces"):
+                # Enforce's path from here: no release, no would-block, the scrub kept.
+                if not isinstance(outcome, _ExecuteTool):
+                    _record_not_run(args, kwargs, call_state)
+                elif _inventory_due(outcome):
+                    _record_inventory(trace_id_var.get(), agent_id, _func_name,
+                                      _bound_arguments(_func_sig, args, kwargs),
+                                      in_audit=False, description=_func_doc,
+                                      unsized_write=_unsized_write_of(outcome),
+                                      dest_args=_destination_arguments(_func_sig, args, kwargs))
+                return outcome
             # Trace read AFTER the core runs: _decide auto-starts the session when the
             # caller had none, so reading it first would file the record under "".
             # `_func_name` (not func.__name__) is the partial-safe DISPLAY name the
@@ -11883,6 +11954,54 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             with _stats_lock:
                 _remember_table_copy(run_copies, call_state.get("query"))
 
+        def _read_back_word(unconfirmed):
+            """What `verify=` found, in the run file's words; None for a tool with no `verify=`."""
+            if verify is None:
+                return None
+            return "confirmed" if unconfirmed is None else unconfirmed.reason
+
+        def _note_later(args, kwargs, read_back, raised=None, at=None):
+            """A call that ran, for the local run file (`runs.py`), as a function to run: None when
+            nothing is to be written (no task running and AGENTX_KEEP_ARG_VALUES unset, at the
+            cost of one lookup). The task and run are read here, in the caller's context; the
+            write is the returned function's, so an async tool runs it off its event loop.
+            Never raises."""
+            try:
+                if runs_module.current_task() is None and not runs_module.keeping_values():
+                    return None
+                named = {k: v for k, v in _verify_arguments(_func_sig, args, kwargs).items()
+                         if k not in ("self", "cls")}
+                return runs_module.note_call_later(_func_name, named, read_back, raised, at,
+                                                   effect=effect)
+            except Exception:
+                return None
+
+        def _note_run(args, kwargs, read_back, raised=None, at=None):
+            """A sync tool's line, through the run file's one writer (`runs.write_soon`): not waited
+            for when the tool was called on an event loop, so the loop does not wait on the file."""
+            later = _note_later(args, kwargs, read_back, raised, at)
+            if later is not None:
+                runs_module.write_soon(later)
+
+        def _note_cancelled(args, kwargs, read_back, raised, at=None):
+            """The line for an async call whose task was cancelled: handed to the writer and not
+            awaited, since a cancelled task should get on with stopping. Never raises."""
+            later = _note_later(args, kwargs, read_back, raised, at)
+            if later is not None:
+                runs_module.write_soon(later)
+
+        async def _note_run_async(args, kwargs, read_back, raised=None, at=None):
+            """The same, written on the run file's own thread (`runs.writer()`), never the pool the
+            gateway calls and approval waits use, and shielded: a cancellation of the agent's task
+            still lets the line finish."""
+            later = _note_later(args, kwargs, read_back, raised, at)
+            if later is not None:
+                try:
+                    await asyncio.shield(
+                        asyncio.get_running_loop().run_in_executor(runs_module.writer(), later))
+                except Exception:
+                    pass
+
         def _finish_sync(decision, args, kwargs, call_state):
             """Run the tool for a SYNC verdict and apply any scrub, or pass the
             terminal verdict straight back."""
@@ -11891,8 +12010,21 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # Before the scrub: `verify=` compares the tool's real result. When it does not
                 # confirm, that result never reaches the agent, so there is nothing to scrub or
                 # to remember.
-                raw = func(*args, **kwargs)
-                unconfirmed = _read_back(args, kwargs, raw)
+                at = runs_module.started()        # the line carries when the tool started
+                try:
+                    raw = func(*args, **kwargs)
+                except Exception as exc:
+                    # Its work may have landed before the error (a text sent, then a timeout
+                    # reading the answer): noted, marked, so its record is not a change with no
+                    # call behind it.
+                    _note_run(args, kwargs, None, type(exc).__name__, at)
+                    raise
+                try:
+                    unconfirmed = _read_back(args, kwargs, raw)
+                except AgentXUnconfirmedError as exc:
+                    _note_run(args, kwargs, exc.reason, at=at)
+                    raise
+                _note_run(args, kwargs, _read_back_word(unconfirmed), at=at)
                 if unconfirmed is not None:
                     return unconfirmed
                 result = _apply_scrub(raw, decision)
@@ -11928,8 +12060,48 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 )
                 if isinstance(decision, _ExecuteTool):
                     _remember_copy_on_run(call_state)
-                    raw = await func(*args, **kwargs)
-                    unconfirmed = await _read_back_async(args, kwargs, raw)
+                    at = runs_module.started()    # the line carries when the tool started
+                    try:
+                        raw = await func(*args, **kwargs)
+                    except asyncio.CancelledError:
+                        # Cancelled mid-call (a timeout around the agent): its work may have
+                        # landed, so it is noted as raised.
+                        _note_cancelled(args, kwargs, None, "CancelledError", at)
+                        raise
+                    except Exception as exc:
+                        await _note_run_async(args, kwargs, None, type(exc).__name__, at)
+                        raise
+                    try:
+                        unconfirmed = await _read_back_async(args, kwargs, raw)
+                    except asyncio.CancelledError:
+                        # The tool finished; its read-back was cancelled, so what it found is
+                        # unknown. The person is told as on any check that could not run, the call
+                        # is still noted, and the ledger gets the same row a read-back that failed
+                        # gets, so `agentx audit` and the run file agree. The row is written on the
+                        # run file's thread, not this event loop: a cancelled task should get on
+                        # with stopping, not wait on the ledger.
+                        # The caller cancelled it, so it hears nothing back: the line says what is
+                        # known instead of "the caller was told".
+                        _say_could_not_check("it was cancelled before it finished",
+                                             "Whether the change held is unknown.")
+                        try:
+                            # The shape and posture now, as the call had them; only the write waits,
+                            # and the call's arguments are not kept waiting with it. write_soon does
+                            # not wait on this loop, and writes in place once the writer is shut down.
+                            shape = _call_shape(_func_name, _bound_arguments(_func_sig, args, kwargs))
+                            runs_module.write_soon(
+                                contextvars.copy_context().run, _read_back_row, None, None,
+                                _UNCONFIRMED_ROW_WORDS[_UNCONFIRMED_COULD_NOT_CHECK],
+                                db_module.UNCONFIRMED_STATUS, shape,
+                                _resolve_enforcement(enforcement))
+                        except Exception:
+                            pass
+                        _note_cancelled(args, kwargs, "could_not_check", None, at)
+                        raise
+                    except AgentXUnconfirmedError as exc:
+                        await _note_run_async(args, kwargs, exc.reason, at=at)
+                        raise
+                    await _note_run_async(args, kwargs, _read_back_word(unconfirmed), at=at)
                     if unconfirmed is not None:
                         return unconfirmed
                     result = _apply_scrub(raw, decision)

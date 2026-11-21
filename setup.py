@@ -88,9 +88,14 @@ setup(
     packages=find_packages(include=["agentx_sdk", "agentx_sdk.*"]),
     # The evidence file's words (`agentx evidence`): data, not code, so it is named here or it
     # would be left out of the wheel.
-    package_data={"agentx_sdk": ["evidence_words.json"]},
+    package_data={"agentx_sdk": ["evidence_words.json", "matcher/demo/*"]},
     install_requires=[
         "requests>=2.25.0",
+        # Time zone data, for `agentx match` on a calendar: Windows has none Python can read, so
+        # without it every Outlook event stays in its own unconverted zone. Data only, no code;
+        # where the system has zone data, Python reads the system's first. Python 3.8 has no
+        # zoneinfo to read it with, so it is not installed there.
+        "tzdata; python_version >= '3.9'",
     ],
     # 💡 THE observabilty entrypoint mapping hook
     entry_points={

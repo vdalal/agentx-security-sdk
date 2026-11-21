@@ -380,6 +380,24 @@ def _print_unconfirmed_calls():
            % ("it" if one else "them")).split())
 
 
+def _print_read_backs_confirmed():
+    """`agentx audit`: how many calls `verify=` read back and found done. Prints nothing when there
+    are none. Its own sentence, never a total with the unconfirmed count: confirmed calls were
+    first recorded in 0.5.12, so on an older ledger "read back N" would add a count from the start
+    to a count from 0.5.12 and come out short."""
+    try:
+        from . import db as db_module
+        found = db_module.get_read_backs()
+        n = (found or {}).get("confirmed") or 0
+    except Exception:
+        return
+    if not n:
+        return
+    print()
+    _print_wrapped("✅ On this ledger, %s read back with verify= and confirmed."
+                   % ("1 call was" if n == 1 else "%d calls were" % n))
+
+
 def _shown_policy(name):
     """A stored policy name as a person reads it (one stored name is our jargon). Never raises."""
     try:
@@ -6141,6 +6159,7 @@ def _execute_audit_screen(args=None):
         if reason != "unreadable":
             _print_server_events(db_module)
             # Every call on this ledger may have tripped a policy, and a watched one still ran.
+            _print_read_backs_confirmed()
             _print_unconfirmed_calls()
 
         print("=" * 75)
@@ -6304,6 +6323,8 @@ def _execute_audit_screen(args=None):
             else:
                 print("  Wrap one of your tools and its calls land here beside these.")
     # After the count and whose calls those are, before the table, as on the TypeScript screen.
+    # The confirmed line is Python only for now: the TypeScript SDK records no confirmed row yet.
+    _print_read_backs_confirmed()
     _print_unconfirmed_calls()
     _totals = inventory.get("totals") or {}
     # Printed UNDER the table now (founder decision: a two-line opener), beside the tools it
@@ -10493,6 +10514,16 @@ def execute_allowlist(args, gateway_url, api_key, admin_key=None, admin_refusal=
             print("\n❌ " + _unreached(err, gateway_url, "sent", "list", "agentx allowlist"))
             print("=" * 75)
             sys.exit(1)
+        if res.status_code == 202:
+            # The hosted gateway kept it as a waiting change: sent with the agent's key, which
+            # cannot change the rules that hold the agent. Not refused, not applied.
+            print("\n⏳ Nothing changed yet: the hosted gateway keeps this list as a waiting change,")
+            print("   because it was sent with your agent's key. Whoever reads the email address")
+            print("   this key was issued to approves it at agentx-core.com/app (Held calls,")
+            print("   Waiting changes).")
+            print("   A newer push replaces it.")
+            print("=" * 75)
+            sys.exit(0)
         if res.status_code != 200:
             try:
                 detail = _remote_json(res).get("detail") or res.text
@@ -14142,6 +14173,10 @@ def _print_cli_usage(advanced=False):
     print("  evidence    A file for your reviewer: rules in force, calls stopped or flagged, a record link")
     print("                (writes agentx-evidence-<date>.json, or '--out FILE'; '--json' prints it)")
     print("                ('--gateway' writes the file your gateway builds, for every agent on your key)")
+    print("  match       Check what your agent was asked, did and said against your records, on this")
+    print("                machine: nothing is sent anywhere ('match --demo' shows a practice week;")
+    print("                'match --tasks FILE --log FILE --records FILE' checks yours;")
+    print("                'match --from-sdk --records FILE' reads what this SDK kept)")
     print("  status      Local protection stats + armed policies (default; live view needs the gateway)")
     print("  review      One-key pass over pending blocks: adopt a safe-path, or label a block")
     print("                ('--stats' for a summary of every incident's outcome, not just what's pending)")
@@ -14260,7 +14295,9 @@ def main():
     # non-raising, the same contract init_db has always relied on one line below its own docstring.
     # Lazy import, like every other db use in this file.
     from .db import ensure_ledger_current as _ensure_ledger_current
-    _ensure_ledger_current()
+    # `agentx match` reads only the files it is given: it neither reads nor upgrades a ledger.
+    if sys.argv[1:2] != ["match"]:
+        _ensure_ledger_current()
 
     # ONE brand line, not a boxed category. This prints before EVERY `agentx` command, and
     # every subcommand already announces itself underneath it -- so the old three-line box
@@ -14308,6 +14345,13 @@ def main():
         print(f" 📦 Update AgentX: {stale}.", file=_chrome)
         print(f"    ▶ {pulse.UPGRADE_COMMAND}", file=_chrome)
         print("=" * 75, file=_chrome)
+
+    # `agentx match` reads the files it is given: no key, no gateway, no mode, no ledger (the upgrade
+    # above skips it). It dispatches HERE, after the banner and the offline update notice and before
+    # the key check below, which would otherwise refuse it on an install set to cloud mode with no key.
+    if sys.argv[1:2] == ["match"]:
+        from .matcher import main as _match_main
+        sys.exit(_match_main(sys.argv[2:]))
 
     env = load_env_file()
 

@@ -634,8 +634,10 @@ def build(db_path=None):
     sites = _masked_sites(db.get_destinations(db_path, statuses=db.RAN_WITHOUT_OPINION_STATUSES)) \
         if readable else None
     head, intact = _record_head(db_path)
+    read_backs = db.get_read_backs(db_path) if readable else None
     could_not_read = [name for name, value in (("stopped_or_held_calls", stopped),
                                                ("sites_recorded", sites),
+                                               ("read_backs", read_backs),
                                                ("outbound_allowlist", allowlist))
                       if value is None]
     # The hosted file's rule, decided once: a shown row with no date makes the list's period
@@ -695,6 +697,9 @@ def build(db_path=None):
              "held_then": e["held"]}
             for e in db.get_server_events(db_path)],
         "server_changes_note": notes["server_changes"],
+        # What `verify=` found: counts of calls the agent made, never more calls.
+        "read_backs": read_backs,
+        "read_backs_note": notes["read_backs"],
         "outbound_allowlist": allowlist,
         "outbound_allowlist_note": notes["outbound_allowlist"],
         "rule_sources": rule_sources(),

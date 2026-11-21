@@ -1557,6 +1557,14 @@ def _push(gateway_url, api_key, admin_key, admin_refusal):
         _say("Nothing was sent: your gateway at %s does not take a push of team rules (it is "
              "older than %s)." % (gateway_url, _RULES_ROUTE_SINCE))
         return 1
+    if res.status_code == 202:
+        # The hosted gateway kept it as a waiting change: this was the agent's key, and the
+        # agent's own key cannot change the rules that hold it. Not refused, not applied.
+        _say("Nothing changed yet: the hosted gateway keeps this push as a waiting change, "
+             "because it was sent with your agent's key. Whoever reads the email address this "
+             "key was issued to approves it at agentx-core.com/app (Held calls, Waiting changes). A newer push "
+             "replaces it.")
+        return 0
     if res.status_code != 200:
         try:
             detail = _remote_json(res).get("detail") or res.text

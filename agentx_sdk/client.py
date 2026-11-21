@@ -271,7 +271,7 @@ class AgentXClient:
                         action=None, args=None, session_tokens=0, session_cost_usd=0, budget_pool_id=None,
                         enforcement=None, strike_count=None, tool=None, shield_matched=None,
                         statement_text=None, dest_hosts=None, watch_source=None,
-                        rule_args=None, dest_domains=None, environment=None):
+                        rule_args=None, dest_domains=None, environment=None, obeys_posture=False):
         # `tool` is APPENDED, after the deprecated `strike_count`, not slotted in beside
         # the fields it belongs with. `strike_count` is retained precisely so existing
         # direct callers do not break, and inserting ahead of it would hand a caller
@@ -457,6 +457,14 @@ class AgentXClient:
         # request, not only when it differs from the default, because the gateway's fallback
         # for an absent field has to assume the oldest released SDK rather than this one.
         payload["client_timeout_s"] = EVALUATE_TIMEOUT_S
+
+        # The CALLER stops a watched call when the gateway says the KEY enforces
+        # (`X-AgentX-Posture`, read below into `key_posture`): only `@agentx_protect` does, so only
+        # it passes `obeys_posture=True`. A direct caller of this client that runs whatever comes
+        # back sends nothing, and a gateway that keeps a posture per key records its watched call
+        # as "ran against this key's setting" (code review: the transport claimed it for all).
+        if obeys_posture is True:
+            payload["obeys_posture"] = True
 
         # What THIS build can actually redact, so the gateway only asks for what we can do.
         #
@@ -733,6 +741,13 @@ class AgentXClient:
             # not supply it ("Approved by SOC" as the reason on a refused call; review round 1).
             if isinstance(result, dict):
                 result.pop("cause", None)
+                # The KEY's posture, from the gateway's header only, never from the body: the
+                # hosted gateway keeps whether a key watches or enforces, and says
+                # `X-AgentX-Posture: enforce` when this call asked to only watch on a key a person
+                # set to enforce. The decorator then stops the call as an enforcing one would.
+                result.pop("key_posture", None)
+                if (response.headers.get("X-AgentX-Posture") or "").strip().lower() == "enforce":
+                    result["key_posture"] = "enforce"
             hdr = response.headers.get("X-AgentX-Reasoning")
             if hdr is not None and isinstance(result, dict):
                 result["reasoning_enabled"] = (hdr == "1")

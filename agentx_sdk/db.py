@@ -419,11 +419,47 @@ def _server_event_where():
 # did not confirm the change. Not a call, or every count of calls would see one call twice, and
 # not a block, because nothing was stopped. `policy_name` says which of the two it was.
 UNCONFIRMED_STATUS = "UNCONFIRMED"
+# Its other half: the tool ran and its `verify=` read the change back. Also a second row for one
+# call, so also not a call. Written from 0.5.12; a ledger's confirmed calls before then wrote none,
+# so a count of these starts there and is never added to the unconfirmed count as "read back".
+CONFIRMED_STATUS = "CONFIRMED"
+CONFIRMED_ROW_WORDS = "Confirmed"
+# The unconfirmed row's words for a read-back that itself failed (decorators' `_UNCONFIRMED_ROW_WORDS`
+# uses this one), so `get_read_backs` can tell it from "Not confirmed".
+COULD_NOT_CHECK_ROW_WORDS = "Could not check"
 
 
 def _not_a_call_where():
     """The rows that are not a call the agent made."""
-    return "(%s OR status IS '%s')" % (_server_event_where(), UNCONFIRMED_STATUS)
+    return "(%s OR status IS '%s' OR status IS '%s')" % (
+        _server_event_where(), UNCONFIRMED_STATUS, CONFIRMED_STATUS)
+
+
+def get_read_backs(path=None):
+    """What `verify=` found, over the whole ledger. Never raises; None when the ledger cannot be
+    read, zeros when there is none.
+
+    ``{"confirmed": int, "not_confirmed": int, "could_not_check": int}``. The two unconfirmed
+    kinds are told apart by the row's fixed words, which `_unconfirmed` writes and nothing else
+    does."""
+    out = {"confirmed": 0, "not_confirmed": 0, "could_not_check": 0}
+    if not os.path.exists(path or DB_PATH):
+        return out
+    try:
+        with _connection(path) as conn:
+            rows = conn.execute(
+                "SELECT status, policy_name, COUNT(*) FROM event_log WHERE status IN (?, ?) "
+                "GROUP BY status, policy_name", (CONFIRMED_STATUS, UNCONFIRMED_STATUS)).fetchall()
+    except Exception:
+        return None
+    for status, words, n in rows:
+        if status == CONFIRMED_STATUS:
+            out["confirmed"] += n
+        elif words == COULD_NOT_CHECK_ROW_WORDS:
+            out["could_not_check"] += n
+        else:
+            out["not_confirmed"] += n
+    return out
 
 
 def _calls_subquery():
@@ -2262,7 +2298,7 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
             # get_ledger_census's `interceptions`". That is the rule -- and applying it to the
             # census and not here is what left it half-done.
             #
-            # Nor is what a server did to a tool, or a call its `verify=` did not confirm: a
+            # Nor is what a server did to a tool, or what a call's `verify=` found: a
             # trimmed one is not an older block record dropped (it is still a row, so the trim
             # itself takes it like any other).
             _catch_sql, _catch_params = _had_an_opinion_clause()
@@ -2310,15 +2346,18 @@ def prune_ledger(path=None, now=None, max_age_days=None, max_rows=None):
                 # overage actually requires. Deleting every ALLOWED row whenever the ledger is
                 # one row over would throw away the whole inventory to make room for one block.
                 excess = remaining - cap
+                # A confirmed read-back row is spent with the inventory: it is a second row for
+                # an allowed call, and kept back it would fill the ledger while the calls it
+                # describes went first. An unconfirmed one is a finding, and is spared like a block.
                 inventory_pick = (
-                    "SELECT id FROM event_log WHERE status = ? ORDER BY id LIMIT ?")
+                    "SELECT id FROM event_log WHERE status IN (?, ?) ORDER BY id LIMIT ?")
                 cursor.execute(
                     "SELECT MIN(timestamp) FROM event_log "
                     "WHERE timestamp IS NOT NULL AND id IN (%s)" % inventory_pick,
-                    (INVENTORY_STATUS, excess))
+                    (INVENTORY_STATUS, CONFIRMED_STATUS, excess))
                 oldest_by_size = cursor.fetchone()[0]
                 dropped += _chain_delete(conn, "id IN (%s)" % inventory_pick,
-                                         (INVENTORY_STATUS, excess))
+                                         (INVENTORY_STATUS, CONFIRMED_STATUS, excess))
 
                 # Re-count rather than subtract: pass 1 can delete FEWER rows than `excess`
                 # when there is not enough inventory to cover it, and assuming otherwise would

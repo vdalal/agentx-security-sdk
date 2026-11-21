@@ -1,0 +1,65 @@
+change_id,time_local,record_id,record_name,field,old,new,changed_by
+H5000,2026-11-02 09:05,C108,Ivo Petrov,stage,Lead,Proposal,agent-bot
+H5058,2026-11-02 14:01,C105,Fay Kim,stage,Proposal,Won,devon.k
+H5001,2026-11-02 14:41,C110,Kai Moss,stage,Lead,Proposal,agent-bot
+H5002,2026-11-02 16:58,C102,Chen Wei,stage,Lead,Qualified,agent-bot
+H5038,2026-11-03 00:10,C118,Sara Nunez,stage,Lead,Proposal,maria.s
+H5003,2026-11-03 01:23,C114,Omar Haddad,stage,Lead,Qualified,agent-bot
+H5004,2026-11-03 04:01,C117,Rui Costa,note,,Customer asked for a call next week.,agent-bot
+H5043,2026-11-03 08:56,C116,Quinn Reyes,stage,Proposal,Won,maria.s
+H5005,2026-11-03 09:34,C107,Hana Mori,note,,Customer asked for a call next week.,agent-bot
+H5006,2026-11-03 14:54,C116,Quinn Reyes,note,,Customer asked for a call next week.,agent-bot
+H5007,2026-11-03 14:54,C116,Quinn Reyes,note,,Customer asked for a call next week.,agent-bot
+H5008,2026-11-03 17:24,C118,Sara Nunez,deal_amount,0,4000,agent-bot
+H5009,2026-11-03 20:53,C116,Quinn Reyes,deal_amount,0,1200,agent-bot
+H5050,2026-11-04 00:38,C118,Sara Nunez,stage,Proposal,Qualified,devon.k
+H5054,2026-11-04 00:59,C106,Gus Hale,stage,Qualified,Proposal,devon.k
+H5010,2026-11-04 02:03,C103,Dana Fox,stage,Lead,Proposal,agent-bot
+H5011,2026-11-04 10:12,C109,Jo Lane,deal_amount,0,500,agent-bot
+H5047,2026-11-04 14:27,C111,Lea Brandt,stage,Won,Qualified,devon.k
+H5012,2026-11-04 15:00,C107,Hana Mori,stage,Lead,qualified,agent-bot
+H5040,2026-11-04 15:33,C100,Ana Ruiz,stage,Won,Qualified,maria.s
+H5055,2026-11-04 16:49,C104,Eli Park,stage,Lead,Lead,maria.s
+H5013,2026-11-04 17:39,C112,Max Ortiz,note,,Customer asked for a call next week.,agent-bot
+H5061,2026-11-04 19:21,C100,Ana Ruiz,stage,Won,Proposal,maria.s
+H5014,2026-11-04 21:41,C117,Rui Costa,stage,Lead,Won,agent-bot
+H5060,2026-11-04 22:12,C115,Pia Lund,stage,Proposal,Qualified,devon.k
+H5015,2026-11-05 01:22,C107,Hana Mori,deal_amount,0,2500,agent-bot
+H5016,2026-11-05 04:31,C108,Ivo Petrov,stage,Lead,Proposal,agent-bot
+H5053,2026-11-05 08:11,C100,Ana Ruiz,stage,Proposal,Lead,devon.k
+H5017,2026-11-05 08:38,C110,Kai Moss,note,,Customer asked for a call next week.,agent-bot
+H5062,2026-11-05 10:00,C107,Hana Mori,stage,Qualified,Lead,agent-bot
+H5018,2026-11-05 16:36,C109,Jo Lane,deal_amount,0,500,agent-bot
+H5019,2026-11-05 20:57,C116,Quinn Reyes,note,,Customer asked for a call next week.,agent-bot
+H5048,2026-11-05 23:19,C106,Gus Hale,stage,Qualified,Lead,maria.s
+H5020,2026-11-06 00:35,C108,Ivo Petrov,note,,Customer asked for a call next week.,agent-bot
+H5046,2026-11-06 00:36,C101,Ben Cole,stage,Won,Proposal,devon.k
+H5021,2026-11-06 05:51,C118,Sara Nunez,stage,Lead,Proposal,agent-bot
+H5022,2026-11-06 05:51,C118,Sara Nunez,stage,Lead,Proposal,agent-bot
+H5042,2026-11-06 08:10,C105,Fay Kim,stage,Lead,Lead,devon.k
+H5023,2026-11-06 10:43,C118,Sara Nunez,note,,Customer asked for a call next week.,agent-bot
+H5024,2026-11-06 13:31,C112,Max Ortiz,stage,Lead,Qualified,agent-bot
+H5049,2026-11-06 15:55,C114,Omar Haddad,stage,Lead,Won,maria.s
+H5025,2026-11-06 17:04,C112,Max Ortiz,stage,Lead,Won,agent-bot
+H5057,2026-11-06 18:59,C110,Kai Moss,stage,Lead,Proposal,maria.s
+H5039,2026-11-06 20:06,C106,Gus Hale,stage,Proposal,Proposal,maria.s
+H5026,2026-11-06 20:07,C111,Lea Brandt,stage,Lead,Proposal,agent-bot
+H5045,2026-11-06 21:10,C101,Ben Cole,stage,Qualified,Qualified,maria.s
+H5044,2026-11-06 21:36,C100,Ana Ruiz,stage,Proposal,Qualified,devon.k
+H5027,2026-11-07 01:39,C118,Sara Nunez,stage,Lead,Qualified,agent-bot
+H5056,2026-11-07 04:42,C107,Hana Mori,stage,Qualified,Won,maria.s
+H5028,2026-11-07 04:47,C104,Eli Park,note,,Customer asked for a call next week.,agent-bot
+H5052,2026-11-07 08:16,C118,Sara Nunez,stage,Won,Won,maria.s
+H5029,2026-11-07 10:32,C109,Jo Lane,note,,Customer asked for a call next week.,agent-bot
+H5030,2026-11-07 18:37,C102,Chen Wei,deal_amount,0,2500,agent-bot
+H5031,2026-11-07 21:08,C104,Eli Park,deal_amount,0,2500,agent-bot
+H5032,2026-11-08 01:57,C103,Dana Fox,stage,Lead,Proposal,agent-bot
+H5033,2026-11-08 04:30,C102,Chen Wei,stage,Lead,Qualified,agent-bot
+H5063,2026-11-08 05:00,C113,Nia Shaw,owner,maria.s,agent-bot,agent-bot
+H5051,2026-11-08 05:14,C114,Omar Haddad,stage,Lead,Lead,maria.s
+H5059,2026-11-08 06:15,C109,Jo Lane,stage,Lead,Won,maria.s
+H5037,2026-11-08 09:11,C104,Eli Park,stage,Lead,Won,maria.s
+H5041,2026-11-08 10:51,C119,Tom Byrne,stage,Qualified,Qualified,devon.k
+H5034,2026-11-08 12:15,C115,Pia Lund,stage,Lead,Won,agent-bot
+H5035,2026-11-08 18:13,C103,Dana Fox,stage,Lead,Qualified,agent-bot
+H5036,2026-11-08 20:42,C119,Tom Byrne,deal_amount,0,500,agent-bot
