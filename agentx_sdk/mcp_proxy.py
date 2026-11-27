@@ -114,7 +114,8 @@ try:
                                read_novelty, advance_watermark, format_novelty_item, top_novelty,
                                current_call_shape, _call_shape, _dest_hosts_value,
                                _dest_domains_value, WATERMARK_SESSION,
-                               record_mcp_roster, MCP_DRIFT_POLICY_NAME, MCP_DRIFT_DISPLAY_NAME,
+                               record_mcp_roster, record_held_keys,
+                               MCP_DRIFT_POLICY_NAME, MCP_DRIFT_DISPLAY_NAME,
                                MCP_POISON_POLICY_NAME, MCP_POISON_DISPLAY_NAME,
                                MCP_HELD_CALL_POLICY_NAME, SERVER_EVENT_STATUS)
 finally:
@@ -1729,6 +1730,35 @@ def _inspect_list_line(line, pins, pending_list_ids, server_key, mode, drifted, 
         return
 
 
+def _server_keys(child_cmd, environ):
+    """The keys the wrapped server holds, described without the key: its environment (the client
+    applies the server's `env` block when it starts this proxy, and the server inherits it) and
+    a connection string or key shape in its command line. Never raises."""
+    try:
+        from agentx_sdk import credentials as _credentials
+        found = _credentials.held_in(environ)
+        for i, arg in enumerate(child_cmd or ()):
+            d = _credentials.describe("argument %d" % (i + 1), str(arg))
+            if d:
+                found.append(d)
+        return found
+    except Exception:
+        return []
+
+
+def _note_server_keys(session_stats):
+    """Write the wrapped server's keys to the ledger once (`agentx audit` names them under the
+    server), when there is a ledger to write to: the first recorded call creates it. Never raises."""
+    try:
+        if session_stats.get("_keys_noted") or not session_stats.get("_keys_held"):
+            return
+        agent = "mcp_proxy:" + (session_stats.get("_keys_label") or "")[:120]
+        if record_held_keys(agent, session_stats["_keys_held"]):
+            session_stats["_keys_noted"] = True
+    except Exception:
+        pass
+
+
 def _flush_mcp_roster(session_stats):
     """Write every pending advertised list to the ledger, for each server that has a
     numerator. Never raises.
@@ -2272,6 +2302,7 @@ def _screen_message(msg, session_stats, streaks, max_turns, writer, log, harvest
                 pass
             # The numerator exists now; a menu seen before this call can be written.
             _flush_mcp_roster(session_stats)
+            _note_server_keys(session_stats)
         return "forward"
 
     # AUDIT posture: this call matched a policy, but AGENTX_POSTURE=audit — record the
@@ -2614,6 +2645,8 @@ def run_proxy(child_cmd, *, client_in, client_out, session_stats, log=None,
     server_key = _server_key(child_cmd)
     session_stats["_roster_key"] = _roster_key(child_cmd)
     session_stats["_roster_replaces"] = server_key
+    session_stats["_keys_label"] = _server_label(child_cmd)
+    session_stats["_keys_held"] = _server_keys(child_cmd, os.environ)
     pending_list_ids = set()
     drifted = set()
     if pins is not None:

@@ -3872,7 +3872,11 @@ _SCRUB_REGEX_MAP = {
     # ten digits it can reach INSIDE a longer identifier, so a tracking number such as
     # `1Z999AA10123456784` comes back as `1Z999AA[REDACTED_PHONE]`. A phone-shaped run only
     # counts when it is not part of a longer number; `+1 (415) 555-0142` still redacts.
-    "PHONE": r'(?<!\d)(?:\+\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)',
+    # And not part of a longer TOKEN: a letter or `_` beside it makes it an id, so
+    # `sk-0123456789abcdef...` and `ORD4155550142` are not phone numbers (the gateway's phone
+    # patterns refuse a word character the same way). `Tel:4155550142` still redacts, and an
+    # extension (`x204`, `ext. 5`) is part of the number, so `415-555-0142x204` redacts whole.
+    "PHONE": r'(?<![0-9A-Za-z_])(?:\+\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?:\s*(?:[xX]|[eE][xX][tT]\.?)\s*\d{1,6})?(?![0-9A-Za-z_])',
     # A US SSN in its WRITTEN form only. A bare nine-digit run is not identifiable: it is also
     # an order number, a part number and a zip+4, and redacting those is the defect that put
     # `[REDACTED_PHONE]` in the middle of a tracking number. Requiring the dashes means we miss
@@ -4255,7 +4259,8 @@ _BUILTIN_POLICY_KEYWORDS = [
         # used to sit here AND removes their bare-integer false positive (a numeric id
         # such as `WHERE id = 2852039166` is no longer mistaken for the metadata IP).
         "blocked_intents": ["169.254.169.254", "localhost", "127.0.0.1", "0.0.0.0", "metadata.google.internal", "100.100.100.200", "[::1]", "fd00:ec2::254", "::ffff:169.254.169.254"],
-        "socratic_prompt": "This target is a loopback or cloud-metadata address, a common SSRF path to internal credentials.",
+        # "Private network" too: a 10.x or 192.168.x address is stopped by the same rule.
+        "socratic_prompt": "This target is a loopback, private-network or cloud-metadata address, a common SSRF path to internal systems and credentials.",
         "preferred_alternative": "Send the request to the intended external service hostname over HTTPS, not an internal IP, localhost, or 169.254.169.254.",
     },
     {
@@ -5859,8 +5864,10 @@ def _detect_destructive_sql(normalized):
 # _coerce_ip decode. It is deliberately NARROWER than the gateway's detect_ssrf_target: it
 # fires ONLY on a host inside an explicit scheme://URL (not a bare host, and not the gateway's
 # `.internal`/`.localhost` suffix rule), so a bare numeric id in a payload
-# (`WHERE id = 2852039166`) is never coerced -> no false positive. (Dotted-octal like
-# 0177.0.0.1 is NOT decoded -- ipaddress rejects leading-zero octets; same limit as the gateway.)
+# (`WHERE id = 2852039166`) is never coerced -> no false positive. Inside a URL a client reads
+# the host the way inet_aton does, so every spelling it accepts is decoded: 127.1, 127.0.1,
+# 0x7f.0.0.1, 0177.0.0.1 and 017700000001 all reach 127.0.0.1 (`_inet_aton_ip_keyless`, the same
+# rules as the gateway's `_inet_aton_ip`).
 # The pattern (`_SSRF_URL_RE`) and the host extraction (`url_hosts`) live in `statement.py`,
 # where the ledger reads the same hosts; both are imported at the top of this file, and
 # `_SSRF_URL_RE` is the name the gateway's copy is compared against.
@@ -5885,28 +5892,70 @@ _INT_HOST_SPACE_KEYLESS = 1 << 32
 
 
 def _coerce_ip_keyless(host):
-    """Canonicalize a host token to an ipaddress, decoding the common SSRF-bypass
-    encodings (decimal int, hex int, dotted, IPv6). Returns None for a genuine hostname.
-    Kept in step with the gateway's _coerce_ip on the UPPER bound; see the note above for the
-    one deliberate divergence (the gateway's schemeless small-int rule, which has no analogue
-    here)."""
+    """Canonicalize a host token to an ipaddress, decoding every spelling inet_aton accepts
+    (one to four parts, each decimal, 0x-hex or 0-led octal) and IPv6. Returns None for a
+    genuine hostname. Agrees with the gateway's _coerce_ip on every URL host (asserted by the
+    cross-surface tripwire); see the note above for the one deliberate divergence (the gateway's
+    schemeless small-int rule, which has no analogue here)."""
     import ipaddress
-    h = host.strip().strip("[]")
+    # A trailing dot is the fully qualified spelling of the same host: `127.1.` is 127.0.0.1 to
+    # a resolver and to inet_aton. The gateway strips it before this check; this door did not.
+    h = host.strip().strip("[]").rstrip(".")
     if not h:
         return None
     try:
         return ipaddress.ip_address(h)
     except ValueError:
         pass
-    try:
-        as_int = int(h, 16) if h.lower().startswith("0x") else int(h)
-    except (ValueError, OverflowError):
+    return _inet_aton_ip_keyless(h)
+
+
+_INET_ATON_PART_RE_KEYLESS = re.compile(r"0[xX][0-9a-fA-F]*|[0-9]+")
+
+
+def _inet_aton_ip_keyless(h):
+    """The IPv4 address inet_aton reads from a host of one to four dot-separated parts, or None.
+    The last part fills the remaining bytes, so a single part is the whole 32-bit value; that
+    keeps integer hosts inside `_INT_HOST_SPACE_KEYLESS`. The same rules as the gateway's
+    `_inet_aton_ip`."""
+    import ipaddress
+    import unicodedata
+    # Full-width digits read as digits, as int() read them before this reader existed.
+    h = unicodedata.normalize("NFKC", h)
+    parts = h.split(".")
+    if not 1 <= len(parts) <= 4:
         return None
+    values = []
+    for p in parts:
+        if not _INET_ATON_PART_RE_KEYLESS.fullmatch(p):
+            return None
+        # Leading zeros are dropped BEFORE the length cap: a client reads `0x0000a9fea9fe` as
+        # 169.254.169.254, and capping the padded text refused it. No 32-bit value takes more than
+        # 12 digits (037777777777), and int() of a very long digit string raises, so a longer
+        # value is refused before it is read.
+        if p.lower().startswith("0x"):
+            digits, base = p[2:].lstrip("0") or "0", 16
+        elif len(p) > 1 and p.startswith("0"):
+            digits, base = p.lstrip("0") or "0", 8
+            if not set(digits) <= set("01234567"):
+                return None
+        else:
+            digits, base = p, 10
+        if len(digits) > 12:
+            return None
+        values.append(int(digits, base))
+    last_bits = 8 * (5 - len(values))
+    if any(v > 255 for v in values[:-1]) or values[-1] >= (1 << last_bits):
+        return None
+    as_int = 0
+    for v in values[:-1]:
+        as_int = (as_int << 8) | v
+    as_int = (as_int << last_bits) | values[-1]
     if not (0 <= as_int < _INT_HOST_SPACE_KEYLESS):
         return None
     try:
         return ipaddress.ip_address(as_int)
-    except (ValueError, OverflowError):
+    except ValueError:
         return None
 
 
@@ -9955,6 +10004,42 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
             _tool_changes.note_wrapped_tool(_func_name, func)
         except Exception:
             pass
+        # Which of the agent's keys this tool uses, as far as its own code says: read ONCE here
+        # (credentials.tool_reads keeps variable and provider names, never the code), linked to
+        # the held keys at the first call, when the environment is settled. Never raises.
+        try:
+            from . import credentials as _credentials
+            _cred_reads = _credentials.tool_reads(func)
+        except Exception:
+            _credentials, _cred_reads = None, None
+        _cred_uses = []
+
+        def _credential_refs():
+            if _credentials is None or _cred_reads is None:
+                return None
+            try:
+                if not _cred_uses:
+                    _cred_uses.append(_credentials.keys_used(_cred_reads, _credentials.held()))
+                return _cred_uses[0] or None
+            except Exception:
+                return None
+
+        # The same keys on this machine's ledger (`agentx audit`), keyless included: the tool's
+        # links once, the agent's held list once per process (credentials.note_held). Each write
+        # needs a ledger that exists; until the first call's own row creates it, the next call
+        # tries again. Never per call once written; never raises.
+        _links_noted = []
+
+        def _note_keys():
+            if _credentials is None or _cred_reads is None:
+                return
+            try:
+                if not _links_noted and db_module.record_key_links(
+                        agent_id, _func_name, _credential_refs() or []):
+                    _links_noted.append(True)
+                _credentials.note_held(agent_id, _call_environment(), db_module)
+            except Exception:
+                pass
         # The decorated function's own docstring is this door's equivalent of the description
         # an MCP server advertises: the sentence the author wrote to say what the tool does.
         # Resolved ONCE here for the same reason the signature is -- this runs inside every
@@ -9979,6 +10064,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
         # the call's positional/keyword arguments (the body still unpacks them with
         # *args/**kwargs exactly as before).
         def _decide(args, kwargs, call_state=None):
+            _note_keys()
             # 🔴 THE DECORATOR DOOR'S SCHEMA MIGRATION, ONCE PER PROCESS. init_db() ran at
             # import and carried this for free; dropping it would have quietly narrowed db.py's
             # promise that "a column added here migrates itself onto every ledger that already
@@ -10926,6 +11012,10 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 # Where this deployment runs (AGENTX_ENVIRONMENT), for a team rule's number per
                 # environment. From the process, never from the tool's arguments.
                 environment=_call_environment(),
+                # The keys this agent holds (on its first call, then every few minutes) and the
+                # ones this tool's code links it to. Watch only; never a key's value.
+                credentials=(_credentials.held_to_send(agent_id) if _credentials else None),
+                credential_refs=_credential_refs(),
                 session_tokens=session_tokens_total,
                 session_cost_usd=session_cost_total,
                 budget_pool_id=resolved_pool_id,
@@ -10964,7 +11054,7 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                     _KEY_POSTURE_SAID.append(True)
                     # "the gateway checks": a match on this machine's own files, decided here
                     # before the gateway is asked, still only watches (code review).
-                    print("🔒 [AgentX SDK] This key is set to enforce on the gateway, so the "
+                    print("🔒 [AgentX SDK] This AgentX key is set to enforce on the gateway, so the "
                           "calls the gateway checks are enforced even where this code says only "
                           "watch. A person changes that at agentx-core.com/app.")
 
@@ -11862,6 +11952,16 @@ def agentx_protect(agent_id: str, extract_query_func=None, extract_cot_func=None
                 pass
 
         def _decide_watched(args, kwargs, call_state=None):
+            """`_decide_watched_core`, then the keys noted once more: on a brand-new ledger the
+            first try (inside `_decide`) runs before this call's own row creates the file, so an
+            agent whose only call was the first lost its keys (copy pass render). Once written,
+            both tries are a set lookup."""
+            try:
+                return _decide_watched_core(args, kwargs, call_state)
+            finally:
+                _note_keys()
+
+        def _decide_watched_core(args, kwargs, call_state=None):
             """Run the decision core, then hold the AUDIT guarantee at ONE chokepoint.
 
             Every verdict this decorator can produce — returned or RAISED — passes through

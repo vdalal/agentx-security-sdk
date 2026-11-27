@@ -1368,7 +1368,7 @@ def _pulled_here(gateway_url, key):
                 "AGENTX_API_KEY, the key the hook uses.")
     doc = read_pulled(gateway_url, key)
     if not doc:
-        return ("This machine's hook has not taken them yet with this key; it does at the next "
+        return ("This machine's hook has not taken them yet with this AgentX key; it does at the next "
                 "Claude Code or Codex call, when AGENTX_API_KEY is set where those run.")
     if doc.get("status") == "ok":
         return "This machine's hook took them from it on %s." % _local_date(doc.get("rules_at"))

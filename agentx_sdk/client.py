@@ -271,7 +271,8 @@ class AgentXClient:
                         action=None, args=None, session_tokens=0, session_cost_usd=0, budget_pool_id=None,
                         enforcement=None, strike_count=None, tool=None, shield_matched=None,
                         statement_text=None, dest_hosts=None, watch_source=None,
-                        rule_args=None, dest_domains=None, environment=None, obeys_posture=False):
+                        rule_args=None, dest_domains=None, environment=None, obeys_posture=False,
+                        credentials=None, credential_refs=None):
         # `tool` is APPENDED, after the deprecated `strike_count`, not slotted in beside
         # the fields it belongs with. `strike_count` is retained precisely so existing
         # direct callers do not break, and inserting ahead of it would hand a caller
@@ -410,6 +411,14 @@ class AgentXClient:
         # number may differ per environment. Sent only when set.
         if environment:
             payload["environment"] = str(environment)
+        # The keys this agent holds, described without the key (agentx_sdk/credentials.py), sent
+        # on an agent's first call and then at most every few minutes; and the ones this call's
+        # tool is linked to by its own code. Watch only: the gateway records them, never decides
+        # on them. Neither carries a key's value.
+        if credentials:
+            payload["credentials"] = list(credentials)
+        if credential_refs:
+            payload["credential_refs"] = list(credential_refs)
         # Cumulative session spend for the budget-ceiling floor.
         # Sent like strike_count — the gateway owns the ceiling + verdict. Omitted
         # when zero so an un-metered caller's payload is unchanged.
@@ -584,7 +593,6 @@ class AgentXClient:
                                             # can exceed 15s). Forwarded above so the gateway
                                             # can fit its judge inside it — see P-157.
             )
-            
             # AUTH IS NOT AVAILABILITY, and the availability contract must not swallow it.
             # 401 was always a hard error; review found the new non-verdict gate below had
             # quietly annexed the rest of the class. An SSO proxy in front of the gateway
@@ -732,6 +740,15 @@ class AgentXClient:
                     out["gateway_answered"] = True
                     out["gateway_identified"] = True
                 return out
+            # A verdict: the held list this call carried has been delivered (until now,
+            # credentials.held_to_send kept it due, so a timed-out or non-verdict first call
+            # does not leave the gateway without it).
+            if "credentials" in payload:
+                try:
+                    from . import credentials as _credentials
+                    _credentials.mark_sent(agent_id)
+                except Exception:
+                    pass
             # Reasoning-tier capability (Recover vs keyless Shield) is advertised as a
             # header on EVERY /v1/evaluate response, so the SDK learns it on any verdict
             # (block/escalate/allow) — not just the body paths that used to mention it.

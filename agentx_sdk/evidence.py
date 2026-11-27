@@ -784,7 +784,7 @@ def _from_gateway(args, gateway_url, api_key, admin_key=None, admin_refusal=None
         say("❌ Could not reach your gateway at %s." % _sanitize_detail(gateway_url, limit=200))
         return 1
     if res.status_code in (401, 403):
-        say("❌ Your gateway did not accept this key (%d)." % res.status_code)
+        say("❌ Your gateway did not accept this AgentX key (%d)." % res.status_code)
         return 1
     try:
         doc = res.json()

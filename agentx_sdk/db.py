@@ -3553,6 +3553,150 @@ def get_mcp_roster(path=None):
         return out
 
 
+# ---- The keys an agent holds (credentials.py), described without the key -------------------
+#
+# Two small tables, written once per process (per agent, and per tool), never per call: which keys
+# an agent held, and which held key each tool's own code links it to. "Used by N calls" is then
+# counted from event_log, the record that already exists. Neither table holds a key's value:
+# a recognised key by its last four and a 12-character id, a connection string by user@host.
+# Created on write, like the roster, and NEVER the store itself: a process that only held keys
+# and recorded no call leaves no ledger behind.
+_CREATE_HELD_KEYS_SQL = """CREATE TABLE IF NOT EXISTS held_keys (
+    agent_id    TEXT NOT NULL,
+    ref         TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    provider    TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    label       TEXT NOT NULL,
+    live        INTEGER,
+    last4       TEXT,
+    account     TEXT,
+    environment TEXT,
+    first_seen  REAL NOT NULL,
+    last_seen   REAL NOT NULL,
+    PRIMARY KEY (agent_id, ref, source)
+)"""
+_CREATE_KEY_LINKS_SQL = """CREATE TABLE IF NOT EXISTS key_links (
+    agent_id   TEXT NOT NULL,
+    tool_name  TEXT NOT NULL,
+    ref        TEXT NOT NULL,
+    how        TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen  REAL NOT NULL,
+    PRIMARY KEY (agent_id, tool_name, ref)
+)"""
+
+
+def record_held_keys(agent_id, held, environment=None, path=None):
+    """Write the keys `agent_id` holds (credentials.held()). Best-effort, never raises; True when
+    written, False when there is no ledger yet (the caller tries again at its next call)."""
+    try:
+        if not agent_id or not os.path.exists(path or DB_PATH):
+            return False
+        from . import credentials as _credentials
+        now = time.time()
+        with _connection(path) as conn:
+            conn.execute(_CREATE_HELD_KEYS_SQL)
+            for d in held or []:
+                live = d.get("live")
+                conn.execute(
+                    "INSERT INTO held_keys (agent_id, ref, source, provider, kind, label, live, last4, "
+                    "account, environment, first_seen, last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(agent_id, ref, source) DO UPDATE SET provider=excluded.provider, "
+                    "kind=excluded.kind, label=excluded.label, live=excluded.live, last4=excluded.last4, "
+                    "account=excluded.account, environment=excluded.environment, last_seen=excluded.last_seen",
+                    (str(agent_id), _credentials.ref_of(d), str(d["source"]), str(d["provider"]),
+                     str(d["kind"]), str(d["label"]), None if live is None else int(bool(live)),
+                     d.get("last4"), d.get("account"), environment, now, now))
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def record_key_links(agent_id, tool_name, uses, path=None):
+    """Write which held keys `tool_name`'s code links it to (credentials.keys_used). Best-effort,
+    never raises; True when written (nothing to write counts), False when there is no ledger yet."""
+    try:
+        if not agent_id or not tool_name or not os.path.exists(path or DB_PATH):
+            return False
+        if not uses:
+            return True
+        now = time.time()
+        with _connection(path) as conn:
+            conn.execute(_CREATE_KEY_LINKS_SQL)
+            for u in uses:
+                conn.execute(
+                    "INSERT INTO key_links (agent_id, tool_name, ref, how, first_seen, last_seen) "
+                    "VALUES (?,?,?,?,?,?) ON CONFLICT(agent_id, tool_name, ref) DO UPDATE SET "
+                    "how=excluded.how, last_seen=excluded.last_seen",
+                    (str(agent_id), str(tool_name), str(u["ref"]), str(u["how"]), now, now))
+            conn.commit()
+        return True
+    except Exception:
+        return False
+
+
+def get_held_keys(path=None):
+    """Every agent's held keys, each with the calls that used it, and the three flags. Never
+    raises. `agents` is empty when no key was recorded (every ledger before this shipped).
+
+    A key's calls: event_log rows of that agent for the tools whose code links them to it.
+    Flags: a live key in a run whose name is a dev or test one (credentials.DEV_ENVIRONMENTS); a
+    long-lived AWS access key; one key (by id) held by two or more agents."""
+    empty = {"readable": True, "agents": [], "flags": []}
+    if not os.path.exists(path or DB_PATH):
+        return empty
+    try:
+        from . import credentials as _credentials
+        with _calls_connection(path) as conn:
+            try:
+                held = conn.execute(
+                    "SELECT agent_id, ref, source, provider, kind, label, live, last4, account, "
+                    "environment FROM held_keys ORDER BY agent_id, provider, source").fetchall()
+            except sqlite3.OperationalError:
+                return empty
+            try:
+                links = conn.execute("SELECT agent_id, tool_name, ref FROM key_links").fetchall()
+            except sqlite3.OperationalError:
+                links = []
+            tools_for = {}
+            for agent, tool, ref in links:
+                tools_for.setdefault((agent, ref), set()).add(tool)
+            agents, holders = {}, {}
+            for (agent, ref, source, provider, kind, label, live, last4, account, env) in held:
+                tools = sorted(tools_for.get((agent, ref), ()))
+                used = 0
+                if tools:
+                    marks = ",".join("?" * len(tools))
+                    used = conn.execute(
+                        "SELECT COUNT(*) FROM event_log WHERE agent_id = ? AND tool_name IN (%s)" % marks,
+                        [agent] + tools).fetchone()[0]
+                agents.setdefault(agent, []).append({
+                    "ref": ref, "source": source, "provider": provider, "kind": kind, "label": label,
+                    "live": None if live is None else bool(live), "last4": last4, "account": account,
+                    "environment": env, "tools": tools, "used_by": int(used or 0)})
+                if not ref.startswith("env:"):
+                    holders.setdefault(ref, set()).add(agent)
+        flags = []
+        for agent, keys in sorted(agents.items()):
+            for k in keys:
+                if k["live"] and (k["environment"] or "") in _credentials.DEV_ENVIRONMENTS:
+                    flags.append({"flag": "live_in_dev", "agent": agent, "ref": k["ref"]})
+                if k["kind"] == "access_key_long_lived":
+                    flags.append({"flag": "long_lived_aws", "agent": agent, "ref": k["ref"]})
+        for ref, who in sorted(holders.items()):
+            if len(who) > 1:
+                flags.append({"flag": "shared", "agents": sorted(who), "ref": ref})
+        return {"readable": True,
+                "agents": [{"agent": a, "keys": ks} for a, ks in sorted(agents.items())],
+                "flags": flags}
+    except Exception:
+        out = dict(empty)
+        out["readable"] = False
+        return out
+
+
 #: Every count a sentence about this ledger can rest on, and the ONLY place they are
 #: computed. Both audit views and both output shapes read these, so they cannot disagree.
 _LEDGER_TOTAL_KEYS = ("rows", "inventory", "flagged", "observed", "observed_excluding_ours",

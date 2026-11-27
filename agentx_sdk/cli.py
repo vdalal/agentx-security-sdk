@@ -1740,7 +1740,7 @@ def _collect_candidates():
     return harvest, reframe_flat, rule_list, mcp_flat
 
 
-def _wrap(text, prefix, width=75):
+def _wrap(text, prefix, width=75, hang=""):
     """Hanging-indent wrap for a candidate line, shared by `insights` + `mcp-insights` so the
     two sibling renderers can't drift. Never truncates (a safe-path's discriminating clause is
     usually in its tail); density is bounded by per-policy caps, not by cutting sentences.
@@ -1748,11 +1748,14 @@ def _wrap(text, prefix, width=75):
     Default 75, the fence every screen draws. It was 84 for as long as it existed, and every
     caller that took the default printed nine columns past the fence: the adopt screen's
     arming clause at 83, the undo screen's "if removed:" at 81 beside a "✓ removed:" that
-    had been set to 75 by hand (scoped review of the copy branch). One default, one fence."""
+    had been set to 75 by hand (scoped review of the copy branch). One default, one fence.
+
+    `hang` adds to the indent of every line after the first, for a list whose items wrap: without
+    it an item's second line starts where the next item does and reads as one more item."""
     import textwrap
     text = " ".join(str(text).split())
     return textwrap.fill(text, width=width, initial_indent=prefix,
-                         subsequent_indent=" " * len(prefix),
+                         subsequent_indent=" " * len(prefix) + hang,
                          break_long_words=False, break_on_hyphens=False)
 
 
@@ -4898,6 +4901,11 @@ def _audit_json_payload(db_module, opts, inventory=None, log=None):
                 "never_called": s["never_called"],
                 "advertised_at": _iso(s["ts"]),
             } for s in roster["servers"]]
+        # The keys each agent held, described without the key, with the calls whose tool's code
+        # uses each, and the three flags. ABSENT when no key was recorded, the roster's rule.
+        keys = _their_held_keys(db_module)      # our demo's keys are not the reader's
+        if keys.get("agents"):
+            payload["held_keys"] = {"agents": keys["agents"], "flags": keys["flags"]}
         # The sites each agent's calls were addressed to, host only. Calls
         # that RAN; a stopped call's host stays on its ledger row and is not listed. ABSENT when nothing
         # was recorded, the roster's rule: an empty list would claim the agent reached nothing.
@@ -5043,6 +5051,232 @@ def _print_roster(db_module):
     """
     try:
         lines = _roster_lines(db_module.get_mcp_roster())
+    except Exception:
+        lines = []
+    for ln in lines:
+        print(ln)
+    if lines:
+        print("")
+
+
+_MCP_KEYS_PREFIX = "mcp_proxy:"   # held_keys rows the MCP proxy writes, one per wrapped server
+# A stranger read: "no call's code uses it" read as unused, and a reader would revoke the key. The
+# same sentence as the TypeScript report and the /app Keys tab.
+_NOT_SEEN_NOTE = ("A key not seen may still be in use: a library can find a key on its own, or it can "
+                  "be set up outside the tool's code. Check before you revoke one.")
+
+
+def _key_desc(k):
+    """'Stripe live secret key ...4f2a', never the key."""
+    what = "%s %s" % (k["provider"], k["label"])
+    if k.get("last4"):
+        what += " ...%s" % k["last4"]
+    elif k.get("account"):
+        what += " %s" % k["account"]
+    return what
+
+
+def _key_words(k):
+    """'Stripe live secret key ...4f2a (STRIPE_SECRET_KEY)', never the key."""
+    return "%s (%s)" % (_key_desc(k), k["source"])
+
+
+def _held_keys_lines(data):
+    """The keys each agent holds, from its environment, with the calls whose tool's own code
+    uses each, then the flags. Returns the lines; empty when no key was recorded."""
+    agents = (data or {}).get("agents") or []
+    if not agents:
+        return []
+    named = len([a for a in agents if not a["agent"].startswith(_MCP_KEYS_PREFIX)]) > 1
+    lines = ["  Keys your agents hold (read from their environment, never the key itself)"]
+    # What each agent could touch leads, the one thing only AgentX can show (held vs seen used);
+    # two warnings follow; a key several agents hold is a note on its row, not a warning (agents
+    # in one app share one environment).
+    for a in agents:
+        if not a["agent"].startswith(_MCP_KEYS_PREFIX):
+            lines.append(_wrap(_agent_summary(a), "    ", hang="  "))
+    unseen = False
+    for a in agents:
+        if a["agent"].startswith(_MCP_KEYS_PREFIX):
+            for k in a["keys"]:
+                lines.append(_wrap("MCP server %s: %s, held by the server"
+                                   % (a["agent"][len(_MCP_KEYS_PREFIX):], _key_words(k)), "    ", hang="  "))
+    # One line per key, the agents holding it named first (two agents in one environment printed
+    # every key twice). A wrapped line indents its second line, so it never reads as another key.
+    for g in _key_groups([a for a in agents if not a["agent"].startswith(_MCP_KEYS_PREFIX)]):
+        k, holders, used = g["key"], g["holders"], g["used"]
+        total = sum(used.values())
+        unseen = unseen or not _seen(g)
+        if not total and g["tools"]:
+            tools = [t or "a tool with no name" for t in g["tools"]]
+            said = "used in the code of %s (no call to %s is on record)" % (
+                tools[0] if len(tools) == 1 else "%s and %s" % (", ".join(tools[:-1]), tools[-1]),
+                "it" if len(tools) == 1 else "them")
+        elif not total:
+            said = "not seen in any tool's code"
+        elif len(holders) == 1:
+            said = "used by %s" % _plural(total, "call")
+        else:
+            users = [(a or "no agent name", n) for a, n in used.items() if n]
+            said = "used by %s (%s)" % (_plural(total, "call"), users[0][0] if len(users) == 1
+                                        else ", ".join("%s %d" % u for u in users))
+        who = ("%s: " % ", ".join(h or "an agent with no name" for h in holders)) if named else ""
+        what = "%s (%s)" % (_key_desc(k), ", ".join(g["sources"]))
+        note = ("; same user and host, the password is never kept, so it may differ"
+                if g["by_host"] and len(holders) > 1 else "")
+        lines.append(_wrap("%s%s, %s%s" % (who, what, said, note), "    ", hang="  "))
+    if unseen:
+        lines.append(_wrap(_NOT_SEEN_NOTE, "    ", hang="  "))
+    for line in _flag_sentences(data.get("flags") or [], agents):
+        lines.append(_wrap("! " + line, "    ", hang="  "))
+    return lines
+
+
+def _key_id(k):
+    """What makes two held rows ONE key. A key with a fingerprint: its id, whichever variable
+    holds it (the same token in GITHUB_TOKEN and GH_TOKEN is one key). A connection string, which
+    has no fingerprint (never a password): its provider, user, host and variable, which is all
+    that can be said. Anything else: its ref and its account, since a ref with no id is only the
+    variable's name (two agents on AWS_PROFILE=prod and =staging are two profiles; scoped review).
+    The same rule as ui/utils/keys.ts keyId and the TypeScript report."""
+    if k.get("kind") == "connection_string" and k.get("account"):
+        return ("host", k["provider"], k["account"], k["source"])
+    return ("ref", k["ref"], k.get("account") or "")
+
+
+def _key_groups(agents):
+    """The held keys as one entry per key (`_key_id`). Each: {key, holders, sources, used
+    {agent: calls}, tools, by_host}. A key in two variables is two rows, each with the key's full
+    call count, so an agent's count is the largest of its rows, never their sum (scoped review: one
+    key in two variables read as 2 keys and 6 calls for 3). `tools` are the tools whose code uses
+    the key, kept when their calls are not (retention). The same grouping as the TypeScript
+    report; ui/utils/keys.ts groups the same way (the gateway sends no tools)."""
+    groups, order = {}, []
+    for a in agents:
+        for k in a.get("keys") or []:
+            gid = _key_id(k)
+            if gid not in groups:
+                groups[gid] = {"key": k, "holders": [], "sources": [], "used": {}, "tools": [],
+                               "by_host": gid[0] == "host"}
+                order.append(gid)
+            g = groups[gid]
+            if a["agent"] not in g["holders"]:
+                g["holders"].append(a["agent"])
+            if k["source"] not in g["sources"]:
+                g["sources"].append(k["source"])
+            for t in k.get("tools") or []:
+                if t not in g["tools"]:
+                    g["tools"].append(t)
+            g["used"][a["agent"]] = max(g["used"].get(a["agent"], 0), int(k.get("used_by") or 0))
+    return [groups[gid] for gid in order]
+
+
+def _seen(g):
+    """A key was seen when a kept call used it, or when a tool's code uses it and its calls were
+    trimmed (scoped review: that key read "not seen in any tool's code")."""
+    return any(g["used"].values()) or bool(g["tools"])
+
+
+def _agent_summary(a):
+    """'billing holds 5 keys; its tools were seen using 2 (Slack, Stripe).' What the agent could
+    touch beside what its tools were seen touching, counted by key (`_key_id`), not by row. The
+    same words as ui/utils/keys.ts and the TypeScript report."""
+    g = _key_groups([a])
+    used = [x for x in g if _seen(x)]
+    providers = []
+    for x in used:
+        if x["key"]["provider"] not in providers:
+            providers.append(x["key"]["provider"])
+    name = a.get("agent") or "An agent with no name"
+    if not used:
+        return "%s holds %s; none was seen in its tools' code." % (name, _plural(len(g), "key"))
+    return "%s holds %s; its tools were seen using %d (%s)." % (
+        name, _plural(len(g), "key"), len(used), ", ".join(providers))
+
+
+def _flag_key(agents, agent, ref):
+    for a in agents:
+        if a["agent"] == agent:
+            for k in a["keys"]:
+                if k["ref"] == ref:
+                    return k
+    return None
+
+
+def _and_list(names):
+    names = [n or "an agent with no name" for n in names] or ["an agent with no name"]
+    return names[0] if len(names) == 1 else "%s and %s" % (", ".join(names[:-1]), names[-1])
+
+
+def _flag_sentences(flags, agents):
+    """Two warnings, one line each, the agents it applies to merged: a live key in a dev or test
+    run, a long-lived AWS key. (A key several agents hold is a note on its row: two agents in one
+    app share one environment, so it fired on every key.) The same words as ui/utils/keys.ts
+    flagSentences and the TypeScript report's."""
+    groups, order = {}, []
+    for f in flags:
+        kind, ref, agent = f.get("flag"), f.get("ref"), f.get("agent", "")
+        if kind not in ("live_in_dev", "long_lived_aws"):
+            continue
+        env = (_flag_key(agents, agent, ref) or {}).get("environment") or "" if kind == "live_in_dev" else ""
+        key = (kind, ref, env)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        if agent not in groups[key]:
+            groups[key].append(agent)
+    out = []
+    for kind, ref, env in order:
+        who = groups[(kind, ref, env)]
+        k = _flag_key(agents, who[0], ref)
+        what = _key_desc(k) if k else "A key"
+        # A wrapped MCP server by the name its own line uses ("MCP server github"), never the
+        # ledger's internal id ("mcp_proxy:github"), which no screen shows (scoped review).
+        names = ", ".join(
+            ("MCP server %s" % n[len(_MCP_KEYS_PREFIX):]) if n.startswith(_MCP_KEYS_PREFIX)
+            else (n or "an agent with no name") for n in who)
+        if kind == "live_in_dev":
+            where = ("runs set to AGENTX_ENVIRONMENT=%s" % env) if env else "runs named dev or test"
+            out.append("%s, in %s (%s): test calls with it are real. Use a test key there."
+                       % (what, where, names))
+        else:
+            out.append("%s (%s): it works until someone deletes it. Use temporary credentials "
+                       "(ASIA..., from a role) instead." % (what, names))
+    return out
+
+
+def _their_held_keys(db_module):
+    """The keys record without our own agents (the demo and the shipped examples): their keys
+    are not the reader's, as on every other part of these screens. Never raises."""
+    try:
+        data = db_module.get_held_keys() or {}
+    except Exception:
+        return {"agents": [], "flags": []}
+    ours = db_module.is_demo_agent
+    flags = []
+    for f in data.get("flags") or []:
+        if "agents" in f:
+            who = [a for a in f["agents"] if not ours(a)]
+            if len(who) > 1:
+                flags.append(dict(f, agents=who))
+        elif not ours(f.get("agent")):
+            flags.append(f)
+    return {"agents": [a for a in data.get("agents") or [] if not ours(a["agent"])], "flags": flags}
+
+
+def _a_tool_of_theirs_ran(db_module, mcp=False):
+    """True when the keys record holds an agent of the reader's: its row is written at a wrapped
+    tool's call, or (mcp=True) once the proxy fronts a server (`mcp_proxy:`). Our own agents are
+    never the reader's."""
+    return any((a["agent"] or "").startswith(_MCP_KEYS_PREFIX) == mcp
+               for a in _their_held_keys(db_module)["agents"])
+
+
+def _print_held_keys(db_module):
+    """Print the held-keys block, or nothing, followed by one blank line when it printed. ONE
+    helper for both branches of the grouped screen, the roster's rule."""
+    try:
+        lines = _held_keys_lines(_their_held_keys(db_module))
     except Exception:
         lines = []
     for ln in lines:
@@ -5640,8 +5874,20 @@ def _record_footer():
         if not v or not v.get("journaled") or v.get("intact") is None:
             return None
         if v["intact"]:
-            return ("Record intact, %s. Details: %s --record"
-                    % (_record_head_line(v, "ledger"), _audit_cmd()))
+            # Said as what the check found ("intact" did not say what it protects against), never
+            # more: it cannot see a rewrite of the whole journal, nor edits made before journaling
+            # began (chain.py), so "every change went through AgentX" overclaimed (scoped review).
+            # The handle stays, since `--record --head` takes it, and the number is named as
+            # changes: a bare "ledger:990" beside 987 calls reads as a call count.
+            n = v["head_seq"] or 0
+            if not n:
+                return "Tamper check passed: nothing recorded yet. Details: %s --record" % _audit_cmd()
+            when = datetime.fromtimestamp(v["head_at"]).strftime("%Y-%m-%d %H:%M") if v.get(
+                "head_at") else "?"
+            return ("Tamper check passed: no change outside AgentX's journal was found in %s "
+                    "(the latest, ledger:%s:%s, %s). Details: %s --record"
+                    % ("its 1 change" if n == 1 else "its %s changes" % format(n, ","), n,
+                       (v["head_link"] or "")[:12], when, _audit_cmd()))
         return ("🚨 This ledger was %s: %s. Details: %s --record"
                 % (_RECORD_WARNING, _record_problem_line(v), _audit_cmd()))
     except Exception:
@@ -6011,7 +6257,18 @@ def _execute_audit_screen(args=None):
                                               of_total=inventory["flagged_total"]):
                         print(_ln)
         else:
-            print("  No calls recorded yet.")
+            # Retention removed every call: "yet" was false beside a key "used in the code of
+            # refund". Only age can empty a ledger (the row limit keeps the newest), so the
+            # sentence names the days alone.
+            try:
+                _trim = get_retention_status() or {}
+            except Exception:
+                _trim = {}
+            if _trim.get("rows_dropped"):
+                print("  No calls in the last %d days; older ones are removed."
+                      % _trim["current_max_age_days"])
+            else:
+                print("  No calls recorded yet.")
             # 🔴 NAME THE LEDGER, because the likeliest cause of this screen is the reader
             # being in a different folder. DB_PATH is cwd-relative, so an agent run in
             # ~/proj and `agentx audit` run from ~ read two different files, and every
@@ -6028,6 +6285,7 @@ def _execute_audit_screen(args=None):
         # The roster prints on this branch too: an agent whose only call was stopped still
         # has a menu it could reach, and this is the one screen that can say so.
         _print_roster(db_module)
+        _print_held_keys(db_module)
         _print_destinations(db_module)
         if MCP_ENTRY:
             # 🔴 NEITHER THE SHELL'S POSTURE NOR THE PYTHON CTA IS TRUE ON THIS DOOR, and
@@ -6071,7 +6329,8 @@ def _execute_audit_screen(args=None):
             if _only_refused_theirs:
                 print("  Fix %s, then use the server again."
                       % ("those" if _print_refused_reasons(_totals) > 1 else "that"))
-            elif _theirs_on_record:
+            elif _theirs_on_record or _a_tool_of_theirs_ran(db_module, mcp=True):
+                # A server's keys row is written only once the proxy fronts it: wired.
                 print("  Use the server as usual, then run this again.")
             else:
                 print("  AgentX writes this down for any server it fronts. In your mcp.json,")
@@ -6104,7 +6363,9 @@ def _execute_audit_screen(args=None):
             # TS report's: a refused, halted, stopped or unsized call of theirs is proof a tool
             # is wrapped, so the snippet and the demo offer asked them to do it again (founder
             # walk). Our demo's rows do not count: that reader has wrapped nothing yet.
-            if _theirs_on_record:
+            # A held-keys row of theirs is proof too: it is written at a wrapped tool's call, and
+            # the keys block above names the tool.
+            if _theirs_on_record or _a_tool_of_theirs_ran(db_module):
                 if _only_refused_theirs:
                     print("  Fix %s, then run your agent again."
                           % ("those" if _print_refused_reasons(_totals) > 1 else "that"))
@@ -6473,6 +6734,7 @@ def _execute_audit_screen(args=None):
     # who sees "4 tools" in the table and only then learns there were 23 has already formed
     # the wrong idea. Prints nothing on a ledger with no roster (see _roster_lines).
     _print_roster(db_module)
+    _print_held_keys(db_module)
     _print_destinations(db_module)
     # 🔴 THE AGENT IS SHOWN ONLY WHEN IT DISCRIMINATES. On the common single-agent ledger
     # every row would carry the same name, which is a column of one repeated fact on the
@@ -10519,8 +10781,8 @@ def execute_allowlist(args, gateway_url, api_key, admin_key=None, admin_refusal=
             # cannot change the rules that hold the agent. Not refused, not applied.
             print("\n⏳ Nothing changed yet: the hosted gateway keeps this list as a waiting change,")
             print("   because it was sent with your agent's key. Whoever reads the email address")
-            print("   this key was issued to approves it at agentx-core.com/app (Held calls,")
-            print("   Waiting changes).")
+            print("   this AgentX key was issued to approves it at agentx-core.com/app")
+            print("   (Held calls, Waiting changes).")
             print("   A newer push replaces it.")
             print("=" * 75)
             sys.exit(0)
@@ -14025,10 +14287,12 @@ def execute_audit_demo(closing=True):
     # accurately until _call_shape stopped taking the largest value in the payload, and a
     # promise about what we record is the last place a stale description is noticed: nothing
     # can go red, and the reader has no way to check it. Four surfaces carried this one
-    # sentence -- here, both copies of example 12, and the README that ships to PyPI.
+    # sentence -- here, both copies of example 12, and the README that ships to PyPI. It names
+    # both columns taken from argument values: the URL host and the email-recipient domain.
     print("    What it wrote down is the SHAPE of each call: the argument names, the")
-    print("    surface it touched, the size of any amount passed, and the site any web")
-    print("    address pointed at (the host alone). Never the values.")
+    print("    surface it touched, the size of any amount passed, the site any web")
+    print("    address pointed at (the host alone) and the domain of any email")
+    print("    recipient. No other value.")
     print("")
     # 🔴 THE COMBINED RUN STOPS HERE, AND EVERYTHING BELOW IS WHY. What follows is this
     # command's CLOSING SCREEN: read it back, wrap your own tool, set enforce. The enforce

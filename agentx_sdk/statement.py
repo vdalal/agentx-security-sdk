@@ -46,6 +46,7 @@ describing itself is a defect this project has already had once.
 """
 import datetime
 import decimal
+import enum
 import json
 import math
 import numbers
@@ -108,6 +109,11 @@ _STATEMENT_ARG_NAMES = frozenset((
 
 _WIRE_DEPTH = 32
 _WIRE_DROP = object()
+# Bytes up to this size go as their text; longer ones as their size only. Their text is about 3.5
+# times their length and goes three times (`query`, `args`, `rule_args`), so a 4 MiB upload sent
+# 44 MB, past Cloud Run's 32 MiB request limit: the 413 read as an unreachable gateway and fail-open
+# ran the tool (scoped review of 597ab466).
+_WIRE_BYTES_MAX = 4096
 
 
 def _decimal_wire_text(value):
@@ -137,9 +143,10 @@ def _wire_leaf(value):
     reached `rule_args` and not `args`). A Decimal, a date, a time and a UUID go as their text; a
     non-finite float as its text (`requests` encodes with allow_nan=False, so `inf` raised there,
     the client read an unreachable gateway and fail-open ran the tool); any other real number
-    (numpy's int64 and float64, a Fraction) as the number it is. Anything else (bytes, a
-    timedelta, a client, a database connection) is `_WIRE_DROP`: its `str` is not an argument a
-    rule names, and can carry a password in a DSN."""
+    (numpy's int64 and float64, a Fraction) as the number it is; bytes and a plain Enum as their
+    text, which `query` carried already (bytes past `_WIRE_BYTES_MAX` as their size only). Anything else (a timedelta, a client, a database
+    connection) is `_WIRE_DROP`: its `str` is not an argument a rule names, and can carry a
+    password in a DSN."""
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
@@ -159,6 +166,14 @@ def _wire_leaf(value):
         except Exception:
             return _WIRE_DROP
         return text if isinstance(text, str) else _WIRE_DROP
+    # Bytes and a plain Enum as their `str`, in `args` and `query` alike: `query` already wrote that
+    # text (`b'x'`, `Tier.GOLD`) and `args` left the value out, so a list or dict holding one made
+    # the two sides differ, and the gateway read a note beside it as a statement and stopped it.
+    # An Enum built on str or int never reaches here: it is sent as its value above.
+    if isinstance(value, (bytes, bytearray)):
+        return str(value) if len(value) <= _WIRE_BYTES_MAX else "<%d bytes>" % len(value)
+    if isinstance(value, enum.Enum):
+        return str(value)
     if isinstance(value, numbers.Integral):
         return int(value)
     if isinstance(value, numbers.Real):

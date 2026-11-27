@@ -47,8 +47,34 @@ _EXTRA_SHAPES = (
     # with no `@` in it, and this scan runs on every protected tool's return.
     ("email", re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){1,8}")),
     ("private key",re.compile(r"-----BEGIN (?:[A-Z0-9]+ ){0,3}PRIVATE KEY-----")),
-    ("GitHub token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{20,}\b|\bgithub_pat_[0-9A-Za-z_]{20,}\b")),
+    # The first branch: an installation token may be `ghs_APPID_JWT`, ~520 characters with dots.
+    # It ends on a letter or digit: ending on any allowed character remembered "<token>." from
+    # prose, and a later send of the bare token, which does not hold the ".", went uncaught.
+    ("GitHub token", re.compile(r"\bghs_[0-9A-Za-z_.-]{35,2047}[0-9A-Za-z]|\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{20,}\b|\bgithub_pat_[0-9A-Za-z_]{20,}\b")),
 )
+
+
+# One list of the vendor key labels: the shapes below are named by it and `_SECRET_KINDS` is built
+# from it, so a key kind cannot be remembered without being counted and advised as a secret.
+_VENDOR_KEY_LABELS = {"Slack": "Slack token", "OpenAI": "OpenAI key", "Anthropic": "Anthropic key",
+                      "Stripe": "Stripe key", "Google": "Google API key"}
+
+
+def _vendor_key_shapes():
+    """The key shapes the SDK describes held keys by (credentials.KEY_KINDS), one pattern per
+    vendor, for the vendors the shapes above do not already cover (AWS key ids are the scrubber's,
+    GitHub tokens are above). A key starts where a word does; every repeat is bounded, since this
+    scan runs on every protected tool's return."""
+    from . import credentials
+    by_vendor = {}
+    for provider, _kind, _label, pattern, _live in credentials.KEY_KINDS:
+        if provider in _VENDOR_KEY_LABELS:
+            by_vendor.setdefault(provider, []).append(re.sub(r"\{(\d+),\}", r"{\1,1024}", pattern))
+    return tuple((_VENDOR_KEY_LABELS[p], re.compile(r"(?<![0-9A-Za-z_.-])(?:%s)" % "|".join(pats)))
+                 for p, pats in by_vendor.items())
+
+
+_EXTRA_SHAPES = _EXTRA_SHAPES + _vendor_key_shapes()
 _SHAPE_LABELS = {"EMAIL": "email", "PHONE": "phone number", "SSN": "social security number",
                  "CREDIT_CARD": "card number", "AWS_KEYS": "AWS key"}
 _DIGIT_KINDS = {"phone number", "social security number", "card number"}
@@ -508,7 +534,7 @@ def find_leak(run_values, arguments, *, name_sends, flagged_sends):
     return None
 
 
-_SECRET_KINDS = {"AWS key", "private key", "GitHub token"}
+_SECRET_KINDS = {"AWS key", "private key", "GitHub token"} | set(_VENDOR_KEY_LABELS.values())
 
 
 def category(leak):
